@@ -5,21 +5,18 @@
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
-package store_test
+package store
 
 import (
 	"database/sql"
 	"path/filepath"
 	"testing"
-
-	_ "modernc.org/sqlite"
-	"icloud-hme/internal/store"
 )
 
 // MIG01: 空库迁移生成完整 DDL 与初始版本
 func TestMIG01_EmptyDBInit(t *testing.T) {
 	dir := t.TempDir()
-	st, err := store.NewStore(dir)
+	st, err := NewStore(dir)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
@@ -62,7 +59,7 @@ func TestMIG02_LegacyLeasesUnambiguousToken(t *testing.T) {
 	}
 	rawDB.Close()
 
-	st, err := store.NewStore(dir)
+	st, err := NewStore(dir)
 	if err != nil {
 		t.Fatalf("加载旧库失败: %v", err)
 	}
@@ -106,7 +103,7 @@ func TestMIG03_DuplicateTokenNamesMappedToLegacyUnknown(t *testing.T) {
 	}
 	rawDB.Close()
 
-	st, err := store.NewStore(dir)
+	st, err := NewStore(dir)
 	if err != nil {
 		t.Fatalf("加载旧库失败: %v", err)
 	}
@@ -145,7 +142,7 @@ func TestMIG04_RoutesOnlyMigratedAsUnknown(t *testing.T) {
 	}
 	rawDB.Close()
 
-	st, err := store.NewStore(dir)
+	st, err := NewStore(dir)
 	if err != nil {
 		t.Fatalf("加载旧库失败: %v", err)
 	}
@@ -167,15 +164,15 @@ func TestMIG04_RoutesOnlyMigratedAsUnknown(t *testing.T) {
 // MIG05: 重复执行迁移幂等，不破坏既有数据与状态
 func TestMIG05_MigrationIdempotency(t *testing.T) {
 	dir := t.TempDir()
-	st1, err := store.NewStore(dir)
+	st1, err := NewStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = st1.SaveToken(store.APIToken{Name: "bot", Token: "tok-123"})
+	_ = st1.SaveToken(APIToken{Name: "bot", Token: "tok-123"})
 	st1.Close()
 
 	// 再次打开执行重复迁移
-	st2, err := store.NewStore(dir)
+	st2, err := NewStore(dir)
 	if err != nil {
 		t.Fatalf("MIG05 失败: 重复加载 Store 报错: %v", err)
 	}
@@ -190,7 +187,7 @@ func TestMIG05_MigrationIdempotency(t *testing.T) {
 // MIG06: DDL 初始化执行顺序严格按依赖拓扑，无表不存在异常
 func TestMIG06_DDLInitializationTopology(t *testing.T) {
 	dir := t.TempDir()
-	st, err := store.NewStore(dir)
+	st, err := NewStore(dir)
 	if err != nil {
 		t.Fatalf("MIG06 失败: DDL 执行拓扑异常: %v", err)
 	}

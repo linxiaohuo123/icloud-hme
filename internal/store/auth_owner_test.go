@@ -5,19 +5,17 @@
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
-package store_test
+package store
 
 import (
 	"context"
 	"testing"
-
-	"icloud-hme/internal/store"
 )
 
 // AUTH01: IsEmailOwnedByToken 仅查 alias_allocations，token_id 不匹配返回 false
 func TestAUTH01_OwnershipRequiresMatchingTokenID(t *testing.T) {
 	dir := t.TempDir()
-	st, err := store.NewStore(dir)
+	st, err := NewStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,11 +23,11 @@ func TestAUTH01_OwnershipRequiresMatchingTokenID(t *testing.T) {
 
 	ctx := context.Background()
 	// 保存 token A 与 token B
-	_ = st.SaveToken(store.APIToken{ID: "tok_A", Name: "botA", Token: "secA"})
-	_ = st.SaveToken(store.APIToken{ID: "tok_B", Name: "botB", Token: "secB"})
+	_ = st.SaveToken(APIToken{ID: "tok_A", Name: "botA", Token: "secA"})
+	_ = st.SaveToken(APIToken{ID: "tok_B", Name: "botB", Token: "secB"})
 
 	// 给 token A 分配别名
-	alloc := &store.AliasAllocation{
+	alloc := &AliasAllocation{
 		AllocationID: "alloc_1",
 		AliasEmail:   "alpha@icloud.com",
 		AccountID:    "acc_1",
@@ -57,7 +55,7 @@ func TestAUTH01_OwnershipRequiresMatchingTokenID(t *testing.T) {
 // AUTH02: token_name 相同但 token_id 不同（删除重建同名 token），权限核验返回 false
 func TestAUTH02_RecreatedSameNameTokenDoesNotInherit(t *testing.T) {
 	dir := t.TempDir()
-	st, err := store.NewStore(dir)
+	st, err := NewStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,8 +63,8 @@ func TestAUTH02_RecreatedSameNameTokenDoesNotInherit(t *testing.T) {
 
 	ctx := context.Background()
 	// 原 token A
-	_ = st.SaveToken(store.APIToken{ID: "tok_old", Name: "faka_bot", Token: "sec_old"})
-	alloc := &store.AliasAllocation{
+	_ = st.SaveToken(APIToken{ID: "tok_old", Name: "faka_bot", Token: "sec_old"})
+	alloc := &AliasAllocation{
 		AllocationID: "alloc_2",
 		AliasEmail:   "beta@icloud.com",
 		AccountID:    "acc_1",
@@ -80,7 +78,7 @@ func TestAUTH02_RecreatedSameNameTokenDoesNotInherit(t *testing.T) {
 
 	// 删除原 token，新建同名但不同 ID 的 token
 	_, _ = st.DeleteToken("tok_old")
-	_ = st.SaveToken(store.APIToken{ID: "tok_new", Name: "faka_bot", Token: "sec_new"})
+	_ = st.SaveToken(APIToken{ID: "tok_new", Name: "faka_bot", Token: "sec_new"})
 
 	// 新同名 token 不可继承
 	if st.IsEmailOwnedByToken(ctx, "beta@icloud.com", "tok_new") {
@@ -91,7 +89,7 @@ func TestAUTH02_RecreatedSameNameTokenDoesNotInherit(t *testing.T) {
 // AUTH03: 外部 token 试图用 legacy 记录绕过所有权检查，被阻断
 func TestAUTH03_LegacyRecordCannotBeClaimedByExternalToken(t *testing.T) {
 	dir := t.TempDir()
-	st, err := store.NewStore(dir)
+	st, err := NewStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,10 +97,10 @@ func TestAUTH03_LegacyRecordCannotBeClaimedByExternalToken(t *testing.T) {
 
 	ctx := context.Background()
 	// 创建一个新外部 token
-	_ = st.SaveToken(store.APIToken{ID: "tok_attacker", Name: "attacker", Token: "sec_att"})
+	_ = st.SaveToken(APIToken{ID: "tok_attacker", Name: "attacker", Token: "sec_att"})
 
 	// 模拟一条归属为 legacy_unknown 的分配
-	alloc := &store.AliasAllocation{
+	alloc := &AliasAllocation{
 		AllocationID: "alloc_legacy",
 		AliasEmail:   "legacy@icloud.com",
 		AccountID:    "acc_1",
@@ -123,14 +121,14 @@ func TestAUTH03_LegacyRecordCannotBeClaimedByExternalToken(t *testing.T) {
 // AUTH04: 管理员身份在各所有权接口中可正常穿透
 func TestAUTH04_AdminOwnershipBypass(t *testing.T) {
 	dir := t.TempDir()
-	st, err := store.NewStore(dir)
+	st, err := NewStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
 
 	ctx := context.Background()
-	alloc := &store.AliasAllocation{
+	alloc := &AliasAllocation{
 		AllocationID: "alloc_admin",
 		AliasEmail:   "admin_target@icloud.com",
 		AccountID:    "acc_1",
