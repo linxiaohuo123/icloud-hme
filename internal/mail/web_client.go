@@ -404,12 +404,13 @@ func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
 		return nil, err
 	}
 
-	// 本地过滤: To/CC/BCC 或主题中包含 alias
+	// 本地过滤: To/CC/BCC 或主题/正文预览中包含 alias
 	filtered := make([]Message, 0, limit)
 	for _, m := range raw {
 		if strings.Contains(strings.ToLower(m.Subject), strings.ToLower(alias)) ||
 			strings.Contains(strings.ToLower(m.From), strings.ToLower(alias)) ||
-			strings.Contains(strings.ToLower(m.To), strings.ToLower(alias)) {
+			strings.Contains(strings.ToLower(m.To), strings.ToLower(alias)) ||
+			strings.Contains(strings.ToLower(m.Preview), strings.ToLower(alias)) {
 			if m.To == "" {
 				m.To = alias
 			}

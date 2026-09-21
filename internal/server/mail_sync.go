@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 sync, time, net/mail, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 MailSyncWorker, NewMailSyncWorker
- * [POS]: server 的后台单协程拉信同步器，独占 IMAP 连接，集中解析后向 EventBus 广播
+ * [POS]: server 的后台单协程拉信同步器，独占 IMAP 连接，集中解析后向 EventBus 广播；支持 Trigger 即时事件唤醒消灭轮询盲等
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -42,6 +42,7 @@ type MailSyncWorker struct {
 	eventBus       *mail.EventBus
 	store          *store.Store
 	interval       time.Duration
+	triggerCh      chan struct{}
 	stopCh         chan struct{}
 	once           sync.Once
 	stopOnce       sync.Once
@@ -61,6 +62,7 @@ func NewMailSyncWorker(be Backend, st *store.Store, eventBus *mail.EventBus, int
 		store:          st,
 		eventBus:       eventBus,
 		interval:       interval,
+		triggerCh:      make(chan struct{}, 1),
 		stopCh:         make(chan struct{}),
 		aliasToAccount: make(map[string]string),
 		published:      make(map[string]time.Time),
@@ -166,6 +168,17 @@ func (w *MailSyncWorker) Stop() {
 	})
 }
 
+// Trigger 立即唤醒同步器执行一轮同步 (非阻塞)。
+func (w *MailSyncWorker) Trigger() {
+	if w == nil {
+		return
+	}
+	select {
+	case w.triggerCh <- struct{}{}:
+	default:
+	}
+}
+
 // loop 定时执行批量拉信与事件分发。
 func (w *MailSyncWorker) loop() {
 	ticker := time.NewTicker(w.interval)
@@ -175,6 +188,8 @@ func (w *MailSyncWorker) loop() {
 		select {
 		case <-w.stopCh:
 			return
+		case <-w.triggerCh:
+			w.syncOnce()
 		case <-ticker.C:
 			w.syncOnce()
 		}
@@ -333,30 +348,24 @@ func (w *MailSyncWorker) fetchAndPublish(accountID, alias string) bool {
 			continue
 		}
 
-		recipients := parseRecipientEmails(msg.To)
-		if len(recipients) == 0 && alias != "" {
-			recipients = []string{strings.ToLower(alias)}
-		} else if alias != "" {
-			foundTarget := false
-			targetLower := strings.ToLower(alias)
-			for _, r := range recipients {
-				if r == targetLower {
-					foundTarget = true
-					break
-				}
-			}
-			if !foundTarget {
-				recipients = append(recipients, targetLower)
-			}
-		}
-
-		for _, email := range recipients {
-			// 同一封历史邮件绝不重复广播(否则二次取码会拿到已消费的陈旧 OTP)
-			if !w.markPublished(accountID, msg.Folder, msg.ID, email) {
+		target := strings.ToLower(strings.TrimSpace(alias))
+		if target != "" {
+			// 定向匹配：仅向当前待查别名广播，绝不向 To 头中包含的其它无关主号或抄送地址交叉泄露 OTP
+			if !w.markPublished(accountID, msg.Folder, msg.ID, target) {
 				continue
 			}
-			w.eventBus.Publish(email, accountID, msg.Subject, msg.From, msg.Date, otp)
+			w.eventBus.Publish(target, accountID, msg.Subject, msg.From, msg.Date, otp)
 			hasMatch = true
+		} else {
+			recipients := parseRecipientEmails(msg.To)
+			for _, email := range recipients {
+				// 同一封历史邮件绝不重复广播(否则二次取码会拿到已消费的陈旧 OTP)
+				if !w.markPublished(accountID, msg.Folder, msg.ID, email) {
+					continue
+				}
+				w.eventBus.Publish(email, accountID, msg.Subject, msg.From, msg.Date, otp)
+				hasMatch = true
+			}
 		}
 	}
 	return hasMatch

@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 database/sql, modernc.org/sqlite, os, path/filepath, sync, time, encoding/json
- * [OUTPUT]: 对外提供 Store 结构及其对 Tags, Tokens, Leases, Schedules 的 SQLite/WAL 高性能持久化能力
- * [POS]: internal/store 的持久化层，基于纯 Go 嵌入式 SQLite 引擎提供零依赖、无损事务存储；UpdateLeaseStatus 支持邮箱大小写不敏感更新并命中 LOWER(email) 表达式索引
+ * [OUTPUT]: 对外提供 Store 结构及其对 Tags, Tokens, Leases, Schedules, Pool-First 别名池原子认领、CountConsumedPoolAliases 与覆盖索引的高性能持久化能力
+ * [POS]: internal/store 的持久化层，基于纯 Go 嵌入式 SQLite 引擎提供零依赖、无损事务存储；ClaimPoolAlias 支持并发安全原子认领与多注册机防重号
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -313,6 +313,8 @@ func (s *Store) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_leases_email ON lease_records (email);
 	-- 表达式索引: 兼容历史混合大小写行的 LOWER(email) 等值反查(FindLeaseAccount)
 	CREATE INDEX IF NOT EXISTS idx_leases_email_lower ON lease_records (LOWER(email));
+	-- 覆盖复合索引: 支撑 ClaimPoolAlias 与 CountConsumedPoolAliases 的纯索引只读扫描 (Index-Only Scan)，彻底消除回表
+	CREATE INDEX IF NOT EXISTS idx_leases_email_lower_token ON lease_records (LOWER(email), token_name);
 	CREATE INDEX IF NOT EXISTS idx_leases_tag ON lease_records (tag);
 	CREATE INDEX IF NOT EXISTS idx_leases_status ON lease_records (status);
 
@@ -787,6 +789,157 @@ func (s *Store) UpdateLeaseStatus(id, status string) error {
 		return fmt.Errorf("记录不存在: %s", id)
 	}
 	return nil
+}
+
+// PoolCandidate 待从别名池领用的候选别名
+type PoolCandidate struct {
+	AccountID string
+	Email     string
+}
+
+// ClaimPoolAlias 原子地从候选别名列表中挑选第一个未被外部消费者领用的别名并生成领用记录。
+// 并发安全：多协程并发领号时，同一别名绝不会被重复分发。
+// 若无可用别名，返回 nil, nil。
+func (s *Store) ClaimPoolAlias(candidates []PoolCandidate, tag, tokenName string) (*LeaseRecord, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	if tag == "" {
+		tag = "default"
+	}
+	if tokenName == "" {
+		tokenName = "admin_console"
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	const batchSize = 500
+	for i := 0; i < len(candidates); i += batchSize {
+		end := i + batchSize
+		if end > len(candidates) {
+			end = len(candidates)
+		}
+		chunk := candidates[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for j, c := range chunk {
+			placeholders[j] = "?"
+			args[j] = normalizeEmail(c.Email)
+		}
+
+		query := fmt.Sprintf(
+			`SELECT LOWER(email) FROM lease_records WHERE LOWER(email) IN (%s) AND COALESCE(token_name, '') != 'scheduler'`,
+			strings.Join(placeholders, ","),
+		)
+		rows, err := s.db.Query(query, args...)
+		if err != nil {
+			return nil, err
+		}
+		consumed := make(map[string]bool, len(chunk))
+		for rows.Next() {
+			var em string
+			if err := rows.Scan(&em); err == nil {
+				consumed[normalizeEmail(em)] = true
+			}
+		}
+		_ = rows.Close()
+
+		for _, c := range chunk {
+			norm := normalizeEmail(c.Email)
+			if norm == "" || consumed[norm] {
+				continue
+			}
+
+			// 命中首个可用别名，原子插入领用流水！
+			rec := LeaseRecord{
+				ID:          fmt.Sprintf("lease_%d_%d", time.Now().UnixNano(), atomic.AddUint64(&leaseSeq, 1)),
+				Email:       norm,
+				AccountID:   c.AccountID,
+				Tag:         tag,
+				Status:      "completed",
+				AllocatedAt: time.Now().Format(time.RFC3339),
+				CompletedAt: time.Now().Format(time.RFC3339),
+				TokenName:   tokenName,
+			}
+			insQuery := `INSERT INTO lease_records (id, email, account_id, tag, status, allocated_at, completed_at, token_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+			if _, insertErr := s.db.Exec(insQuery, rec.ID, rec.Email, rec.AccountID, rec.Tag, rec.Status, rec.AllocatedAt, rec.CompletedAt, rec.TokenName); insertErr != nil {
+				return nil, insertErr
+			}
+			if rec.AccountID != "" {
+				_ = s.UpsertAliasRoutes(rec.AccountID, []string{rec.Email})
+			}
+			s.UpdateTagLastAssigned(tag)
+			return &rec, nil
+		}
+	}
+
+	return nil, nil
+}
+
+// CountAvailablePoolAliases 统计候选别名列表中未被消费的可用数量。
+func (s *Store) CountAvailablePoolAliases(candidates []PoolCandidate) (int, error) {
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	totalAvailable := 0
+	const batchSize = 500
+	for i := 0; i < len(candidates); i += batchSize {
+		end := i + batchSize
+		if end > len(candidates) {
+			end = len(candidates)
+		}
+		chunk := candidates[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for j, c := range chunk {
+			placeholders[j] = "?"
+			args[j] = normalizeEmail(c.Email)
+		}
+
+		query := fmt.Sprintf(
+			`SELECT LOWER(email) FROM lease_records WHERE LOWER(email) IN (%s) AND COALESCE(token_name, '') != 'scheduler'`,
+			strings.Join(placeholders, ","),
+		)
+		rows, err := s.db.Query(query, args...)
+		if err != nil {
+			return 0, err
+		}
+		consumed := make(map[string]bool, len(chunk))
+		for rows.Next() {
+			var em string
+			if err := rows.Scan(&em); err == nil {
+				consumed[normalizeEmail(em)] = true
+			}
+		}
+		_ = rows.Close()
+
+		for _, c := range chunk {
+			norm := normalizeEmail(c.Email)
+			if norm != "" && !consumed[norm] {
+				totalAvailable++
+			}
+		}
+	}
+
+	return totalAvailable, nil
+}
+
+// CountConsumedPoolAliases 统计已被外部消费者认领（非 scheduler 占位）的唯一别名数。
+// 得益于 idx_leases_email_lower_token 覆盖复合索引，该查询由 SQLite 纯索引只读引擎在亚毫秒内完成。
+func (s *Store) CountConsumedPoolAliases() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var n int
+	_ = s.db.QueryRow(`SELECT COUNT(DISTINCT LOWER(email)) FROM lease_records WHERE COALESCE(token_name, '') != 'scheduler'`).Scan(&n)
+	return n
 }
 
 // --- 定时配置 Schedules ---

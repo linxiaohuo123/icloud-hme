@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 hooks/useAccounts, api/client 的 request/ApiError, api/types 的 ScheduleConfig/ScheduleLog/ScheduleStatus/AccountSummary, components/ToastProvider, components/icons, components/schedule
  * [OUTPUT]: 对外提供 SchedulePage 定时别名任务与调度大盘组件
- * [POS]: web/src/pages 的核心页面，组装 ScheduleMetrics, ScheduleAccountRow, ScheduleMacroHintBar, ScheduleLogConsole
+ * [POS]: web/src/pages 的核心页面，组装 ScheduleMetrics, ScheduleAccountRow, ScheduleMacroHintBar, ScheduleLogConsole，支持常规补货与强制全员补货(?all=true)
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -226,16 +226,17 @@ export default function SchedulePage() {
     [handleUpdateLabel],
   )
 
-  const handleTriggerNow = async () => {
+  const handleTriggerNow = async (all = false) => {
     setTriggering(true)
     try {
-      await request('/api/schedule/run-now', { method: 'POST' })
+      const url = all ? '/api/schedule/run-now?all=true' : '/api/schedule/run-now'
+      await request(url, { method: 'POST' })
       setStatus((prev) => ({
         running: true,
         last_run_at: prev?.last_run_at,
         interval_seconds: prev?.interval_seconds ?? 300,
       }))
-      show('已触发一轮定时别名补货任务')
+      show(all ? '已强制对全部账号触发一轮补货任务' : '已触发一轮定时别名补货任务')
     } catch (err) {
       show(err instanceof ApiError ? err.message : '触发任务失败')
     } finally {
@@ -275,11 +276,20 @@ export default function SchedulePage() {
             定时为已启用的账号补充 HME 别名，支持设置每小时限额与 Cookie 失效自动暂停
           </p>
         </div>
-        <div>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => void handleTriggerNow(true)}
+            disabled={triggering || status?.running === true}
+            title="对全部账号（包含尚未开启定时任务的账号）强制触发一轮补货"
+          >
+            <span>强制全员补货</span>
+          </button>
           <button
             type="button"
             className="btn btn-primary"
-            onClick={() => void handleTriggerNow()}
+            onClick={() => void handleTriggerNow(false)}
             disabled={triggering || status?.running === true}
           >
             <IconZap size={15} />

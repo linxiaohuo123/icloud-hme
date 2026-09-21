@@ -337,6 +337,12 @@ func readBody(msg *mail.Message) (string, error) {
 		raw, _ := io.ReadAll(io.LimitReader(msg.Body, maxBodyRead))
 		decoded := decodeTransferData(raw, msg.Header.Get("Content-Transfer-Encoding"))
 		plainText, htmlText := readMultipartBody(decoded, params["boundary"], 0)
+		if plainText != "" && htmlText != "" {
+			if strings.TrimSpace(plainText) == strings.TrimSpace(htmlText) {
+				return plainText, nil
+			}
+			return plainText + "\n\n" + htmlText, nil
+		}
 		if plainText != "" {
 			return plainText, nil
 		}

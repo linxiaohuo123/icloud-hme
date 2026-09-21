@@ -84,6 +84,18 @@ func TestExtractOTP(t *testing.T) {
 			body:         "58291 is your security code.",
 			expectedCode: "58291",
 		},
+		{
+			name:         "PIN独立关键词提取",
+			subject:      "Security",
+			body:         "Your PIN is: 739201",
+			expectedCode: "739201",
+		},
+		{
+			name:         "OTP独立关键词提取",
+			subject:      "Login Authentication",
+			body:         "Your OTP is 829104 for verification.",
+			expectedCode: "829104",
+		},
 	}
 
 	for _, tt := range tests {
@@ -110,3 +122,17 @@ func BenchmarkExtractOTP(b *testing.B) {
 		_ = ExtractOTP(subject, body)
 	}
 }
+
+func TestExtractOTPFalsePositiveImmunity(t *testing.T) {
+	// 普通购物/餐厅邮件中包含 shopping(内含 pin) 或 hotpot(内含 otp)，不能误判为验证码
+	shoppingMail := "Thank you for shopping: 123456 is your order number."
+	if res := ExtractOTP("Receipt", shoppingMail); res != nil && res.Code != "" {
+		t.Fatalf("shopping 单词不应被当作 pin 提取验证码，实际得到: %q", res.Code)
+	}
+
+	hotpotMail := "Welcome to Hotpot restaurant! Bill: 883921"
+	if res := ExtractOTP("Dining", hotpotMail); res != nil && res.Code != "" {
+		t.Fatalf("hotpot 单词不应被当作 otp 提取验证码，实际得到: %q", res.Code)
+	}
+}
+

@@ -322,3 +322,30 @@ func TestScaleMailSyncFanout(t *testing.T) {
 	}
 	t.Logf("负缓存生效: 第二轮新增 IMAP 拉取 0 次")
 }
+
+func TestMailSyncWorkerTrigger(t *testing.T) {
+	accs := []account.Summary{{ID: "acc_1", Status: "active", HasCookies: true, HasAppPassword: true}}
+	be := &countingInboxBackend{fakeBackend: &fakeBackend{accounts: accs}}
+	bus := mail.NewEventBus(5 * time.Minute)
+	// 设置长周期 (1 小时)，证明无需等待 ticker，可被 Trigger 即时唤醒
+	w := NewMailSyncWorker(be, nil, bus, time.Hour)
+	w.Start()
+	defer w.Stop()
+
+	bus.Subscribe("test-trigger@icloud.com")
+	w.Trigger()
+
+	deadline := time.Now().Add(2 * time.Second)
+	triggered := false
+	for time.Now().Before(deadline) {
+		if be.callCount() > 0 {
+			triggered = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !triggered {
+		t.Fatal("MailSyncWorker.Trigger() 未能即时唤醒同步协程")
+	}
+}
+

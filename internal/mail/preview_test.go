@@ -1,6 +1,9 @@
 package mail
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestSanitizePreviewRemovesInvisibleHTMLBlocks(t *testing.T) {
 	raw := `<html><head><style>@font-face { font-family: Söhne; } body { color: red; }</style></head><body><p>验证码：123456</p><script>alert(1)</script></body></html>`
@@ -61,5 +64,17 @@ func TestDecodeAppleRelay(t *testing.T) {
 		if got := decodeAppleRelay(tc.in); got != tc.want {
 			t.Errorf("decodeAppleRelay(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestSanitizePreviewPreservesLinksForMagicLink(t *testing.T) {
+	raw := `<p>请点击下方链接激活您的账号：</p><a href="https://example.com/activate?token=sec_987654">立即激活</a>`
+	got := sanitizePreview(raw)
+	if !strings.Contains(got, "https://example.com/activate?token=sec_987654") {
+		t.Fatalf("sanitizePreview() = %q, want link URL preserved", got)
+	}
+	otp := ExtractOTP("激活邮件", got)
+	if otp == nil || otp.MagicLink != "https://example.com/activate?token=sec_987654" {
+		t.Fatalf("ExtractOTP failed to extract magic link from preview: %+v", otp)
 	}
 }

@@ -312,7 +312,7 @@ Content-Type: application/json
 }
 ```
 
-### 14. 智能一键出号 / 分销分配 (注册机首选推荐)
+### 14. 智能一键出号 / 分销分配 (号池优先 / 注册机首选推荐)
 
 ```http
 POST /api/quick-create
@@ -325,15 +325,26 @@ Content-Type: application/json
 
 {
   "tag": "reg_pool_a",
-  "label": "某平台注册任务"
+  "label": "某平台注册任务",
+  "mode": "pool"
 }
 ```
 
+**请求参数说明：**
+- `tag` (可选，字符串)：指定业务标签。优先分配绑定该标签的母号资产；如未指定则匹配通用号池，杜绝跨业务串号。
+- `label` (可选，字符串)：别名备注标签。
+- `mode` (可选，字符串，默认 `"pool"`)：
+  - `"pool"`（**默认推荐**）：**号池优先**。毫秒级从后台预先按限速积攒的就绪别名池中原子认领出号；若号池耗尽，则自动无缝降级触发 Apple 实时建号。
+  - `"pool_only"`：**严格仅用号池**。仅从预存就绪号池中认领，绝不实时调用 Apple 上游；若号池耗尽立即返回 `503 POOL_EMPTY`（附带 `Retry-After: 60`），保护注册机免受上游风控与阻塞。
+  - `"create"`：**强制实时建号**。绕过预存号池，直接调用 Apple 上游 API 创建全新别名（受每小时 5 个配额限制）。
+
 **出号机制与核心优势：**
-- **无需指定 `account_id`**：底层自动化调度引擎结合内存预热池（AliasBuffer）与 Round-Robin 算法秒级分配。
+- **零延迟提取 (~1ms)**：后台定时任务（Schedules/Jobs）在平时按 Apple 5个/小时限制平稳囤号，注册机高峰期直接从号池原子提取，彻底打破 5个/小时的瞬时瓶颈。
+- **无需指定 `account_id`**：底层自动化调度引擎结合号池优先策略与 Round-Robin 算法秒级分配。
 - **业务标签亲和隔离 (`tag`)**：优先分配打上指定业务标签的专属母号；若无则自动匹配通用号池，严禁跨业务串号。
-- **自动审计与流水落库**：若使用 `am_` 外部接入令牌发起调用，系统将自动记录该 Token、分配的别名、业务标签至 SQLite 数据库中。
-- **500 别名安全熔断与配额保护**：自动规避达到 500 上限的母号，确保出号 100% 成功。
+- **并发原子防重**：底层 SQLite/WAL 事务排他锁 (`ClaimPoolAlias`) 保证千并发抢号绝无并发碰撞或重复出号。
+- **自动审计与流水落库**：使用外部接入令牌发起调用时，自动记录该 Token、分配的别名、出号来源 (`pool`/`created`)、业务标签至数据库。
+- **突破 500 别名上限**：单号达到 500 限制后虽无法新建，但其存量预置别名仍可自由划入号池被注册机认领。
 
 **响应：**
 ```json
@@ -344,10 +355,12 @@ Content-Type: application/json
     "account_id": "acc_1",
     "label": "某平台注册任务",
     "tag": "reg_pool_a",
+    "source": "pool",
     "created_at": "2026-09-20T14:25:00+08:00"
   }
 }
 ```
+- `source`: 出号来源，`"pool"`（从预存号池秒级认领）或 `"created"`（触发 Apple 上游即时创建）。
 
 ### 15. 批量创建别名
 
@@ -962,28 +975,29 @@ Authorization: Bearer <API_KEY>
 
 ## 客户端极速接入示例
 
-### 场景一：注册机极速闭环脚本 (Shell / curl)
+### 场景一：注册机极速闭环脚本 (号池秒级出号 + 长期资产留存，推荐标准方案)
 
 ```bash
 #!/usr/bin/env bash
 BASE="http://127.0.0.1:8081"
 API_KEY="your_admin_api_key_or_token"
 
-# 1. 一键租用新别名 (智能负载均衡，附带业务标签)
+# 1. 秒级认领邮箱 (优先从后台定时囤积的号池中认领，~1ms 零延迟，不触发 Apple 限速)
 ALLOC=$(curl -s -X POST "$BASE/api/allocate" \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"tag":"reg_pool_a","label":"AutoRegBot"}')
+  -d '{"tag":"reg_pool_a","label":"AutoRegBot","mode":"pool"}')
 
 EMAIL=$(echo "$ALLOC" | jq -r '.data.email')
-echo "获取到新别名: $EMAIL"
+SOURCE=$(echo "$ALLOC" | jq -r '.data.source')
+echo "获取到别名: $EMAIL (出号来源: $SOURCE)"
 
 # 2. 调用目标网站发起注册...
 # curl -X POST "https://example.com/register" -d "email=$EMAIL"
 
-# 3. 毫秒级长轮询验证码 (提取后自动在后台销毁别名以释放 Apple 配额)
+# 3. 毫秒级长轮询验证码 (不传 auto_delete，别名作为永久资产留存，后续可随时收邮件/找回密码)
 echo "等待验证码到达..."
-CODE_RESP=$(curl -s "$BASE/api/external/v1/verify-code?email=$EMAIL&timeout=60&auto_delete=true" \
+CODE_RESP=$(curl -s "$BASE/api/external/v1/verify-code?email=$EMAIL&timeout=60" \
   -H "Authorization: Bearer $API_KEY")
 
 CODE=$(echo "$CODE_RESP" | jq -r '.data.code')
@@ -991,6 +1005,10 @@ MAGIC=$(echo "$CODE_RESP" | jq -r '.data.magic_link')
 
 echo "捕获验证码: $CODE, 激活链接: $MAGIC"
 ```
+
+> **注意：资产留存 vs 用完即抛**
+> - **长期留存（默认/推荐）**：不要在取码请求中传 `auto_delete=true`。别名将永久保留在 iCloud 母号中，日后目标网站重置密码或发通知时随时可在系统内查收邮件。
+> - **用完即抛（可选）**：仅当明确不需要该账号且欲释放母号 500 个上限时，才在 `verify-code` 中传入 `auto_delete=true`。
 
 ### 场景二：Python 极速自动化封装
 
@@ -1000,15 +1018,21 @@ import requests
 BASE = "http://127.0.0.1:8081"
 HEADERS = {"Authorization": "Bearer your_api_key"}
 
-# 1. 租用邮箱
-resp = requests.post(f"{BASE}/api/quick-create", json={"label": "PyTask"}, headers=HEADERS).json()
-email = resp["data"]["email"]
-print(f"Allocated: {email}")
+# 1. 优先从号池提取就绪别名 (~1ms，并发无冲突)
+resp = requests.post(
+    f"{BASE}/api/allocate",
+    json={"tag": "reg_pool_a", "label": "PyTask", "mode": "pool"},
+    headers=HEADERS
+).json()
 
-# 2. 获取验证码并自动销毁
+email = resp["data"]["email"]
+source = resp["data"]["source"]
+print(f"Allocated: {email} (source: {source})")
+
+# 2. 获取验证码 (长期保留别名资产，不传 auto_delete)
 verify = requests.get(
     f"{BASE}/api/verify-code",
-    params={"email": email, "timeout": 30, "auto_delete": "true"},
+    params={"email": email, "timeout": 30},
     headers=HEADERS
 ).json()
 

@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 os, path/filepath, runtime, time, gin
  * [OUTPUT]: 对外提供 (Server).systemStatsHandler 与 (CookieMonitor).Interval
- * [POS]: internal/server 的运行时可观测性端点，暴露进程/存储/后台引擎的关键水位供运维判断容量
+ * [POS]: internal/server 的运行时可观测性端点，暴露进程/存储/后台引擎/别名池(alias_pool)资产关键水位供运维与自动化注册集群调度
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -43,6 +43,26 @@ func (s *Server) systemStatsHandler(c *gin.Context) {
 			"alias_routes":  s.store.CountAliasRoutes(),
 			"leases":        s.store.CountLeases(),
 			"db_size_bytes": s.dbSizeBytes(),
+		}
+
+		// 号池资产水位 (实时透出可用别名存量，供外部注册机/集群调度器秒级感知是否需要补仓)
+		totalActiveAliases := 0
+		if s.be != nil {
+			for _, acc := range s.be.ListAccounts() {
+				if acc.Status == "active" {
+					totalActiveAliases += acc.AliasActive
+				}
+			}
+		}
+		consumedAliases := s.store.CountConsumedPoolAliases()
+		availableAliases := totalActiveAliases - consumedAliases
+		if availableAliases < 0 {
+			availableAliases = 0
+		}
+		stats["alias_pool"] = gin.H{
+			"total_active_aliases": totalActiveAliases,
+			"consumed_aliases":     consumedAliases,
+			"available_aliases":    availableAliases,
 		}
 	}
 

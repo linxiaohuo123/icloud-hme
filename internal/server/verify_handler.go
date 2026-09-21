@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 gin, time, strings, strconv, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 verifyCodeHandler
- * [POS]: server 的验证码极速提取管道，基于 MailEventBus 实现纯内存事件分发与零锁争用
+ * [POS]: server 的验证码极速提取管道，基于 MailEventBus 实现纯内存事件分发与零锁争用，Trigger 即时触发收信，持久化兜底配额释放
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -48,6 +48,11 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 	subID, ch := s.eventBus.SubscribeWithFresh(email, fresh)
 	defer s.eventBus.Unsubscribe(email, subID)
 
+	// 立即唤醒后台拉信同步器，消除最多 2 秒的轮询盲等
+	if s.syncWorker != nil {
+		s.syncWorker.Trigger()
+	}
+
 	timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
 	defer timer.Stop()
 
@@ -78,6 +83,13 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 func (s *Server) autoDeactivateAlias(accountID, email string) {
 	if accountID == "" && s.syncWorker != nil {
 		accountID = s.syncWorker.GetAliasAccount(email)
+	}
+	if accountID == "" && s.store != nil {
+		if accID, ok := s.store.FindAliasRoute(email); ok {
+			accountID = accID
+		} else if accID, ok := s.store.FindLeaseAccount(email); ok {
+			accountID = accID
+		}
 	}
 	if accountID == "" {
 		return

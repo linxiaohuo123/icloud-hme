@@ -74,7 +74,7 @@ func TestSystemStatsEndpoint(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("admin 应能读取系统水位: %d %s", resp.StatusCode, body)
 	}
-	for _, key := range []string{"uptime_seconds", "goroutines", "store", "engines", "alias_routes", "leases"} {
+	for _, key := range []string{"uptime_seconds", "goroutines", "store", "engines", "alias_routes", "leases", "alias_pool", "available_aliases"} {
 		if !strings.Contains(body, key) {
 			t.Fatalf("系统水位应包含 %q: %s", key, body)
 		}

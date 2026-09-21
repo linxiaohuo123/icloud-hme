@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 html, regexp, strings
  * [OUTPUT]: 对外提供 sanitizePreview, sanitizePlainPreview 等邮件内容清洗与 CSS 剥离能力
- * [POS]: internal/mail 的正文解析与摘要脱敏工具
+ * [POS]: internal/mail 的正文解析与摘要脱敏工具，支持 HTML 链接地址保留以供激活链接/MagicLink 嗅探
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -20,6 +20,7 @@ var (
 	htmlBreakRE      = regexp.MustCompile(`(?i)<br\s*/?>`)
 	htmlBlockEndRE   = regexp.MustCompile(`(?i)</(p|div|tr|h[1-6])\s*>`)
 	htmlListItemRE   = regexp.MustCompile(`(?i)<li\b[^>]*>`)
+	htmlLinkRE       = regexp.MustCompile(`(?is)<a\b[^>]*?\bhref=["']?([^"'\s>]+)["']?[^>]*>(.*?)</a>`)
 
 	cssSignalRE      = regexp.MustCompile(`(?i)(@font-face|@media|@import|@supports|@keyframes|(^|[\s;{])(-webkit-|-moz-|-ms-|mso-)[\w-]*|(^|[\s;{])(font-family|text-size-adjust|border-collapse|mso-table-[\w-]+)\s*:)`)
 	cssDeclarationRE = regexp.MustCompile(`(?i)(^|[;{])\s*[-a-z_][\w-]*\s*:\s*[^;{}]+`)
@@ -56,6 +57,7 @@ func stripHTML(raw string) string {
 	raw = htmlBreakRE.ReplaceAllString(raw, "\n")
 	raw = htmlBlockEndRE.ReplaceAllString(raw, "\n")
 	raw = htmlListItemRE.ReplaceAllString(raw, "\n- ")
+	raw = htmlLinkRE.ReplaceAllString(raw, "$2 ( $1 )")
 	raw = htmlTagRE.ReplaceAllString(raw, "")
 	return normalizePreview(stdhtml.UnescapeString(raw))
 }

@@ -111,3 +111,38 @@ func TestReadBodySkipAttachment(t *testing.T) {
 		t.Fatalf("attachment content should be skipped, but got: %q", body)
 	}
 }
+
+// 测试 multipart/alternative 下如果纯文本部分未包含验证码，但 HTML 包含验证码时，两者均被保留
+func TestReadBodyMultipartAlternativeCombinesPlainAndHTML(t *testing.T) {
+	raw := "From: sender@example.com\r\n" +
+		"To: alias@icloud.com\r\n" +
+		"Subject: Verification\r\n" +
+		"Content-Type: multipart/alternative; boundary=boundary_alt\r\n" +
+		"\r\n" +
+		"--boundary_alt\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"Please view this email in an HTML compatible browser.\r\n" +
+		"--boundary_alt\r\n" +
+		"Content-Type: text/html; charset=utf-8\r\n" +
+		"\r\n" +
+		"<p>Your security code is <strong>654321</strong></p>\r\n" +
+		"--boundary_alt--\r\n"
+
+	msg, err := mail.ReadMessage(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("ReadMessage failed: %v", err)
+	}
+	body, err := readBody(msg)
+	if err != nil {
+		t.Fatalf("readBody failed: %v", err)
+	}
+	if !strings.Contains(body, "654321") {
+		t.Fatalf("verification code in HTML must not be dropped: %q", body)
+	}
+	otp := ExtractOTP("Verification", body)
+	if otp == nil || otp.Code != "654321" {
+		t.Fatalf("ExtractOTP failed to extract code: %+v", otp)
+	}
+}
+
