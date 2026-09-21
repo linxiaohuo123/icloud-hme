@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+      - 'pr/**'
   pull_request:
     branches: [ main ]
   workflow_dispatch:
@@ -61,10 +63,13 @@ jobs:
           path: internal/webui/dist/
 
       - name: Test
-        run: go test -race ./internal/... .
+        run: go test ./...
+
+      - name: Test (race)
+        run: go test -race ./...
 
       - name: Vet
-        run: go vet ./internal/... .
+        run: go vet ./...
 
       - name: Build
-        run: go build ./internal/... .
+        run: go build ./...

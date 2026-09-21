@@ -39,7 +39,7 @@ type CreateResult struct {
 
 // ListAliasesWithContext 列出当前账号所有 Hide My Email 别名 (支持 Context 贯穿与严格模式)。
 func (c *Client) ListAliasesWithContext(ctx context.Context) ([]Alias, error) {
-	if err := c.resolveService(); err != nil {
+	if err := c.resolveService(ctx); err != nil {
 		return nil, err
 	}
 	c.log("获取别名列表...")
@@ -51,7 +51,7 @@ func (c *Client) ListAliasesWithContext(ctx context.Context) ([]Alias, error) {
 		// 若已缓存的 serviceURL 失效，清空并重新走一次 ValidateSession 自愈
 		if c.ServiceURL() != "" {
 			c.ResetServiceEndpoint()
-			if resolveErr := c.resolveService(); resolveErr == nil {
+			if resolveErr := c.resolveService(ctx); resolveErr == nil {
 				body, err = c.RequestWithContext(ctx, "GET", c.ServiceURL()+"/v2/hme/list", nil, 0, MaxRetries)
 			}
 		}
@@ -74,7 +74,7 @@ func (c *Client) ListAliases() ([]Alias, error) {
 
 // GenerateWithContext 生成一个候选别名(尚未保留,需再调用 ReserveWithContext)。
 func (c *Client) GenerateWithContext(ctx context.Context) (string, error) {
-	if err := c.resolveService(); err != nil {
+	if err := c.resolveService(ctx); err != nil {
 		return "", err
 	}
 	c.log("生成候选别名...")
@@ -114,9 +114,9 @@ func (c *Client) Generate() (string, error) {
 	return c.GenerateWithContext(context.Background())
 }
 
-// ReserveWithContext 保留/确认候选别名,使其正式生效 (包含网络中断后的写入状态核对)。
+// ReserveWithContext 保留/确认候选别名,使其正式生效 (写操作 maxAttempts=1，包含网络中断后的写入状态核对)。
 func (c *Client) ReserveWithContext(ctx context.Context, hme, label string) (string, error) {
-	if err := c.resolveService(); err != nil {
+	if err := c.resolveService(ctx); err != nil {
 		return "", err
 	}
 	if label == "" {
@@ -128,7 +128,8 @@ func (c *Client) ReserveWithContext(ctx context.Context, hme, label string) (str
 		"label": label,
 		"note":  "Created by icloud_hme tool",
 	}
-	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/reserve", payload, 0, 2)
+	// 写操作必须 maxAttempts=1，严禁通用盲目重试导致重复保留
+	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/reserve", payload, 0, 1)
 	if err != nil {
 		if errors.Is(err, ErrAuthFailed) || ctx.Err() != nil {
 			return "", err
@@ -248,12 +249,12 @@ func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error
 
 // DeactivateHMEWithContext 停用别名(可恢复)。
 func (c *Client) DeactivateHMEWithContext(ctx context.Context, anonymousID string) (bool, error) {
-	if err := c.resolveService(); err != nil {
+	if err := c.resolveService(ctx); err != nil {
 		return false, err
 	}
 	c.log("停用 %s ...", anonymousID)
 	payload := map[string]string{"anonymousId": anonymousID}
-	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/deactivate", payload, 0, 2)
+	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/deactivate", payload, 0, 1)
 	if err != nil {
 		return false, err
 	}
@@ -267,12 +268,12 @@ func (c *Client) DeactivateHME(anonymousID string) (bool, error) {
 
 // ReactivateHMEWithContext 激活已停用的别名。
 func (c *Client) ReactivateHMEWithContext(ctx context.Context, anonymousID string) (bool, error) {
-	if err := c.resolveService(); err != nil {
+	if err := c.resolveService(ctx); err != nil {
 		return false, err
 	}
 	c.log("激活 %s ...", anonymousID)
 	payload := map[string]string{"anonymousId": anonymousID}
-	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/reactivate", payload, 0, 2)
+	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/reactivate", payload, 0, 1)
 	if err != nil {
 		return false, err
 	}
@@ -286,18 +287,18 @@ func (c *Client) ReactivateHME(anonymousID string) (bool, error) {
 
 // DeleteWithContext 删除别名。若直接删除失败会先停用再删。
 func (c *Client) DeleteWithContext(ctx context.Context, anonymousID string) error {
-	if err := c.resolveService(); err != nil {
+	if err := c.resolveService(ctx); err != nil {
 		return err
 	}
 	c.log("删除 %s ...", anonymousID)
 	payload := map[string]string{"anonymousId": anonymousID}
 	doDelete := func() (string, error) {
-		return c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/delete", payload, 0, 2)
+		return c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/delete", payload, 0, 1)
 	}
 	body, err := doDelete()
 	if err != nil || !gjson.Get(body, "success").Bool() {
 		c.log("直接删除失败,尝试先停用...")
-		_, _ = c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/deactivate", payload, 0, 2)
+		_, _ = c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/deactivate", payload, 0, 1)
 		body, err = doDelete()
 		if err != nil {
 			return err
@@ -317,7 +318,7 @@ func (c *Client) Delete(anonymousID string) error {
 
 // UpdateMetaDataWithContext 更新别名备注 (label) 与说明 (note)。
 func (c *Client) UpdateMetaDataWithContext(ctx context.Context, anonymousID, label, note string) error {
-	if err := c.resolveService(); err != nil {
+	if err := c.resolveService(ctx); err != nil {
 		return err
 	}
 	c.log("更新别名备注 %s -> %s ...", anonymousID, label)
@@ -326,7 +327,7 @@ func (c *Client) UpdateMetaDataWithContext(ctx context.Context, anonymousID, lab
 		"label":       label,
 		"note":        note,
 	}
-	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/updateMetaData", payload, 0, 2)
+	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/updateMetaData", payload, 0, 1)
 	if err != nil {
 		return err
 	}
@@ -369,11 +370,8 @@ func parseAliasList(body string) ([]Alias, error) {
 	}
 
 	arr := root.Get("result.hmeEmails")
-	if !arr.Exists() {
-		arr = findFirstDictArray(root)
-	}
-	if !arr.IsArray() {
-		return nil, fmt.Errorf("%w: missing hmeEmails array in response", ErrInvalidResponseSchema)
+	if !arr.Exists() || !arr.IsArray() {
+		return nil, fmt.Errorf("%w: missing or invalid result.hmeEmails array in response", ErrInvalidResponseSchema)
 	}
 
 	var aliases []Alias
@@ -426,27 +424,6 @@ func parseAliasList(body string) ([]Alias, error) {
 		return aliases[i].Email < aliases[j].Email
 	})
 	return aliases, nil
-}
-
-// findFirstDictArray 递归查找第一个「对象数组」。
-func findFirstDictArray(v gjson.Result) gjson.Result {
-	if v.IsArray() {
-		if len(v.Array()) > 0 && v.Array()[0].IsObject() {
-			return v
-		}
-	}
-	if v.IsObject() {
-		var found gjson.Result
-		v.ForEach(func(_, val gjson.Result) bool {
-			if r := findFirstDictArray(val); r.IsArray() && len(r.Array()) > 0 {
-				found = r
-				return false
-			}
-			return true
-		})
-		return found
-	}
-	return gjson.Result{}
 }
 
 // formatTimestamp 将 iCloud 返回的各类时间戳转换为标准 RFC3339 字符串。

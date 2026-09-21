@@ -141,3 +141,45 @@ go test -race ./...              -> Exit Code: 1 (本地 Windows 环境未安装
   go test -race ./...              -> Exit Code: 1 (本地 Windows 环境未安装 GCC/CGO, 由 CI 执行)
   ```
 
+---
+
+## 阶段批次：PR-05-1 Correctness Gate (统一出号单一真相源、所有权安全隔离、幂等契约加固与上游可靠性测试)
+
+- **执行日期**：2026-09-21
+- **起始分支**：`pr/pr03-pr05-domain-correctness` (`eeb5c6f`)
+- **工作分支**：`pr/pr05-1-correctness-fix`
+- **实现清单**：
+  1. **统一出号单一真相源 (Section I & II)**：
+     - 新建 `internal/server/allocation_service.go` (`AliasAllocationService`)，接管 `/api/quick-create`, `/api/alias/lease`, `/api/allocate`, `/api/external/v1/allocate`, `/api/external/v2/allocate`。
+     - 彻底消除两套库存真相源：旧 `lease_records` 仅作兼容记录；出号一律以 `alias_inventory` 与 `alias_allocations` 为权威。
+     - 外部令牌在号池空时强制返回 503 `POOL_EMPTY` 并附带 `Retry-After: 60` 响应头，彻底阻断隐式远程建号；仅管理员在 `mode=create` 或降级允许时方可现场建号。
+     - 修复 `quick_create_handler.go` 中母号匹配逻辑，优先匹配业务标识指定母号并支持 `default` 标签回退。
+  2. **所有权安全与 DDL 迁移拓扑 (Section III & IV)**：
+     - `IsEmailOwnedByToken` 移除 `token_name` 参数与 `lease_records` 兜底，仅依据不可变 `token_id` 与 `alias_allocations` 鉴权。
+     - `internal/store/store.go` 中 DDL 按依赖拓扑严格执行（基础表 -> `PRAGMA table_info` 校验 -> `ALTER TABLE` -> 覆盖索引 -> `initInventorySchema` -> 单事务 `migrateInventory`）。
+     - 重名 token 及 `scheduler` 历史流水全部降级标记为 `legacy_unknown`，防止越权继承。
+     - 实现 `RecordAllocation` 原子写入 `alias_inventory`, `alias_allocations`, `lease_records`。
+     - 完成 MIG01~MIG06 单测 (`internal/store/migration_test.go`) 与 AUTH01~AUTH04 单测 (`internal/store/auth_owner_test.go`)。
+  3. **外部 v2 契约与幂等控制 (Section V)**：
+     - `internal/server/external_v2_handlers.go` 对外部 token 强制要求 `Idempotency-Key`（缺失 400），参数冲突返回 409 `IDEMPOTENCY_CONFLICT`，已认领直出原结果。
+     - 持久化 `verification_requests` 表，阻断 query 传 `email` 绕过 `lease_id` 机制。
+     - 完成 LEGACY01~03, ALLOC01~04, IDEMP01~06 单测 (`internal/server/alloc_correctness_test.go`)。
+  4. **上游 HME 客户端与调用可靠性 (Section VII)**：
+     - `internal/hme/client.go`：`RequestWithContext` 中每次尝试均派生 `attemptCtx, cancel := context.WithTimeout(ctx, timeout)`，真正实现超时硬截断；429 解析 `Retry-After` 头并在 context 预算内等待重试；`resolveService` 与 `validateSessionLocked` 接收并全链路传递 `ctx`。
+     - `internal/hme/alias.go`：写操作（`Reserve`, `Delete`, `DeactivateHME`, `ReactivateHME`, `UpdateMetaData`）使用 `maxAttempts = 1` 阻断盲目重试；`Reserve` 失败核对远端 `ListAliasesWithContext` 恢复；`parseAliasList` 彻底删除 `findFirstDictArray` 模糊遍历，严格要求 `result.hmeEmails` 数组。
+     - 完成 UP01~UP06 单测 (`internal/hme/hme_up_test.go`)。
+  5. **邮件详情前后端契约与能力边界 (Section VIII)**：
+     - `internal/server/backend_mail.go`：`InboxQuery` 增加 `FolderSpecified` 与 `DaysSpecified`；若 WebMail 模式指定了不支持的文件夹或天数筛选，显式返回 `CAPABILITY_UNSUPPORTED`。
+     - `internal/server/mail_handlers.go`：`POST /api/messages` 支持 `message_ref` 查询，缓存键严格使用 `ref.CacheKey()`（彻底移除 `account:uid` 裸键），逐项容错返回 `items: [{requested_ref, message, error}]`，单封失败不阻断批次。
+- **真实命令与退出码**：
+  ```text
+  npm --prefix web run lint        -> Exit Code: 0 (0 错误, 5 警告)
+  npm --prefix web run test:run    -> Exit Code: 0 (16/16 文件通过, 101/101 用例全部通过)
+  npm --prefix web run build       -> Exit Code: 0 (TypeScript 校验通过, 构建成功)
+  go vet ./...                     -> Exit Code: 0 (0 警告)
+  go build ./...                   -> Exit Code: 0 (全模块编译构建成功)
+  go test ./...                    -> Exit Code: 0 (全部模块通过)
+  go test -race ./...              -> Exit Code: 1 (本地 Windows 环境未安装 GCC/CGO, 由 CI 执行)
+  ```
+
+

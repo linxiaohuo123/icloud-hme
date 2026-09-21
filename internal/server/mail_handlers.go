@@ -43,15 +43,19 @@ func (s *Server) listInboxHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: days 需为 1-90 的整数")
 		return
 	}
+	folderSpecified := c.Query("folder") != "" && c.Query("folder") != "all" && !strings.EqualFold(c.Query("folder"), "INBOX")
+	daysSpecified := c.Query("days") != ""
 	withBody := c.Query("body") == "1" || strings.EqualFold(c.Query("body"), "true")
 
 	result, err := s.be.ListInbox(InboxQuery{
-		AccountID: accountID,
-		Alias:     alias,
-		Folder:    folder,
-		Limit:     limit,
-		Days:      days,
-		WithBody:  withBody,
+		AccountID:       accountID,
+		Alias:           alias,
+		Folder:          folder,
+		Limit:           limit,
+		Days:            days,
+		WithBody:        withBody,
+		FolderSpecified: folderSpecified,
+		DaysSpecified:   daysSpecified,
 	})
 	if err != nil {
 		backendFail(c, err)
@@ -139,7 +143,7 @@ func (s *Server) handleGetMessageDetail(c *gin.Context, rawID string) {
 		}
 	}
 
-	s.putMessageCache([]string{cacheKey, fmt.Sprintf("%s:%s", accountID, rawID)}, message, provider, method)
+	s.putMessageCache([]string{cacheKey}, message, provider, method)
 
 	ok(c, gin.H{
 		"account_id": accountID,
@@ -158,13 +162,22 @@ func (s *Server) getMessagePrimeHandler(c *gin.Context) {
 	s.handleGetMessageDetail(c, c.Param("id"))
 }
 
+type batchMessageItemReq struct {
+	Folder     string `json:"folder"`
+	UID        string `json:"uid"`
+	ID         string `json:"id"`
+	MessageRef string `json:"message_ref"`
+}
+
 type getMessagesReq struct {
-	AccountID string `json:"account_id"`
-	Messages  []struct {
-		Folder string `json:"folder"`
-		UID    string `json:"uid"`
-		ID     string `json:"id"`
-	} `json:"messages"`
+	AccountID string                `json:"account_id"`
+	Messages  []batchMessageItemReq `json:"messages"`
+}
+
+type BatchItemResult struct {
+	RequestedRef string            `json:"requested_ref"`
+	Message      *mail.FullMessage `json:"message,omitempty"`
+	Error        string            `json:"error,omitempty"`
 }
 
 func (s *Server) getMessagesHandler(c *gin.Context) {
@@ -182,6 +195,7 @@ func (s *Server) getMessagesHandler(c *gin.Context) {
 		ok(c, gin.H{
 			"account_id": req.AccountID,
 			"messages":   []*mail.FullMessage{},
+			"items":      []BatchItemResult{},
 			"count":      0,
 		})
 		return
@@ -191,55 +205,151 @@ func (s *Server) getMessagesHandler(c *gin.Context) {
 		return
 	}
 
-	var uncachedRefs []MessageRef
+	var items []BatchItemResult
 	var out []*mail.FullMessage
 	now := time.Now()
 
-	s.msgCacheMu.RLock()
+	type pendingItem struct {
+		rawRef  string
+		refObj  mail.MessageRef
+		imapRef MessageRef
+	}
+	var pendingIMAP []pendingItem
+
 	for _, m := range req.Messages {
-		rawUID := strings.TrimSpace(m.UID)
-		if rawUID == "" {
-			rawUID = strings.TrimSpace(m.ID)
-		}
-		uid, err := strconv.ParseUint(rawUID, 10, 32)
-		if err != nil {
-			continue
-		}
+		rawRef := strings.TrimSpace(m.MessageRef)
 		folder := strings.TrimSpace(m.Folder)
 		if folder == "" {
 			folder = "INBOX"
 		}
-		key := fmt.Sprintf("%s:%s:%s", req.AccountID, folder, rawUID)
-		if entry, hit := s.msgCache[key]; hit && now.Before(entry.expiresAt) {
-			out = append(out, entry.msg)
-		} else {
-			uncachedRefs = append(uncachedRefs, MessageRef{Folder: folder, UID: uint32(uid)})
+		rawUID := strings.TrimSpace(m.UID)
+		if rawUID == "" {
+			rawUID = strings.TrimSpace(m.ID)
 		}
-	}
-	s.msgCacheMu.RUnlock()
 
-	if len(uncachedRefs) > 0 {
-		fetched, err := s.be.GetMessages(req.AccountID, uncachedRefs)
-		if err != nil {
-			backendFail(c, err)
-			return
-		}
-		for _, msg := range fetched {
-			folder := msg.Folder
-			if folder == "" {
-				folder = "INBOX"
+		var refObj mail.MessageRef
+		var refErr error
+		if rawRef != "" {
+			refObj, refErr = mail.ParseMessageRef(rawRef, req.AccountID)
+		} else if uid, err := strconv.ParseUint(rawUID, 10, 32); err == nil && uid > 0 {
+			refObj = mail.MessageRef{
+				Provider:  "imap",
+				AccountID: req.AccountID,
+				Mailbox:   folder,
+				UID:       uint32(uid),
 			}
-			s.putMessageCache([]string{
-				fmt.Sprintf("%s:%s:%s", req.AccountID, folder, msg.ID),
-				fmt.Sprintf("%s:%s", req.AccountID, msg.ID),
-			}, msg, msg.Provider, msg.Method)
-			out = append(out, msg)
+			rawRef = refObj.Encode()
+		} else if rawUID != "" {
+			refObj = mail.MessageRef{
+				Provider:  "webmail",
+				AccountID: req.AccountID,
+				ThreadID:  rawUID,
+			}
+			rawRef = refObj.Encode()
+		} else {
+			refErr = errors.New("missing message_ref or uid")
+		}
+
+		if refErr != nil {
+			items = append(items, BatchItemResult{
+				RequestedRef: rawRef,
+				Error:        refErr.Error(),
+			})
+			continue
+		}
+
+		cacheKey := refObj.CacheKey()
+		s.msgCacheMu.RLock()
+		entry, hit := s.msgCache[cacheKey]
+		s.msgCacheMu.RUnlock()
+
+		if hit && now.Before(entry.expiresAt) {
+			items = append(items, BatchItemResult{
+				RequestedRef: rawRef,
+				Message:      entry.msg,
+			})
+			out = append(out, entry.msg)
+			continue
+		}
+
+		if refObj.Provider == "webmail" {
+			msg, err := s.be.GetMessage(req.AccountID, refObj.ThreadID)
+			if err != nil {
+				items = append(items, BatchItemResult{
+					RequestedRef: rawRef,
+					Error:        err.Error(),
+				})
+			} else {
+				msg.Provider = "webmail"
+				msg.Method = "web_api"
+				s.putMessageCache([]string{cacheKey}, msg, "webmail", "web_api")
+				items = append(items, BatchItemResult{
+					RequestedRef: rawRef,
+					Message:      msg,
+				})
+				out = append(out, msg)
+			}
+			continue
+		}
+
+		pendingIMAP = append(pendingIMAP, pendingItem{
+			rawRef:  rawRef,
+			refObj:  refObj,
+			imapRef: MessageRef{Folder: refObj.Mailbox, UID: refObj.UID},
+		})
+	}
+
+	if len(pendingIMAP) > 0 {
+		var imapRefs []MessageRef
+		for _, pi := range pendingIMAP {
+			imapRefs = append(imapRefs, pi.imapRef)
+		}
+		fetched, err := s.be.GetMessages(req.AccountID, imapRefs)
+		if err != nil {
+			if len(out) == 0 && len(req.Messages) == len(pendingIMAP) {
+				backendFail(c, err)
+				return
+			}
+			for _, pi := range pendingIMAP {
+				items = append(items, BatchItemResult{
+					RequestedRef: pi.rawRef,
+					Error:        err.Error(),
+				})
+			}
+		} else {
+			for i, pi := range pendingIMAP {
+				if i < len(fetched) && fetched[i] != nil {
+					msg := fetched[i]
+					provider := msg.Provider
+					if provider == "" {
+						provider = "imap"
+					}
+					method := msg.Method
+					if method == "" {
+						method = "imap"
+					}
+					msg.Provider = provider
+					msg.Method = method
+					s.putMessageCache([]string{pi.refObj.CacheKey()}, msg, provider, method)
+					items = append(items, BatchItemResult{
+						RequestedRef: pi.rawRef,
+						Message:      msg,
+					})
+					out = append(out, msg)
+				} else {
+					items = append(items, BatchItemResult{
+						RequestedRef: pi.rawRef,
+						Error:        "message not found",
+					})
+				}
+			}
 		}
 	}
 
 	ok(c, gin.H{
 		"account_id": req.AccountID,
 		"messages":   out,
+		"items":      items,
 		"count":      len(out),
 	})
 }

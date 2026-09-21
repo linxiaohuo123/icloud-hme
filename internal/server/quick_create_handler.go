@@ -1,20 +1,20 @@
 /**
- * [INPUT]: 依赖 gin, net/http, sort, strings, time, icloud-hme/internal/account, icloud-hme/internal/hme, icloud-hme/internal/store
+ * [INPUT]: 依赖 gin, net/http, sort, strings, errors, icloud-hme/internal/account, icloud-hme/internal/hme, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 quickCreateHandler, selectAccountCandidates, selectAccountByTag, selectPoolAccounts
- * [POS]: server 的一键别名快速租用与分销出号接口，支持 Pool-First 别名池交错轮转、惰性切块流式认领 (Lazy Chunking 零内存分配)、标签隔离与平滑容灾
+ * [POS]: server 的统一出号入口门面 (Section I)，统一委托 AliasAllocationService 驱动单一库存真相源
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 package server
 
 import (
+	"errors"
 	"net/http"
 	"sort"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"icloud-hme/internal/account"
-	"icloud-hme/internal/hme"
 	"icloud-hme/internal/store"
 )
 
@@ -37,7 +37,7 @@ func selectAccountCandidates(accounts []account.Summary, tag string, st *store.S
 	tag = strings.TrimSpace(strings.ToLower(tag))
 	var candidates []account.Summary
 
-	if tag != "" && tag != "default" {
+	if tag != "" {
 		for _, acc := range accounts {
 			if acc.Status == "active" && acc.HasCookies && acc.AliasTotal < 500 && acc.AliasActive < 500 {
 				for _, t := range acc.Tags {
@@ -144,7 +144,7 @@ func selectAccountByTag(accounts []account.Summary, tag string) string {
 	return cands[0]
 }
 
-// quickCreateHandler 处理 POST /api/quick-create、/api/allocate 与 /api/external/v1/allocate。
+// quickCreateHandler 处理 POST /api/quick-create、/api/alias/lease、/api/allocate 与 /api/external/v1/allocate。
 func (s *Server) quickCreateHandler(c *gin.Context) {
 	var req quickCreateReq
 	if err := c.ShouldBindJSON(&req); err != nil && err.Error() != "EOF" {
@@ -177,170 +177,49 @@ func (s *Server) quickCreateHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: label 最长 200 字符")
 		return
 	}
-	// 【PR-01 安全止损】1. 存储层安全前置检查
-	if s.store == nil {
-		failCode(c, http.StatusServiceUnavailable, "ALLOCATION_STATE_NOT_READY", "存储层未就绪，无法安全验证别名分配状态")
-		return
-	}
 
-	// 【PR-01 安全止损】2. 普通外部令牌禁止越权指定母号
-	if req.AccountID != "" {
-		scopes, _ := c.Get("auth_scopes")
-		scopesStr, _ := scopes.(string)
-		if !store.HasScope(scopesStr, store.ScopeAdmin) {
+	p, _ := getPrincipal(c)
+
+	// 统一调用 AliasAllocationService 单一真相源出号
+	allocRes, err := s.allocService.Allocate(c.Request.Context(), p, AllocationRequest{
+		Tag:       req.Tag,
+		Label:     req.Label,
+		AccountID: req.AccountID,
+		Mode:      req.Mode,
+	})
+
+	if err != nil {
+		if errors.Is(err, ErrAllocationNotReady) {
+			failCode(c, http.StatusServiceUnavailable, "ALLOCATION_STATE_NOT_READY", "存储层未就绪，无法安全验证别名分配状态")
+			return
+		}
+		if errors.Is(err, ErrForbiddenAccountID) {
 			failCode(c, http.StatusForbidden, "FORBIDDEN", "普通外部令牌禁止指定 account_id 出号")
 			return
 		}
-		if _, err := s.be.GetAccount(req.AccountID); err != nil {
-			backendFail(c, err)
+		if errors.Is(err, ErrForbiddenRemoteCreation) {
+			failCode(c, http.StatusServiceUnavailable, "ALLOCATION_STATE_NOT_READY", "现场按需创建能力未就绪，当前仅支持已验证库存池分配 (mode=pool)")
 			return
 		}
-	}
-
-	// 【PR-01 安全止损】3. 现场创建在超时贯穿与写入恢复未就绪前禁止调用
-	if req.Mode == "create" {
-		failCode(c, http.StatusServiceUnavailable, "ALLOCATION_STATE_NOT_READY", "现场按需创建能力未就绪，当前仅支持已验证库存池分配 (mode=pool)")
-		return
-	}
-
-	tokenName, _ := c.Get("token_name")
-	tokenNameStr, _ := tokenName.(string)
-	if tokenNameStr == "" {
-		tokenNameStr = "admin_console"
-	}
-
-	// 别名池优先领用 (Pool-First): 从现存活跃别名池中原子划拨
-	var poolAccountIDs []string
-	if req.AccountID != "" {
-		poolAccountIDs = []string{req.AccountID}
-	} else {
-		poolAccountIDs = selectPoolAccounts(s.be.ListAccounts(), req.Tag)
-	}
-
-	// 跨账号交错交织构建候选池 (Round-Robin Interleaving):
-	// 避免单一账号被瞬时连续领空导致所有目标邮件砸向单一邮箱，
-	// 实现领号与后续收信负载在多母号间极致均匀平摊。
-	var accountAliases [][]store.PoolCandidate
-	maxCount := 0
-	for _, accID := range poolAccountIDs {
-		aliases, _ := s.be.ListAliases(accID)
-		var list []store.PoolCandidate
-		for _, a := range aliases {
-			if a.Active {
-				list = append(list, store.PoolCandidate{
-					AccountID: accID,
-					Email:     a.Email,
-				})
-			}
-		}
-		if len(list) > 0 {
-			accountAliases = append(accountAliases, list)
-			if len(list) > maxCount {
-				maxCount = len(list)
-			}
-		}
-	}
-
-	// 跨账号交错交织惰性切块探查 (Lazy Chunk Streaming & Round-Robin Interleaving):
-	// 采用固定 500 容量切片复用，避免在数万别名场景下一次性贪婪分配巨额切片引发 GC 抖动。
-	// 绝大多数情况下首批 500 条内即可命中可用号，实现亚毫秒级短路返回。
-	const chunkSize = 500
-	chunk := make([]store.PoolCandidate, 0, chunkSize)
-	var claimed *store.LeaseRecord
-	var claimErr error
-
-	for i := 0; i < maxCount; i++ {
-		for _, list := range accountAliases {
-			if i < len(list) {
-				chunk = append(chunk, list[i])
-				if len(chunk) >= chunkSize {
-					claimed, claimErr = s.store.ClaimPoolAlias(chunk, req.Tag, tokenNameStr)
-					if claimErr != nil {
-						failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", "别名池认领失败: "+claimErr.Error())
-						return
-					}
-					if claimed != nil {
-						break
-					}
-					chunk = chunk[:0] // 原地重用底层数组，零内存再分配
-				}
-			}
-		}
-		if claimed != nil {
-			break
-		}
-	}
-
-	// 检查尾批不足 500 条的剩余候选
-	if claimed == nil && len(chunk) > 0 {
-		claimed, claimErr = s.store.ClaimPoolAlias(chunk, req.Tag, tokenNameStr)
-		if claimErr != nil {
-			failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", "别名池认领失败: "+claimErr.Error())
+		if errors.Is(err, ErrTagNotAllowed) {
+			failCode(c, http.StatusForbidden, "FORBIDDEN", "指定的业务标签不在该主体授权范围内")
 			return
 		}
-	}
-
-	if claimed != nil {
-		if s.syncWorker != nil {
-			s.syncWorker.RegisterAliasAccount(claimed.Email, claimed.AccountID)
+		if errors.Is(err, ErrPoolEmpty) {
+			c.Header("Retry-After", "60")
+			failCode(c, http.StatusServiceUnavailable, "POOL_EMPTY", "当前业务池无可用预存别名，请等待定时补货或使用 mode=pool")
+			return
 		}
-		ok(c, gin.H{
-			"email":      claimed.Email,
-			"account_id": claimed.AccountID,
-			"label":      req.Label,
-			"tag":        req.Tag,
-			"source":     "pool",
-			"created_at": claimed.AllocatedAt,
-		})
-		return
-	}
-
-	// 若明确声明只走别名池 (pool_only)，池空即终止，绝不上游新建打扰 Apple
-	if req.Mode == "pool_only" {
-		c.Header("Retry-After", "60") // 【BUG-07 修复】补充 Retry-After 响应头
-		failCode(c, http.StatusServiceUnavailable, "POOL_EMPTY", "当前业务池无可用预存别名，请等待定时补货或使用 mode=pool")
-		return
-	}
-
-	// 2. 降级现场新建 (On-Demand Creation): 池已空或强制指定 mode="create"
-	var res *hme.CreateResult
-	var accountID string
-	var err error
-
-	if req.AccountID != "" {
-		res, err = s.be.CreateAlias(req.AccountID, req.Label)
-		accountID = req.AccountID
-	} else {
-		candidates := selectAccountCandidates(s.be.ListAccounts(), req.Tag, s.store)
-		for _, candID := range candidates {
-			res, err = s.be.CreateAlias(candID, req.Label)
-			if err == nil {
-				accountID = candID
-				break
-			}
-		}
-	}
-
-	if err != nil {
 		backendFail(c, err)
 		return
 	}
-	if res == nil {
-		failCode(c, http.StatusServiceUnavailable, "NO_ACCOUNT_AVAILABLE", "当前标签没有可用的健康 iCloud 账号或配额已耗尽")
-		return
-	}
-	if s.syncWorker != nil {
-		s.syncWorker.RegisterAliasAccount(res.Email, accountID)
-	}
-
-	s.recordLease(accountID, res.Email, req.Tag, tokenNameStr)
 
 	ok(c, gin.H{
-		"email":      res.Email,
-		"account_id": accountID,
-		"label":      res.Label,
-		"tag":        req.Tag,
-		"source":     "created",
-		"created_at": res.CreatedAt,
+		"email":      allocRes.Allocation.AliasEmail,
+		"account_id": allocRes.Allocation.AccountID,
+		"label":      req.Label,
+		"tag":        allocRes.Allocation.BusinessTag,
+		"source":     allocRes.Source,
+		"created_at": allocRes.Allocation.AllocatedAt,
 	})
 }

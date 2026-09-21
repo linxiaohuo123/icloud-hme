@@ -18,12 +18,14 @@ import (
 
 // InboxQuery 是收件箱查询参数。
 type InboxQuery struct {
-	AccountID string
-	Alias     string
-	Folder    string
-	Limit     int
-	Days      int
-	WithBody  bool
+	AccountID       string
+	Alias           string
+	Folder          string
+	Limit           int
+	Days            int
+	WithBody        bool
+	FolderSpecified bool
+	DaysSpecified   bool
 }
 
 // InboxResult 是收件箱查询结果。
@@ -123,6 +125,13 @@ func (b *managerBackend) ListInbox(q InboxQuery) (InboxResult, error) {
 		}, nil
 	}
 	// IMAP 失败,继续尝试 Web API
+	if q.FolderSpecified || q.DaysSpecified {
+		return InboxResult{}, &BackendError{
+			Status:  http.StatusBadRequest,
+			Code:    "CAPABILITY_UNSUPPORTED",
+			Message: "WebMail 模式不支持指定文件夹或按天数筛选",
+		}
+	}
 
 	// 回退到 Web API (Cookie 认证,无需 App Password)
 	wmc, err := b.mgr.WebMailClient(q.AccountID)

@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 database/sql, context, time, fmt, errors, strings
- * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation 模型及 ClaimInventoryAlias, SyncAliasInventory, GetPrincipalAllocation 等原子持久化能力
- * [POS]: internal/store 的领域状态与库存隔离层 (PR-03)，分离 remote_state 与 allocation_state，提供 SQLite 事务级唯一约束与幂等认领
+ * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation, VerificationRequest 模型及 ClaimInventoryAlias, SyncAliasInventory, GetPrincipalAllocation, CreateVerificationRequest, GetVerificationRequest, UpdateVerificationRequestResult 等原子持久化能力
+ * [POS]: internal/store 的领域状态与库存隔离层 (PR-03/PR-05-1)，分离 remote_state 与 allocation_state，提供 SQLite 事务级唯一约束、幂等认领与持久化取码请求
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -27,6 +27,8 @@ var (
 	ErrOperationPending = errors.New("operation is pending")
 	// ErrAllocationNotFound 未找到分配记录
 	ErrAllocationNotFound = errors.New("allocation not found")
+	// ErrVerificationRequestNotFound 未找到取码任务记录
+	ErrVerificationRequestNotFound = errors.New("verification request not found")
 )
 
 // RemoteState 远端上游真实状态
@@ -65,6 +67,7 @@ type AliasInventory struct {
 type AliasAllocation struct {
 	AllocationID string `json:"allocation_id"`
 	AliasEmail   string `json:"alias_email"`
+	AccountID    string `json:"account_id"`
 	OwnerKind    string `json:"owner_kind"` // "token" 或 "admin"
 	OwnerID      string `json:"owner_id"`   // token_id 或 "admin"
 	BusinessTag  string `json:"business_tag"`
@@ -88,6 +91,23 @@ type Operation struct {
 	UpdatedAt      string `json:"updated_at"`
 }
 
+// VerificationRequest 持久化取码请求实体 (Section VI)
+type VerificationRequest struct {
+	RequestID           string `json:"request_id"`
+	PrincipalKind       string `json:"principal_kind"`
+	PrincipalID         string `json:"principal_id"`
+	LeaseID             string `json:"lease_id"`
+	AliasEmail          string `json:"alias_email"`
+	Status              string `json:"status"` // "pending", "succeeded", "expired", "failed"
+	CreatedAt           string `json:"created_at"`
+	ExpiresAt           string `json:"expires_at"`
+	BaselineProvider    string `json:"baseline_provider,omitempty"`
+	BaselineUIDValidity uint32 `json:"baseline_uidvalidity,omitempty"`
+	BaselineUID         uint32 `json:"baseline_uid,omitempty"`
+	MatchedEventRef     string `json:"matched_event_ref,omitempty"`
+	Code                string `json:"code,omitempty"`
+}
+
 func (s *Store) initInventorySchema() error {
 	ddl := `
 	CREATE TABLE IF NOT EXISTS alias_inventory (
@@ -106,6 +126,7 @@ func (s *Store) initInventorySchema() error {
 	CREATE TABLE IF NOT EXISTS alias_allocations (
 		allocation_id TEXT PRIMARY KEY,
 		alias_email TEXT NOT NULL UNIQUE,
+		account_id TEXT NOT NULL DEFAULT '',
 		owner_kind TEXT NOT NULL,
 		owner_id TEXT NOT NULL,
 		business_tag TEXT DEFAULT '',
@@ -131,13 +152,62 @@ func (s *Store) initInventorySchema() error {
 		CONSTRAINT uq_op_idempotency UNIQUE (principal_kind, principal_id, operation_kind, idempotency_key)
 	);
 	CREATE INDEX IF NOT EXISTS idx_operations_lookup ON operations (principal_kind, principal_id, operation_kind, idempotency_key);
+
+	CREATE TABLE IF NOT EXISTS verification_requests (
+		request_id TEXT PRIMARY KEY,
+		principal_kind TEXT NOT NULL,
+		principal_id TEXT NOT NULL,
+		lease_id TEXT NOT NULL,
+		alias_email TEXT NOT NULL,
+		status TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		expires_at TEXT NOT NULL,
+		baseline_provider TEXT DEFAULT '',
+		baseline_uidvalidity INTEGER DEFAULT 0,
+		baseline_uid INTEGER DEFAULT 0,
+		matched_event_ref TEXT DEFAULT '',
+		code TEXT DEFAULT ''
+	);
+	CREATE INDEX IF NOT EXISTS idx_vreq_principal ON verification_requests (principal_kind, principal_id);
+	CREATE INDEX IF NOT EXISTS idx_vreq_lease ON verification_requests (lease_id);
+	CREATE INDEX IF NOT EXISTS idx_vreq_email ON verification_requests (alias_email);
 	`
 	_, err := s.db.Exec(ddl)
 	return err
 }
 
 func (s *Store) migrateInventory() error {
-	// 1. 迁移已有流水：将已交付别名入库，标记为已分配 (allocated)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 1. 映射 api_tokens 中唯一无歧义的 token name -> id (忽略大小写)
+	rows, err := tx.Query(`
+		SELECT LOWER(TRIM(name)), COUNT(1), MAX(id)
+		FROM api_tokens
+		WHERE TRIM(name) != ''
+		GROUP BY LOWER(TRIM(name))
+	`)
+	if err != nil {
+		return fmt.Errorf("query api_tokens for migration failed: %w", err)
+	}
+	defer rows.Close()
+
+	uniqueTokenMap := make(map[string]string) // lower(name) -> id
+	for rows.Next() {
+		var name, id string
+		var count int
+		if err := rows.Scan(&name, &count, &id); err == nil {
+			if count == 1 {
+				uniqueTokenMap[name] = id
+			}
+		}
+	}
+	_ = rows.Close()
+
+	// 2. 迁移已有流水：将已交付别名入库，标记为已分配 (allocated)
 	qLeases := `
 	INSERT INTO alias_inventory (email, account_id, remote_state, allocation_state, source_type, snapshot_version)
 	SELECT LOWER(TRIM(email)), account_id, 'unknown', 'allocated', 'legacy_unknown', 1
@@ -146,23 +216,47 @@ func (s *Store) migrateInventory() error {
 	ON CONFLICT(email) DO UPDATE SET
 		allocation_state = 'allocated'
 	`
-	if _, err := s.db.Exec(qLeases); err != nil {
+	if _, err := tx.Exec(qLeases); err != nil {
 		return fmt.Errorf("迁移 lease_records 到 alias_inventory 失败: %w", err)
 	}
 
-	// 2. 补全 alias_allocations 唯一分配关系
-	qAlloc := `
-	INSERT INTO alias_allocations (allocation_id, alias_email, owner_kind, owner_id, business_tag, allocated_at, status)
-	SELECT id, LOWER(TRIM(email)), 'token', COALESCE(NULLIF(token_name, ''), 'legacy_token'), tag, allocated_at, 'allocated'
-	FROM lease_records
-	WHERE TRIM(email) != ''
-	ON CONFLICT(alias_email) DO NOTHING
-	`
-	if _, err := s.db.Exec(qAlloc); err != nil {
-		return fmt.Errorf("迁移 lease_records 到 alias_allocations 失败: %w", err)
+	// 3. 逐条精确迁移 lease_records 到 alias_allocations
+	leaseRows, err := tx.Query(`SELECT id, LOWER(TRIM(email)), account_id, TRIM(COALESCE(token_name, '')), tag, allocated_at FROM lease_records WHERE TRIM(email) != ''`)
+	if err != nil {
+		return fmt.Errorf("query lease_records for migration failed: %w", err)
 	}
+	defer leaseRows.Close()
 
-	// 3. 迁移 alias_routes 中未有流水记录的别名，默认 unknown (严禁直接设为 available)
+	allocStmt, err := tx.Prepare(`
+		INSERT INTO alias_allocations (allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'allocated')
+		ON CONFLICT(alias_email) DO NOTHING
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare alias_allocations insert failed: %w", err)
+	}
+	defer allocStmt.Close()
+
+	for leaseRows.Next() {
+		var id, email, accountID, tokenName, tag, allocatedAt string
+		if err := leaseRows.Scan(&id, &email, &accountID, &tokenName, &tag, &allocatedAt); err != nil {
+			return err
+		}
+		tokenNameLower := strings.ToLower(tokenName)
+		// 严禁因为名字相同让新 token 继承旧数据；scheduler/admin_console 或无法唯一映射的设为 legacy_unknown
+		if tokenID, ok := uniqueTokenMap[tokenNameLower]; ok && tokenNameLower != "scheduler" && tokenNameLower != "admin_console" && tokenNameLower != "" {
+			if _, err := allocStmt.Exec(id, email, accountID, "token", tokenID, tag, allocatedAt); err != nil {
+				return err
+			}
+		} else {
+			if _, err := allocStmt.Exec(id, email, accountID, "legacy_unknown", "legacy_unknown", tag, allocatedAt); err != nil {
+				return err
+			}
+		}
+	}
+	_ = leaseRows.Close()
+
+	// 4. 迁移 alias_routes 中未有流水记录的别名，默认 unknown (严禁直接设为 available)
 	qRoutes := `
 	INSERT INTO alias_inventory (email, account_id, remote_state, allocation_state, source_type, snapshot_version)
 	SELECT LOWER(TRIM(email)), account_id, 'unknown', 'unknown', 'legacy_unknown', 1
@@ -170,11 +264,11 @@ func (s *Store) migrateInventory() error {
 	WHERE TRIM(email) != ''
 	ON CONFLICT(email) DO NOTHING
 	`
-	if _, err := s.db.Exec(qRoutes); err != nil {
+	if _, err := tx.Exec(qRoutes); err != nil {
 		return fmt.Errorf("迁移 alias_routes 到 alias_inventory 失败: %w", err)
 	}
 
-	return nil
+	return tx.Commit()
 }
 
 // AddInventoryAlias 将新生成或补货的别名登记入库
@@ -206,6 +300,23 @@ func (s *Store) AddInventoryAlias(accountID string, alias hme.Alias, sourceType 
 	`
 	_, err := s.db.Exec(q, email, accountID, alias.AnonymousID, remoteState, allocState, sourceType, now)
 	return err
+}
+
+// GetInventoryAlias 按邮箱查询库存记录
+func (s *Store) GetInventoryAlias(email string) (*AliasInventory, error) {
+	email = strings.TrimSpace(strings.ToLower(email))
+	var inv AliasInventory
+	err := s.db.QueryRow(`
+		SELECT email, account_id, provider_alias_id, remote_state, allocation_state, source_type, last_verified_at, snapshot_version
+		FROM alias_inventory
+		WHERE email = ?
+	`, email).Scan(
+		&inv.Email, &inv.AccountID, &inv.ProviderAliasID, &inv.RemoteState, &inv.AllocationState, &inv.SourceType, &inv.LastVerifiedAt, &inv.SnapshotVersion,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &inv, nil
 }
 
 // SyncAliasInventory 同步远端别名快照；严禁将 allocated 覆盖为 available
@@ -253,42 +364,47 @@ func (s *Store) ClaimInventoryAlias(
 	ctx context.Context,
 	principalKind, principalID, operationKind, idempKey, reqHash, tag string,
 	accountID string,
-) (*AliasAllocation, error) {
+) (*AliasAllocation, *Operation, error) {
 	principalKind = strings.TrimSpace(principalKind)
 	principalID = strings.TrimSpace(principalID)
 	operationKind = strings.TrimSpace(operationKind)
 	idempKey = strings.TrimSpace(idempKey)
 	now := time.Now().UTC().Format(time.RFC3339)
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	// 1. 幂等预检：相同幂等键直出原结果或阻断冲突
 	if idempKey != "" {
-		var opState, opReqHash, resultRef, candEmail string
+		var op Operation
 		err := s.db.QueryRowContext(ctx, `
-			SELECT state, request_hash, result_ref, candidate_email
+			SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, candidate_email, result_ref, error_code, created_at, updated_at
 			FROM operations
 			WHERE principal_kind = ? AND principal_id = ? AND operation_kind = ? AND idempotency_key = ?
-		`, principalKind, principalID, operationKind, idempKey).Scan(&opState, &opReqHash, &resultRef, &candEmail)
+		`, principalKind, principalID, operationKind, idempKey).Scan(
+			&op.OperationID, &op.PrincipalKind, &op.PrincipalID, &op.OperationKind, &op.IdempotencyKey, &op.RequestHash, &op.State, &op.CandidateEmail, &op.ResultRef, &op.ErrorCode, &op.CreatedAt, &op.UpdatedAt,
+		)
 
 		if err == nil {
-			if reqHash != "" && opReqHash != "" && opReqHash != reqHash {
-				return nil, ErrIdempotencyConflict
+			if reqHash != "" && op.RequestHash != "" && op.RequestHash != reqHash {
+				return nil, nil, ErrIdempotencyConflict
 			}
-			if opState == "succeeded" {
+			if op.State == "succeeded" {
 				var alloc AliasAllocation
 				qErr := s.db.QueryRowContext(ctx, `
-					SELECT allocation_id, alias_email, owner_kind, owner_id, business_tag, allocated_at, status
+					SELECT allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status
 					FROM alias_allocations
 					WHERE allocation_id = ? OR alias_email = ?
-				`, resultRef, candEmail).Scan(&alloc.AllocationID, &alloc.AliasEmail, &alloc.OwnerKind, &alloc.OwnerID, &alloc.BusinessTag, &alloc.AllocatedAt, &alloc.Status)
+				`, op.ResultRef, op.CandidateEmail).Scan(&alloc.AllocationID, &alloc.AliasEmail, &alloc.AccountID, &alloc.OwnerKind, &alloc.OwnerID, &alloc.BusinessTag, &alloc.AllocatedAt, &alloc.Status)
 				if qErr == nil {
-					return &alloc, nil
+					return &alloc, &op, nil
 				}
 			}
-			if opState == "pending" {
-				return nil, ErrOperationPending
+			if op.State == "pending" {
+				return nil, &op, ErrOperationPending
 			}
-			if opState == "failed" {
-				return nil, errors.New("previous operation failed")
+			if op.State == "failed" {
+				return nil, &op, errors.New("previous operation failed")
 			}
 		}
 	}
@@ -296,11 +412,12 @@ func (s *Store) ClaimInventoryAlias(
 	// 2. 开启原子认领事务
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer tx.Rollback()
 
 	opID := newOpaqueID("op_")
+	var currentOp *Operation
 	if idempKey != "" {
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO operations (
@@ -309,9 +426,39 @@ func (s *Store) ClaimInventoryAlias(
 		`, opID, principalKind, principalID, operationKind, idempKey, reqHash, now, now)
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-				return nil, ErrOperationPending
+				// 并发重入，查询既有操作
+				var existingOp Operation
+				_ = s.db.QueryRowContext(ctx, `
+					SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, candidate_email, result_ref, error_code, created_at, updated_at
+					FROM operations
+					WHERE principal_kind = ? AND principal_id = ? AND operation_kind = ? AND idempotency_key = ?
+				`, principalKind, principalID, operationKind, idempKey).Scan(
+					&existingOp.OperationID, &existingOp.PrincipalKind, &existingOp.PrincipalID, &existingOp.OperationKind, &existingOp.IdempotencyKey, &existingOp.RequestHash, &existingOp.State, &existingOp.CandidateEmail, &existingOp.ResultRef, &existingOp.ErrorCode, &existingOp.CreatedAt, &existingOp.UpdatedAt,
+				)
+				return nil, &existingOp, ErrOperationPending
 			}
-			return nil, fmt.Errorf("记录操作失败: %w", err)
+			return nil, nil, fmt.Errorf("记录操作失败: %w", err)
+		}
+		currentOp = &Operation{
+			OperationID:    opID,
+			PrincipalKind:  principalKind,
+			PrincipalID:    principalID,
+			OperationKind:  operationKind,
+			IdempotencyKey: idempKey,
+			RequestHash:    reqHash,
+			State:          "pending",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+	} else {
+		currentOp = &Operation{
+			OperationID:   opID,
+			PrincipalKind: principalKind,
+			PrincipalID:   principalID,
+			OperationKind: operationKind,
+			State:         "succeeded",
+			CreatedAt:     now,
+			UpdatedAt:     now,
 		}
 	}
 
@@ -335,10 +482,12 @@ func (s *Store) ClaimInventoryAlias(
 			if idempKey != "" {
 				_, _ = tx.ExecContext(ctx, `UPDATE operations SET state = 'failed', error_code = 'NO_AVAILABLE_INVENTORY', updated_at = ? WHERE operation_id = ?`, now, opID)
 				_ = tx.Commit()
+				currentOp.State = "failed"
+				currentOp.ErrorCode = "NO_AVAILABLE_INVENTORY"
 			}
-			return nil, ErrNoAvailableInventory
+			return nil, currentOp, ErrNoAvailableInventory
 		}
-		return nil, err
+		return nil, currentOp, err
 	}
 
 	// 4. 条件更新库存：利用受影响行数防重 (CAS)
@@ -348,11 +497,11 @@ func (s *Store) ClaimInventoryAlias(
 		WHERE email = ? AND allocation_state = 'available'
 	`, candEmail)
 	if err != nil {
-		return nil, err
+		return nil, currentOp, err
 	}
 	rowsAffected, _ := res.RowsAffected()
 	if rowsAffected == 0 {
-		return nil, ErrNoAvailableInventory
+		return nil, currentOp, ErrNoAvailableInventory
 	}
 
 	// 5. 插入分配凭据
@@ -360,6 +509,7 @@ func (s *Store) ClaimInventoryAlias(
 	alloc := &AliasAllocation{
 		AllocationID: allocID,
 		AliasEmail:   candEmail,
+		AccountID:    candAccountID,
 		OwnerKind:    principalKind,
 		OwnerID:      principalID,
 		BusinessTag:  tag,
@@ -369,18 +519,26 @@ func (s *Store) ClaimInventoryAlias(
 
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO alias_allocations (
-			allocation_id, alias_email, owner_kind, owner_id, business_tag, allocated_at, status
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, alloc.AllocationID, alloc.AliasEmail, alloc.OwnerKind, alloc.OwnerID, alloc.BusinessTag, alloc.AllocatedAt, alloc.Status)
+			allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, alloc.AllocationID, alloc.AliasEmail, alloc.AccountID, alloc.OwnerKind, alloc.OwnerID, alloc.BusinessTag, alloc.AllocatedAt, alloc.Status)
 	if err != nil {
-		return nil, fmt.Errorf("写入分配关系失败: %w", err)
+		return nil, currentOp, fmt.Errorf("写入分配关系失败: %w", err)
 	}
 
 	// 6. 兼容性写入 lease_records (确保既有管理控制台及审计视图无缝运作)
+	tokenName := principalID
+	if principalKind == "token" {
+		var name string
+		_ = tx.QueryRowContext(ctx, `SELECT name FROM api_tokens WHERE id = ?`, principalID).Scan(&name)
+		if name != "" {
+			tokenName = name
+		}
+	}
 	_, _ = tx.ExecContext(ctx, `
 		INSERT INTO lease_records (id, email, account_id, tag, status, allocated_at, token_name)
 		VALUES (?, ?, ?, ?, 'leased', ?, ?)
-	`, allocID, candEmail, candAccountID, tag, now, principalID)
+	`, allocID, candEmail, candAccountID, tag, now, tokenName)
 
 	// 7. 更新操作记录为 succeeded
 	if idempKey != "" {
@@ -389,13 +547,59 @@ func (s *Store) ClaimInventoryAlias(
 			SET state = 'succeeded', result_ref = ?, candidate_email = ?, updated_at = ?
 			WHERE operation_id = ?
 		`, allocID, candEmail, now, opID)
+		currentOp.State = "succeeded"
+		currentOp.ResultRef = allocID
+		currentOp.CandidateEmail = candEmail
+		currentOp.UpdatedAt = now
 	}
 
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("事务提交失败: %w", err)
+		return nil, currentOp, fmt.Errorf("事务提交失败: %w", err)
 	}
 
-	return alloc, nil
+	return alloc, currentOp, nil
+}
+
+// RecordAllocation 原子持久化新建别名的分配凭据与审计流水
+func (s *Store) RecordAllocation(alloc *AliasAllocation, tokenName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 1. 确保 inventory 为 allocated
+	_, _ = tx.Exec(`
+		UPDATE alias_inventory
+		SET allocation_state = 'allocated'
+		WHERE email = ?
+	`, alloc.AliasEmail)
+
+	// 2. 写入 alias_allocations
+	_, err = tx.Exec(`
+		INSERT INTO alias_allocations (allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(alias_email) DO UPDATE SET
+			owner_kind = excluded.owner_kind,
+			owner_id = excluded.owner_id,
+			status = excluded.status
+	`, alloc.AllocationID, alloc.AliasEmail, alloc.AccountID, alloc.OwnerKind, alloc.OwnerID, alloc.BusinessTag, alloc.AllocatedAt, alloc.Status)
+	if err != nil {
+		return err
+	}
+
+	// 3. 写入 lease_records 审计流水
+	_, err = tx.Exec(`
+		INSERT INTO lease_records (id, email, account_id, tag, status, allocated_at, completed_at, token_name)
+		VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)
+	`, alloc.AllocationID, alloc.AliasEmail, alloc.AccountID, alloc.BusinessTag, alloc.AllocatedAt, alloc.AllocatedAt, tokenName)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 // GetPrincipalAllocation 根据邮箱与主体核验分配归属
@@ -403,11 +607,11 @@ func (s *Store) GetPrincipalAllocation(ctx context.Context, email, ownerKind, ow
 	email = strings.TrimSpace(strings.ToLower(email))
 	var alloc AliasAllocation
 	err := s.db.QueryRowContext(ctx, `
-		SELECT allocation_id, alias_email, owner_kind, owner_id, business_tag, allocated_at, status
+		SELECT allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status
 		FROM alias_allocations
 		WHERE alias_email = ? AND owner_kind = ? AND owner_id = ?
 	`, email, ownerKind, ownerID).Scan(
-		&alloc.AllocationID, &alloc.AliasEmail, &alloc.OwnerKind, &alloc.OwnerID, &alloc.BusinessTag, &alloc.AllocatedAt, &alloc.Status,
+		&alloc.AllocationID, &alloc.AliasEmail, &alloc.AccountID, &alloc.OwnerKind, &alloc.OwnerID, &alloc.BusinessTag, &alloc.AllocatedAt, &alloc.Status,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -423,11 +627,11 @@ func (s *Store) GetPrincipalAllocationByID(ctx context.Context, allocationID, ow
 	allocationID = strings.TrimSpace(allocationID)
 	var alloc AliasAllocation
 	err := s.db.QueryRowContext(ctx, `
-		SELECT allocation_id, alias_email, owner_kind, owner_id, business_tag, allocated_at, status
+		SELECT allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status
 		FROM alias_allocations
 		WHERE allocation_id = ? AND owner_kind = ? AND owner_id = ?
 	`, allocationID, ownerKind, ownerID).Scan(
-		&alloc.AllocationID, &alloc.AliasEmail, &alloc.OwnerKind, &alloc.OwnerID, &alloc.BusinessTag, &alloc.AllocatedAt, &alloc.Status,
+		&alloc.AllocationID, &alloc.AliasEmail, &alloc.AccountID, &alloc.OwnerKind, &alloc.OwnerID, &alloc.BusinessTag, &alloc.AllocatedAt, &alloc.Status,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -438,27 +642,18 @@ func (s *Store) GetPrincipalAllocationByID(ctx context.Context, allocationID, ow
 	return &alloc, nil
 }
 
-// IsEmailOwnedByToken 校验指定别名邮箱是否归属于该令牌 (同时兼容 v2 alias_allocations 与 v1 lease_records)
-func (s *Store) IsEmailOwnedByToken(ctx context.Context, email, tokenID, tokenName string) bool {
+// IsEmailOwnedByToken 校验指定别名邮箱是否归属于该令牌 (仅基于不可变 token_id 与 alias_allocations)
+func (s *Store) IsEmailOwnedByToken(ctx context.Context, email, tokenID string) bool {
 	email = strings.TrimSpace(strings.ToLower(email))
-	if email == "" {
+	tokenID = strings.TrimSpace(tokenID)
+	if email == "" || tokenID == "" {
 		return false
 	}
-	// 1. 优先查 PR-03/PR-04 alias_allocations
 	var cnt int
 	_ = s.db.QueryRowContext(ctx, `
 		SELECT COUNT(1) FROM alias_allocations
-		WHERE alias_email = ? AND owner_kind = 'token' AND (owner_id = ? OR owner_id = ?)
-	`, email, tokenID, tokenName).Scan(&cnt)
-	if cnt > 0 {
-		return true
-	}
-
-	// 2. 回退兼容 v1 lease_records
-	_ = s.db.QueryRowContext(ctx, `
-		SELECT COUNT(1) FROM lease_records
-		WHERE LOWER(email) = ? AND (token_name = ? OR token_name = ?)
-	`, email, tokenName, tokenID).Scan(&cnt)
+		WHERE alias_email = ? AND owner_kind = 'token' AND owner_id = ?
+	`, email, tokenID).Scan(&cnt)
 	return cnt > 0
 }
 
@@ -479,4 +674,54 @@ func (s *Store) GetOperation(ctx context.Context, operationID, principalKind, pr
 		return nil, err
 	}
 	return &op, nil
+}
+
+// CreateVerificationRequest 创建持久化取码请求 (Section VI)
+func (s *Store) CreateVerificationRequest(ctx context.Context, req *VerificationRequest) error {
+	q := `
+	INSERT INTO verification_requests (
+		request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
+		baseline_provider, baseline_uidvalidity, baseline_uid, matched_event_ref, code
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err := s.db.ExecContext(ctx, q,
+		req.RequestID, req.PrincipalKind, req.PrincipalID, req.LeaseID, req.AliasEmail, req.Status, req.CreatedAt, req.ExpiresAt,
+		req.BaselineProvider, req.BaselineUIDValidity, req.BaselineUID, req.MatchedEventRef, req.Code,
+	)
+	return err
+}
+
+// GetVerificationRequest 获取持久化取码请求 (Section VI)
+func (s *Store) GetVerificationRequest(ctx context.Context, requestID, principalKind, principalID string) (*VerificationRequest, error) {
+	requestID = strings.TrimSpace(requestID)
+	var req VerificationRequest
+	q := `
+	SELECT request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
+	       baseline_provider, baseline_uidvalidity, baseline_uid, matched_event_ref, code
+	FROM verification_requests
+	WHERE request_id = ? AND principal_kind = ? AND principal_id = ?
+	`
+	err := s.db.QueryRowContext(ctx, q, requestID, principalKind, principalID).Scan(
+		&req.RequestID, &req.PrincipalKind, &req.PrincipalID, &req.LeaseID, &req.AliasEmail, &req.Status, &req.CreatedAt, &req.ExpiresAt,
+		&req.BaselineProvider, &req.BaselineUIDValidity, &req.BaselineUID, &req.MatchedEventRef, &req.Code,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrVerificationRequestNotFound
+		}
+		return nil, err
+	}
+	return &req, nil
+}
+
+// UpdateVerificationRequestResult 更新取码任务结果
+func (s *Store) UpdateVerificationRequestResult(ctx context.Context, requestID, status, code, matchedEventRef string) error {
+	requestID = strings.TrimSpace(requestID)
+	q := `
+	UPDATE verification_requests
+	SET status = ?, code = ?, matched_event_ref = ?
+	WHERE request_id = ?
+	`
+	_, err := s.db.ExecContext(ctx, q, status, code, matchedEventRef, requestID)
+	return err
 }

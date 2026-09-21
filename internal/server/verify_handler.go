@@ -56,7 +56,7 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 		return
 	}
 	if p.Kind == auth.PrincipalToken && s.store != nil {
-		if !s.store.IsEmailOwnedByToken(c.Request.Context(), email, p.ID, p.TokenName) {
+		if !s.store.IsEmailOwnedByToken(c.Request.Context(), email, p.ID) {
 			failCode(c, http.StatusNotFound, "RESOURCE_NOT_FOUND", "未找到该别名或无权访问")
 			return
 		}

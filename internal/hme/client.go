@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -299,17 +300,21 @@ func (c *Client) RequestWithContext(ctx context.Context, method, rawURL string, 
 		default:
 		}
 
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+
 		var reqBody io.Reader
 		if body != nil {
 			buf, err := json.Marshal(body)
 			if err != nil {
+				cancel()
 				return "", err
 			}
 			reqBody = bytes.NewReader(buf)
 		}
 
-		req, err := http.NewRequestWithContext(ctx, method, fullURL, reqBody)
+		req, err := http.NewRequestWithContext(attemptCtx, method, fullURL, reqBody)
 		if err != nil {
+			cancel()
 			return "", err
 		}
 		origin := requestOrigin(rawURL)
@@ -362,6 +367,7 @@ func (c *Client) RequestWithContext(ctx context.Context, method, rawURL string, 
 
 		resp, err := c.httpc.Do(req)
 		if err != nil {
+			cancel()
 			lastErr = fmt.Errorf("连接失败: %w", err)
 			if attempt < maxAttempts {
 				if sleepErr := c.sleepRetry(ctx, attempt); sleepErr != nil {
@@ -375,6 +381,7 @@ func (c *Client) RequestWithContext(ctx context.Context, method, rawURL string, 
 		// 读取上限防御
 		text, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 		_ = resp.Body.Close()
+		cancel()
 		if err != nil {
 			lastErr = fmt.Errorf("读取响应失败: %w", err)
 			if attempt < maxAttempts {
@@ -414,6 +421,15 @@ func (c *Client) RequestWithContext(ctx context.Context, method, rawURL string, 
 			}
 			if resp.StatusCode == 429 {
 				lastErr = fmt.Errorf("%w: HTTP 429: %s", ErrRateLimited, snippet)
+				idx := min(attempt-1, len(retryDelays)-1)
+				retryDelay := parseRetryAfter(resp.Header.Get("Retry-After"), retryDelays[idx])
+				if attempt < maxAttempts {
+					if sleepErr := c.sleepDuration(ctx, retryDelay); sleepErr != nil {
+						return "", sleepErr
+					}
+					continue
+				}
+				return "", lastErr
 			} else {
 				lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, snippet)
 			}
@@ -432,6 +448,32 @@ func (c *Client) RequestWithContext(ctx context.Context, method, rawURL string, 
 		return "", lastErr
 	}
 	return "", fmt.Errorf("未知错误")
+}
+
+func parseRetryAfter(val string, fallback time.Duration) time.Duration {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return fallback
+	}
+	if sec, err := strconv.Atoi(val); err == nil && sec > 0 {
+		return time.Duration(sec) * time.Second
+	}
+	if t, err := http.ParseTime(val); err == nil {
+		d := time.Until(t)
+		if d > 0 {
+			return d
+		}
+	}
+	return fallback
+}
+
+func (c *Client) sleepDuration(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
 }
 
 func (c *Client) sleepRetry(ctx context.Context, attempt int) error {
@@ -500,7 +542,10 @@ func (c *Client) ResetServiceEndpoint() {
 //
 // 并发批处理(如 BatchUpdateAliases)前必须串行调用一次，使后续并发方法只读取
 // 已就绪的端点，而不是同时触发多次 ValidateSession。
-func (c *Client) EnsureService() error { return c.resolveService() }
+func (c *Client) EnsureService() error { return c.resolveService(context.Background()) }
+
+// EnsureServiceWithContext 支持 Context 贯穿的端点就绪确认。
+func (c *Client) EnsureServiceWithContext(ctx context.Context) error { return c.resolveService(ctx) }
 
 // Close 释放底层客户端的空闲连接。
 //
@@ -528,13 +573,18 @@ func (c *Client) CookieSnapshot() map[string]string {
 // 失败通常意味着 Cookie 过期或未订阅 iCloud+。
 // 线程安全:内部串行化，同一 Client 的并发校验只会真正执行一次。
 func (c *Client) ValidateSession() error {
+	return c.ValidateSessionWithContext(context.Background())
+}
+
+// ValidateSessionWithContext 支持 Context 贯穿的会话校验。
+func (c *Client) ValidateSessionWithContext(ctx context.Context) error {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
-	return c.validateSessionLocked()
+	return c.validateSessionLocked(ctx)
 }
 
 // validateSessionLocked 是 ValidateSession 的无锁内核，调用方必须持有 stateMu。
-func (c *Client) validateSessionLocked() error {
+func (c *Client) validateSessionLocked(ctx context.Context) error {
 	c.log("校验 iCloud 会话...")
 	c.cookieMu.RLock()
 	cookieLen := len(c.Cookies)
@@ -551,7 +601,7 @@ func (c *Client) validateSessionLocked() error {
 	validationURLs := c.validationURLs()
 	for i, validationURL := range validationURLs {
 		var candidate string
-		candidate, err = c.request("POST", validationURL, nil, 15*time.Second, 1)
+		candidate, err = c.RequestWithContext(ctx, "POST", validationURL, nil, 15*time.Second, 1)
 		if err == nil && !gjson.Valid(candidate) {
 			err = fmt.Errorf("invalid JSON response")
 		}
@@ -630,13 +680,13 @@ func (c *Client) AccountInfo() *AccountInfo {
 //
 // 双重检查 + stateMu 串行化:并发调用中只有第一个真正执行 ValidateSession，
 // 其余等待并复用结果，既消除数据竞争也避免重复 validate 触发 Apple 风控。
-func (c *Client) resolveService() error {
+func (c *Client) resolveService(ctx context.Context) error {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 	if c.serviceURL != "" {
 		return nil
 	}
-	return c.validateSessionLocked()
+	return c.validateSessionLocked(ctx)
 }
 
 // ---- 小工具 ----

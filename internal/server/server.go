@@ -84,6 +84,7 @@ type Server struct {
 	leasePruner *LeasePruner
 	notifier    *notify.Sender
 	store       *store.Store
+	allocService *AliasAllocationService
 	scheduler   *scheduler.Scheduler
 	msgCacheMu  sync.RWMutex
 	msgCache    map[string]messageCacheEntry
@@ -148,11 +149,12 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 		reaper:      reaper,
 		cookieMon:   mon,
 		notifier:    notifier,
-		store:       st,
-		leasePruner: NewLeasePruner(st, cfg.LeaseRetention),
-		startedAt:   time.Now(),
-		ctx:         ctx,
-		cancel:      cancel,
+		store:        st,
+		allocService: NewAliasAllocationService(st, be, syncWorker),
+		leasePruner:  NewLeasePruner(st, cfg.LeaseRetention),
+		startedAt:    time.Now(),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 	// 调度器在 Server 组装完成后注入，使 creator 能复用统一的流水入账口径
 	s.scheduler = scheduler.NewScheduler(st, func(accountID, label string) (*hme.CreateResult, error) {
