@@ -12,8 +12,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -22,9 +20,7 @@ import (
 )
 
 func TestHubHandlers(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_hub_handlers")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	cfg := Config{
 		DataDir:       tempDir,
@@ -34,6 +30,7 @@ func TestHubHandlers(t *testing.T) {
 	s := newWithBackend(&fakeBackend{accounts: []account.Summary{
 		{ID: "acc_1", Name: "主账号", Status: "active"},
 	}}, cfg)
+	defer s.Close()
 
 	// 登录获取 cookie 和 csrf_token
 	loginBody, _ := json.Marshal(map[string]string{"password": "test-password"})

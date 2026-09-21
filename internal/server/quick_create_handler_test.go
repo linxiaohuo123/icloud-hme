@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 testing, os, path/filepath, net/http, net/http/httptest, strings, encoding/json, icloud-hme/internal/account, icloud-hme/internal/hme, icloud-hme/internal/store
+ * [INPUT]: 依赖 testing, net/http, net/http/httptest, strings, encoding/json, icloud-hme/internal/account, icloud-hme/internal/hme, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 TestSelectAccountByTag, TestSelectAccountCandidatesQuotaPriority, TestSelectAccountCandidatesDual500Limit, TestQuickCreateStrictTagIsolation, TestQuickCreatePoolFirstAndFallback
  * [POS]: internal/server 的一键快速出号、别名池毫秒优先领用 (Pool-First)、配额感知号池智能优选、双维 500 熔断避障与严格业务标签隔离单元测试
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -11,8 +11,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -109,9 +107,7 @@ func TestSelectAccountByTag(t *testing.T) {
 }
 
 func TestSelectAccountCandidatesQuotaPriority(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_select_candidates_quota")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	st, err := store.NewStore(tempDir)
 	if err != nil {

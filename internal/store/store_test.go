@@ -22,9 +22,7 @@ import (
 // 同一刻度内的并发创建会得到相同 ID，再叠加 ON CONFLICT(id) DO UPDATE
 // 就会静默覆盖掉刚写入的记录(接口照常返回 200，但记录消失、旧令牌失效)。
 func TestStoreConcurrentCreateNoOverwrite(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_store_concurrent_create")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	s, err := NewStore(tempDir)
 	if err != nil {
@@ -314,15 +312,12 @@ func TestDeleteAccountCascadesAliasRoutes(t *testing.T) {
 }
 
 func TestStorePersistence(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_store_persistence")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	s, err := NewStore(tempDir)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
-	defer s.Close()
 
 	// 1. Tags
 	tag := BusinessTag{Name: "GPT 注册", Tag: "gpt-register", Description: "用于注册"}
@@ -367,6 +362,11 @@ func TestStorePersistence(t *testing.T) {
 		t.Fatalf("IncrementHourlyQuota failed: allowed=%v, count=%d", allowed, count)
 	}
 
+	// 显式关闭第一个 Store 实例，刷盘并释放 SQLite 连接与锁，才能干净模拟重载
+	if err := s.Close(); err != nil {
+		t.Fatalf("s.Close failed: %v", err)
+	}
+
 	// 5. Reload test
 	s2, err := NewStore(tempDir)
 	if err != nil {
@@ -379,10 +379,7 @@ func TestStorePersistence(t *testing.T) {
 }
 
 func TestStoreMigration(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_store_migration")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
-	_ = os.MkdirAll(tempDir, 0755)
+	tempDir := t.TempDir()
 
 	// 写入模拟遗留 JSON 文件
 	legacyTags := `{"tag_1":{"id":"tag_1","name":"旧标签","tag":"legacy-tag","status":"active","created_at":"2026-01-01T00:00:00Z"}}`
@@ -446,10 +443,7 @@ func TestStoreMigration(t *testing.T) {
 
 // 解析失败的遗留 JSON 绝不能被归档，必须保留现场以便重试或人工修复。
 func TestStoreMigrationKeepsCorruptSource(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_store_migration_corrupt")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
-	_ = os.MkdirAll(tempDir, 0755)
+	tempDir := t.TempDir()
 
 	corruptPath := filepath.Join(tempDir, "tags.json")
 	_ = os.WriteFile(corruptPath, []byte(`{"tag_1": {`), 0644)
@@ -469,9 +463,7 @@ func TestStoreMigrationKeepsCorruptSource(t *testing.T) {
 }
 
 func TestStoreLeasePagination(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_store_lease_paged")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	s, err := NewStore(tempDir)
 	if err != nil {
@@ -514,9 +506,7 @@ func TestStoreLeasePagination(t *testing.T) {
 }
 
 func BenchmarkRecordLease(b *testing.B) {
-	tempDir := filepath.Join(os.TempDir(), fmt.Sprintf("bench_store_%d", os.Getpid()))
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := b.TempDir()
 
 	s, err := NewStore(tempDir)
 	if err != nil {
@@ -538,9 +528,7 @@ func BenchmarkRecordLease(b *testing.B) {
 }
 
 func BenchmarkListLeases(b *testing.B) {
-	tempDir := filepath.Join(os.TempDir(), fmt.Sprintf("bench_store_list_%d", os.Getpid()))
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := b.TempDir()
 
 	s, err := NewStore(tempDir)
 	if err != nil {
@@ -566,9 +554,7 @@ func BenchmarkListLeases(b *testing.B) {
 }
 
 func TestScheduleConfigHourWindowReset(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), fmt.Sprintf("test_store_hour_reset_%d", os.Getpid()))
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	s, err := NewStore(tempDir)
 	if err != nil {
@@ -608,9 +594,7 @@ func TestScheduleConfigHourWindowReset(t *testing.T) {
 }
 
 func TestDeleteScheduleConfig(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_delete_schedule_config")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	s, err := NewStore(tempDir)
 	if err != nil {
@@ -642,9 +626,7 @@ func TestDeleteScheduleConfig(t *testing.T) {
 }
 
 func TestStoreConnectionPragmas(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_store_pragmas")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	s, err := NewStore(tempDir)
 	if err != nil {
@@ -671,9 +653,7 @@ func TestStoreConnectionPragmas(t *testing.T) {
 }
 
 func TestStoreUpdateLeaseStatusCaseInsensitive(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_store_lease_status_case")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	s, err := NewStore(tempDir)
 	if err != nil {
@@ -705,9 +685,7 @@ func TestStoreUpdateLeaseStatusCaseInsensitive(t *testing.T) {
 }
 
 func TestClaimPoolAlias(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_claim_pool_alias")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	s, err := NewStore(tempDir)
 	if err != nil {
@@ -773,9 +751,7 @@ func TestClaimPoolAlias(t *testing.T) {
 }
 
 func TestClaimPoolAliasConcurrency(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_claim_pool_concurrency")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	s, err := NewStore(tempDir)
 	if err != nil {
