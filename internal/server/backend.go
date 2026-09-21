@@ -108,9 +108,11 @@ const summaryCacheTTL = time.Second
 func (b *managerBackend) ListAccounts() []account.Summary {
 	b.summaryMu.Lock()
 	if b.summaryCache != nil && time.Since(b.summaryAt) < summaryCacheTTL {
-		cached := b.summaryCache
+		// 【BUG-04 修复】防御性浅拷贝,杜绝调用方排序/修改污染全局缓存(Data Race)
+		res := make([]account.Summary, len(b.summaryCache))
+		copy(res, b.summaryCache)
 		b.summaryMu.Unlock()
-		return cached
+		return res
 	}
 	b.summaryMu.Unlock()
 
@@ -402,5 +404,23 @@ func (b *managerBackend) CheckProxy(proxyURL string) (bool, int64, string, error
 	}
 	defer resp.Body.Close()
 
-	return true, latency, fmt.Sprintf("代理连通成功 (Apple 网关响应 %d)", resp.StatusCode), nil
+	// 【BUG-15 修复】额外探测出口 IP,供运维确认代理出口与预期一致
+	var exitIP string
+	ipReq, ipErr := fhttp.NewRequest(http.MethodGet, "https://api.ipify.org", nil)
+	if ipErr == nil {
+		ipReq.Header.Set("User-Agent", "curl/8.0")
+		if ipResp, ipFetchErr := client.Do(ipReq); ipFetchErr == nil {
+			defer ipResp.Body.Close()
+			buf := make([]byte, 64)
+			if n, readErr := ipResp.Body.Read(buf); readErr == nil || n > 0 {
+				exitIP = strings.TrimSpace(string(buf[:n]))
+			}
+		}
+	}
+
+	msg := fmt.Sprintf("代理连通成功 (Apple 网关响应 %d)", resp.StatusCode)
+	if exitIP != "" {
+		msg = fmt.Sprintf("出口 IP: %s (Apple 网关响应 %d)", exitIP, resp.StatusCode)
+	}
+	return true, latency, msg, nil
 }

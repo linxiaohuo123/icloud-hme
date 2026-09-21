@@ -104,6 +104,7 @@ func (s *Server) listAliasesHandler(c *gin.Context) {
 		// 又会污染缓存。归属字段的填充统一挪到 runBounded 之后的单线程段完成。
 		results := make([][]hme.Alias, len(accounts))
 		tasks := make([]func(), 0, len(accounts))
+		// Go 1.22+ 每次 for 迭代创建新的循环变量副本,闭包捕获安全 (go.mod: go 1.26)
 		for i, acc := range accounts {
 			if acc.Status == "error" || !acc.HasCookies {
 				continue

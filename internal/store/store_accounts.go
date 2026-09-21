@@ -115,7 +115,7 @@ func (s *Store) DeleteAccount(id string) error {
 	if _, err := s.db.Exec(`DELETE FROM accounts WHERE id=?`, id); err != nil {
 		return err
 	}
-	_ = s.deleteAliasRoutesForAccount(id)
+	_ = s.DeleteAliasRoutesForAccount(id)
 	return nil
 }
 

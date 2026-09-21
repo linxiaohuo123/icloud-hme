@@ -270,6 +270,8 @@ func (s *Server) removeAccountHandler(c *gin.Context) {
 	}
 	if s.store != nil {
 		_ = s.store.DeleteScheduleConfig(id)
+		// 【BUG-14 修复】级联清理路由表,防止残留路由指向已删除账号
+		_ = s.store.DeleteAliasRoutesForAccount(id)
 	}
 	ok(c, gin.H{"id": id})
 }

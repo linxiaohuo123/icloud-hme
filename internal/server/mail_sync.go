@@ -75,9 +75,11 @@ func NewMailSyncWorker(be Backend, st *store.Store, eventBus *mail.EventBus, int
 // 【正确性红线】ListInbox 每轮都会把 Days:1 窗口内的全部历史邮件重新返回，
 // 若不做邮件级去重，worker 会在订阅者出现后 2 秒内把【上一次已经用过的验证码】
 // 重新广播出去——fresh=true 也挡不住(它只跳过内存缓存预填)。因此这里必须去重。
+//
+// 【BUG-03 修复】过期指纹清理已移至独立的 cleanupPublished 定时器(每 5 分钟),
+// 此处只做 O(1) 的查重与插入,避免在写锁内执行 O(N) 全表遍历拖垮并发吞吐。
 func (w *MailSyncWorker) markPublished(accountID, folder, msgID, email string) bool {
 	key := strings.Join([]string{accountID, folder, msgID, email}, "|")
-	now := time.Now()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.published == nil {
@@ -86,13 +88,7 @@ func (w *MailSyncWorker) markPublished(accountID, folder, msgID, email string) b
 	if _, seen := w.published[key]; seen {
 		return false
 	}
-	// 顺带淘汰过期指纹，防止长期运行内存无界增长
-	for k, t := range w.published {
-		if now.Sub(t) > publishedWindow {
-			delete(w.published, k)
-		}
-	}
-	w.published[key] = now
+	w.published[key] = time.Now()
 	return true
 }
 
@@ -183,6 +179,9 @@ func (w *MailSyncWorker) Trigger() {
 func (w *MailSyncWorker) loop() {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
+	// 【BUG-03 修复】独立定时器清理过期指纹,避免在高频 markPublished 写锁内做 O(N) 遍历
+	cleanupTicker := time.NewTicker(5 * time.Minute)
+	defer cleanupTicker.Stop()
 
 	for {
 		select {
@@ -192,6 +191,20 @@ func (w *MailSyncWorker) loop() {
 			w.syncOnce()
 		case <-ticker.C:
 			w.syncOnce()
+		case <-cleanupTicker.C:
+			w.cleanupPublished()
+		}
+	}
+}
+
+// cleanupPublished 批量淘汰过期的已发布指纹,防止长期运行内存无界增长。
+func (w *MailSyncWorker) cleanupPublished() {
+	now := time.Now()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for k, t := range w.published {
+		if now.Sub(t) > publishedWindow {
+			delete(w.published, k)
 		}
 	}
 }

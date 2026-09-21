@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 database/sql, modernc.org/sqlite, os, path/filepath, sync, time, encoding/json
- * [OUTPUT]: 对外提供 Store 结构及其对 Tags, Tokens, Leases, Schedules, Pool-First 别名池原子认领、CountConsumedPoolAliases 与覆盖索引的高性能持久化能力
- * [POS]: internal/store 的持久化层，基于纯 Go 嵌入式 SQLite 引擎提供零依赖、无损事务存储；ClaimPoolAlias 支持并发安全原子认领与多注册机防重号
+ * [OUTPUT]: 对外提供 Store 结构及其对 Tags, Tokens, Leases, Schedules, Pool-First 别名池原子认领、ClaimPoolAliasByRoutes、CountConsumedPoolAliases 与覆盖索引的高性能持久化能力
+ * [POS]: internal/store 的持久化层，基于纯 Go 嵌入式 SQLite 引擎提供零依赖、无损事务存储；ClaimPoolAlias 与 ClaimPoolAliasByRoutes 支持并发安全原子认领与多注册机防重号
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -406,6 +406,10 @@ func (s *Store) ListTags() []BusinessTag {
 			res = append(res, t)
 		}
 	}
+	// 【BUG-05 修复】迭代中断时记录日志,防止底层 IO 错误导致结果静默截断
+	if err := rows.Err(); err != nil {
+		log.Printf("[Store] ListTags 迭代中断: %v", err)
+	}
 	return res
 }
 
@@ -433,9 +437,14 @@ func (s *Store) SaveTag(tag BusinessTag) error {
 	return err
 }
 
-func (s *Store) DeleteTag(id string) error {
-	_, err := s.db.Exec(`DELETE FROM business_tags WHERE id = ?`, id)
-	return err
+// DeleteTag 删除业务标签。返回 true 表示实际删除了记录，false 表示本就不存在。
+func (s *Store) DeleteTag(id string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM business_tags WHERE id = ?`, id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 func (s *Store) UpdateTagLastAssigned(tagStr string) {
@@ -458,6 +467,10 @@ func (s *Store) ListTokens() []APIToken {
 		if err := rows.Scan(&tok.ID, &tok.Name, &tok.Token, &tok.CreatedAt, &tok.LastUsedAt, &tok.Scopes); err == nil {
 			res = append(res, tok)
 		}
+	}
+	// 【BUG-05 修复】迭代中断时记录日志
+	if err := rows.Err(); err != nil {
+		log.Printf("[Store] ListTokens 迭代中断: %v", err)
 	}
 	return res
 }
@@ -503,9 +516,14 @@ func (s *Store) SaveToken(token APIToken) error {
 	return err
 }
 
-func (s *Store) DeleteToken(id string) error {
-	_, err := s.db.Exec(`DELETE FROM api_tokens WHERE id = ?`, id)
-	return err
+// DeleteToken 删除 API 令牌。返回 true 表示实际删除了记录，false 表示本就不存在。
+func (s *Store) DeleteToken(id string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM api_tokens WHERE id = ?`, id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 func (s *Store) ValidateToken(tokenStr string) bool {
@@ -593,8 +611,8 @@ func (s *Store) CountAliasRoutes() int {
 	return n
 }
 
-// deleteAliasRoutesForAccount 清理某账号的全部路由(账号注销时级联)。
-func (s *Store) deleteAliasRoutesForAccount(accountID string) error {
+// DeleteAliasRoutesForAccount 清理某账号的全部路由(账号注销时级联)。
+func (s *Store) DeleteAliasRoutesForAccount(accountID string) error {
 	_, err := s.db.Exec(`DELETE FROM alias_routes WHERE account_id = ?`, accountID)
 	return err
 }
@@ -738,6 +756,10 @@ func (s *Store) ListLeases(aliasQuery, tagQuery, statusQuery string, limit, offs
 			records = append(records, rec)
 		}
 	}
+	// 【BUG-05 修复】迭代中断时记录日志
+	if err := rows.Err(); err != nil {
+		log.Printf("[Store] ListLeases 迭代中断: %v", err)
+	}
 	return records, total
 }
 
@@ -800,6 +822,11 @@ type PoolCandidate struct {
 // ClaimPoolAlias 原子地从候选别名列表中挑选第一个未被外部消费者领用的别名并生成领用记录。
 // 并发安全：多协程并发领号时，同一别名绝不会被重复分发。
 // 若无可用别名，返回 nil, nil。
+//
+// 【BUG-06 并发安全模型】当前由 Go 进程级 s.mu 保证查询-插入的原子性。
+// 这仅在**单进程嵌入式 SQLite** 下成立。若未来迁移到多进程部署或 PostgreSQL，
+// 必须改用 SELECT ... FOR UPDATE 行锁或 INSERT ... WHERE NOT EXISTS 子查询，
+// 否则同一别名可能被多进程同时领用。
 func (s *Store) ClaimPoolAlias(candidates []PoolCandidate, tag, tokenName string) (*LeaseRecord, error) {
 	if len(candidates) == 0 {
 		return nil, nil
@@ -873,6 +900,87 @@ func (s *Store) ClaimPoolAlias(candidates []PoolCandidate, tag, tokenName string
 			s.UpdateTagLastAssigned(tag)
 			return &rec, nil
 		}
+	}
+
+	return nil, nil
+}
+
+// ClaimPoolAliasByRoutes 直接从持久化路由表中查找未被外部消费者领用的别名并原子认领。
+//
+// 【BUG-02 修复】原 ClaimPoolAlias 需要调用方先对每个账号 ListAliases 把全部别名
+// 拉到内存再传入(2000 账号 × 200 别名 = 40 万条)。本方法把判断下推到 SQL 层:
+//   - alias_routes 已持久化了「别名 → 母号」映射(出号写穿 + 列表自愈)
+//   - lease_records 记录了已被消费的别名
+//   - 单条 SQL 在索引上完成差集运算，O(1) 选出首个可用别名
+//
+// accountIDs 为空时返回 nil, nil。
+func (s *Store) ClaimPoolAliasByRoutes(accountIDs []string, tag, tokenName string) (*LeaseRecord, error) {
+	if len(accountIDs) == 0 {
+		return nil, nil
+	}
+	if tag == "" {
+		tag = "default"
+	}
+	if tokenName == "" {
+		tokenName = "admin_console"
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 分批查询，避免 IN 列表超长
+	const batchSize = 200
+	for i := 0; i < len(accountIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(accountIDs) {
+			end = len(accountIDs)
+		}
+		chunk := accountIDs[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for j, id := range chunk {
+			placeholders[j] = "?"
+			args[j] = id
+		}
+
+		// 在 alias_routes 中找到未被非 scheduler 消费者认领的别名
+		query := fmt.Sprintf(`
+			SELECT ar.email, ar.account_id
+			FROM alias_routes ar
+			WHERE ar.account_id IN (%s)
+			  AND NOT EXISTS (
+			    SELECT 1 FROM lease_records lr
+			    WHERE lr.email = ar.email
+			      AND COALESCE(lr.token_name, '') != 'scheduler'
+			  )
+			LIMIT 1`,
+			strings.Join(placeholders, ","),
+		)
+
+		var email, accountID string
+		err := s.db.QueryRow(query, args...).Scan(&email, &accountID)
+		if err != nil {
+			continue // 本批无可用别名，试下一批
+		}
+
+		// 命中: 原子插入领用流水
+		rec := LeaseRecord{
+			ID:          fmt.Sprintf("lease_%d_%d", time.Now().UnixNano(), atomic.AddUint64(&leaseSeq, 1)),
+			Email:       normalizeEmail(email),
+			AccountID:   accountID,
+			Tag:         tag,
+			Status:      "completed",
+			AllocatedAt: time.Now().Format(time.RFC3339),
+			CompletedAt: time.Now().Format(time.RFC3339),
+			TokenName:   tokenName,
+		}
+		insQuery := `INSERT INTO lease_records (id, email, account_id, tag, status, allocated_at, completed_at, token_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+		if _, insertErr := s.db.Exec(insQuery, rec.ID, rec.Email, rec.AccountID, rec.Tag, rec.Status, rec.AllocatedAt, rec.CompletedAt, rec.TokenName); insertErr != nil {
+			return nil, insertErr
+		}
+		s.UpdateTagLastAssigned(tag)
+		return &rec, nil
 	}
 
 	return nil, nil
@@ -997,6 +1105,10 @@ func (s *Store) ListScheduleConfigs() []ScheduleConfig {
 			}
 			res = append(res, cfg)
 		}
+	}
+	// 【BUG-05 修复】迭代中断时记录日志
+	if err := rows.Err(); err != nil {
+		log.Printf("[Store] ListScheduleConfigs 迭代中断: %v", err)
 	}
 	return res
 }

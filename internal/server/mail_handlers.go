@@ -90,7 +90,13 @@ func (s *Server) getMessageHandler(c *gin.Context) {
 	entry, hit := s.msgCache[cacheKey]
 	s.msgCacheMu.RUnlock()
 	if hit && time.Now().Before(entry.expiresAt) {
-		ok(c, entry.msg)
+		// 【BUG-08 修复】响应包装对齐 getMessagePrimeHandler，包含 account_id/method/cached
+		ok(c, gin.H{
+			"account_id": accountID,
+			"message":    entry.msg,
+			"method":     "cache",
+			"cached":     true,
+		})
 		return
 	}
 
@@ -102,7 +108,12 @@ func (s *Server) getMessageHandler(c *gin.Context) {
 
 	s.putMessageCache([]string{cacheKey}, message)
 
-	ok(c, message)
+	ok(c, gin.H{
+		"account_id": accountID,
+		"message":    message,
+		"method":     "imap",
+		"cached":     false,
+	})
 }
 
 func (s *Server) getMessagePrimeHandler(c *gin.Context) {

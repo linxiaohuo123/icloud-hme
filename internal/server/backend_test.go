@@ -499,14 +499,16 @@ func TestGetMessageWebMailStringIDHandler(t *testing.T) {
 	var res struct {
 		Success bool `json:"success"`
 		Data    struct {
-			ID string `json:"id"`
+			Message struct {
+				ID string `json:"id"`
+			} `json:"message"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(respBody), &res); err != nil {
 		t.Fatalf("unmarshal error: %v", err)
 	}
-	if res.Data.ID != "thread_abcdef123" {
-		t.Fatalf("expected thread_abcdef123, got: %+v", res.Data)
+	if res.Data.Message.ID != "thread_abcdef123" {
+		t.Fatalf("expected thread_abcdef123, got: %+v", res.Data.Message)
 	}
 }
 

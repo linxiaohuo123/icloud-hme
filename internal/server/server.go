@@ -86,6 +86,8 @@ type Server struct {
 	msgCacheMu  sync.RWMutex
 	msgCache    map[string]messageCacheEntry
 	startedAt   time.Time
+	ctx         context.Context    // 【BUG-11】停机信号,由 Close() 触发 cancel
+	cancel      context.CancelFunc // 【BUG-11】停机信号取消函数
 }
 
 // New 创建 Server。mgr 为账号管理器,st 为持久化存储(可为 nil),cfg 为安全配置。
@@ -133,6 +135,7 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 	mon := NewCookieMonitor(be, cfg.CookieMonitorInterval, notifier)
 	mon.SetThrottle(cfg.CookieMonitorThrottle)
 
+	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
 		be:          be,
 		limiter:     auth.NewLimiter(nil, 15*time.Minute, 5, 10000),
@@ -146,6 +149,8 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 		store:       st,
 		leasePruner: NewLeasePruner(st, cfg.LeaseRetention),
 		startedAt:   time.Now(),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 	// 调度器在 Server 组装完成后注入，使 creator 能复用统一的流水入账口径
 	s.scheduler = scheduler.NewScheduler(st, func(accountID, label string) (*hme.CreateResult, error) {
@@ -274,7 +279,12 @@ func (s *Server) startupSyncGap(n int) time.Duration {
 // 账号间按 startupSyncGap 摊平提交并限制并发，避免两个极端:
 // 固定 2 秒会让 2000 账号预热耗时 66 分钟；不限速则会对 Apple 形成突发。
 func (s *Server) autoSyncAccounts() {
-	time.Sleep(1 * time.Second) // 稍作停顿让 HTTP 监听优先就绪
+	// 【BUG-11 修复】所有等待都响应 s.ctx，SIGTERM 到达时立即退出而非卡在 Sleep 中
+	select {
+	case <-s.ctx.Done():
+		return
+	case <-time.After(1 * time.Second):
+	}
 
 	accounts := s.be.ListAccounts()
 	targets := make([]account.Summary, 0, len(accounts))
@@ -294,7 +304,13 @@ func (s *Server) autoSyncAccounts() {
 	var wg sync.WaitGroup
 	for i, acc := range targets {
 		if i > 0 && gap > 0 {
-			time.Sleep(gap)
+			select {
+			case <-s.ctx.Done():
+				log.Printf("[Server] 启动预热被停机信号中断")
+				wg.Wait()
+				return
+			case <-time.After(gap):
+			}
 		}
 		wg.Add(1)
 		sem <- struct{}{}
@@ -311,6 +327,10 @@ func (s *Server) autoSyncAccounts() {
 
 // Close 停止后台工作引擎。
 func (s *Server) Close() {
+	// 【BUG-11 修复】通知所有引用 s.ctx 的后台 goroutine 立即停止
+	if s.cancel != nil {
+		s.cancel()
+	}
 	s.aliasBuffer.Stop()
 	s.syncWorker.Stop()
 	s.reaper.Stop()

@@ -1,14 +1,13 @@
 /**
  * [INPUT]: 依赖 internal/mail, internal/account
  * [OUTPUT]: 对外提供 managerBackend 的邮件收发与邮箱管理方法 (ListInbox, ListMailboxes, GetMessage, GetMessages, DeleteMessage)、parseMessageID 与 InboxQuery, InboxResult, MessageRef 类型
- * [POS]: internal/server 的邮件业务门面实现；IMAP folder:uid 与 WebMail ThreadID 分流，详情回退精确匹配 ThreadID
+ * [POS]: internal/server 的邮件业务门面实现；IMAP folder:uid 与 WebMail ThreadID 分流，批量详情降级尽力返回 WebMail 列表
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 package server
 
 import (
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -250,33 +249,33 @@ func (b *managerBackend) GetMessages(accountID string, refs []MessageRef) ([]*ma
 		return allMessages, nil
 	}
 
-	// IMAP 批量拉取失败或无 App 密码时，降级走 WebMailClient
+	// IMAP 批量拉取失败或无 App 密码时，降级走 WebMailClient。
+	//
+	// 【BUG-01 修复】IMAP UID 与 WebMail ThreadID 属于完全不同的 ID 空间，
+	// 无法跨协议精确匹配。降级策略改为: 返回 WebMail 最近 N 封邮件(N = 请求数量),
+	// 作为 best-effort 兜底——IMAP 已挂,此时「有数据」优于「空数组」。
 	if wmc, werr := b.mgr.WebMailClient(accountID); werr == nil {
-		if msgs, errList := wmc.ListInbox(webMailLookupLimit); errList == nil {
-			refMap := make(map[string]bool)
-			for _, r := range refs {
-				refMap[fmt.Sprintf("%d", r.UID)] = true
-			}
-			var fallbackList []*mail.FullMessage
+		limit := len(refs)
+		if limit > webMailLookupLimit {
+			limit = webMailLookupLimit
+		}
+		if msgs, errList := wmc.ListInbox(limit); errList == nil && len(msgs) > 0 {
+			fallbackList := make([]*mail.FullMessage, 0, len(msgs))
 			for _, m := range msgs {
-				if refMap[m.ID] {
-					fallbackList = append(fallbackList, &mail.FullMessage{
-						Message: mail.Message{
-							ID:      m.ID,
-							Subject: m.Subject,
-							From:    m.From,
-							To:      m.To,
-							Date:    m.Date,
-							Preview: m.Preview,
-						},
-						Body:        m.Preview,
-						ContentType: "text/plain",
-					})
-				}
+				fallbackList = append(fallbackList, &mail.FullMessage{
+					Message: mail.Message{
+						ID:      m.ID,
+						Subject: m.Subject,
+						From:    m.From,
+						To:      m.To,
+						Date:    m.Date,
+						Preview: m.Preview,
+					},
+					Body:        m.Preview,
+					ContentType: "text/plain",
+				})
 			}
-			if len(fallbackList) > 0 {
-				return fallbackList, nil
-			}
+			return fallbackList, nil
 		}
 	}
 

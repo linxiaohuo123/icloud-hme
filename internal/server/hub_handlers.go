@@ -129,8 +129,14 @@ func (s *Server) findTagByID(id string) (store.BusinessTag, bool) {
 
 func (s *Server) deleteTagHandler(c *gin.Context) {
 	id := c.Param("id")
-	if err := s.store.DeleteTag(id); err != nil {
+	// 【BUG-13 修复】区分"成功删除"和"本就不存在"
+	affected, err := s.store.DeleteTag(id)
+	if err != nil {
 		backendFail(c, err)
+		return
+	}
+	if !affected {
+		failCode(c, http.StatusNotFound, "NOT_FOUND", "业务标识不存在")
 		return
 	}
 	ok(c, gin.H{"deleted": true})
@@ -220,8 +226,14 @@ func normalizeScopes(raw string) (string, error) {
 
 func (s *Server) deleteTokenHandler(c *gin.Context) {
 	id := c.Param("id")
-	if err := s.store.DeleteToken(id); err != nil {
+	// 【BUG-13 修复】区分"成功删除"和"本就不存在"
+	affected, err := s.store.DeleteToken(id)
+	if err != nil {
 		backendFail(c, err)
+		return
+	}
+	if !affected {
+		failCode(c, http.StatusNotFound, "NOT_FOUND", "令牌不存在")
 		return
 	}
 	ok(c, gin.H{"deleted": true})

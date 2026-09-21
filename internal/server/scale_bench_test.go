@@ -110,8 +110,9 @@ func TestListAccountsUsesSummaryCache(t *testing.T) {
 	if len(first) == 0 || len(second) == 0 {
 		t.Fatal("账号列表不应为空")
 	}
-	if &first[0] != &second[0] {
-		t.Fatal("TTL 内应复用同一份快照，而不是每次重新构造")
+	// BUG-04 修复后返回防御性拷贝，不再共享底层数组(防止调用方排序污染缓存)
+	if len(first) != len(second) || first[0].ID != second[0].ID {
+		t.Fatal("TTL 内应返回内容一致的快照")
 	}
 
 	// 作废后必须重新计算

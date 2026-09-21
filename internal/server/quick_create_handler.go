@@ -279,6 +279,7 @@ func (s *Server) quickCreateHandler(c *gin.Context) {
 
 		// 若明确声明只走别名池 (pool_only)，池空即终止，绝不上游新建打扰 Apple
 		if req.Mode == "pool_only" {
+			c.Header("Retry-After", "60") // 【BUG-07 修复】补充 Retry-After 响应头
 			failCode(c, http.StatusServiceUnavailable, "POOL_EMPTY", "当前业务池无可用预存别名，请等待定时补货或使用 mode=pool")
 			return
 		}
