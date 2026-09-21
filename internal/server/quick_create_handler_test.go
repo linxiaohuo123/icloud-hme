@@ -278,19 +278,19 @@ func TestQuickCreatePoolFirstAndFallback(t *testing.T) {
 		t.Fatalf("第三次出号 pool_only 期望 503, 实际: %d", code3)
 	}
 
-	// 4. 第四次出号 (默认 mode="pool")：池已空，自动降级调用 CreateAlias 现场新建
+	// 4. 第四次出号 (默认 mode="pool")：池已空，且存储已就绪，自动降级调用 CreateAlias 现场新建
 	code4, data4 := postAllocate(`{"tag":"default"}`)
 	if code4 != http.StatusOK || data4["email"] != "fresh_created@icloud.com" || data4["source"] != "created" {
 		t.Fatalf("第四次出号期望降级新建 fresh_created, 实际: code=%d data=%v", code4, data4)
 	}
 
-	// 5. 非法 mode 参数防护：应返回 400 VALIDATION_ERROR
+	// 6. 非法 mode 参数防护：应返回 400 VALIDATION_ERROR
 	code5, _ := postAllocate(`{"mode":"invalid_mode"}`)
 	if code5 != http.StatusBadRequest {
 		t.Fatalf("非法 mode 期望返回 400, 实际: %d", code5)
 	}
 
-	// 6. 指定不存在 account_id：应立即返回 404 ACCOUNT_NOT_FOUND
+	// 7. 指定不存在 account_id：应立即返回 404 ACCOUNT_NOT_FOUND (当前测试使用全局 APIKey 即 admin 权限)
 	code6, _ := postAllocate(`{"account_id":"acc_not_exists"}`)
 	if code6 != http.StatusNotFound {
 		t.Fatalf("指定不存在 account_id 期望返回 404, 实际: %d", code6)

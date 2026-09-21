@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 gin, time, strings, strconv, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 verifyCodeHandler
- * [POS]: server 的验证码极速提取管道，基于 MailEventBus 实现纯内存事件分发与零锁争用，Trigger 即时触发收信，持久化兜底配额释放
+ * [POS]: server 的验证码极速提取管道，基于 MailEventBus 实现纯内存事件分发，Trigger 即时触发收信，安全拒绝 auto_delete 副作用
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -41,7 +41,12 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 			timeoutSec = t
 		}
 	}
-	autoDelete := c.Query("auto_delete") == "true"
+	// 【PR-01 安全止损】GET verify-code 不再支持 auto_delete 参数。
+	// HTTP GET 必须具备安全/无副作用语义 (RFC 9110)，严禁因查询操作导致别名被隐式停用；明确报错拒绝。
+	if raw := c.Query("auto_delete"); raw == "true" || raw == "1" {
+		failCode(c, http.StatusBadRequest, "UNSUPPORTED_PARAMETER", "GET verify-code 不再支持 auto_delete 参数，不可通过 GET 请求产生停用别名副作用")
+		return
+	}
 	fresh := c.Query("fresh") == "true" || c.Query("nocache") == "true"
 
 	// 内存订阅与原子缓存捕获 (缓存命中直接返回, 邮件到达触发事件唤醒, 避免 TOCTOU 竞态)
@@ -60,9 +65,6 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 	case item := <-ch:
 		// 成功返回后原子消费清除该别名缓存，杜绝后续重发验证码或二次登录误采陈旧历史 OTP
 		s.eventBus.ConsumeCache(email)
-		if autoDelete {
-			goSafe("auto-deactivate-alias", func() { s.autoDeactivateAlias(item.AccountID, email) })
-		}
 		ok(c, gin.H{
 			"email":      email,
 			"code":       item.OTP.Code,

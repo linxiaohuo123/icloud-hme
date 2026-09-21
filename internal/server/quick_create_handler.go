@@ -177,11 +177,30 @@ func (s *Server) quickCreateHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: label 最长 200 字符")
 		return
 	}
+	// 【PR-01 安全止损】1. 存储层安全前置检查
+	if s.store == nil {
+		failCode(c, http.StatusServiceUnavailable, "ALLOCATION_STATE_NOT_READY", "存储层未就绪，无法安全验证别名分配状态")
+		return
+	}
+
+	// 【PR-01 安全止损】2. 普通外部令牌禁止越权指定母号
 	if req.AccountID != "" {
+		scopes, _ := c.Get("auth_scopes")
+		scopesStr, _ := scopes.(string)
+		if !store.HasScope(scopesStr, store.ScopeAdmin) {
+			failCode(c, http.StatusForbidden, "FORBIDDEN", "普通外部令牌禁止指定 account_id 出号")
+			return
+		}
 		if _, err := s.be.GetAccount(req.AccountID); err != nil {
 			backendFail(c, err)
 			return
 		}
+	}
+
+	// 【PR-01 安全止损】3. 现场创建在超时贯穿与写入恢复未就绪前禁止调用
+	if req.Mode == "create" {
+		failCode(c, http.StatusServiceUnavailable, "ALLOCATION_STATE_NOT_READY", "现场按需创建能力未就绪，当前仅支持已验证库存池分配 (mode=pool)")
+		return
 	}
 
 	tokenName, _ := c.Get("token_name")
@@ -190,99 +209,97 @@ func (s *Server) quickCreateHandler(c *gin.Context) {
 		tokenNameStr = "admin_console"
 	}
 
-	// 1. 别名池优先领用 (Pool-First): 在 mode != "create" 且存储可用时，优先从现存活跃别名池中原子划拨
-	if req.Mode != "create" && s.store != nil {
-		var poolAccountIDs []string
-		if req.AccountID != "" {
-			poolAccountIDs = []string{req.AccountID}
-		} else {
-			poolAccountIDs = selectPoolAccounts(s.be.ListAccounts(), req.Tag)
-		}
+	// 别名池优先领用 (Pool-First): 从现存活跃别名池中原子划拨
+	var poolAccountIDs []string
+	if req.AccountID != "" {
+		poolAccountIDs = []string{req.AccountID}
+	} else {
+		poolAccountIDs = selectPoolAccounts(s.be.ListAccounts(), req.Tag)
+	}
 
-		// 跨账号交错交织构建候选池 (Round-Robin Interleaving):
-		// 避免单一账号被瞬时连续领空导致所有目标邮件砸向单一邮箱，
-		// 实现领号与后续收信负载在多母号间极致均匀平摊。
-		var accountAliases [][]store.PoolCandidate
-		maxCount := 0
-		for _, accID := range poolAccountIDs {
-			aliases, _ := s.be.ListAliases(accID)
-			var list []store.PoolCandidate
-			for _, a := range aliases {
-				if a.Active {
-					list = append(list, store.PoolCandidate{
-						AccountID: accID,
-						Email:     a.Email,
-					})
-				}
-			}
-			if len(list) > 0 {
-				accountAliases = append(accountAliases, list)
-				if len(list) > maxCount {
-					maxCount = len(list)
-				}
+	// 跨账号交错交织构建候选池 (Round-Robin Interleaving):
+	// 避免单一账号被瞬时连续领空导致所有目标邮件砸向单一邮箱，
+	// 实现领号与后续收信负载在多母号间极致均匀平摊。
+	var accountAliases [][]store.PoolCandidate
+	maxCount := 0
+	for _, accID := range poolAccountIDs {
+		aliases, _ := s.be.ListAliases(accID)
+		var list []store.PoolCandidate
+		for _, a := range aliases {
+			if a.Active {
+				list = append(list, store.PoolCandidate{
+					AccountID: accID,
+					Email:     a.Email,
+				})
 			}
 		}
+		if len(list) > 0 {
+			accountAliases = append(accountAliases, list)
+			if len(list) > maxCount {
+				maxCount = len(list)
+			}
+		}
+	}
 
-		// 跨账号交错交织惰性切块探查 (Lazy Chunk Streaming & Round-Robin Interleaving):
-		// 采用固定 500 容量切片复用，避免在数万别名场景下一次性贪婪分配巨额切片引发 GC 抖动。
-		// 绝大多数情况下首批 500 条内即可命中可用号，实现亚毫秒级短路返回。
-		const chunkSize = 500
-		chunk := make([]store.PoolCandidate, 0, chunkSize)
-		var claimed *store.LeaseRecord
-		var claimErr error
+	// 跨账号交错交织惰性切块探查 (Lazy Chunk Streaming & Round-Robin Interleaving):
+	// 采用固定 500 容量切片复用，避免在数万别名场景下一次性贪婪分配巨额切片引发 GC 抖动。
+	// 绝大多数情况下首批 500 条内即可命中可用号，实现亚毫秒级短路返回。
+	const chunkSize = 500
+	chunk := make([]store.PoolCandidate, 0, chunkSize)
+	var claimed *store.LeaseRecord
+	var claimErr error
 
-		for i := 0; i < maxCount; i++ {
-			for _, list := range accountAliases {
-				if i < len(list) {
-					chunk = append(chunk, list[i])
-					if len(chunk) >= chunkSize {
-						claimed, claimErr = s.store.ClaimPoolAlias(chunk, req.Tag, tokenNameStr)
-						if claimErr != nil {
-							failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", "别名池认领失败: "+claimErr.Error())
-							return
-						}
-						if claimed != nil {
-							break
-						}
-						chunk = chunk[:0] // 原地重用底层数组，零内存再分配
+	for i := 0; i < maxCount; i++ {
+		for _, list := range accountAliases {
+			if i < len(list) {
+				chunk = append(chunk, list[i])
+				if len(chunk) >= chunkSize {
+					claimed, claimErr = s.store.ClaimPoolAlias(chunk, req.Tag, tokenNameStr)
+					if claimErr != nil {
+						failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", "别名池认领失败: "+claimErr.Error())
+						return
 					}
+					if claimed != nil {
+						break
+					}
+					chunk = chunk[:0] // 原地重用底层数组，零内存再分配
 				}
 			}
-			if claimed != nil {
-				break
-			}
 		}
-
-		// 检查尾批不足 500 条的剩余候选
-		if claimed == nil && len(chunk) > 0 {
-			claimed, claimErr = s.store.ClaimPoolAlias(chunk, req.Tag, tokenNameStr)
-			if claimErr != nil {
-				failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", "别名池认领失败: "+claimErr.Error())
-				return
-			}
-		}
-
 		if claimed != nil {
-			if s.syncWorker != nil {
-				s.syncWorker.RegisterAliasAccount(claimed.Email, claimed.AccountID)
-			}
-			ok(c, gin.H{
-				"email":      claimed.Email,
-				"account_id": claimed.AccountID,
-				"label":      req.Label,
-				"tag":        req.Tag,
-				"source":     "pool",
-				"created_at": claimed.AllocatedAt,
-			})
-			return
+			break
 		}
+	}
 
-		// 若明确声明只走别名池 (pool_only)，池空即终止，绝不上游新建打扰 Apple
-		if req.Mode == "pool_only" {
-			c.Header("Retry-After", "60") // 【BUG-07 修复】补充 Retry-After 响应头
-			failCode(c, http.StatusServiceUnavailable, "POOL_EMPTY", "当前业务池无可用预存别名，请等待定时补货或使用 mode=pool")
+	// 检查尾批不足 500 条的剩余候选
+	if claimed == nil && len(chunk) > 0 {
+		claimed, claimErr = s.store.ClaimPoolAlias(chunk, req.Tag, tokenNameStr)
+		if claimErr != nil {
+			failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", "别名池认领失败: "+claimErr.Error())
 			return
 		}
+	}
+
+	if claimed != nil {
+		if s.syncWorker != nil {
+			s.syncWorker.RegisterAliasAccount(claimed.Email, claimed.AccountID)
+		}
+		ok(c, gin.H{
+			"email":      claimed.Email,
+			"account_id": claimed.AccountID,
+			"label":      req.Label,
+			"tag":        req.Tag,
+			"source":     "pool",
+			"created_at": claimed.AllocatedAt,
+		})
+		return
+	}
+
+	// 若明确声明只走别名池 (pool_only)，池空即终止，绝不上游新建打扰 Apple
+	if req.Mode == "pool_only" {
+		c.Header("Retry-After", "60") // 【BUG-07 修复】补充 Retry-After 响应头
+		failCode(c, http.StatusServiceUnavailable, "POOL_EMPTY", "当前业务池无可用预存别名，请等待定时补货或使用 mode=pool")
+		return
 	}
 
 	// 2. 降级现场新建 (On-Demand Creation): 池已空或强制指定 mode="create"

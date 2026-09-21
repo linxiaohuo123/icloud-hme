@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 gin, net/http, strings, strconv, time, fmt, errors, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 listInboxHandler, listMailboxesHandler, getMessageHandler, getMessagePrimeHandler, getMessagesHandler, deleteMessageHandler, checkProxyHandler 等 HTTP 端点
- * [POS]: internal/server 的邮件收件箱、消息详情缓存与代理连通性检测路由处理器；WebMail ThreadID 删除返回 400 WEBMAIL_DELETE_UNSUPPORTED，批量拉取兼容 id 作为 uid 别名
+ * [POS]: internal/server 的邮件收件箱、消息详情缓存与代理连通性检测路由处理器；PR-01 物理删信统一安全阻断 400 MAIL_DELETE_UNSUPPORTED，批量拉取兼容 id 作为 uid 别名
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -269,25 +269,9 @@ func (s *Server) putMessageCache(keys []string, msg *mail.FullMessage) {
 }
 
 func (s *Server) deleteMessageHandler(c *gin.Context) {
-	accountID := strings.TrimSpace(c.Query("account_id"))
-	rawID := strings.TrimSpace(c.Param("message_id"))
-	if accountID == "" || rawID == "" {
-		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "account_id 或邮件 ID 无效")
-		return
-	}
-
-	_, idPart, uid, hasUID := parseMessageID(rawID)
-	if !hasUID {
-		failCode(c, http.StatusBadRequest, "WEBMAIL_DELETE_UNSUPPORTED", "当前邮件通道不支持物理删除，请为账号配置 App 专用密码或 IMAP 收件箱后再试")
-		return
-	}
-	if err := s.be.DeleteMessage(accountID, uid); err != nil {
-		backendFail(c, err)
-		return
-	}
-
-	s.clearMessageCache(accountID, rawID, idPart)
-	ok(c, gin.H{"id": rawID})
+	// 【PR-01 安全止损】在邮件身份模型与目标 UID 精确物理删除能力未完善前，
+	// 服务端物理阻断删信入口，杜绝普通 EXPUNGE 连带误删或并发冲突。
+	failCode(c, http.StatusBadRequest, "MAIL_DELETE_UNSUPPORTED", "物理邮件删除功能因安全性考量暂不可用，已安全阻断")
 }
 
 func (s *Server) clearMessageCache(accountID, rawID, idPart string) {

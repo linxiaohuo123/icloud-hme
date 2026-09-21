@@ -364,8 +364,6 @@ func (s *Server) register() {
 			alloc := authed.Group("")
 			alloc.Use(requireScope(store.ScopeAllocate))
 			{
-				alloc.POST("/create", csrfCheck(s.auth), s.createAliasHandler)
-				alloc.POST("/create/batch", csrfCheck(s.auth), s.createAliasBatchHandler)
 				alloc.POST("/quick-create", csrfCheck(s.auth), s.quickCreateHandler)
 				alloc.POST("/alias/lease", csrfCheck(s.auth), s.quickCreateHandler)
 				alloc.POST("/allocate", csrfCheck(s.auth), s.quickCreateHandler)
@@ -376,11 +374,6 @@ func (s *Server) register() {
 			verify := authed.Group("")
 			verify.Use(requireScope(store.ScopeVerify))
 			{
-				verify.GET("/inbox", s.listInboxHandler)
-				verify.GET("/inbox/:message_id", s.getMessageHandler)
-				verify.GET("/messages/:id", s.getMessagePrimeHandler)
-				verify.POST("/messages", s.getMessagesHandler)
-				verify.GET("/mailboxes", s.listMailboxesHandler)
 				verify.GET("/verify-code", s.verifyCodeHandler)
 				verify.GET("/external/v1/verify-code", s.verifyCodeHandler)
 			}
@@ -389,6 +382,17 @@ func (s *Server) register() {
 			adm := authed.Group("")
 			adm.Use(requireScope(store.ScopeAdmin))
 			{
+				// 【PR-01 安全止损】直接建号与母号邮件读取仅对管理员开放，普通外部令牌不可跨权调用
+				adm.POST("/create", csrfCheck(s.auth), s.createAliasHandler)
+				adm.POST("/create/batch", csrfCheck(s.auth), s.createAliasBatchHandler)
+				adm.GET("/inbox", s.listInboxHandler)
+				adm.GET("/inbox/:message_id", s.getMessageHandler)
+				adm.GET("/messages/:id", s.getMessagePrimeHandler)
+				adm.POST("/messages", s.getMessagesHandler)
+				adm.GET("/mailboxes", s.listMailboxesHandler)
+				adm.DELETE("/inbox/:message_id", csrfCheck(s.auth), s.deleteMessageHandler)
+				adm.DELETE("/messages/:id", csrfCheck(s.auth), s.deleteMessageHandler)
+
 				// ===== 账号管理 =====
 				adm.GET("/accounts", s.listAccountsHandler)
 				adm.GET("/accounts/:id", s.getAccountHandler)
@@ -407,8 +411,6 @@ func (s *Server) register() {
 				adm.POST("/create/jobs/:id/pause", csrfCheck(s.auth), s.pauseCreateJobHandler)
 				adm.POST("/create/jobs/:id/resume", csrfCheck(s.auth), s.resumeCreateJobHandler)
 				adm.DELETE("/create/jobs/:id", csrfCheck(s.auth), s.deleteCreateJobHandler)
-
-				adm.DELETE("/inbox/:message_id", csrfCheck(s.auth), s.deleteMessageHandler)
 
 				// ===== 代理连通性检测 =====
 				adm.POST("/proxy/check", csrfCheck(s.auth), s.checkProxyHandler)

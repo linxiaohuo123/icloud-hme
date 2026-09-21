@@ -538,7 +538,7 @@ func TestDeleteMessageWebMailStringIDHandler(t *testing.T) {
 	if err := json.Unmarshal([]byte(respBody), &res); err != nil {
 		t.Fatalf("unmarshal error: %v", err)
 	}
-	if res.Success || res.Code != "WEBMAIL_DELETE_UNSUPPORTED" {
+	if res.Success || res.Code != "MAIL_DELETE_UNSUPPORTED" {
 		t.Fatalf("unexpected delete response: %+v body=%s", res, respBody)
 	}
 }
