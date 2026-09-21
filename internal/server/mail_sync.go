@@ -382,8 +382,10 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 		q = InboxQuery{
 			AccountID: accountID,
 			Alias:     aliases[0],
+			Folder:    "inbox",
 			Limit:     5,
 			Days:      1,
+			WithBody:  true,
 		}
 		if w.store != nil {
 			if uid, err := w.store.GetMinBaselineUIDByEmail(ctx, aliases[0]); err == nil && uid > 0 {
@@ -395,8 +397,10 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 	} else {
 		q = InboxQuery{
 			AccountID: accountID,
+			Folder:    "inbox",
 			Limit:     10,
 			Days:      1,
+			WithBody:  true,
 		}
 		if w.store != nil {
 			var globalMinUID uint32

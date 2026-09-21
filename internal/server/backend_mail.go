@@ -85,7 +85,7 @@ func (b *managerBackend) ListInboxContext(ctx context.Context, q InboxQuery) (In
 		return InboxResult{}, err
 	}
 	if q.Folder == "" {
-		q.Folder = "all"
+		q.Folder = "inbox"
 	}
 	// 优先使用 IMAP 连接池 (App Password 认证, 复用长连接, 严格绑定与传递 ctx)
 	var imapMessages []mail.Message
@@ -101,15 +101,10 @@ func (b *managerBackend) ListInboxContext(ctx context.Context, q InboxQuery) (In
 				imapMessages, e = mc.FindByRecipientInFolder(q.Alias, q.Folder, q.Limit, q.Days)
 			}
 		} else {
-			// 优先在 IMAP 中按 @icloud.com 搜索，直接提取真实的 iCloud 别名邮件，
-			// 避免被个人主邮箱的原生无关杂信（如淘宝、账单）挤占导致别名邮件遗漏
-			if q.SinceUID > 0 {
-				imapMessages, e = mc.FindByRecipientInFolderSince("@icloud.com", q.Folder, q.Limit, q.Days, q.SinceUID)
+			if q.WithBody {
+				imapMessages, e = mc.ListFolderWithBodies(q.Folder, q.Limit, q.Days)
 			} else {
-				imapMessages, e = mc.FindByRecipientInFolder("@icloud.com", q.Folder, q.Limit, q.Days)
-				if e != nil || len(imapMessages) == 0 {
-					imapMessages, e = mc.ListFolder(q.Folder, q.Limit*2, q.Days)
-				}
+				imapMessages, e = mc.ListFolder(q.Folder, q.Limit, q.Days)
 			}
 		}
 		return e

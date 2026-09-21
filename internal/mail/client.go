@@ -281,13 +281,27 @@ func (c *Client) ListMailboxes() ([]Folder, error) {
 	return folders, nil
 }
 
-// ListInbox 拉取收件箱最近 limit 封邮件摘要 (默认检索全部文件夹: INBOX + Junk)。
+// ListInbox 拉取收件箱最近 limit 封邮件摘要 (默认不拉正文，毫秒级响应)。
 func (c *Client) ListInbox(limit int, days int) ([]Message, error) {
-	return c.ListFolder("all", limit, days)
+	return c.ListFolder("inbox", limit, days)
 }
 
-// ListFolder 拉取指定文件夹的最近邮件摘要 (支持 "all"、"inbox"、"junk" 或具体文件夹名)。
+// ListInboxWithBodies 拉取收件箱最近邮件并解析正文 (供 OTP 识别)。
+func (c *Client) ListInboxWithBodies(limit int, days int) ([]Message, error) {
+	return c.ListFolderWithBodies("inbox", limit, days)
+}
+
+// ListFolder 拉取指定文件夹的最近邮件摘要 (支持 "all"、"inbox"、"junk" 或具体文件夹名，默认不拉正文)。
 func (c *Client) ListFolder(folder string, limit int, days int) ([]Message, error) {
+	return c.listFolder(folder, limit, days, false)
+}
+
+// ListFolderWithBodies 拉取指定文件夹的最近邮件并拉取正文。
+func (c *Client) ListFolderWithBodies(folder string, limit int, days int) ([]Message, error) {
+	return c.listFolder(folder, limit, days, true)
+}
+
+func (c *Client) listFolder(folder string, limit int, days int, includeBody bool) ([]Message, error) {
 	if c.cli == nil {
 		return nil, fmt.Errorf("未连接")
 	}
@@ -303,7 +317,7 @@ func (c *Client) ListFolder(folder string, limit int, days int) ([]Message, erro
 	var all []Message
 	var folderErrors []error
 	for _, name := range folders {
-		messages, err := c.listMailbox(name, limit, days)
+		messages, err := c.listMailbox(name, limit, days, includeBody)
 		if err != nil {
 			folderErrors = append(folderErrors, fmt.Errorf("%s: %w", name, err))
 			continue
@@ -317,7 +331,7 @@ func (c *Client) ListFolder(folder string, limit int, days int) ([]Message, erro
 	return all, errors.Join(folderErrors...)
 }
 
-func (c *Client) listMailbox(folder string, limit int, days int) ([]Message, error) {
+func (c *Client) listMailbox(folder string, limit int, days int, includeBody bool) ([]Message, error) {
 	mbox, err := c.cli.Select(folder, true)
 	if err != nil {
 		return nil, err
@@ -335,13 +349,17 @@ func (c *Client) listMailbox(folder string, limit int, days int) ([]Message, err
 	seqset := new(imap.SeqSet)
 	seqset.AddRange(from, mbox.Messages)
 
-	section := &imap.BodySectionName{Peek: true}
 	items := []imap.FetchItem{
 		imap.FetchUid,
 		imap.FetchEnvelope,
 		imap.FetchInternalDate,
 		imap.FetchFlags,
-		section.FetchItem(),
+	}
+	parser := toMessage
+	if includeBody {
+		section := &imap.BodySectionName{Peek: true}
+		items = append(items, section.FetchItem())
+		parser = toMessageWithBody
 	}
 
 	messages := make(chan *imap.Message, limit)
@@ -352,7 +370,7 @@ func (c *Client) listMailbox(folder string, limit int, days int) ([]Message, err
 
 	var out []Message
 	for msg := range messages {
-		m := toMessageWithBody(msg, folder)
+		m := parser(msg, folder)
 		m.UIDValidity = mbox.UidValidity
 		m.Provider = "imap"
 		ref := MessageRef{
@@ -379,9 +397,9 @@ func (c *Client) listMailbox(folder string, limit int, days int) ([]Message, err
 	return out, nil
 }
 
-// FindByRecipient 查找发给指定隐私邮箱别名的最近 limit 封邮件 (默认通扫 INBOX 与 Junk)。
+// FindByRecipient 查找发给指定隐私邮箱别名的最近 limit 封邮件 (默认检索 inbox 文件夹)。
 func (c *Client) FindByRecipient(recipient string, limit int, days int) ([]Message, error) {
-	return c.FindByRecipientInFolder(recipient, "all", limit, days)
+	return c.FindByRecipientInFolder(recipient, "inbox", limit, days)
 }
 
 // FindByRecipientInFolder 在指定文件夹查找发给指定别名的最近邮件。
@@ -389,7 +407,7 @@ func (c *Client) FindByRecipientInFolder(recipient string, folder string, limit 
 	var out []Message
 	err := c.ForEachByRecipientInFolder(recipient, folder, limit, days, func(m Message) bool {
 		out = append(out, m)
-		return true
+		return len(out) < limit
 	})
 	return out, err
 }
@@ -399,14 +417,14 @@ func (c *Client) FindByRecipientInFolderSince(recipient string, folder string, l
 	var out []Message
 	err := c.ForEachByRecipientInFolderSince(recipient, folder, limit, days, sinceUID, func(m Message) bool {
 		out = append(out, m)
-		return true
+		return len(out) < limit
 	})
 	return out, err
 }
 
-// ForEachByRecipient 按新→旧遍历发给 recipient 的最近 limit 封邮件 (默认在 all 文件夹查找)。
+// ForEachByRecipient 按新→旧遍历发给 recipient 的最近 limit 封邮件 (默认在 inbox 文件夹查找)。
 func (c *Client) ForEachByRecipient(recipient string, limit int, days int, onMsg func(Message) bool) error {
-	return c.ForEachByRecipientInFolder(recipient, "all", limit, days, onMsg)
+	return c.ForEachByRecipientInFolder(recipient, "inbox", limit, days, onMsg)
 }
 
 // ForEachByRecipientInFolder 在指定文件夹中按新→旧遍历发给 recipient 的邮件。
@@ -433,8 +451,19 @@ func (c *Client) ForEachByRecipientInFolderSince(recipient string, folder string
 
 	var folderErrors []string
 	successFolders := 0
+	stop := false
+	wrappedOnMsg := func(m Message) bool {
+		cont := onMsg(m)
+		if !cont {
+			stop = true
+		}
+		return cont
+	}
 	for _, name := range folders {
-		if err := c.forEachByRecipientInMailbox(recipient, name, limit, days, sinceUID, onMsg); err != nil {
+		if stop {
+			break
+		}
+		if err := c.forEachByRecipientInMailbox(recipient, name, limit, days, sinceUID, wrappedOnMsg); err != nil {
 			folderErrors = append(folderErrors, fmt.Sprintf("%s: %v", name, err))
 			continue
 		}
@@ -474,6 +503,10 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 					allUIDs = append(allUIDs, u)
 				}
 			}
+		}
+		// 性能关键优化：如果当前已搜出足够数量的 UID（>= limit），立即短路返回，无需再执行后续 3 次无谓网络往返
+		if len(allUIDs) >= limit {
+			break
 		}
 	}
 	sort.Slice(allUIDs, func(i, j int) bool { return allUIDs[i] < allUIDs[j] })
@@ -548,12 +581,12 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 	if total == 0 {
 		return nil
 	}
-	scan := limit * 4
-	if scan < 20 {
-		scan = 20
+	scan := limit * 3
+	if scan < 10 {
+		scan = 10
 	}
-	if scan > 80 {
-		scan = 80
+	if scan > 30 {
+		scan = 30
 	}
 	if scan > total {
 		scan = total
