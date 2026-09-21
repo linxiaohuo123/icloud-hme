@@ -102,6 +102,15 @@ export default function MailDetailDialog({
                       {detail.folder}
                     </span>
                   )}
+                  {detail.body_complete === false && (
+                    <span
+                      className="badge badge-warning"
+                      style={{ fontSize: 11, padding: '1px 6px' }}
+                      title="当前仅提供 WebMail 摘要预览，非完整邮件正文"
+                    >
+                      正文预览
+                    </span>
+                  )}
                 </div>
                 <div className="email-detail-recipient-line">
                   <span className="email-meta-label">收件地址：</span>
@@ -161,6 +170,12 @@ export default function MailDetailDialog({
               >
                 {showRawHtml ? '显示清洗文本' : '显示原始源码'}
               </button>
+            </div>
+          )}
+
+          {detail.body_complete === false && (
+            <div className="hint" style={{ fontSize: 12, marginBottom: 8, color: 'var(--color-warning)' }}>
+              ⚠️ 当前邮件为 WebMail 摘要预览，未能获取完整正文。
             </div>
           )}
 

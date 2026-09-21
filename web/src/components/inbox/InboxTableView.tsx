@@ -1,13 +1,13 @@
 /**
- * [INPUT]: 依赖 api/client (request, ApiError), api/types, components (AsyncState, ConfirmDialog, Select, ToastProvider), utils (clipboard, date, sniffer: extractVerifyCode, parseSenderInfo, buildSniffContext), ./InboxTableRow, ./MailDetailDialog
- * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；正文预取 POST /api/messages 使用 uid 并消费 data.messages
+ * [INPUT]: 依赖 api/client (request, ApiError, getMessageDetail), api/types, components (AsyncState, ConfirmDialog, Select, ToastProvider), utils (clipboard, date, mail, sniffer: extractVerifyCode, parseSenderInfo, buildSniffContext), ./InboxTableRow, ./MailDetailDialog
+ * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；正文预取 POST /api/messages 使用 uid 并消费 data.messages；首屏 capability 保护与 CAPABILITY_UNSUPPORTED 优雅退避重试
  * [POS]: web/src/components/inbox 的核心视图容器，统一单账号工作台与全局收件箱大盘的数据流与交互
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { request, ApiError } from '../../api/client'
+import { request, ApiError, getMessageDetail } from '../../api/client'
 import type { AccountSummary, Alias, FullMessage, InboxMessage, InboxResult, MailboxFolder } from '../../api/types'
 import AsyncState from '../AsyncState'
 import ConfirmDialog from '../ConfirmDialog'
@@ -15,6 +15,7 @@ import Select from '../Select'
 import { useToast } from '../ToastProvider'
 import { copyText } from '../../utils/clipboard'
 import { dateTimestamp } from '../../utils/date'
+import { buildMailCacheKey } from '../../utils/mail'
 import { buildSniffContext, extractVerifyCode, parseSenderInfo } from '../../utils/sniffer'
 import InboxTableRow from './InboxTableRow'
 import MailDetailDialog from './MailDetailDialog'
@@ -35,6 +36,7 @@ export interface InboxTableViewProps {
   onCountChange?: (count: number) => void
 }
 
+
 export default function InboxTableView({
   accountId: propAccountId,
   fixedAccount = false,
@@ -47,6 +49,7 @@ export default function InboxTableView({
   const { show } = useToast()
 
   const [accounts, setAccounts] = useState<AccountSummary[]>([])
+  const [accountCapabilityReady, setAccountCapabilityReady] = useState(false)
   const [accountId, setAccountId] = useState(propAccountId || '')
   const [aliases, setAliases] = useState<Alias[]>([])
   const [folders, setFolders] = useState<MailboxFolder[]>([])
@@ -55,6 +58,17 @@ export default function InboxTableView({
   const [folder, setFolder] = useState('all')
   const [limit, setLimit] = useState(20)
   const [days, setDays] = useState(7)
+
+  // 记录通过 CAPABILITY_UNSUPPORTED 降级或静态推断为仅 WebMail 的账号集合
+  const [effectiveWebMailAccounts, setEffectiveWebMailAccounts] = useState<Record<string, boolean>>({})
+  const unsupportedRetryRef = useRef<Record<string, number>>({})
+
+  const currentAccount = useMemo(() => accounts.find((a) => a.id === accountId), [accounts, accountId])
+  const isWebMailOnly = useMemo(() => {
+    if (effectiveWebMailAccounts[accountId]) return true
+    if (!currentAccount) return false
+    return !currentAccount.has_app_password && !currentAccount.mailbox?.email
+  }, [currentAccount, effectiveWebMailAccounts, accountId])
 
   // 客户端分页
   const [page, setPage] = useState(1)
@@ -80,6 +94,7 @@ export default function InboxTableView({
   const copiedAliasTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const abortRef = useRef<AbortController | null>(null)
+  const accountGenRef = useRef(0)
   const messageCacheRef = useRef<Map<string, FullMessage>>(new Map())
   const hasAccountsLoadedRef = useRef(false)
 
@@ -90,12 +105,16 @@ export default function InboxTableView({
     }
   }, [])
 
-  // 监听外部 propAccountId 变更（工作台模式）
+  // 监听外部 propAccountId 变更（工作台模式），严格杜绝跨账号预取与详情污染
   useEffect(() => {
-    if (propAccountId) {
+    if (propAccountId && propAccountId !== accountId) {
+      accountGenRef.current += 1
+      abortRef.current?.abort()
+      messageCacheRef.current.clear()
+      unsupportedRetryRef.current[propAccountId] = 0
       setAccountId(propAccountId)
     }
-  }, [propAccountId])
+  }, [propAccountId, accountId])
 
   // 监听外部 initialAlias 变更（工作台别名联动）
   useEffect(() => {
@@ -106,13 +125,17 @@ export default function InboxTableView({
 
   // 1. 初始化账号列表（仅在非固定账号模式，或账号为空时拉取一次，防止 searchParams 诱发无限重拉）
   useEffect(() => {
-    if (hasAccountsLoadedRef.current) return
+    if (hasAccountsLoadedRef.current) {
+      setAccountCapabilityReady(true)
+      return
+    }
     let cancelled = false
     request<AccountSummary[]>('/api/accounts')
       .then((data) => {
         if (cancelled) return
         hasAccountsLoadedRef.current = true
         setAccounts(data)
+        setAccountCapabilityReady(true)
         if (!fixedAccount) {
           const queryId = searchParams.get('account_id')
           const valid = data.find((a) => a.id === queryId)
@@ -149,6 +172,8 @@ export default function InboxTableView({
       })
       .catch((err) => {
         if (cancelled) return
+        hasAccountsLoadedRef.current = true
+        setAccountCapabilityReady(true)
         setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
         setLoading(false)
       })
@@ -197,9 +222,13 @@ export default function InboxTableView({
     }
   }, [accountId])
 
-  // 4. 查询收件箱邮件
+  // 4. 查询收件箱邮件 (带代际保护 accountGenRef，防止切换账号后陈旧请求污染新账号视图与缓存)
   useEffect(() => {
     if (!accountId) return
+    // 首屏 capability 栅栏保护：未完成 capability 解析前暂缓发起带参数查询，防止 WebMail 模式被误传 folder/days 参数 (WEBMAIL-01)
+    if (!accountCapabilityReady) return
+
+    const currentGen = ++accountGenRef.current
     setLoading(true)
     abortRef.current?.abort()
     const controller = new AbortController()
@@ -208,55 +237,74 @@ export default function InboxTableView({
 
     const params = new URLSearchParams({ account_id: accountId })
     if (alias) params.set('alias', alias)
-    if (folder) params.set('folder', folder)
+    if (!isWebMailOnly) {
+      if (folder && folder !== 'all') params.set('folder', folder)
+      params.set('days', String(days))
+    }
     params.set('limit', String(limit))
-    params.set('days', String(days))
 
     request<InboxResult>(`/api/inbox?${params.toString()}`, {
       signal: controller.signal,
     })
       .then((data) => {
-        if (cancelled) return
+        if (cancelled || currentGen !== accountGenRef.current) return
         setResult(data)
         setError('')
-        // 静默预取前 20 封邮件正文注入内存缓存
+        unsupportedRetryRef.current[accountId] = 0
+        // 静默预取前 20 封邮件正文注入内存缓存 (基于规范 message_ref)
         if (data && Array.isArray(data.messages) && data.messages.length > 0) {
-          const targets = data.messages.slice(0, 20).map((m) => ({
-            folder: m.folder || 'INBOX',
-            uid: m.id,
-          }))
-          request<{ messages?: FullMessage[] }>('/api/messages', {
-            method: 'POST',
-            body: {
-              account_id: accountId,
-              messages: targets,
-            },
-          })
-            .then((batch) => {
-              const list = Array.isArray(batch?.messages) ? batch.messages : []
-              list.forEach((fm) => {
-                if (fm?.id) {
-                  messageCacheRef.current.set(fm.id, fm)
-                }
-              })
+          const targets = data.messages
+            .slice(0, 20)
+            .map((m) => ({
+              message_ref: m.message_ref,
+            }))
+            .filter((t) => Boolean(t.message_ref))
+
+          if (targets.length > 0) {
+            request<{ messages?: FullMessage[] }>('/api/messages', {
+              method: 'POST',
+              body: {
+                account_id: accountId,
+                messages: targets,
+              },
+              signal: controller.signal,
             })
-            .catch(() => {})
+              .then((batch) => {
+                if (cancelled || currentGen !== accountGenRef.current) return
+                const list = Array.isArray(batch?.messages) ? batch.messages : []
+                list.forEach((fm) => {
+                  if (fm && fm.message_ref) {
+                    messageCacheRef.current.set(buildMailCacheKey(accountId, fm), fm)
+                  }
+                })
+              })
+              .catch(() => {})
+          }
         }
       })
       .catch((err) => {
-        if (cancelled || (err instanceof ApiError && err.code === 'ABORTED')) return
+        if (cancelled || currentGen !== accountGenRef.current || (err instanceof ApiError && err.code === 'ABORTED')) return
+        // 捕获 CAPABILITY_UNSUPPORTED 错误后：最多允许 1 次退避重试 (剥离 folder/days 并记录 effective webmail capability)，严禁陷入无休止重试循环 (WEBMAIL-03, WEBMAIL-04)
+        if (err instanceof ApiError && err.code === 'CAPABILITY_UNSUPPORTED') {
+          const retried = unsupportedRetryRef.current[accountId] || 0
+          if (retried < 1) {
+            unsupportedRetryRef.current[accountId] = retried + 1
+            setEffectiveWebMailAccounts((prev) => ({ ...prev, [accountId]: true }))
+            return
+          }
+        }
         setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
         setResult(null)
       })
       .finally(() => {
-        if (!cancelled) setLoading(false)
+        if (!cancelled && currentGen === accountGenRef.current) setLoading(false)
       })
 
     return () => {
       cancelled = true
       controller.abort()
     }
-  }, [accountId, alias, folder, limit, days, retryKey])
+  }, [accountId, accountCapabilityReady, isWebMailOnly, alias, folder, limit, days, retryKey])
 
   // 查询提交
   function handleSearch() {
@@ -264,39 +312,56 @@ export default function InboxTableView({
     if (!fixedAccount) {
       const next: Record<string, string> = { account_id: accountId }
       if (alias) next.alias = alias
-      if (folder && folder !== 'all') next.folder = folder
+      if (!isWebMailOnly) {
+        if (folder && folder !== 'all') next.folder = folder
+        next.days = String(days)
+      }
       next.limit = String(limit)
-      next.days = String(days)
       setSearchParams(next, { replace: true })
     }
     setRetryKey((k) => k + 1)
   }
 
   function handleAccountChange(newAccountId: string) {
+    accountGenRef.current += 1
+    abortRef.current?.abort()
     setAccountId(newAccountId)
     setAlias('')
     setPage(1)
     messageCacheRef.current.clear()
+    unsupportedRetryRef.current[newAccountId] = 0
     setSearchParams({ account_id: newAccountId }, { replace: true })
   }
 
   async function openMessage(message: InboxMessage) {
-    const cached = messageCacheRef.current.get(message.id)
+    const currentGen = accountGenRef.current
+    const primaryKey = buildMailCacheKey(accountId, message)
+    const cached = messageCacheRef.current.get(primaryKey)
     if (cached) {
       setDetail(cached)
       return
     }
     setDetailLoading(true)
+    const targetRefOrId = message.message_ref || message.id
     try {
-      const data = await request<FullMessage>(
-        `/api/inbox/${encodeURIComponent(message.id)}?account_id=${encodeURIComponent(accountId)}`,
-      )
-      messageCacheRef.current.set(message.id, data)
-      setDetail(data)
+      const resp = await getMessageDetail(accountId, targetRefOrId)
+      if (currentGen !== accountGenRef.current) return
+      // 【PR-02 契约】消费规范响应中的 response.message
+      const fullMsg = resp.message
+      if (fullMsg.message_ref) {
+        messageCacheRef.current.set(buildMailCacheKey(accountId, fullMsg), fullMsg)
+      } else {
+        messageCacheRef.current.set(primaryKey, fullMsg)
+      }
+      setDetail(fullMsg)
     } catch (err) {
-      show(err instanceof ApiError ? err.message : '读取邮件详情失败')
+      if (currentGen === accountGenRef.current) {
+        show(err instanceof ApiError ? err.message : '读取邮件详情失败')
+      }
     } finally {
-      setDetailLoading(false)
+      if (currentGen === accountGenRef.current) {
+        setDetailLoading(false)
+      }
     }
   }
 
@@ -304,11 +369,12 @@ export default function InboxTableView({
     if (!deleteFor) return
     setDeleting(true)
     try {
+      const targetRefOrId = deleteFor.message_ref || deleteFor.id
       await request(
-        `/api/inbox/${encodeURIComponent(deleteFor.id)}?account_id=${encodeURIComponent(accountId)}`,
+        `/api/inbox/${encodeURIComponent(targetRefOrId)}?account_id=${encodeURIComponent(accountId)}`,
         { method: 'DELETE' },
       )
-      messageCacheRef.current.delete(deleteFor.id)
+      messageCacheRef.current.delete(buildMailCacheKey(accountId, deleteFor))
       setDeleteFor(null)
       setDetail(null)
       show('邮件已删除')
@@ -370,7 +436,6 @@ export default function InboxTableView({
     }
   }, [filteredMessages.length, onCountChange])
 
-  const currentAccount = accounts.find((a) => a.id === accountId)
   const currentAccountName = currentAccount?.name || currentAccount?.real_email || (accountId || '未选择')
   const totalCount = result?.count ?? filteredMessages.length
   const codesDetectedCount = useMemo(() => {
@@ -465,6 +530,12 @@ export default function InboxTableView({
                 </span>
               </span>
             )}
+
+            {isWebMailOnly && (
+              <span className="card-stat-pill" style={{ color: '#e6a23c', borderColor: 'rgba(230,162,60,0.3)' }} title="当前账号未配置 App 专用密码，运行于 WebMail 模式，仅支持默认收件箱拉取，文件夹与天数筛选已禁用">
+                <span>WebMail 模式 (仅支持基础收件箱)</span>
+              </span>
+            )}
           </div>
         </div>
 
@@ -508,15 +579,16 @@ export default function InboxTableView({
 
           <div className="inbox-filter-item">
             <label htmlFor="inbox-folder" className="inbox-filter-label">
-              文件夹
+              文件夹 {isWebMailOnly && <span style={{ opacity: 0.6, fontSize: '0.85em' }}>(WebMail固定)</span>}
             </label>
             <Select
               id="inbox-folder"
               aria-label="文件夹"
-              value={folder}
+              value={isWebMailOnly ? 'INBOX' : folder}
               onChange={(val) => setFolder(val)}
-              options={folderOptions}
-              style={{ minWidth: 200 }}
+              options={isWebMailOnly ? [{ value: 'INBOX', label: '收件箱 (WebMail模式)' }] : folderOptions}
+              disabled={isWebMailOnly}
+              style={{ minWidth: 200, opacity: isWebMailOnly ? 0.6 : 1 }}
             />
           </div>
 
@@ -540,7 +612,7 @@ export default function InboxTableView({
 
           <div className="inbox-filter-item">
             <label htmlFor="inbox-days" className="inbox-filter-label">
-              时间范围
+              时间范围 {isWebMailOnly && <span style={{ opacity: 0.6, fontSize: '0.85em' }}>(全量)</span>}
             </label>
             <Select
               id="inbox-days"
@@ -553,7 +625,8 @@ export default function InboxTableView({
                 { value: 30, label: '30 天' },
                 { value: 90, label: '90 天' },
               ]}
-              style={{ minWidth: 90 }}
+              disabled={isWebMailOnly}
+              style={{ minWidth: 90, opacity: isWebMailOnly ? 0.6 : 1 }}
             />
           </div>
 

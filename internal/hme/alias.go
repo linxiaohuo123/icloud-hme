@@ -1,13 +1,15 @@
 /**
- * [INPUT]: 依赖 github.com/tidwall/gjson, time, strings, sort, strconv, fmt
- * [OUTPUT]: 对外提供 Alias, CreateResult, ListAliases, Generate, Reserve, CreateAlias, DeactivateHME, ReactivateHME, Delete, UpdateMetaData
- * [POS]: internal/hme 的 HME 别名协议操作层，负责别名生成、保留、列出、激活、修改与删除
+ * [INPUT]: 依赖 context, errors, fmt, sort, strconv, strings, time, github.com/tidwall/gjson
+ * [OUTPUT]: 对外提供 Alias, CreateResult, ListAliases, ListAliasesWithContext, Generate, GenerateWithContext, Reserve, ReserveWithContext, CreateAlias, CreateAliasWithContext, DeactivateHME, ReactivateHME, Delete, UpdateMetaData
+ * [POS]: internal/hme 的 HME 别名协议操作层，负责别名生成、保留、列出、激活、修改、删除与状态核对
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 package hme
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -35,47 +37,61 @@ type CreateResult struct {
 	CreatedAt string `json:"created_at"`
 }
 
-// ListAliases 列出当前账号所有 Hide My Email 别名。
-func (c *Client) ListAliases() ([]Alias, error) {
-	if err := c.resolveService(); err != nil {
+// ListAliasesWithContext 列出当前账号所有 Hide My Email 别名 (支持 Context 贯穿与严格模式)。
+func (c *Client) ListAliasesWithContext(ctx context.Context) ([]Alias, error) {
+	if err := c.resolveService(ctx); err != nil {
 		return nil, err
 	}
 	c.log("获取别名列表...")
-	body, err := c.request("GET", c.ServiceURL()+"/v2/hme/list", nil, 0, MaxRetries)
+	body, err := c.RequestWithContext(ctx, "GET", c.ServiceURL()+"/v2/hme/list", nil, 0, MaxRetries)
 	if err != nil {
+		if errors.Is(err, ErrAuthFailed) || ctx.Err() != nil {
+			return nil, err
+		}
 		// 若已缓存的 serviceURL 失效，清空并重新走一次 ValidateSession 自愈
 		if c.ServiceURL() != "" {
 			c.ResetServiceEndpoint()
-			if resolveErr := c.resolveService(); resolveErr == nil {
-				body, err = c.request("GET", c.ServiceURL()+"/v2/hme/list", nil, 0, MaxRetries)
+			if resolveErr := c.resolveService(ctx); resolveErr == nil {
+				body, err = c.RequestWithContext(ctx, "GET", c.ServiceURL()+"/v2/hme/list", nil, 0, MaxRetries)
 			}
 		}
 		if err != nil {
 			return nil, err
 		}
 	}
-	aliases := parseAliasList(body)
+	aliases, err := parseAliasList(body)
+	if err != nil {
+		return nil, err
+	}
 	c.log("共 %d 个别名", len(aliases))
 	return aliases, nil
 }
 
-// Generate 生成一个候选别名(尚未保留,需再调用 Reserve)。
-func (c *Client) Generate() (string, error) {
-	if err := c.resolveService(); err != nil {
+// ListAliases 列出当前账号所有 Hide My Email 别名。
+func (c *Client) ListAliases() ([]Alias, error) {
+	return c.ListAliasesWithContext(context.Background())
+}
+
+// GenerateWithContext 生成一个候选别名(尚未保留,需再调用 ReserveWithContext)。
+func (c *Client) GenerateWithContext(ctx context.Context) (string, error) {
+	if err := c.resolveService(ctx); err != nil {
 		return "", err
 	}
 	c.log("生成候选别名...")
-	body, err := c.request("POST", c.ServiceURL()+"/v1/hme/generate", map[string]string{"langCode": "en-us"}, 0, 2)
+	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/generate", map[string]string{"langCode": "en-us"}, 0, 2)
 	if err != nil {
 		return "", err
+	}
+	trimmed := strings.TrimSpace(body)
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "<!doctype") || strings.HasPrefix(lower, "<html") || !gjson.Valid(body) {
+		return "", fmt.Errorf("%w: invalid generate response schema", ErrInvalidResponseSchema)
 	}
 	parsed := gjson.Parse(body)
 	if !parsed.Get("success").Bool() {
 		errMsg := parsed.Get("error.errorMessage").String()
 		return "", fmt.Errorf("生成失败: %s", nonEmpty(errMsg, "unknown"))
 	}
-	// 某些响应把 hme 包在嵌套对象里: gjson 对 object 调 .String() 返回原始 JSON 文本(非空),
-	// 必须先用 IsObject 判别,否则嵌套分支永远走不到,会把 JSON 原文当别名地址传给 Reserve
 	hmeResult := parsed.Get("result.hme")
 	hme := ""
 	if hmeResult.IsObject() {
@@ -86,13 +102,21 @@ func (c *Client) Generate() (string, error) {
 	} else {
 		hme = hmeResult.String()
 	}
+	if hme == "" {
+		return "", fmt.Errorf("%w: empty candidate email in response", ErrInvalidResponseSchema)
+	}
 	c.log("候选: %s", hme)
 	return hme, nil
 }
 
-// Reserve 保留/确认候选别名,使其正式生效。
-func (c *Client) Reserve(hme, label string) (string, error) {
-	if err := c.resolveService(); err != nil {
+// Generate 生成一个候选别名(尚未保留,需再调用 Reserve)。
+func (c *Client) Generate() (string, error) {
+	return c.GenerateWithContext(context.Background())
+}
+
+// ReserveWithContext 保留/确认候选别名,使其正式生效 (写操作 maxAttempts=1，包含网络中断后的写入状态核对)。
+func (c *Client) ReserveWithContext(ctx context.Context, hme, label string) (string, error) {
+	if err := c.resolveService(ctx); err != nil {
 		return "", err
 	}
 	if label == "" {
@@ -104,10 +128,33 @@ func (c *Client) Reserve(hme, label string) (string, error) {
 		"label": label,
 		"note":  "Created by icloud_hme tool",
 	}
-	body, err := c.request("POST", c.ServiceURL()+"/v1/hme/reserve", payload, 0, 2)
+	// 写操作必须 maxAttempts=1，严禁通用盲目重试导致重复保留
+	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/reserve", payload, 0, 1)
 	if err != nil {
-		return "", err
+		if errors.Is(err, ErrAuthFailed) || ctx.Err() != nil {
+			return "", err
+		}
+		// 上游写入状态不明: 发送请求后网络断开或超时，尝试核对上游别名列表确认候选是否已被创建成功 (U04)
+		c.log("Reserve 请求返回错误 (%v)，启动上游一致性核对...", err)
+		aliases, listErr := c.ListAliasesWithContext(ctx)
+		if listErr == nil {
+			for _, a := range aliases {
+				if strings.EqualFold(a.Email, hme) {
+					c.log("核对恢复成功: 候选 %s 已存在于上游列表", hme)
+					return a.Email, nil
+				}
+			}
+			return "", fmt.Errorf("%w: reserve failed (%v) and candidate not found in upstream list", ErrOutcomeUnknown, err)
+		}
+		return "", fmt.Errorf("%w (reconciliation failed: %v): %v", ErrOutcomeUnknown, listErr, err)
 	}
+
+	trimmed := strings.TrimSpace(body)
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "<!doctype") || strings.HasPrefix(lower, "<html") || !gjson.Valid(body) {
+		return "", fmt.Errorf("%w: invalid reserve response schema", ErrInvalidResponseSchema)
+	}
+
 	parsed := gjson.Parse(body)
 	if !parsed.Get("success").Bool() {
 		errMsg := parsed.Get("error.errorMessage").String()
@@ -124,37 +171,62 @@ func (c *Client) Reserve(hme, label string) (string, error) {
 	return alias, nil
 }
 
-// CreateAlias 一步完成「生成 + 保留」,创建一个新别名。
-//
-// 由于 generate / reserve 偶发失败,内部会重试 maxRetries 次,
-// 每次重试会重置 serviceURL 强制重新校验会话。
-func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error) {
+// Reserve 保留/确认候选别名,使其正式生效。
+func (c *Client) Reserve(hme, label string) (string, error) {
+	return c.ReserveWithContext(context.Background(), hme, label)
+}
+
+// CreateAliasWithContext 一步完成「生成 + 保留」,创建一个新别名 (支持 Context 贯穿与状态机防护)。
+func (c *Client) CreateAliasWithContext(ctx context.Context, label string, maxRetries int) (*CreateResult, error) {
 	if maxRetries <= 0 {
 		maxRetries = 5
 	}
-	var lastErr string
+	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
 		if attempt > 0 {
 			c.ResetServiceEndpoint()
 			c.log("重试 %d/%d ...", attempt+1, maxRetries)
 		}
-		hme, err := c.Generate()
+		hme, err := c.GenerateWithContext(ctx)
 		if err != nil {
-			lastErr = "generate 失败: " + err.Error()
+			lastErr = fmt.Errorf("generate 失败: %w", err)
 			c.log("%s", lastErr)
+			if errors.Is(err, ErrAuthFailed) {
+				return nil, err
+			}
 			if attempt < maxRetries-1 {
-				time.Sleep(time.Second)
-				continue
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(time.Second):
+					continue
+				}
 			}
 			break
 		}
-		email, err := c.Reserve(hme, label)
+		email, err := c.ReserveWithContext(ctx, hme, label)
 		if err != nil {
-			lastErr = err.Error()
-			c.log("reserve 失败: %s", lastErr)
+			lastErr = fmt.Errorf("reserve 失败: %w", err)
+			c.log("%s", lastErr)
+			if errors.Is(err, ErrAuthFailed) {
+				return nil, err
+			}
+			// 若结果不明，不可盲目生成新候选覆盖，立即返回避免重复占号
+			if errors.Is(err, ErrOutcomeUnknown) {
+				return nil, lastErr
+			}
 			if attempt < maxRetries-1 {
-				time.Sleep(time.Second)
-				continue
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(time.Second):
+					continue
+				}
 			}
 			break
 		}
@@ -164,20 +236,44 @@ func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error
 			CreatedAt: time.Now().Format(time.RFC3339),
 		}, nil
 	}
-	if lastErr != "" {
-		return nil, fmt.Errorf("创建别名失败: %s", lastErr)
+	if lastErr != nil {
+		return nil, fmt.Errorf("创建别名失败: %w", lastErr)
 	}
 	return nil, fmt.Errorf("创建别名失败,已重试 %d 次", maxRetries)
 }
 
-// DeactivateHME 停用别名(可恢复)。
-func (c *Client) DeactivateHME(anonymousID string) (bool, error) {
-	if err := c.resolveService(); err != nil {
+// CreateAlias 一步完成「生成 + 保留」,创建一个新别名。
+func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error) {
+	return c.CreateAliasWithContext(context.Background(), label, maxRetries)
+}
+
+// DeactivateHMEWithContext 停用别名(可恢复)。
+func (c *Client) DeactivateHMEWithContext(ctx context.Context, anonymousID string) (bool, error) {
+	if err := c.resolveService(ctx); err != nil {
 		return false, err
 	}
 	c.log("停用 %s ...", anonymousID)
 	payload := map[string]string{"anonymousId": anonymousID}
-	body, err := c.request("POST", c.ServiceURL()+"/v1/hme/deactivate", payload, 0, 2)
+	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/deactivate", payload, 0, 1)
+	if err != nil {
+		return false, err
+	}
+	return gjson.Get(body, "success").Bool(), nil
+}
+
+// DeactivateHME 停用别名(可恢复)。
+func (c *Client) DeactivateHME(anonymousID string) (bool, error) {
+	return c.DeactivateHMEWithContext(context.Background(), anonymousID)
+}
+
+// ReactivateHMEWithContext 激活已停用的别名。
+func (c *Client) ReactivateHMEWithContext(ctx context.Context, anonymousID string) (bool, error) {
+	if err := c.resolveService(ctx); err != nil {
+		return false, err
+	}
+	c.log("激活 %s ...", anonymousID)
+	payload := map[string]string{"anonymousId": anonymousID}
+	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/reactivate", payload, 0, 1)
 	if err != nil {
 		return false, err
 	}
@@ -186,32 +282,23 @@ func (c *Client) DeactivateHME(anonymousID string) (bool, error) {
 
 // ReactivateHME 激活已停用的别名。
 func (c *Client) ReactivateHME(anonymousID string) (bool, error) {
-	if err := c.resolveService(); err != nil {
-		return false, err
-	}
-	c.log("激活 %s ...", anonymousID)
-	payload := map[string]string{"anonymousId": anonymousID}
-	body, err := c.request("POST", c.ServiceURL()+"/v1/hme/reactivate", payload, 0, 2)
-	if err != nil {
-		return false, err
-	}
-	return gjson.Get(body, "success").Bool(), nil
+	return c.ReactivateHMEWithContext(context.Background(), anonymousID)
 }
 
-// Delete 删除别名。若直接删除失败会先停用再删。
-func (c *Client) Delete(anonymousID string) error {
-	if err := c.resolveService(); err != nil {
+// DeleteWithContext 删除别名。若直接删除失败会先停用再删。
+func (c *Client) DeleteWithContext(ctx context.Context, anonymousID string) error {
+	if err := c.resolveService(ctx); err != nil {
 		return err
 	}
 	c.log("删除 %s ...", anonymousID)
 	payload := map[string]string{"anonymousId": anonymousID}
 	doDelete := func() (string, error) {
-		return c.request("POST", c.ServiceURL()+"/v1/hme/delete", payload, 0, 2)
+		return c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/delete", payload, 0, 1)
 	}
 	body, err := doDelete()
 	if err != nil || !gjson.Get(body, "success").Bool() {
 		c.log("直接删除失败,尝试先停用...")
-		_, _ = c.request("POST", c.ServiceURL()+"/v1/hme/deactivate", payload, 0, 2)
+		_, _ = c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/deactivate", payload, 0, 1)
 		body, err = doDelete()
 		if err != nil {
 			return err
@@ -224,9 +311,14 @@ func (c *Client) Delete(anonymousID string) error {
 	return nil
 }
 
-// UpdateMetaData 更新别名备注 (label) 与说明 (note)。
-func (c *Client) UpdateMetaData(anonymousID, label, note string) error {
-	if err := c.resolveService(); err != nil {
+// Delete 删除别名。若直接删除失败会先停用再删。
+func (c *Client) Delete(anonymousID string) error {
+	return c.DeleteWithContext(context.Background(), anonymousID)
+}
+
+// UpdateMetaDataWithContext 更新别名备注 (label) 与说明 (note)。
+func (c *Client) UpdateMetaDataWithContext(ctx context.Context, anonymousID, label, note string) error {
+	if err := c.resolveService(ctx); err != nil {
 		return err
 	}
 	c.log("更新别名备注 %s -> %s ...", anonymousID, label)
@@ -235,7 +327,7 @@ func (c *Client) UpdateMetaData(anonymousID, label, note string) error {
 		"label":       label,
 		"note":        note,
 	}
-	body, err := c.request("POST", c.ServiceURL()+"/v1/hme/updateMetaData", payload, 0, 2)
+	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/updateMetaData", payload, 0, 1)
 	if err != nil {
 		return err
 	}
@@ -248,22 +340,38 @@ func (c *Client) UpdateMetaData(anonymousID, label, note string) error {
 	return nil
 }
 
+// UpdateMetaData 更新别名备注 (label) 与说明 (note)。
+func (c *Client) UpdateMetaData(anonymousID, label, note string) error {
+	return c.UpdateMetaDataWithContext(context.Background(), anonymousID, label, note)
+}
+
 // ---- 别名列表解析 (对应 ICloudHME._parse_alias_list) ----
 
 // parseAliasList 解析 iCloud 返回的别名列表 JSON。
-// 容错:优先取 result.hmeEmails,找不到则递归查找第一个对象数组。
-func parseAliasList(body string) []Alias {
+// 严防格式假成功: 若收到 HTML、无效 JSON、success=false 或缺失关键数组，必须返回 ErrInvalidResponseSchema。
+func parseAliasList(body string) ([]Alias, error) {
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" {
+		return nil, fmt.Errorf("%w: empty response body", ErrInvalidResponseSchema)
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "<!doctype") || strings.HasPrefix(lower, "<html") || strings.HasPrefix(lower, "<head") {
+		return nil, fmt.Errorf("%w: received HTML page instead of JSON", ErrInvalidResponseSchema)
+	}
 	if !gjson.Valid(body) {
-		return []Alias{}
+		return nil, fmt.Errorf("%w: invalid JSON format", ErrInvalidResponseSchema)
 	}
 	root := gjson.Parse(body)
 
-	arr := root.Get("result.hmeEmails")
-	if !arr.IsArray() {
-		arr = findFirstDictArray(root)
+	successVal := root.Get("success")
+	if successVal.Exists() && !successVal.Bool() {
+		errMsg := root.Get("error.errorMessage").String()
+		return nil, fmt.Errorf("%w: upstream success=false: %s", ErrInvalidResponseSchema, nonEmpty(errMsg, "unknown error"))
 	}
-	if !arr.IsArray() {
-		return []Alias{}
+
+	arr := root.Get("result.hmeEmails")
+	if !arr.Exists() || !arr.IsArray() {
+		return nil, fmt.Errorf("%w: missing or invalid result.hmeEmails array in response", ErrInvalidResponseSchema)
 	}
 
 	var aliases []Alias
@@ -304,6 +412,10 @@ func parseAliasList(body string) []Alias {
 		return true
 	})
 
+	if aliases == nil {
+		aliases = []Alias{}
+	}
+
 	// 活跃的排前面,再按邮箱字母序。
 	sort.SliceStable(aliases, func(i, j int) bool {
 		if aliases[i].Active != aliases[j].Active {
@@ -311,28 +423,7 @@ func parseAliasList(body string) []Alias {
 		}
 		return aliases[i].Email < aliases[j].Email
 	})
-	return aliases
-}
-
-// findFirstDictArray 递归查找第一个「对象数组」。
-func findFirstDictArray(v gjson.Result) gjson.Result {
-	if v.IsArray() {
-		if len(v.Array()) > 0 && v.Array()[0].IsObject() {
-			return v
-		}
-	}
-	if v.IsObject() {
-		var found gjson.Result
-		v.ForEach(func(_, val gjson.Result) bool {
-			if r := findFirstDictArray(val); r.IsArray() && len(r.Array()) > 0 {
-				found = r
-				return false
-			}
-			return true
-		})
-		return found
-	}
-	return gjson.Result{}
+	return aliases, nil
 }
 
 // formatTimestamp 将 iCloud 返回的各类时间戳转换为标准 RFC3339 字符串。

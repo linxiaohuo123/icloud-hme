@@ -1,6 +1,12 @@
 name: CI
 
 on:
+  push:
+    branches:
+      - main
+      - 'pr/**'
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -57,10 +63,31 @@ jobs:
           path: internal/webui/dist/
 
       - name: Test
-        run: go test -race ./internal/... .
+        run: |
+          go test -p 1 -v -timeout 4m ./... > test.log 2>&1 || {
+            STATUS=$?
+            echo "::error title=Go Test Failed::exit code $STATUS"
+            tail -n 50 test.log | while IFS= read -r line; do
+              echo "::warning::$line"
+            done
+            cat test.log
+            exit $STATUS
+          }
+
+      - name: Test (race)
+        run: |
+          go test -p 1 -v -race -timeout 5m ./... > test_race.log 2>&1 || {
+            STATUS=$?
+            echo "::error title=Go Race Test Failed::exit code $STATUS"
+            tail -n 50 test_race.log | while IFS= read -r line; do
+              echo "::warning::$line"
+            done
+            cat test_race.log
+            exit $STATUS
+          }
 
       - name: Vet
-        run: go vet ./internal/... .
+        run: go vet ./...
 
       - name: Build
-        run: go build ./internal/... .
+        run: go build ./...

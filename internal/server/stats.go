@@ -55,10 +55,7 @@ func (s *Server) systemStatsHandler(c *gin.Context) {
 			}
 		}
 		consumedAliases := s.store.CountConsumedPoolAliases()
-		availableAliases := totalActiveAliases - consumedAliases
-		if availableAliases < 0 {
-			availableAliases = 0
-		}
+		availableAliases := s.store.CountAuthoritativeAvailableAliases()
 		stats["alias_pool"] = gin.H{
 			"total_active_aliases": totalActiveAliases,
 			"consumed_aliases":     consumedAliases,
@@ -67,9 +64,11 @@ func (s *Server) systemStatsHandler(c *gin.Context) {
 	}
 
 	// 内存缓存水位(用于判断是否接近上限)
-	s.msgCacheMu.RLock()
-	stats["message_cache_entries"] = len(s.msgCache)
-	s.msgCacheMu.RUnlock()
+	if s.mailReadService != nil {
+		stats["message_cache_entries"] = s.mailReadService.CacheLen()
+	} else {
+		stats["message_cache_entries"] = 0
+	}
 
 	// 后台引擎状态
 	stats["engines"] = gin.H{

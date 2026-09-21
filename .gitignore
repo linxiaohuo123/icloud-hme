@@ -37,9 +37,11 @@ accounts.json.migrated
 CLAUDE.md
 /.claude/
 .agents/
-docs/
+/docs/*
+!/docs/remediation/
 .ccg/
 .superpowers/
+/icloud-hme-gemini-execution-plan/
 
 # Temp / scratch files
 /fresh-req.json

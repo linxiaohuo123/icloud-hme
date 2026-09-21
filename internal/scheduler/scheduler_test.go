@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 testing, os, path/filepath, time, fmt, icloud-hme/internal/account, icloud-hme/internal/hme, icloud-hme/internal/store
+ * [INPUT]: 依赖 testing, time, fmt, icloud-hme/internal/account, icloud-hme/internal/hme, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 TestSchedulerRunOnce, TestSchedulerDoubleQuotaPrevention 等单元测试套件
  * [POS]: internal/scheduler 的调度生命周期与配额防重扣单元测试
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -9,8 +9,6 @@ package scheduler
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -20,14 +18,13 @@ import (
 )
 
 func TestSchedulerRunOnce(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_scheduler")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	st, err := store.NewStore(tempDir)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
+	defer st.Close()
 
 	accID := "acc_test_1"
 	// 保存开启配置，额度 2
@@ -65,14 +62,13 @@ func TestSchedulerRunOnce(t *testing.T) {
 
 // 计划触发且 0 个启用账号时空转静默:不产生日志也不创建;手动触发正常执行
 func TestSchedulerSilentIdleRound(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_scheduler_idle")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	st, err := store.NewStore(tempDir)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
+	defer st.Close()
 
 	// 账号存在但未启用调度
 	mockAccounts := func() []account.Summary {
@@ -105,14 +101,13 @@ func TestSchedulerSilentIdleRound(t *testing.T) {
 
 // RunOnce 前后 Status 的 running/last_run_at 如实翻转
 func TestSchedulerStatus(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_scheduler_status")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	st, err := store.NewStore(tempDir)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
+	defer st.Close()
 
 	accID := "acc_status"
 	_ = st.SaveScheduleConfig(store.ScheduleConfig{
@@ -148,14 +143,13 @@ func TestSchedulerStatus(t *testing.T) {
 }
 
 func TestSchedulerCustomLabel(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_scheduler_custom_label")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	st, err := store.NewStore(tempDir)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
+	defer st.Close()
 
 	accID := "acc_test_custom"
 	_ = st.SaveScheduleConfig(store.ScheduleConfig{
@@ -218,14 +212,13 @@ func TestIsInDailyWindow(t *testing.T) {
 }
 
 func TestSchedulerAliasLimitCircuitBreak(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), "test_scheduler_limit")
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	st, err := store.NewStore(tempDir)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
+	defer st.Close()
 
 	accID := "acc_full"
 	_ = st.SaveScheduleConfig(store.ScheduleConfig{
@@ -320,9 +313,7 @@ func TestDurationExpired(t *testing.T) {
 
 // TestSchedulerDoubleQuotaPrevention 验证调度器调用原子出号门面时绝不发生配额双重扣减。
 func TestSchedulerDoubleQuotaPrevention(t *testing.T) {
-	tempDir := filepath.Join(os.TempDir(), fmt.Sprintf("test_sched_quota_%d", os.Getpid()))
-	_ = os.RemoveAll(tempDir)
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	st, err := store.NewStore(tempDir)
 	if err != nil {

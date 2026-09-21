@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 errors, fmt, log, sync, time, icloud-hme/internal/account, icloud-hme/internal/notify, icloud-hme/internal/scheduler
  * [OUTPUT]: 对外提供 CookieMonitor, NewCookieMonitor, EventSink
- * [POS]: server 的 Cookie 健康监控器，周期校验账号会话、凭据失效即标记 error 并在跳变沿推送通知
+ * [POS]: server 的 Cookie 健康监控器 (PR-07 §10.4)，周期校验账号会话、凭据失效即标记 error 并在跳变沿推送通知，支持平稳停机等待
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -46,6 +46,7 @@ type CookieMonitor struct {
 	stopCh     chan struct{}
 	once       sync.Once
 	stopOnce   sync.Once
+	wg         sync.WaitGroup
 	mu         sync.Mutex
 	prevStatus map[string]string // accountID → 上次已知状态
 	prevQuota  map[string]int    // accountID → 上次已知 active 别名数
@@ -116,7 +117,11 @@ func (m *CookieMonitor) perAccountGap(n int) time.Duration {
 // Start 启动后台校验协程。首轮延迟 1 分钟，错开启动期 autoSyncAccounts 的请求。
 func (m *CookieMonitor) Start() {
 	m.once.Do(func() {
-		go m.loop()
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			m.loop()
+		}()
 	})
 }
 
@@ -139,11 +144,12 @@ func (m *CookieMonitor) loop() {
 	}
 }
 
-// Stop 停止监控协程(线程安全且幂等)。
+// Stop 停止监控协程并平稳等待退出(线程安全且幂等，PR-07 §10.4)。
 func (m *CookieMonitor) Stop() {
 	m.stopOnce.Do(func() {
 		close(m.stopCh)
 	})
+	m.wg.Wait()
 }
 
 // Logs 返回监控环形日志快照。

@@ -46,23 +46,23 @@ func TestLeasePrunerRespectsRetention(t *testing.T) {
 		t.Fatalf("未启用时流水应保持 2 条, 实际 %d", got)
 	}
 
-	// 配置 180 天保留期: 只删过期的
+	// 配置 180 天保留期: 保留配置且启用，但 PruneOnce 安全暂停(不删除历史流水以防重号)
 	p := NewLeasePruner(st, 180*24*time.Hour)
 	if !p.Enabled() {
 		t.Fatal("配置保留期后应启用")
 	}
-	if n := p.PruneOnce(); n != 1 {
-		t.Fatalf("应删除 1 条过期流水, 实际 %d", n)
+	if n := p.PruneOnce(); n != 0 {
+		t.Fatalf("PR-01 阶段安全暂停物理清理, 删除条数应为 0, 实际 %d", n)
 	}
-	if got := st.CountLeases(); got != 1 {
-		t.Fatalf("清理后应剩 1 条, 实际 %d", got)
+	if got := st.CountLeases(); got != 2 {
+		t.Fatalf("安全暂停期间流水应完整保留 2 条, 实际 %d", got)
 	}
 	// 路由同样必须保留
 	if got := st.CountAliasRoutes(); got != 2 {
 		t.Fatalf("路由表不得受影响, 期望 2, 实际 %d", got)
 	}
-	if len(p.Logs()) == 0 {
-		t.Fatal("清理后应留下可观测日志")
+	if len(p.Logs()) == 0 || !strings.Contains(p.Logs()[0], "安全暂停") {
+		t.Fatal("清理应留下安全暂停的可观测告警日志")
 	}
 }
 

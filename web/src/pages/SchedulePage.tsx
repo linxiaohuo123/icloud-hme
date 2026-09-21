@@ -102,7 +102,9 @@ export default function SchedulePage() {
   }, [logs])
 
   const configsRef = useRef(configs)
-  configsRef.current = configs
+  useEffect(() => {
+    configsRef.current = configs
+  }, [configs])
 
   const handleToggleAccount = useCallback(
     async (acc: AccountSummary) => {

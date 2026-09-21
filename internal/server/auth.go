@@ -37,8 +37,69 @@ func sessionIDFromCookie(c *gin.Context) string {
 //
 // 通过后写入两个上下文键:
 //
-//	is_api_key_auth: 是否为令牌/Key 认证(决定是否跳过 CSRF)
-//	auth_scopes:     授权作用域;浏览器会话恒为 "admin",令牌取库中 scopes
+// requireExternalV2Auth 严格仅支持 Bearer Token / X-API-Key 认证，彻底拒绝 Cookie 会话，杜绝 CSRF 与混淆代理 (Issue 19 方案 A)
+func requireExternalV2Auth(apiKey string, st *store.Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		reqKey := c.GetHeader("X-API-Key")
+		if reqKey == "" {
+			authHeader := c.GetHeader("Authorization")
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				reqKey = strings.TrimPrefix(authHeader, "Bearer ")
+			}
+		}
+		if reqKey == "" {
+			failCode(c, http.StatusUnauthorized, "AUTH_REQUIRED", "外部 v2 接口仅支持 Bearer Token 认证，拒绝 Cookie 会话")
+			c.Abort()
+			return
+		}
+		// 恒时比较全局 API Key
+		if apiKey != "" && subtle.ConstantTimeCompare([]byte(reqKey), []byte(apiKey)) == 1 {
+			p := auth.Principal{
+				Kind:      auth.PrincipalAdmin,
+				ID:        "admin",
+				TokenName: "global_api_key",
+				Scopes:    []string{store.ScopeAdmin},
+			}
+			c.Set("is_api_key_auth", true)
+			c.Set("token_name", "global_api_key")
+			c.Set("auth_scopes", store.ScopeAdmin)
+			c.Set("principal", p)
+			c.Next()
+			return
+		}
+		if st != nil {
+			if id, tokName, scopes, ok := st.ValidateTokenPrincipal(reqKey); ok {
+				var scopeList []string
+				if strings.TrimSpace(scopes) == "" || strings.TrimSpace(scopes) == store.ScopeAdmin {
+					scopeList = []string{store.ScopeAdmin}
+				} else {
+					for _, sc := range strings.Split(scopes, ",") {
+						sc = strings.TrimSpace(sc)
+						if sc != "" {
+							scopeList = append(scopeList, sc)
+						}
+					}
+				}
+				p := auth.Principal{
+					Kind:      auth.PrincipalToken,
+					ID:        id,
+					TokenName: tokName,
+					Scopes:    scopeList,
+				}
+				c.Set("is_api_key_auth", true)
+				c.Set("token_name", tokName)
+				c.Set("auth_scopes", scopes)
+				c.Set("principal", p)
+				c.Next()
+				return
+			}
+		}
+		failCode(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key / Bearer Token 无效")
+		c.Abort()
+	}
+}
+
+// requireSession 校验会话,失败返回 401/AUTH_REQUIRED。支持全局 API Key 及动态 Tokens 旁路。
 func requireSession(mgr *authManager, apiKey string, st *store.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		reqKey := c.GetHeader("X-API-Key")
@@ -51,17 +112,42 @@ func requireSession(mgr *authManager, apiKey string, st *store.Store) gin.Handle
 		if reqKey != "" {
 			// 恒时比较, 避免环境变量 Key 的时序侧信道
 			if apiKey != "" && subtle.ConstantTimeCompare([]byte(reqKey), []byte(apiKey)) == 1 {
+				p := auth.Principal{
+					Kind:      auth.PrincipalAdmin,
+					ID:        "admin",
+					TokenName: "global_api_key",
+					Scopes:    []string{store.ScopeAdmin},
+				}
 				c.Set("is_api_key_auth", true)
 				c.Set("token_name", "global_api_key")
 				c.Set("auth_scopes", store.ScopeAdmin)
+				c.Set("principal", p)
 				c.Next()
 				return
 			}
 			if st != nil {
-				if tokName, scopes, ok := st.ValidateTokenWithName(reqKey); ok {
+				if id, tokName, scopes, ok := st.ValidateTokenPrincipal(reqKey); ok {
+					var scopeList []string
+					if strings.TrimSpace(scopes) == "" || strings.TrimSpace(scopes) == store.ScopeAdmin {
+						scopeList = []string{store.ScopeAdmin}
+					} else {
+						for _, sc := range strings.Split(scopes, ",") {
+							sc = strings.TrimSpace(sc)
+							if sc != "" {
+								scopeList = append(scopeList, sc)
+							}
+						}
+					}
+					p := auth.Principal{
+						Kind:      auth.PrincipalToken,
+						ID:        id,
+						TokenName: tokName,
+						Scopes:    scopeList,
+					}
 					c.Set("is_api_key_auth", true)
 					c.Set("token_name", tokName)
 					c.Set("auth_scopes", scopes)
+					c.Set("principal", p)
 					c.Next()
 					return
 				}
@@ -79,11 +165,28 @@ func requireSession(mgr *authManager, apiKey string, st *store.Store) gin.Handle
 			failCode(c, http.StatusUnauthorized, "AUTH_REQUIRED", "会话已失效,请重新登录")
 			return
 		}
+		p := auth.Principal{
+			Kind:      auth.PrincipalAdmin,
+			ID:        "admin",
+			TokenName: "admin_session",
+			Scopes:    []string{store.ScopeAdmin},
+		}
 		c.Set("session_id", sessionID)
 		// 浏览器管理员会话拥有全部作用域
 		c.Set("auth_scopes", store.ScopeAdmin)
+		c.Set("principal", p)
 		c.Next()
 	}
+}
+
+// getPrincipal 从 Gin 上下文中获取当前已认证的统一主体 (PR-04)
+func getPrincipal(c *gin.Context) (auth.Principal, bool) {
+	v, exists := c.Get("principal")
+	if !exists {
+		return auth.Principal{}, false
+	}
+	p, ok := v.(auth.Principal)
+	return p, ok
 }
 
 // requireScope 在 requireSession 之后做最小权限校验。

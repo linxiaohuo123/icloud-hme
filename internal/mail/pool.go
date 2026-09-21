@@ -10,6 +10,7 @@ package mail
 
 import (
 	"container/list"
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -64,8 +65,13 @@ func (p *Pool) SetMaxConns(max int) {
 	p.evictOldestLocked()
 }
 
-// Do 借出已连接的 Client 执行 fn; 用完不 Logout, 连接留在池中。
-func (p *Pool) Do(appleID, appPassword, proxyURL string, fn func(*Client) error) error {
+// DoContext 借出已连接的 Client 执行 fn，支持真实 Context 超时与取消 (Issue 13)。
+// 当 ctx.Done() 触发时，对底层 net.Conn 调用 SetDeadline(time.Now()) 并 forceClose() 真正打断网络 I/O，
+// 且强制将已中断的连接从连接池中丢弃 (pc.client = nil)，严禁放回连接池复用。
+func (p *Pool) DoContext(ctx context.Context, appleID, appPassword, proxyURL string, fn func(*Client) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if appleID == "" || appPassword == "" {
 		return fmt.Errorf("IMAP 凭据为空")
 	}
@@ -73,7 +79,22 @@ func (p *Pool) Do(appleID, appPassword, proxyURL string, fn func(*Client) error)
 	if pc == nil {
 		return fmt.Errorf("连接池已关闭")
 	}
-	pc.mu.Lock()
+
+	lockCh := make(chan struct{})
+	go func() {
+		pc.mu.Lock()
+		close(lockCh)
+	}()
+
+	select {
+	case <-ctx.Done():
+		go func() {
+			<-lockCh
+			pc.mu.Unlock()
+		}()
+		return ctx.Err()
+	case <-lockCh:
+	}
 	defer pc.mu.Unlock()
 
 	// 密码或代理变更则换新 (仅在单账号自身锁 pc.mu 内执行, 杜绝占死全局池锁 p.mu)
@@ -90,19 +111,54 @@ func (p *Pool) Do(appleID, appPassword, proxyURL string, fn func(*Client) error)
 	if err := pc.ensure(p.idleClose); err != nil {
 		return err
 	}
-	// IMAP 命令无内建超时: 设置绝对截止时间, 挂起时以 i/o timeout 断开,
-	// 池据此丢弃坏连接重建, 避免一次网络黑洞永久占死该账号
+
+	// 监听 Context 取消：真正打断底层 TCP/TLS 连接网络 I/O
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			if pc.client != nil {
+				pc.client.SetDeadline(time.Now())
+				pc.client.forceClose()
+			}
+		case <-stopWatch:
+		}
+	}()
+
 	pc.client.SetDeadline(time.Now().Add(IMAPCommandTimeout))
-	defer pc.client.SetDeadline(time.Time{})
+	defer func() {
+		if pc.client != nil {
+			pc.client.SetDeadline(time.Time{})
+		}
+	}()
 
 	err := fn(pc.client)
 	pc.lastUsed = time.Now()
+
+	// 若在执行期间 context 已触发取消，连接已被打断，必须从连接池丢弃，严禁复用 (Issue 13)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if pc.client != nil {
+			pc.client.forceClose()
+			pc.client = nil
+		}
+		return ctxErr
+	}
+
 	if err != nil && isLikelyConnErr(err) {
 		// 连接坏了, 丢掉, 下次重建
-		pc.client.forceClose()
-		pc.client = nil
+		if pc.client != nil {
+			pc.client.forceClose()
+			pc.client = nil
+		}
 	}
 	return err
+}
+
+// Do 借出已连接的 Client 执行 fn; 用完不 Logout, 连接留在池中。
+func (p *Pool) Do(appleID, appPassword, proxyURL string, fn func(*Client) error) error {
+	return p.DoContext(context.Background(), appleID, appPassword, proxyURL, fn)
 }
 
 // Close 关闭池内全部连接并停止后台回收协程。

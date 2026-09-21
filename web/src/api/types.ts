@@ -56,6 +56,12 @@ export interface Alias {
 /** 邮件摘要 */
 export interface InboxMessage {
   id: string
+  account_id?: string
+  message_ref?: string
+  provider?: 'imap' | 'webmail'
+  uid_validity?: number
+  uid?: number
+  thread_id?: string
   folder?: string
   from: string
   to: string
@@ -68,6 +74,18 @@ export interface InboxMessage {
 export interface FullMessage extends InboxMessage {
   body: string
   content_type: string
+  body_complete?: boolean
+  provider?: 'imap' | 'webmail'
+  method?: 'imap' | 'web_api'
+}
+
+/** 邮件详情响应统一契约 */
+export interface MessageDetailResponse {
+  account_id: string
+  message: FullMessage
+  provider: 'imap' | 'webmail'
+  method: 'imap' | 'web_api'
+  cached: boolean
 }
 
 /** 邮箱文件夹定义 */

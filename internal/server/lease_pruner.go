@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 log, sync, time, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 LeasePruner, NewLeasePruner
- * [POS]: internal/server 的已用别名流水保留期清理引擎，防止 lease_records 无限增长
+ * [POS]: internal/server 的已用别名流水保留期清理引擎（PR-01 阶段物理清理安全暂停，保护库存防重事实）
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -132,25 +132,10 @@ func (p *LeasePruner) PruneOnce() int {
 		}
 	}()
 
-	cutoff := time.Now().Add(-p.retention)
-	total := 0
-	for batch := 0; batch < leasePruneMaxBatches; batch++ {
-		n, err := p.store.PruneLeases(cutoff, leasePruneBatch)
-		if err != nil {
-			log.Printf("[LeasePruner] 清理失败: %v", err)
-			break
-		}
-		total += n
-		if n < leasePruneBatch {
-			break
-		}
-	}
-	if total > 0 {
-		p.logs.Add(fmt.Sprintf("已清理 %d 条早于 %s 的流水，剩余 %d 条",
-			total, cutoff.Format(time.RFC3339), p.store.CountLeases()))
-		log.Printf("[LeasePruner] 已清理 %d 条早于 %s 的流水", total, cutoff.Format(time.RFC3339))
-	} else {
-		p.logs.Add("本轮无需清理")
-	}
-	return total
+	// 【PR-01 安全止损】库存防重分离前 (PR-03)，流水记录是目前唯一的防重事实依据。
+	// 为防止清理旧流水导致已发放别名被再次重复分配，物理删除已安全暂停，保留配置并记录可见警告。
+	msg := fmt.Sprintf("[安全暂停] 流水物理清理已暂停(等待库存防重数据模型就绪，配置保留期: %v)", p.retention)
+	p.logs.Add(msg)
+	log.Printf("[LeasePruner] %s", msg)
+	return 0
 }

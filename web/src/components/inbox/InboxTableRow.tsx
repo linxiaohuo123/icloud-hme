@@ -51,7 +51,6 @@ export default function InboxTableRow({
   onOpenMessage,
   onCopyCode,
   onCopyAlias,
-  onDelete,
 }: InboxTableRowProps) {
   const code = extractVerifyCode(buildSniffContext(m.subject, m.preview))
   const sender = parseSenderInfo(m.from)
@@ -178,15 +177,14 @@ export default function InboxTableRow({
           >
             详情
           </button>
+          {/* 【PR-01 安全止损】物理删信在邮件身份模型与目标 UID 删除支持完善前暂停 */}
           <button
             type="button"
             className="btn-row-action btn-row-action-danger"
-            onClick={(e) => {
-              e.stopPropagation()
-              onDelete(m)
-            }}
-            title="删除邮件"
-            aria-label="删除邮件"
+            disabled
+            style={{ opacity: 0.4, cursor: 'not-allowed' }}
+            title="物理删信功能因安全性考量暂不可用，已安全暂停"
+            aria-label="删除邮件（已暂停）"
           >
             <IconTrash size={13} />
           </button>

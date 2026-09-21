@@ -87,7 +87,10 @@ func TestParseAliasList_TimestampNormalization(t *testing.T) {
 		}
 	}`
 
-	aliases := parseAliasList(jsonBody)
+	aliases, err := parseAliasList(jsonBody)
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
 	if len(aliases) != 3 {
 		t.Fatalf("expected 3 aliases, got %d", len(aliases))
 	}

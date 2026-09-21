@@ -8,9 +8,11 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -196,6 +198,12 @@ func NewStore(dataDir string) (*Store, error) {
 	// 用出号流水回填别名路由(覆盖本功能上线前已分配的别名)
 	s.backfillAliasRoutes()
 
+	// 自动迁移历史别名库存与唯一分配关系 (PR-03)
+	if err := s.migrateInventory(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("迁移库存失败: %w", err)
+	}
+
 	// 启动令牌活跃度异步批量刷新器
 	go s.activityFlusher()
 
@@ -266,6 +274,29 @@ func (s *Store) Close() error {
 	return nil
 }
 
+// tableHasColumn 使用 PRAGMA table_info 精准探测表字段，绝不盲目依赖忽略 ALTER 报错
+func tableHasColumn(db *sql.DB, tableName, colName string) (bool, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	colNameLower := strings.ToLower(colName)
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notnull, pk int
+		var dfltValue sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notnull, &dfltValue, &pk); err != nil {
+			return false, err
+		}
+		if strings.ToLower(name) == colNameLower {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
 func (s *Store) initSchema() error {
 	pragmas := []string{
 		"PRAGMA journal_mode = WAL;",
@@ -279,7 +310,8 @@ func (s *Store) initSchema() error {
 		}
 	}
 
-	ddl := `
+	// 1. 创建基础表 (暂不包含依赖扩展字段的索引)
+	baseDDL := `
 	CREATE TABLE IF NOT EXISTS business_tags (
 		id TEXT PRIMARY KEY,
 		name TEXT NOT NULL,
@@ -295,8 +327,7 @@ func (s *Store) initSchema() error {
 		name TEXT NOT NULL,
 		token TEXT NOT NULL UNIQUE,
 		created_at TEXT NOT NULL,
-		last_used_at TEXT,
-		scopes TEXT NOT NULL DEFAULT 'admin'
+		last_used_at TEXT
 	);
 
 	CREATE TABLE IF NOT EXISTS lease_records (
@@ -306,31 +337,16 @@ func (s *Store) initSchema() error {
 		tag TEXT NOT NULL,
 		status TEXT NOT NULL,
 		allocated_at TEXT NOT NULL,
-		completed_at TEXT,
-		token_name TEXT DEFAULT ''
+		completed_at TEXT
 	);
-	CREATE INDEX IF NOT EXISTS idx_leases_allocated_at ON lease_records (allocated_at DESC);
-	CREATE INDEX IF NOT EXISTS idx_leases_email ON lease_records (email);
-	-- 表达式索引: 兼容历史混合大小写行的 LOWER(email) 等值反查(FindLeaseAccount)
-	CREATE INDEX IF NOT EXISTS idx_leases_email_lower ON lease_records (LOWER(email));
-	-- 覆盖复合索引: 支撑 ClaimPoolAlias 与 CountConsumedPoolAliases 的纯索引只读扫描 (Index-Only Scan)，彻底消除回表
-	CREATE INDEX IF NOT EXISTS idx_leases_email_lower_token ON lease_records (LOWER(email), token_name);
-	CREATE INDEX IF NOT EXISTS idx_leases_tag ON lease_records (tag);
-	CREATE INDEX IF NOT EXISTS idx_leases_status ON lease_records (status);
 
 	CREATE TABLE IF NOT EXISTS schedules (
 		account_id TEXT PRIMARY KEY,
 		enabled INTEGER NOT NULL DEFAULT 0,
 		hourly_quota INTEGER NOT NULL DEFAULT 5,
-		alias_label TEXT DEFAULT 'scheduled',
 		current_hour_count INTEGER NOT NULL DEFAULT 0,
 		last_hour_window INTEGER NOT NULL DEFAULT 0,
-		last_run_at TEXT,
-		mode TEXT DEFAULT 'always',
-		start_time TEXT DEFAULT '',
-		end_time TEXT DEFAULT '',
-		duration_hours INTEGER DEFAULT 0,
-		started_at TEXT DEFAULT ''
+		last_run_at TEXT
 	);
 
 	CREATE TABLE IF NOT EXISTS settings (
@@ -339,18 +355,11 @@ func (s *Store) initSchema() error {
 		updated_at TEXT NOT NULL
 	);
 
-	-- alias_routes: 「别名邮箱 → 母号」路由表。
-	--
-	-- 存在的意义: 取验证码时必须先知道某个别名属于哪个母号，否则只能遍历全部账号
-	-- 逐个向上游 IMAP 拉取(2000 账号 = 每轮 2000 次请求，必然触发 Apple 风控)。
-	-- 该表让归属解析变成一次主键点查，且跨进程重启依然完整。
-	-- email 写入前一律归一为小写，主键即索引。
 	CREATE TABLE IF NOT EXISTS alias_routes (
 		email      TEXT PRIMARY KEY,
 		account_id TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	);
-	CREATE INDEX IF NOT EXISTS idx_alias_routes_account ON alias_routes (account_id);
 
 	CREATE TABLE IF NOT EXISTS accounts (
 		id            TEXT PRIMARY KEY,
@@ -372,21 +381,72 @@ func (s *Store) initSchema() error {
 		tags          TEXT DEFAULT '[]',
 		updated_at    TEXT NOT NULL
 	);
-	CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 	`
-	if _, err := s.db.Exec(ddl); err != nil {
+	if _, err := s.db.Exec(baseDDL); err != nil {
+		return fmt.Errorf("创建基础表失败: %w", err)
+	}
+
+	// 2. 使用 PRAGMA table_info 探测并补充历史遗留库缺失的字段
+	hasTokenName, err := tableHasColumn(s.db, "lease_records", "token_name")
+	if err != nil {
 		return err
 	}
-	_, _ = s.db.Exec(`ALTER TABLE lease_records ADD COLUMN token_name TEXT DEFAULT ''`)
-	// 升级前的历史令牌补 'admin' 作用域，保证既有外部接入不被收窄打断
-	_, _ = s.db.Exec(`ALTER TABLE api_tokens ADD COLUMN scopes TEXT NOT NULL DEFAULT 'admin'`)
-	_, _ = s.db.Exec(`ALTER TABLE schedules ADD COLUMN alias_label TEXT DEFAULT 'scheduled'`)
-	_, _ = s.db.Exec(`ALTER TABLE schedules ADD COLUMN mode TEXT DEFAULT 'always'`)
-	_, _ = s.db.Exec(`ALTER TABLE schedules ADD COLUMN start_time TEXT DEFAULT ''`)
-	_, _ = s.db.Exec(`ALTER TABLE schedules ADD COLUMN end_time TEXT DEFAULT ''`)
-	_, _ = s.db.Exec(`ALTER TABLE schedules ADD COLUMN duration_hours INTEGER DEFAULT 0`)
-	_, _ = s.db.Exec(`ALTER TABLE schedules ADD COLUMN started_at TEXT DEFAULT ''`)
-	return nil
+	if !hasTokenName {
+		if _, err := s.db.Exec(`ALTER TABLE lease_records ADD COLUMN token_name TEXT DEFAULT ''`); err != nil {
+			return fmt.Errorf("alter lease_records add token_name failed: %w", err)
+		}
+	}
+
+	hasScopes, err := tableHasColumn(s.db, "api_tokens", "scopes")
+	if err != nil {
+		return err
+	}
+	if !hasScopes {
+		if _, err := s.db.Exec(`ALTER TABLE api_tokens ADD COLUMN scopes TEXT NOT NULL DEFAULT 'admin'`); err != nil {
+			return fmt.Errorf("alter api_tokens add scopes failed: %w", err)
+		}
+	}
+
+	scheduleCols := []struct {
+		col string
+		def string
+	}{
+		{"alias_label", "TEXT DEFAULT 'scheduled'"},
+		{"mode", "TEXT DEFAULT 'always'"},
+		{"start_time", "TEXT DEFAULT ''"},
+		{"end_time", "TEXT DEFAULT ''"},
+		{"duration_hours", "INTEGER DEFAULT 0"},
+		{"started_at", "TEXT DEFAULT ''"},
+	}
+	for _, sc := range scheduleCols {
+		hasCol, err := tableHasColumn(s.db, "schedules", sc.col)
+		if err != nil {
+			return err
+		}
+		if !hasCol {
+			if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE schedules ADD COLUMN %s %s`, sc.col, sc.def)); err != nil {
+				return fmt.Errorf("alter schedules add %s failed: %w", sc.col, err)
+			}
+		}
+	}
+
+	// 3. 字段补充完毕后，安全创建基础表索引 (包括依赖 token_name 的覆盖复合索引)
+	indexesDDL := `
+	CREATE INDEX IF NOT EXISTS idx_leases_allocated_at ON lease_records (allocated_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_leases_email ON lease_records (email);
+	CREATE INDEX IF NOT EXISTS idx_leases_email_lower ON lease_records (LOWER(email));
+	CREATE INDEX IF NOT EXISTS idx_leases_email_lower_token ON lease_records (LOWER(email), token_name);
+	CREATE INDEX IF NOT EXISTS idx_leases_tag ON lease_records (tag);
+	CREATE INDEX IF NOT EXISTS idx_leases_status ON lease_records (status);
+	CREATE INDEX IF NOT EXISTS idx_alias_routes_account ON alias_routes (account_id);
+	CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
+	`
+	if _, err := s.db.Exec(indexesDDL); err != nil {
+		return fmt.Errorf("创建基础表索引失败: %w", err)
+	}
+
+	// 4. 初始化领域库存与操作表
+	return s.initInventorySchema()
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -544,6 +604,35 @@ func (s *Store) ValidateTokenWithName(tokenStr string) (name string, scopes stri
 	default:
 	}
 	return name, scopes, true
+}
+
+// ValidateTokenPrincipal 校验令牌并返回 ID、名称与作用域集合 (PR-04)。
+func (s *Store) ValidateTokenPrincipal(tokenStr string) (id, name, scopes string, ok bool) {
+	err := s.db.QueryRow(`SELECT id, name, COALESCE(scopes, '') FROM api_tokens WHERE token = ?`, tokenStr).Scan(&id, &name, &scopes)
+	if err != nil {
+		return "", "", "", false
+	}
+	select {
+	case s.activityCh <- id:
+	default:
+	}
+	return id, name, scopes, true
+}
+
+// GetToken 按 ID 查询 API 令牌 (未被撤销则返回) (PR-06 V09)。
+func (s *Store) GetToken(ctx context.Context, id string) (*APIToken, error) {
+	id = strings.TrimSpace(id)
+	var tok APIToken
+	err := s.db.QueryRowContext(ctx, `SELECT id, name, token, created_at, COALESCE(last_used_at, ''), COALESCE(scopes, '') FROM api_tokens WHERE id = ?`, id).Scan(
+		&tok.ID, &tok.Name, &tok.Token, &tok.CreatedAt, &tok.LastUsedAt, &tok.Scopes,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errors.New("token not found")
+		}
+		return nil, err
+	}
+	return &tok, nil
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -827,20 +916,55 @@ type PoolCandidate struct {
 // 这仅在**单进程嵌入式 SQLite** 下成立。若未来迁移到多进程部署或 PostgreSQL，
 // 必须改用 SELECT ... FOR UPDATE 行锁或 INSERT ... WHERE NOT EXISTS 子查询，
 // 否则同一别名可能被多进程同时领用。
-func (s *Store) ClaimPoolAlias(candidates []PoolCandidate, tag, tokenName string) (*LeaseRecord, error) {
+func (s *Store) ClaimPoolAlias(candidates []PoolCandidate, tag, principalKind, principalID, tokenDisplayName string) (*LeaseRecord, error) {
 	if len(candidates) == 0 {
 		return nil, nil
 	}
 	if tag == "" {
 		tag = "default"
 	}
-	if tokenName == "" {
-		tokenName = "admin_console"
+	if principalKind == "" {
+		principalKind = "token"
+	}
+	if principalID == "" {
+		principalID = tokenDisplayName
+	}
+	if tokenDisplayName == "" {
+		tokenDisplayName = principalID
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().Format(time.RFC3339)
+
+	// 1. 同步预存候选到 alias_inventory (确保单一真相源)
+	prepInv, err := tx.Prepare(`
+		INSERT INTO alias_inventory (email, account_id, remote_state, allocation_state, source_type, snapshot_version)
+		VALUES (?, ?, 'active', 'available', 'pool', 1)
+		ON CONFLICT(email) DO NOTHING
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer prepInv.Close()
+
+	for _, c := range candidates {
+		norm := normalizeEmail(c.Email)
+		if norm != "" {
+			if _, err := prepInv.Exec(norm, c.AccountID); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// 2. 分批在可用库存中选号
 	const batchSize = 500
 	for i := 0; i < len(candidates); i += batchSize {
 		end := i + batchSize
@@ -857,78 +981,113 @@ func (s *Store) ClaimPoolAlias(candidates []PoolCandidate, tag, tokenName string
 		}
 
 		query := fmt.Sprintf(
-			`SELECT LOWER(email) FROM lease_records WHERE LOWER(email) IN (%s) AND COALESCE(token_name, '') != 'scheduler'`,
+			`SELECT email, account_id FROM alias_inventory
+			 WHERE email IN (%s) AND allocation_state = 'available' AND remote_state = 'active'
+			 LIMIT 1`,
 			strings.Join(placeholders, ","),
 		)
-		rows, err := s.db.Query(query, args...)
+		var candEmail, candAccountID string
+		qErr := tx.QueryRow(query, args...).Scan(&candEmail, &candAccountID)
+		if qErr != nil {
+			if errors.Is(qErr, sql.ErrNoRows) {
+				continue
+			}
+			return nil, qErr
+		}
+
+		// 3. CAS 更新库存状态
+		res, err := tx.Exec(`
+			UPDATE alias_inventory
+			SET allocation_state = 'allocated'
+			WHERE email = ? AND allocation_state = 'available'
+		`, candEmail)
 		if err != nil {
 			return nil, err
 		}
-		consumed := make(map[string]bool, len(chunk))
-		for rows.Next() {
-			var em string
-			if err := rows.Scan(&em); err == nil {
-				consumed[normalizeEmail(em)] = true
-			}
+		rowsAffected, _ := res.RowsAffected()
+		if rowsAffected == 0 {
+			continue
 		}
-		_ = rows.Close()
 
-		for _, c := range chunk {
-			norm := normalizeEmail(c.Email)
-			if norm == "" || consumed[norm] {
-				continue
-			}
+		// 4. 归属身份 (权威身份永远直接写 principalID，禁止通过 token name 反查)
+		ownerKind := principalKind
+		ownerID := principalID
 
-			// 命中首个可用别名，原子插入领用流水！
-			rec := LeaseRecord{
-				ID:          fmt.Sprintf("lease_%d_%d", time.Now().UnixNano(), atomic.AddUint64(&leaseSeq, 1)),
-				Email:       norm,
-				AccountID:   c.AccountID,
-				Tag:         tag,
-				Status:      "completed",
-				AllocatedAt: time.Now().Format(time.RFC3339),
-				CompletedAt: time.Now().Format(time.RFC3339),
-				TokenName:   tokenName,
-			}
-			insQuery := `INSERT INTO lease_records (id, email, account_id, tag, status, allocated_at, completed_at, token_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-			if _, insertErr := s.db.Exec(insQuery, rec.ID, rec.Email, rec.AccountID, rec.Tag, rec.Status, rec.AllocatedAt, rec.CompletedAt, rec.TokenName); insertErr != nil {
-				return nil, insertErr
-			}
-			if rec.AccountID != "" {
-				_ = s.UpsertAliasRoutes(rec.AccountID, []string{rec.Email})
-			}
-			s.UpdateTagLastAssigned(tag)
-			return &rec, nil
+		allocID := fmt.Sprintf("lease_%d_%d", time.Now().UnixNano(), atomic.AddUint64(&leaseSeq, 1))
+
+		// 5. 写入 alias_allocations (owner_id 永远直接写 principalID)
+		_, err = tx.Exec(`
+			INSERT INTO alias_allocations (allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 'allocated')
+			ON CONFLICT(alias_email) DO UPDATE SET
+				owner_kind = excluded.owner_kind,
+				owner_id = excluded.owner_id,
+				status = 'allocated'
+		`, allocID, candEmail, candAccountID, ownerKind, ownerID, tag, now)
+		if err != nil {
+			return nil, fmt.Errorf("写入 alias_allocations 失败: %w", err)
 		}
+
+		// 6. 兼容写入 lease_records (tokenDisplayName 只允许写入审计字段 token_name)
+		rec := LeaseRecord{
+			ID:          allocID,
+			Email:       candEmail,
+			AccountID:   candAccountID,
+			Tag:         tag,
+			Status:      "completed",
+			AllocatedAt: now,
+			CompletedAt: now,
+			TokenName:   tokenDisplayName,
+		}
+		insQuery := `INSERT INTO lease_records (id, email, account_id, tag, status, allocated_at, completed_at, token_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+		if _, insertErr := tx.Exec(insQuery, rec.ID, rec.Email, rec.AccountID, rec.Tag, rec.Status, rec.AllocatedAt, rec.CompletedAt, rec.TokenName); insertErr != nil {
+			return nil, insertErr
+		}
+
+		if rec.AccountID != "" {
+			_, _ = tx.Exec(`INSERT INTO alias_routes (email, account_id, updated_at) VALUES (?, ?, ?) ON CONFLICT(email) DO UPDATE SET account_id=excluded.account_id`, rec.Email, rec.AccountID, now)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+
+		s.UpdateTagLastAssigned(tag)
+		return &rec, nil
 	}
 
 	return nil, nil
 }
 
-// ClaimPoolAliasByRoutes 直接从持久化路由表中查找未被外部消费者领用的别名并原子认领。
-//
-// 【BUG-02 修复】原 ClaimPoolAlias 需要调用方先对每个账号 ListAliases 把全部别名
-// 拉到内存再传入(2000 账号 × 200 别名 = 40 万条)。本方法把判断下推到 SQL 层:
-//   - alias_routes 已持久化了「别名 → 母号」映射(出号写穿 + 列表自愈)
-//   - lease_records 记录了已被消费的别名
-//   - 单条 SQL 在索引上完成差集运算，O(1) 选出首个可用别名
-//
-// accountIDs 为空时返回 nil, nil。
-func (s *Store) ClaimPoolAliasByRoutes(accountIDs []string, tag, tokenName string) (*LeaseRecord, error) {
+// ClaimPoolAliasByRoutes 直接从持久化库存表中查找未被消费的可用别名并原子认领。
+func (s *Store) ClaimPoolAliasByRoutes(accountIDs []string, tag, principalKind, principalID, tokenDisplayName string) (*LeaseRecord, error) {
 	if len(accountIDs) == 0 {
 		return nil, nil
 	}
 	if tag == "" {
 		tag = "default"
 	}
-	if tokenName == "" {
-		tokenName = "admin_console"
+	if principalKind == "" {
+		principalKind = "token"
+	}
+	if principalID == "" {
+		principalID = tokenDisplayName
+	}
+	if tokenDisplayName == "" {
+		tokenDisplayName = principalID
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 分批查询，避免 IN 列表超长
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().Format(time.RFC3339)
+
 	const batchSize = 200
 	for i := 0; i < len(accountIDs); i += batchSize {
 		end := i + batchSize
@@ -944,41 +1103,76 @@ func (s *Store) ClaimPoolAliasByRoutes(accountIDs []string, tag, tokenName strin
 			args[j] = id
 		}
 
-		// 在 alias_routes 中找到未被非 scheduler 消费者认领的别名
 		query := fmt.Sprintf(`
-			SELECT ar.email, ar.account_id
-			FROM alias_routes ar
-			WHERE ar.account_id IN (%s)
-			  AND NOT EXISTS (
-			    SELECT 1 FROM lease_records lr
-			    WHERE lr.email = ar.email
-			      AND COALESCE(lr.token_name, '') != 'scheduler'
-			  )
+			SELECT email, account_id
+			FROM alias_inventory
+			WHERE account_id IN (%s)
+			  AND allocation_state = 'available'
+			  AND remote_state = 'active'
 			LIMIT 1`,
 			strings.Join(placeholders, ","),
 		)
 
-		var email, accountID string
-		err := s.db.QueryRow(query, args...).Scan(&email, &accountID)
+		var candEmail, candAccountID string
+		err := tx.QueryRow(query, args...).Scan(&candEmail, &candAccountID)
 		if err != nil {
-			continue // 本批无可用别名，试下一批
+			continue
 		}
 
-		// 命中: 原子插入领用流水
+		// CAS 更新
+		res, err := tx.Exec(`
+			UPDATE alias_inventory
+			SET allocation_state = 'allocated'
+			WHERE email = ? AND allocation_state = 'available'
+		`, candEmail)
+		if err != nil {
+			return nil, err
+		}
+		rowsAffected, _ := res.RowsAffected()
+		if rowsAffected == 0 {
+			continue
+		}
+
+		ownerKind := principalKind
+		ownerID := principalID
+
+		allocID := fmt.Sprintf("lease_%d_%d", time.Now().UnixNano(), atomic.AddUint64(&leaseSeq, 1))
+
+		_, err = tx.Exec(`
+			INSERT INTO alias_allocations (allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 'allocated')
+			ON CONFLICT(alias_email) DO UPDATE SET
+				owner_kind = excluded.owner_kind,
+				owner_id = excluded.owner_id,
+				status = 'allocated'
+		`, allocID, candEmail, candAccountID, ownerKind, ownerID, tag, now)
+		if err != nil {
+			return nil, fmt.Errorf("写入 alias_allocations 失败: %w", err)
+		}
+
 		rec := LeaseRecord{
-			ID:          fmt.Sprintf("lease_%d_%d", time.Now().UnixNano(), atomic.AddUint64(&leaseSeq, 1)),
-			Email:       normalizeEmail(email),
-			AccountID:   accountID,
+			ID:          allocID,
+			Email:       candEmail,
+			AccountID:   candAccountID,
 			Tag:         tag,
 			Status:      "completed",
-			AllocatedAt: time.Now().Format(time.RFC3339),
-			CompletedAt: time.Now().Format(time.RFC3339),
-			TokenName:   tokenName,
+			AllocatedAt: now,
+			CompletedAt: now,
+			TokenName:   tokenDisplayName,
 		}
 		insQuery := `INSERT INTO lease_records (id, email, account_id, tag, status, allocated_at, completed_at, token_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-		if _, insertErr := s.db.Exec(insQuery, rec.ID, rec.Email, rec.AccountID, rec.Tag, rec.Status, rec.AllocatedAt, rec.CompletedAt, rec.TokenName); insertErr != nil {
+		if _, insertErr := tx.Exec(insQuery, rec.ID, rec.Email, rec.AccountID, rec.Tag, rec.Status, rec.AllocatedAt, rec.CompletedAt, rec.TokenName); insertErr != nil {
 			return nil, insertErr
 		}
+
+		if rec.AccountID != "" {
+			_, _ = tx.Exec(`INSERT INTO alias_routes (email, account_id, updated_at) VALUES (?, ?, ?) ON CONFLICT(email) DO UPDATE SET account_id=excluded.account_id`, rec.Email, rec.AccountID, now)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+
 		s.UpdateTagLastAssigned(tag)
 		return &rec, nil
 	}

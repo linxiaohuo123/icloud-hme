@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/account, internal/auth, internal/mail, internal/webui
  * [OUTPUT]: 对外提供 Server 结构体, New, Run, Handler
- * [POS]: internal/server 的主入口与路由注册中心，统一管理 API 与 WebUI 路由
+ * [POS]: internal/server 的主入口与路由注册中心 (PR-07 §10.4)，统一管理 API 与 WebUI 路由，提供优雅停机生命周期闭环
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -9,6 +9,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -62,11 +63,6 @@ type Config struct {
 	TrustedProxies []string
 }
 
-type messageCacheEntry struct {
-	msg       *mail.FullMessage
-	expiresAt time.Time
-}
-
 // Server 封装 Gin 引擎、账号后端与认证。
 type Server struct {
 	be          Backend
@@ -80,14 +76,16 @@ type Server struct {
 	reaper      *AliasReaper
 	cookieMon   *CookieMonitor
 	leasePruner *LeasePruner
-	notifier    *notify.Sender
-	store       *store.Store
-	scheduler   *scheduler.Scheduler
-	msgCacheMu  sync.RWMutex
-	msgCache    map[string]messageCacheEntry
+	notifier        *notify.Sender
+	store           *store.Store
+	allocService    *AliasAllocationService
+	verifyService   *VerificationService
+	mailReadService *MailReadService
+	scheduler       *scheduler.Scheduler
 	startedAt   time.Time
 	ctx         context.Context    // 【BUG-11】停机信号,由 Close() 触发 cancel
 	cancel      context.CancelFunc // 【BUG-11】停机信号取消函数
+	closeOnce   sync.Once          // 优雅停机幂等保证 (PR-07 §10.4)
 }
 
 // New 创建 Server。mgr 为账号管理器,st 为持久化存储(可为 nil),cfg 为安全配置。
@@ -145,20 +143,35 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 		syncWorker:  syncWorker,
 		reaper:      reaper,
 		cookieMon:   mon,
-		notifier:    notifier,
-		store:       st,
-		leasePruner: NewLeasePruner(st, cfg.LeaseRetention),
-		startedAt:   time.Now(),
-		ctx:         ctx,
-		cancel:      cancel,
+		notifier:        notifier,
+		store:           st,
+		allocService:    NewAliasAllocationService(st, be, syncWorker),
+		verifyService:   NewVerificationService(be, st, eventBus, syncWorker),
+		mailReadService: NewMailReadService(be),
+		leasePruner:     NewLeasePruner(st, cfg.LeaseRetention),
+		startedAt:       time.Now(),
+		ctx:             ctx,
+		cancel:          cancel,
 	}
-	// 调度器在 Server 组装完成后注入，使 creator 能复用统一的流水入账口径
+	// 调度器在 Server 组装完成后注入，语义闭环为可用库存补货 (PR-06 §9.4, Issue 10)
 	s.scheduler = scheduler.NewScheduler(st, func(accountID, label string) (*hme.CreateResult, error) {
 		res, err := be.CreateAlias(accountID, label)
 		if err == nil && res != nil {
 			syncWorker.RegisterAliasAccount(res.Email, accountID)
-			// 调度产出的别名同样必须入流水，否则审计账本与 tag 对账会漏统计全部定时产出
-			s.recordLease(accountID, res.Email, s.scheduledTag(accountID), "scheduler")
+			// 补货只做：AddInventoryAlias(source_type='replenish', allocation_state='available')
+			// 严禁在补货时创建 consumer allocation / lease，确保普通出号能原子认领
+			if st != nil {
+				if addErr := st.AddInventoryAlias(accountID, hme.Alias{
+					Email:     res.Email,
+					Label:     res.Label,
+					CreatedAt: res.CreatedAt,
+					Active:    true,
+				}, "replenish", true); addErr != nil {
+					log.Printf("[Scheduler] 补货入库失败 email=%s: %v", res.Email, addErr)
+					return nil, fmt.Errorf("补货入库持久化失败 email=%s: %w", res.Email, addErr)
+				}
+				_ = st.UpsertAliasRoutes(accountID, []string{res.Email})
+			}
 		}
 		return res, err
 	}, be.ListAccounts)
@@ -325,22 +338,36 @@ func (s *Server) autoSyncAccounts() {
 	log.Printf("[Server] 启动预热完成: %d 个账号", len(targets))
 }
 
-// Close 停止后台工作引擎。
+// Close 停止后台工作引擎，严格遵守优雅停机生命周期顺序 (PR-07 §10.4)：
+// 1. 发送上下文取消信号 (停止接纳新工作)
+// 2. 依次关闭各后台 worker 并平稳等待在途任务收敛
+// 3. 关闭底层客户端连接池 (IMAP / HME Pool)
+// 4. 关闭底层持久化数据库 (Store)
 func (s *Server) Close() {
-	// 【BUG-11 修复】通知所有引用 s.ctx 的后台 goroutine 立即停止
-	if s.cancel != nil {
-		s.cancel()
-	}
-	s.aliasBuffer.Stop()
-	s.syncWorker.Stop()
-	s.reaper.Stop()
-	s.cookieMon.Stop()
-	s.leasePruner.Stop()
-	s.scheduler.Stop()
-	s.notifier.Stop()
-	if s.store != nil {
-		_ = s.store.Close()
-	}
+	s.closeOnce.Do(func() {
+		// 1. 停止接收新工作，通知所有引用 s.ctx 的后台 goroutine 立即取消
+		if s.cancel != nil {
+			s.cancel()
+		}
+		// 2. 依次优雅停机各 worker
+		s.aliasBuffer.Stop()
+		s.syncWorker.Stop()
+		s.reaper.Stop()
+		s.cookieMon.Stop()
+		s.leasePruner.Stop()
+		s.scheduler.Stop()
+		s.notifier.Stop()
+
+		// 3. 关闭底层客户端连接池
+		if closer, ok := s.be.(interface{ Close() }); ok {
+			closer.Close()
+		}
+
+		// 4. 最后关闭持久化存储
+		if s.store != nil {
+			_ = s.store.Close()
+		}
+	})
 }
 
 // Handler 返回底层 gin 引擎(便于测试)。
@@ -364,8 +391,6 @@ func (s *Server) register() {
 			alloc := authed.Group("")
 			alloc.Use(requireScope(store.ScopeAllocate))
 			{
-				alloc.POST("/create", csrfCheck(s.auth), s.createAliasHandler)
-				alloc.POST("/create/batch", csrfCheck(s.auth), s.createAliasBatchHandler)
 				alloc.POST("/quick-create", csrfCheck(s.auth), s.quickCreateHandler)
 				alloc.POST("/alias/lease", csrfCheck(s.auth), s.quickCreateHandler)
 				alloc.POST("/allocate", csrfCheck(s.auth), s.quickCreateHandler)
@@ -376,11 +401,6 @@ func (s *Server) register() {
 			verify := authed.Group("")
 			verify.Use(requireScope(store.ScopeVerify))
 			{
-				verify.GET("/inbox", s.listInboxHandler)
-				verify.GET("/inbox/:message_id", s.getMessageHandler)
-				verify.GET("/messages/:id", s.getMessagePrimeHandler)
-				verify.POST("/messages", s.getMessagesHandler)
-				verify.GET("/mailboxes", s.listMailboxesHandler)
 				verify.GET("/verify-code", s.verifyCodeHandler)
 				verify.GET("/external/v1/verify-code", s.verifyCodeHandler)
 			}
@@ -389,6 +409,17 @@ func (s *Server) register() {
 			adm := authed.Group("")
 			adm.Use(requireScope(store.ScopeAdmin))
 			{
+				// 【PR-01 安全止损】直接建号与母号邮件读取仅对管理员开放，普通外部令牌不可跨权调用
+				adm.POST("/create", csrfCheck(s.auth), s.createAliasHandler)
+				adm.POST("/create/batch", csrfCheck(s.auth), s.createAliasBatchHandler)
+				adm.GET("/inbox", s.listInboxHandler)
+				adm.GET("/inbox/:message_id", s.getMessageHandler)
+				adm.GET("/messages/:id", s.getMessagePrimeHandler)
+				adm.POST("/messages", s.getMessagesHandler)
+				adm.GET("/mailboxes", s.listMailboxesHandler)
+				adm.DELETE("/inbox/:message_id", csrfCheck(s.auth), s.deleteMessageHandler)
+				adm.DELETE("/messages/:id", csrfCheck(s.auth), s.deleteMessageHandler)
+
 				// ===== 账号管理 =====
 				adm.GET("/accounts", s.listAccountsHandler)
 				adm.GET("/accounts/:id", s.getAccountHandler)
@@ -407,8 +438,6 @@ func (s *Server) register() {
 				adm.POST("/create/jobs/:id/pause", csrfCheck(s.auth), s.pauseCreateJobHandler)
 				adm.POST("/create/jobs/:id/resume", csrfCheck(s.auth), s.resumeCreateJobHandler)
 				adm.DELETE("/create/jobs/:id", csrfCheck(s.auth), s.deleteCreateJobHandler)
-
-				adm.DELETE("/inbox/:message_id", csrfCheck(s.auth), s.deleteMessageHandler)
 
 				// ===== 代理连通性检测 =====
 				adm.POST("/proxy/check", csrfCheck(s.auth), s.checkProxyHandler)
@@ -452,6 +481,25 @@ func (s *Server) register() {
 				// ===== 系统 =====
 				adm.POST("/reload", csrfCheck(s.auth), s.reloadConfigHandler)
 				adm.GET("/system/stats", s.systemStatsHandler)
+			}
+		}
+
+		// ===== 外部 v2 独立路由组：仅允许 Bearer Token / API Key 认证，彻底拒绝 Cookie 会话，杜绝 CSRF (Issue 19 方案 A) =====
+		v2 := api.Group("/external/v2")
+		v2.Use(requireExternalV2Auth(s.cfg.APIKey, s.store))
+		{
+			v2Alloc := v2.Group("")
+			v2Alloc.Use(requireScope(store.ScopeAllocate))
+			{
+				v2Alloc.POST("/allocate", s.externalV2AllocateHandler)
+				v2Alloc.GET("/operations/:operation_id", s.externalV2GetOperationHandler)
+			}
+
+			v2Verify := v2.Group("")
+			v2Verify.Use(requireScope(store.ScopeVerify))
+			{
+				v2Verify.POST("/verification-requests", s.externalV2CreateVerificationRequestHandler)
+				v2Verify.GET("/verification-requests/:request_id", s.externalV2GetVerificationRequestHandler)
 			}
 		}
 	}

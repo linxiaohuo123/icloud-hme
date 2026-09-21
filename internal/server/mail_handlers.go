@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 gin, net/http, strings, strconv, time, fmt, errors, icloud-hme/internal/mail
+ * [INPUT]: 依赖 gin, net/http, strings, strconv, errors, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 listInboxHandler, listMailboxesHandler, getMessageHandler, getMessagePrimeHandler, getMessagesHandler, deleteMessageHandler, checkProxyHandler 等 HTTP 端点
- * [POS]: internal/server 的邮件收件箱、消息详情缓存与代理连通性检测路由处理器；WebMail ThreadID 删除返回 400 WEBMAIL_DELETE_UNSUPPORTED，批量拉取兼容 id 作为 uid 别名
+ * [POS]: internal/server 的邮件收件箱与消息详情路由处理器，统一由 MailReadService 驱动并消除冗余私有缓存
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -9,12 +9,10 @@ package server
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"icloud-hme/internal/mail"
@@ -43,16 +41,27 @@ func (s *Server) listInboxHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: days 需为 1-90 的整数")
 		return
 	}
+	folderSpecified := c.Query("folder") != "" && c.Query("folder") != "all" && !strings.EqualFold(c.Query("folder"), "INBOX")
+	daysSpecified := c.Query("days") != ""
 	withBody := c.Query("body") == "1" || strings.EqualFold(c.Query("body"), "true")
 
-	result, err := s.be.ListInbox(InboxQuery{
-		AccountID: accountID,
-		Alias:     alias,
-		Folder:    folder,
-		Limit:     limit,
-		Days:      days,
-		WithBody:  withBody,
-	})
+	query := InboxQuery{
+		AccountID:       accountID,
+		Alias:           alias,
+		Folder:          folder,
+		Limit:           limit,
+		Days:            days,
+		WithBody:        withBody,
+		FolderSpecified: folderSpecified,
+		DaysSpecified:   daysSpecified,
+	}
+
+	var result InboxResult
+	if s.mailReadService != nil {
+		result, err = s.mailReadService.ListInbox(c.Request.Context(), query)
+	} else {
+		result, err = s.be.ListInboxContext(c.Request.Context(), query)
+	}
 	if err != nil {
 		backendFail(c, err)
 		return
@@ -77,90 +86,40 @@ func (s *Server) listMailboxesHandler(c *gin.Context) {
 	})
 }
 
-func (s *Server) getMessageHandler(c *gin.Context) {
+func (s *Server) handleGetMessageDetail(c *gin.Context, rawID string) {
 	accountID := strings.TrimSpace(c.Query("account_id"))
-	rawID := strings.TrimSpace(c.Param("message_id"))
+	rawID = strings.TrimSpace(rawID)
 	if accountID == "" || rawID == "" {
-		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "account_id 或邮件 ID 无效")
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数缺失: account_id 或邮件 ID 无效")
 		return
 	}
 
-	cacheKey := fmt.Sprintf("%s:%s", accountID, rawID)
-	s.msgCacheMu.RLock()
-	entry, hit := s.msgCache[cacheKey]
-	s.msgCacheMu.RUnlock()
-	if hit && time.Now().Before(entry.expiresAt) {
-		// 【BUG-08 修复】响应包装对齐 getMessagePrimeHandler，包含 account_id/method/cached
-		ok(c, gin.H{
-			"account_id": accountID,
-			"message":    entry.msg,
-			"method":     "cache",
-			"cached":     true,
-		})
-		return
-	}
-
-	message, err := s.be.GetMessage(accountID, rawID)
+	msg, provider, method, cached, err := s.mailReadService.GetMessageDetail(c.Request.Context(), accountID, rawID)
 	if err != nil {
 		backendFail(c, err)
 		return
 	}
 
-	s.putMessageCache([]string{cacheKey}, message)
-
 	ok(c, gin.H{
 		"account_id": accountID,
-		"message":    message,
-		"method":     "imap",
-		"cached":     false,
+		"message":    msg,
+		"provider":   provider,
+		"method":     method,
+		"cached":     cached,
 	})
+}
+
+func (s *Server) getMessageHandler(c *gin.Context) {
+	s.handleGetMessageDetail(c, c.Param("message_id"))
 }
 
 func (s *Server) getMessagePrimeHandler(c *gin.Context) {
-	accountID := strings.TrimSpace(c.Query("account_id"))
-	rawID := strings.TrimSpace(c.Param("id"))
-	if accountID == "" || rawID == "" {
-		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数缺失: account_id 或邮件 ID")
-		return
-	}
-
-	cacheKey := fmt.Sprintf("%s:%s", accountID, rawID)
-	s.msgCacheMu.RLock()
-	entry, hit := s.msgCache[cacheKey]
-	s.msgCacheMu.RUnlock()
-	if hit && time.Now().Before(entry.expiresAt) {
-		ok(c, gin.H{
-			"account_id": accountID,
-			"message":    entry.msg,
-			"method":     "cache",
-			"cached":     true,
-		})
-		return
-	}
-
-	message, err := s.be.GetMessage(accountID, rawID)
-	if err != nil {
-		backendFail(c, err)
-		return
-	}
-
-	s.putMessageCache([]string{cacheKey}, message)
-
-	ok(c, gin.H{
-		"account_id": accountID,
-		"message":    message,
-		"method":     "imap",
-		"cached":     false,
-	})
+	s.handleGetMessageDetail(c, c.Param("id"))
 }
 
 type getMessagesReq struct {
-	AccountID string `json:"account_id"`
-	Messages  []struct {
-		Folder string `json:"folder"`
-		UID    string `json:"uid"`
-		ID     string `json:"id"`
-	} `json:"messages"`
+	AccountID string                `json:"account_id"`
+	Messages  []batchMessageItemReq `json:"messages"`
 }
 
 func (s *Server) getMessagesHandler(c *gin.Context) {
@@ -178,6 +137,7 @@ func (s *Server) getMessagesHandler(c *gin.Context) {
 		ok(c, gin.H{
 			"account_id": req.AccountID,
 			"messages":   []*mail.FullMessage{},
+			"items":      []BatchItemResult{},
 			"count":      0,
 		})
 		return
@@ -187,124 +147,24 @@ func (s *Server) getMessagesHandler(c *gin.Context) {
 		return
 	}
 
-	var uncachedRefs []MessageRef
-	var out []*mail.FullMessage
-	now := time.Now()
-
-	s.msgCacheMu.RLock()
-	for _, m := range req.Messages {
-		rawUID := strings.TrimSpace(m.UID)
-		if rawUID == "" {
-			rawUID = strings.TrimSpace(m.ID)
-		}
-		uid, err := strconv.ParseUint(rawUID, 10, 32)
-		if err != nil {
-			continue
-		}
-		folder := strings.TrimSpace(m.Folder)
-		if folder == "" {
-			folder = "INBOX"
-		}
-		key := fmt.Sprintf("%s:%s:%s", req.AccountID, folder, rawUID)
-		if entry, hit := s.msgCache[key]; hit && now.Before(entry.expiresAt) {
-			out = append(out, entry.msg)
-		} else {
-			uncachedRefs = append(uncachedRefs, MessageRef{Folder: folder, UID: uint32(uid)})
-		}
-	}
-	s.msgCacheMu.RUnlock()
-
-	if len(uncachedRefs) > 0 {
-		fetched, err := s.be.GetMessages(req.AccountID, uncachedRefs)
-		if err != nil {
-			backendFail(c, err)
-			return
-		}
-		for _, msg := range fetched {
-			folder := msg.Folder
-			if folder == "" {
-				folder = "INBOX"
-			}
-			s.putMessageCache([]string{
-				fmt.Sprintf("%s:%s:%s", req.AccountID, folder, msg.ID),
-				fmt.Sprintf("%s:%s", req.AccountID, msg.ID),
-			}, msg)
-			out = append(out, msg)
-		}
+	out, items, err := s.mailReadService.GetMessagesBatch(c.Request.Context(), req.AccountID, req.Messages)
+	if err != nil {
+		backendFail(c, err)
+		return
 	}
 
 	ok(c, gin.H{
 		"account_id": req.AccountID,
 		"messages":   out,
+		"items":      items,
 		"count":      len(out),
 	})
 }
 
-const maxMessageCacheEntries = 1000
-
-func (s *Server) putMessageCache(keys []string, msg *mail.FullMessage) {
-	s.msgCacheMu.Lock()
-	defer s.msgCacheMu.Unlock()
-	if s.msgCache == nil {
-		s.msgCache = make(map[string]messageCacheEntry)
-	}
-	now := time.Now()
-	if len(s.msgCache) >= maxMessageCacheEntries {
-		for k, e := range s.msgCache {
-			if now.After(e.expiresAt) {
-				delete(s.msgCache, k)
-			}
-		}
-		if len(s.msgCache) >= maxMessageCacheEntries {
-			s.msgCache = make(map[string]messageCacheEntry)
-		}
-	}
-	entry := messageCacheEntry{
-		msg:       msg,
-		expiresAt: now.Add(10 * time.Minute),
-	}
-	for _, k := range keys {
-		s.msgCache[k] = entry
-	}
-}
-
 func (s *Server) deleteMessageHandler(c *gin.Context) {
-	accountID := strings.TrimSpace(c.Query("account_id"))
-	rawID := strings.TrimSpace(c.Param("message_id"))
-	if accountID == "" || rawID == "" {
-		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "account_id 或邮件 ID 无效")
-		return
-	}
-
-	_, idPart, uid, hasUID := parseMessageID(rawID)
-	if !hasUID {
-		failCode(c, http.StatusBadRequest, "WEBMAIL_DELETE_UNSUPPORTED", "当前邮件通道不支持物理删除，请为账号配置 App 专用密码或 IMAP 收件箱后再试")
-		return
-	}
-	if err := s.be.DeleteMessage(accountID, uid); err != nil {
-		backendFail(c, err)
-		return
-	}
-
-	s.clearMessageCache(accountID, rawID, idPart)
-	ok(c, gin.H{"id": rawID})
-}
-
-func (s *Server) clearMessageCache(accountID, rawID, idPart string) {
-	cacheKey := fmt.Sprintf("%s:%s", accountID, rawID)
-	s.msgCacheMu.Lock()
-	defer s.msgCacheMu.Unlock()
-	if s.msgCache == nil {
-		return
-	}
-	delete(s.msgCache, cacheKey)
-	prefix := accountID + ":"
-	suffix := ":" + idPart
-	for k := range s.msgCache {
-		if strings.HasPrefix(k, prefix) && strings.HasSuffix(k, suffix) {
-			delete(s.msgCache, k)
-		}
-	}
+	// 【PR-01 安全止损】在邮件身份模型与目标 UID 精确物理删除能力未完善前，
+	// 服务端物理阻断删信入口，杜绝普通 EXPUNGE 连带误删或并发冲突。
+	failCode(c, http.StatusBadRequest, "MAIL_DELETE_UNSUPPORTED", "物理邮件删除功能因安全性考量暂不可用，已安全阻断")
 }
 
 func parseInboxInt(raw string, min, max int) (int, error) {

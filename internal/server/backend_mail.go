@@ -8,6 +8,9 @@
 package server
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,12 +20,15 @@ import (
 
 // InboxQuery 是收件箱查询参数。
 type InboxQuery struct {
-	AccountID string
-	Alias     string
-	Folder    string
-	Limit     int
-	Days      int
-	WithBody  bool
+	AccountID       string
+	Alias           string
+	Folder          string
+	Limit           int
+	Days            int
+	WithBody        bool
+	FolderSpecified bool
+	DaysSpecified   bool
+	SinceUID        uint32
 }
 
 // InboxResult 是收件箱查询结果。
@@ -35,11 +41,8 @@ type InboxResult struct {
 	Method    string         `json:"method"`
 }
 
-// MessageRef 邮件引用标识 (文件夹 + UID)
-type MessageRef struct {
-	Folder string `json:"folder"`
-	UID    uint32 `json:"uid"`
-}
+// MessageRef 别名映射至 mail.MessageRef，确保统一规范身份
+type MessageRef = mail.MessageRef
 
 // webMailLookupLimit 与 listInboxHandler 的 limit 上限对齐，避免详情回退只扫前 50 封漏信。
 const webMailLookupLimit = 100
@@ -76,23 +79,37 @@ func webMailIDMatch(messageID, rawID, idPart string) bool {
 	return idPart != "" && idPart != rawID && messageID == idPart
 }
 
-// ListInbox 读取收件箱摘要:IMAP (App Password) 优先,Web API (Cookie) 回退。
-func (b *managerBackend) ListInbox(q InboxQuery) (InboxResult, error) {
+// ListInboxContext 读取收件箱摘要 (支持 context 上下文超时与真实底层连接中断，支持 SinceUID 增量游标，Issue 13 & 14)。
+func (b *managerBackend) ListInboxContext(ctx context.Context, q InboxQuery) (InboxResult, error) {
+	if err := ctx.Err(); err != nil {
+		return InboxResult{}, err
+	}
 	if q.Folder == "" {
 		q.Folder = "all"
 	}
-	// 优先使用 IMAP 连接池 (App Password 认证,复用长连接)
+	// 优先使用 IMAP 连接池 (App Password 认证, 复用长连接, 严格绑定与传递 ctx)
 	var imapMessages []mail.Message
-	poolErr := b.mgr.WithMailClient(q.AccountID, func(mc *mail.Client) error {
+	poolErr := b.mgr.WithMailClientContext(ctx, q.AccountID, func(mc *mail.Client) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		var e error
 		if q.Alias != "" {
-			imapMessages, e = mc.FindByRecipientInFolder(q.Alias, q.Folder, q.Limit, q.Days)
+			if q.SinceUID > 0 {
+				imapMessages, e = mc.FindByRecipientInFolderSince(q.Alias, q.Folder, q.Limit, q.Days, q.SinceUID)
+			} else {
+				imapMessages, e = mc.FindByRecipientInFolder(q.Alias, q.Folder, q.Limit, q.Days)
+			}
 		} else {
 			// 优先在 IMAP 中按 @icloud.com 搜索，直接提取真实的 iCloud 别名邮件，
 			// 避免被个人主邮箱的原生无关杂信（如淘宝、账单）挤占导致别名邮件遗漏
-			imapMessages, e = mc.FindByRecipientInFolder("@icloud.com", q.Folder, q.Limit, q.Days)
-			if e != nil || len(imapMessages) == 0 {
-				imapMessages, e = mc.ListFolder(q.Folder, q.Limit*2, q.Days)
+			if q.SinceUID > 0 {
+				imapMessages, e = mc.FindByRecipientInFolderSince("@icloud.com", q.Folder, q.Limit, q.Days, q.SinceUID)
+			} else {
+				imapMessages, e = mc.FindByRecipientInFolder("@icloud.com", q.Folder, q.Limit, q.Days)
+				if e != nil || len(imapMessages) == 0 {
+					imapMessages, e = mc.ListFolder(q.Folder, q.Limit*2, q.Days)
+				}
 			}
 		}
 		return e
@@ -100,6 +117,17 @@ func (b *managerBackend) ListInbox(q InboxQuery) (InboxResult, error) {
 	if poolErr == nil {
 		if imapMessages == nil {
 			imapMessages = []mail.Message{}
+		}
+		for i := range imapMessages {
+			imapMessages[i].Provider = "imap"
+			ref := mail.MessageRef{
+				Provider:    "imap",
+				AccountID:   q.AccountID,
+				Mailbox:     imapMessages[i].Folder,
+				UIDValidity: imapMessages[i].UIDValidity,
+				UID:         imapMessages[i].UID,
+			}
+			imapMessages[i].MessageRef = ref.Encode()
 		}
 		return InboxResult{
 			AccountID: q.AccountID,
@@ -110,7 +138,19 @@ func (b *managerBackend) ListInbox(q InboxQuery) (InboxResult, error) {
 			Method:    "imap",
 		}, nil
 	}
+
+	if ctx.Err() != nil {
+		return InboxResult{}, ctx.Err()
+	}
+
 	// IMAP 失败,继续尝试 Web API
+	if q.FolderSpecified || q.DaysSpecified {
+		return InboxResult{}, &BackendError{
+			Status:  http.StatusBadRequest,
+			Code:    "CAPABILITY_UNSUPPORTED",
+			Message: "WebMail 模式不支持指定文件夹或按天数筛选",
+		}
+	}
 
 	// 回退到 Web API (Cookie 认证,无需 App Password)
 	wmc, err := b.mgr.WebMailClient(q.AccountID)
@@ -118,24 +158,37 @@ func (b *managerBackend) ListInbox(q InboxQuery) (InboxResult, error) {
 		return InboxResult{}, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "无可用邮件客户端: 需要 App Password 或 Cookie"}
 	}
 
+	var messages []mail.Message
 	if q.Alias != "" {
-		messages, err := wmc.FindByAlias(q.Alias, q.Limit)
+		messages, err = wmc.FindByAliasContext(ctx, q.Alias, q.Limit)
 		if err != nil {
 			return InboxResult{}, classifyInboxErr(err)
 		}
-		if messages == nil {
-			messages = []mail.Message{}
+	} else {
+		messages, err = wmc.ListInboxContext(ctx, q.Limit)
+		if err != nil {
+			return InboxResult{}, classifyInboxErr(err)
 		}
-		return InboxResult{AccountID: q.AccountID, Alias: q.Alias, Folder: q.Folder, Count: len(messages), Messages: messages, Method: "web_api"}, nil
-	}
-	messages, err := wmc.ListInbox(q.Limit)
-	if err != nil {
-		return InboxResult{}, classifyInboxErr(err)
 	}
 	if messages == nil {
 		messages = []mail.Message{}
 	}
-	return InboxResult{AccountID: q.AccountID, Folder: q.Folder, Count: len(messages), Messages: messages, Method: "web_api"}, nil
+	for i := range messages {
+		messages[i].Provider = "webmail"
+		messages[i].ThreadID = messages[i].ID
+		ref := mail.MessageRef{
+			Provider:  "webmail",
+			AccountID: q.AccountID,
+			ThreadID:  messages[i].ID,
+		}
+		messages[i].MessageRef = ref.Encode()
+	}
+	return InboxResult{AccountID: q.AccountID, Alias: q.Alias, Folder: q.Folder, Count: len(messages), Messages: messages, Method: "web_api"}, nil
+}
+
+// ListInbox 读取收件箱摘要 (代理至 ListInboxContext)。
+func (b *managerBackend) ListInbox(q InboxQuery) (InboxResult, error) {
+	return b.ListInboxContext(context.Background(), q)
 }
 
 func (b *managerBackend) ListMailboxes(accountID string) ([]mail.Folder, error) {
@@ -155,134 +208,191 @@ func (b *managerBackend) ListMailboxes(accountID string) ([]mail.Folder, error) 
 }
 
 func (b *managerBackend) GetMessage(accountID string, rawID string) (*mail.FullMessage, error) {
-	folder, idPart, uid, hasUID := parseMessageID(rawID)
-
-	var (
-		message *mail.FullMessage
-		imapErr error
-	)
-	if hasUID {
-		lookupFolder := folder
-		if lookupFolder == "" {
-			lookupFolder = "all"
-		}
-		imapErr = b.mgr.WithMailClient(accountID, func(mc *mail.Client) error {
-			var e error
-			message, e = mc.GetFullInFolder(lookupFolder, uid)
-			return e
-		})
-		if imapErr == nil {
-			return message, nil
-		}
+	ref, err := mail.ParseMessageRef(rawID, accountID)
+	if err != nil {
+		return nil, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "邮件引用格式无效"}
+	}
+	if ref.AccountID != "" && ref.AccountID != accountID {
+		return nil, &BackendError{Status: http.StatusForbidden, Code: "FORBIDDEN", Message: "跨账号邮件读取被拒绝"}
 	}
 
-	// IMAP 失败或未配置 App 密码、或非数字 ThreadID 时，降级走 WebMailClient 读取
-	wmc, werr := b.mgr.WebMailClient(accountID)
-	if werr == nil {
+	// 1. 如果是 WebMail 邮件引用或非数字 ThreadID
+	if ref.Provider == "webmail" {
+		wmc, werr := b.mgr.WebMailClient(accountID)
+		if werr != nil {
+			return nil, classifyInboxErr(werr)
+		}
 		msgs, errList := wmc.ListInbox(webMailLookupLimit)
 		if errList != nil {
-			if !hasUID {
-				return nil, classifyInboxErr(errList)
-			}
-			if classified := classifyInboxErr(errList); classified.Code == "UPSTREAM_UNAUTHORIZED" || classified.Code == "NON_ICLOUD_MAIL_USER" {
-				return nil, classified
-			}
-		} else {
-			for _, m := range msgs {
-				if webMailIDMatch(m.ID, rawID, idPart) {
-					return &mail.FullMessage{
-						Message: mail.Message{
-							ID:      m.ID,
-							Subject: m.Subject,
-							From:    m.From,
-							To:      m.To,
-							Date:    m.Date,
-							Preview: m.Preview,
-						},
-						Body:        m.Preview,
-						ContentType: "text/plain",
-					}, nil
+			return nil, classifyInboxErr(errList)
+		}
+		for _, m := range msgs {
+			if m.ID == ref.ThreadID || (ref.ThreadID != "" && m.ThreadID == ref.ThreadID) {
+				fullRef := mail.MessageRef{
+					Provider:  "webmail",
+					AccountID: accountID,
+					ThreadID:  m.ID,
 				}
+				return &mail.FullMessage{
+					Message: mail.Message{
+						ID:         m.ID,
+						MessageRef: fullRef.Encode(),
+						Folder:     "INBOX",
+						Subject:    m.Subject,
+						From:       m.From,
+						To:         m.To,
+						Date:       m.Date,
+						Preview:    m.Preview,
+						Provider:   "webmail",
+						ThreadID:   m.ID,
+					},
+					Body:         m.Preview,
+					ContentType:  "text/plain",
+					BodyComplete: false, // 显式标识正文不完整（仅预览）
+					Provider:     "webmail",
+					Method:       "web_api",
+				}, nil
 			}
 		}
+		return nil, &BackendError{Status: http.StatusNotFound, Code: "MESSAGE_NOT_FOUND", Message: "邮件不存在"}
+	}
+
+	// 2. 如果是 IMAP 邮件引用
+	lookupFolder := ref.Mailbox
+	if lookupFolder == "" || strings.EqualFold(lookupFolder, "all") {
+		lookupFolder = "INBOX"
+	}
+	var message *mail.FullMessage
+	imapErr := b.mgr.WithMailClient(accountID, func(mc *mail.Client) error {
+		var e error
+		if ref.UIDValidity > 0 {
+			message, e = mc.GetFullInFolderWithValidity(lookupFolder, ref.UIDValidity, ref.UID)
+		} else {
+			message, e = mc.GetFullInFolder(lookupFolder, ref.UID)
+		}
+		return e
+	})
+	if imapErr == nil && message != nil {
+		message.AccountID = accountID
+		message.Provider = "imap"
+		message.Method = "imap"
+		message.BodyComplete = true
+		fullRef := mail.MessageRef{
+			Provider:    "imap",
+			AccountID:   accountID,
+			Mailbox:     message.Folder,
+			UIDValidity: message.UIDValidity,
+			UID:         message.UID,
+		}
+		message.MessageRef = fullRef.Encode()
+		return message, nil
+	}
+
+	if errors.Is(imapErr, mail.ErrUIDValidityMismatch) {
+		return nil, &BackendError{Status: http.StatusNotFound, Code: "UIDVALIDITY_MISMATCH", Message: "邮箱 UIDVALIDITY 已变更，原邮件引用失效"}
 	}
 
 	if imapErr != nil {
 		msg := imapErr.Error()
-		if strings.Contains(msg, "账号不存在") {
-			return nil, mapAccountErr(imapErr)
+		if strings.Contains(msg, "不存在") {
+			return nil, &BackendError{Status: http.StatusNotFound, Code: "MESSAGE_NOT_FOUND", Message: "邮件不存在"}
 		}
-		// 未设置 App 密码: 仅在 WebMail 也不可用时上抛，避免 WebMail 号被误导去配 IMAP
-		if werr != nil && strings.Contains(msg, "未设置") {
+		if strings.Contains(msg, "账号不存在") || strings.Contains(msg, "未设置") {
 			return nil, mapAccountErr(imapErr)
 		}
 	}
 	return nil, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "读取邮件详情失败"}
 }
 
-func (b *managerBackend) GetMessages(accountID string, refs []MessageRef) ([]*mail.FullMessage, error) {
+func (b *managerBackend) GetMessages(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error) {
 	if len(refs) == 0 {
 		return []*mail.FullMessage{}, nil
 	}
 
-	byFolder := make(map[string][]uint32)
+	type folderGroup struct {
+		folder      string
+		uidValidity uint32
+		uids        []uint32
+	}
+	groups := make(map[string]*folderGroup)
+	var webMailRefs []mail.MessageRef
+
 	for _, r := range refs {
-		f := strings.TrimSpace(r.Folder)
+		if strings.EqualFold(r.Provider, "webmail") || r.ThreadID != "" {
+			webMailRefs = append(webMailRefs, r)
+			continue
+		}
+		f := strings.TrimSpace(r.Mailbox)
 		if f == "" || strings.EqualFold(f, "all") {
 			f = "INBOX"
 		}
-		byFolder[f] = append(byFolder[f], r.UID)
+		if r.UID > 0 {
+			key := fmt.Sprintf("%s:%d", f, r.UIDValidity)
+			g, ok := groups[key]
+			if !ok {
+				g = &folderGroup{
+					folder:      f,
+					uidValidity: r.UIDValidity,
+				}
+				groups[key] = g
+			}
+			g.uids = append(g.uids, r.UID)
+		}
 	}
 
 	var allMessages []*mail.FullMessage
-	err := b.mgr.WithMailClient(accountID, func(mc *mail.Client) error {
-		for f, uids := range byFolder {
-			msgs, e := mc.GetFullBatchInFolder(f, uids)
-			if e != nil {
-				return e
+	if len(groups) > 0 {
+		err := b.mgr.WithMailClient(accountID, func(mc *mail.Client) error {
+			for _, g := range groups {
+				var msgs []*mail.FullMessage
+				var e error
+				if g.uidValidity > 0 {
+					msgs, e = mc.GetFullBatchInFolderWithValidity(g.folder, g.uidValidity, g.uids)
+				} else {
+					msgs, e = mc.GetFullBatchInFolder(g.folder, g.uids)
+				}
+				if e != nil {
+					if errors.Is(e, mail.ErrUIDValidityMismatch) {
+						// UIDVALIDITY 不一致表示代际变更，不能读取新代际邮件充当旧邮件，跳过该组
+						continue
+					}
+					return e
+				}
+				for _, m := range msgs {
+					m.AccountID = accountID
+					m.Provider = "imap"
+					m.Method = "imap"
+					m.BodyComplete = true
+					fullRef := mail.MessageRef{
+						Provider:    "imap",
+						AccountID:   accountID,
+						Mailbox:     m.Folder,
+						UIDValidity: m.UIDValidity,
+						UID:         m.UID,
+					}
+					m.MessageRef = fullRef.Encode()
+					allMessages = append(allMessages, m)
+				}
 			}
-			allMessages = append(allMessages, msgs...)
+			return nil
+		})
+		if err != nil {
+			if strings.Contains(err.Error(), "不存在") || strings.Contains(err.Error(), "未设置") {
+				return nil, mapAccountErr(err)
+			}
+			return nil, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "批量读取邮件详情失败"}
 		}
-		return nil
-	})
-	if err == nil {
-		return allMessages, nil
 	}
 
-	// IMAP 批量拉取失败或无 App 密码时，降级走 WebMailClient。
-	//
-	// 【BUG-01 修复】IMAP UID 与 WebMail ThreadID 属于完全不同的 ID 空间，
-	// 无法跨协议精确匹配。降级策略改为: 返回 WebMail 最近 N 封邮件(N = 请求数量),
-	// 作为 best-effort 兜底——IMAP 已挂,此时「有数据」优于「空数组」。
-	if wmc, werr := b.mgr.WebMailClient(accountID); werr == nil {
-		limit := len(refs)
-		if limit > webMailLookupLimit {
-			limit = webMailLookupLimit
-		}
-		if msgs, errList := wmc.ListInbox(limit); errList == nil && len(msgs) > 0 {
-			fallbackList := make([]*mail.FullMessage, 0, len(msgs))
-			for _, m := range msgs {
-				fallbackList = append(fallbackList, &mail.FullMessage{
-					Message: mail.Message{
-						ID:      m.ID,
-						Subject: m.Subject,
-						From:    m.From,
-						To:      m.To,
-						Date:    m.Date,
-						Preview: m.Preview,
-					},
-					Body:        m.Preview,
-					ContentType: "text/plain",
-				})
+	for _, wr := range webMailRefs {
+		if wr.ThreadID != "" {
+			if m, err := b.GetMessage(accountID, wr.ThreadID); err == nil && m != nil {
+				allMessages = append(allMessages, m)
 			}
-			return fallbackList, nil
 		}
 	}
 
-	if strings.Contains(err.Error(), "不存在") || strings.Contains(err.Error(), "未设置") {
-		return nil, mapAccountErr(err)
-	}
-	return nil, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "批量读取邮件详情失败"}
+	return allMessages, nil
 }
 
 func (b *managerBackend) DeleteMessage(accountID string, uid uint32) error {
@@ -296,6 +406,38 @@ func (b *managerBackend) DeleteMessage(accountID string, uid uint32) error {
 		return &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "删除邮件失败"}
 	}
 	return nil
+}
+
+func (b *managerBackend) GetMailboxBoundary(accountID, folder string) (string, uint32, uint32, error) {
+	var uidValidity, uidNext uint32
+	var imapErr error
+	poolErr := b.mgr.WithMailClient(accountID, func(mc *mail.Client) error {
+		v, n, err := mc.GetMailboxBoundary(folder)
+		if err != nil {
+			imapErr = err
+			return err
+		}
+		uidValidity = v
+		uidNext = n
+		return nil
+	})
+	if poolErr == nil && imapErr == nil {
+		return "imap", uidValidity, uidNext, nil
+	}
+
+	acc, ok := b.mgr.GetAccount(accountID)
+	if ok && (len(acc.Cookies) > 0 || acc.AppPassword != "") {
+		return "webmail", 0, 0, &BackendError{
+			Status:  http.StatusBadRequest,
+			Code:    "CAPABILITY_UNSUPPORTED",
+			Message: "WebMail 不支持严格时效验证码基线 (无单邮件稳定游标)",
+		}
+	}
+	return "", 0, 0, &BackendError{
+		Status:  http.StatusServiceUnavailable,
+		Code:    "BASELINE_UNAVAILABLE",
+		Message: "无法获取邮件基线边界: 邮箱客户端未就绪",
+	}
 }
 
 // classifyInboxErr 映射收件箱读取错误, 特殊处理未开通 iCloud 邮件的账号。

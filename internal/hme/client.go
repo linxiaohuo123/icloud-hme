@@ -13,10 +13,12 @@ package hme
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -266,6 +268,11 @@ func requestOrigin(rawURL string) string {
 
 // request 执行带重试的 HTTP 请求,返回响应体字符串。
 func (c *Client) request(method, rawURL string, body any, timeout time.Duration, maxAttempts int) (string, error) {
+	return c.RequestWithContext(context.Background(), method, rawURL, body, timeout, maxAttempts)
+}
+
+// RequestWithContext 执行带 context 贯穿与重试预算的 HTTP 请求 (PR-05)。
+func (c *Client) RequestWithContext(ctx context.Context, method, rawURL string, body any, timeout time.Duration, maxAttempts int) (string, error) {
 	if timeout == 0 {
 		timeout = RequestTimeout
 	}
@@ -287,17 +294,27 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+
 		var reqBody io.Reader
 		if body != nil {
 			buf, err := json.Marshal(body)
 			if err != nil {
+				cancel()
 				return "", err
 			}
 			reqBody = bytes.NewReader(buf)
 		}
 
-		req, err := http.NewRequest(method, fullURL, reqBody)
+		req, err := http.NewRequestWithContext(attemptCtx, method, fullURL, reqBody)
 		if err != nil {
+			cancel()
 			return "", err
 		}
 		origin := requestOrigin(rawURL)
@@ -316,7 +333,6 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
 
 		// 手动添加 Cookie 头（确保跨域也能传递）
-		// 浏览器发送的 Cookie 值带双引号,iCloud 严格匹配
 		var cookieHeader string
 		c.cookieMu.RLock()
 		if len(c.Cookies) > 0 {
@@ -336,7 +352,6 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 			req.Header.Set("Cookie", cookieHeader)
 			if c.Verbose {
 				c.log(">>> URL: %s", fullURL)
-				// 凭据类头部一律打码:verbose 日志会进 journal/docker logs，绝不能落明文会话令牌
 				c.log(">>> Cookie: %s", redactSecret(cookieHeader))
 				for k, vv := range req.Header {
 					for _, v := range vv {
@@ -352,27 +367,32 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 
 		resp, err := c.httpc.Do(req)
 		if err != nil {
+			cancel()
 			lastErr = fmt.Errorf("连接失败: %w", err)
 			if attempt < maxAttempts {
-				c.sleepRetry(attempt)
+				if sleepErr := c.sleepRetry(ctx, attempt); sleepErr != nil {
+					return "", sleepErr
+				}
 				continue
 			}
 			return "", lastErr
 		}
 
-		// 读取上限防御: 异常响应不至于把内存吃满
+		// 读取上限防御
 		text, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 		_ = resp.Body.Close()
+		cancel()
 		if err != nil {
 			lastErr = fmt.Errorf("读取响应失败: %w", err)
 			if attempt < maxAttempts {
-				c.sleepRetry(attempt)
+				if sleepErr := c.sleepRetry(ctx, attempt); sleepErr != nil {
+					return "", sleepErr
+				}
 				continue
 			}
 			return "", lastErr
 		}
 
-		// 从 Set-Cookie 响应头更新 Cookie（模拟浏览器行为,iCloud 会刷新或吊销 token）
 		respCookies := resp.Cookies()
 		if len(respCookies) > 0 {
 			now := time.Now()
@@ -395,13 +415,28 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 			if len(snippet) > 200 {
 				snippet = snippet[:200]
 			}
-			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, snippet)
 			// 401/403 说明 Cookie 失效,不重试直接返回。
 			if resp.StatusCode == 401 || resp.StatusCode == 403 {
+				return "", fmt.Errorf("%w: HTTP %d: %s", ErrAuthFailed, resp.StatusCode, snippet)
+			}
+			if resp.StatusCode == 429 {
+				lastErr = fmt.Errorf("%w: HTTP 429: %s", ErrRateLimited, snippet)
+				idx := min(attempt-1, len(retryDelays)-1)
+				retryDelay := parseRetryAfter(resp.Header.Get("Retry-After"), retryDelays[idx])
+				if attempt < maxAttempts {
+					if sleepErr := c.sleepDuration(ctx, retryDelay); sleepErr != nil {
+						return "", sleepErr
+					}
+					continue
+				}
 				return "", lastErr
+			} else {
+				lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, snippet)
 			}
 			if attempt < maxAttempts {
-				c.sleepRetry(attempt)
+				if sleepErr := c.sleepRetry(ctx, attempt); sleepErr != nil {
+					return "", sleepErr
+				}
 				continue
 			}
 			return "", lastErr
@@ -415,12 +450,43 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 	return "", fmt.Errorf("未知错误")
 }
 
-func (c *Client) sleepRetry(attempt int) {
+func parseRetryAfter(val string, fallback time.Duration) time.Duration {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return fallback
+	}
+	if sec, err := strconv.Atoi(val); err == nil && sec > 0 {
+		return time.Duration(sec) * time.Second
+	}
+	if t, err := http.ParseTime(val); err == nil {
+		d := time.Until(t)
+		if d > 0 {
+			return d
+		}
+	}
+	return fallback
+}
+
+func (c *Client) sleepDuration(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
+}
+
+func (c *Client) sleepRetry(ctx context.Context, attempt int) error {
 	idx := attempt - 1
 	if idx >= len(retryDelays) {
 		idx = len(retryDelays) - 1
 	}
-	time.Sleep(retryDelays[idx])
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(retryDelays[idx]):
+		return nil
+	}
 }
 
 // validationURLs 返回会话校验端点。
@@ -476,7 +542,10 @@ func (c *Client) ResetServiceEndpoint() {
 //
 // 并发批处理(如 BatchUpdateAliases)前必须串行调用一次，使后续并发方法只读取
 // 已就绪的端点，而不是同时触发多次 ValidateSession。
-func (c *Client) EnsureService() error { return c.resolveService() }
+func (c *Client) EnsureService() error { return c.resolveService(context.Background()) }
+
+// EnsureServiceWithContext 支持 Context 贯穿的端点就绪确认。
+func (c *Client) EnsureServiceWithContext(ctx context.Context) error { return c.resolveService(ctx) }
 
 // Close 释放底层客户端的空闲连接。
 //
@@ -504,13 +573,18 @@ func (c *Client) CookieSnapshot() map[string]string {
 // 失败通常意味着 Cookie 过期或未订阅 iCloud+。
 // 线程安全:内部串行化，同一 Client 的并发校验只会真正执行一次。
 func (c *Client) ValidateSession() error {
+	return c.ValidateSessionWithContext(context.Background())
+}
+
+// ValidateSessionWithContext 支持 Context 贯穿的会话校验。
+func (c *Client) ValidateSessionWithContext(ctx context.Context) error {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
-	return c.validateSessionLocked()
+	return c.validateSessionLocked(ctx)
 }
 
 // validateSessionLocked 是 ValidateSession 的无锁内核，调用方必须持有 stateMu。
-func (c *Client) validateSessionLocked() error {
+func (c *Client) validateSessionLocked(ctx context.Context) error {
 	c.log("校验 iCloud 会话...")
 	c.cookieMu.RLock()
 	cookieLen := len(c.Cookies)
@@ -527,7 +601,7 @@ func (c *Client) validateSessionLocked() error {
 	validationURLs := c.validationURLs()
 	for i, validationURL := range validationURLs {
 		var candidate string
-		candidate, err = c.request("POST", validationURL, nil, 15*time.Second, 1)
+		candidate, err = c.RequestWithContext(ctx, "POST", validationURL, nil, 15*time.Second, 1)
 		if err == nil && !gjson.Valid(candidate) {
 			err = fmt.Errorf("invalid JSON response")
 		}
@@ -606,13 +680,13 @@ func (c *Client) AccountInfo() *AccountInfo {
 //
 // 双重检查 + stateMu 串行化:并发调用中只有第一个真正执行 ValidateSession，
 // 其余等待并复用结果，既消除数据竞争也避免重复 validate 触发 Apple 风控。
-func (c *Client) resolveService() error {
+func (c *Client) resolveService(ctx context.Context) error {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 	if c.serviceURL != "" {
 		return nil
 	}
-	return c.validateSessionLocked()
+	return c.validateSessionLocked(ctx)
 }
 
 // ---- 小工具 ----

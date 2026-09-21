@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 testing, net/http, net/http/httptest, icloud-hme/internal/account, icloud-hme/internal/hme, icloud-hme/internal/mail
+ * [INPUT]: 依赖 testing, sync, net/http, net/http/httptest, icloud-hme/internal/account, icloud-hme/internal/hme, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 fakeBackend 测试桩与 Backend 相关集成单元测试
  * [POS]: internal/server 的 Backend 接口门面、双模邮件读取、parseMessageID 与 WebMail 删除 400 单元测试
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -8,22 +8,26 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"icloud-hme/internal/account"
 	"icloud-hme/internal/hme"
 	"icloud-hme/internal/mail"
+	"icloud-hme/internal/store"
 )
 
 // fakeBackend 是测试用内存 Backend,记录调用,不访问网络。
 type fakeBackend struct {
+	mu       sync.RWMutex
 	accounts []account.Summary
 	aliases  []hme.Alias
 	inbox    InboxResult
@@ -58,13 +62,31 @@ type fakeBackend struct {
 	listInboxQuery   InboxQuery
 	reloadCount      int
 
+	onClose       func()
+	onCreateAlias func(accountID, label string) (*hme.CreateResult, error)
+	onListAliases      func(accountID string) ([]hme.Alias, error)
+	onListInbox        func(q InboxQuery) (InboxResult, error)
+	onListInboxContext func(ctx context.Context, q InboxQuery) (InboxResult, error)
+
 	validateID   string
 	validateFunc func(id string) error
+
+	getMessageFunc      func(accountID string, id string) (*mail.FullMessage, error)
+	getMessagesFunc     func(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error)
+	mailboxBoundaryFunc func(accountID, folder string) (string, uint32, uint32, error)
 }
 
-func (f *fakeBackend) ListAccounts() []account.Summary { return f.accounts }
+func (f *fakeBackend) ListAccounts() []account.Summary {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	res := make([]account.Summary, len(f.accounts))
+	copy(res, f.accounts)
+	return res
+}
 
 func (f *fakeBackend) GetAccount(id string) (account.Summary, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	for _, a := range f.accounts {
 		if a.ID == id {
 			return a, nil
@@ -133,11 +155,26 @@ func (f *fakeBackend) RemoveAccount(id string) bool {
 	return f.removedOK
 }
 
+func (f *fakeBackend) Close() {
+	f.mu.RLock()
+	onClose := f.onClose
+	f.mu.RUnlock()
+	if onClose != nil {
+		onClose()
+	}
+}
+
 func (f *fakeBackend) CreateAlias(accountID, label string) (*hme.CreateResult, error) {
+	if f.onCreateAlias != nil {
+		return f.onCreateAlias(accountID, label)
+	}
 	return f.created, nil
 }
 
 func (f *fakeBackend) ListAliases(accountID string) ([]hme.Alias, error) {
+	if f.onListAliases != nil {
+		return f.onListAliases(accountID)
+	}
 	return f.aliases, nil
 }
 
@@ -195,8 +232,41 @@ func (f *fakeBackend) BatchCreateAlias(accountID string, count int, labelPrefix 
 }
 
 func (f *fakeBackend) ListInbox(q InboxQuery) (InboxResult, error) {
+	return f.ListInboxContext(context.Background(), q)
+}
+
+func (f *fakeBackend) ListInboxContext(ctx context.Context, q InboxQuery) (InboxResult, error) {
+	f.mu.Lock()
 	f.listInboxQuery = q
-	return f.inbox, nil
+	onCtx := f.onListInboxContext
+	onList := f.onListInbox
+	inbox := f.inbox
+	f.mu.Unlock()
+
+	if onCtx != nil {
+		return onCtx(ctx, q)
+	}
+	if onList != nil {
+		if err := ctx.Err(); err != nil {
+			return InboxResult{}, err
+		}
+		type fetchRes struct {
+			res InboxResult
+			err error
+		}
+		ch := make(chan fetchRes, 1)
+		go func() {
+			res, err := onList(q)
+			ch <- fetchRes{res, err}
+		}()
+		select {
+		case <-ctx.Done():
+			return InboxResult{}, ctx.Err()
+		case r := <-ch:
+			return r.res, r.err
+		}
+	}
+	return inbox, nil
 }
 
 func (f *fakeBackend) ListMailboxes(accountID string) ([]mail.Folder, error) {
@@ -207,6 +277,9 @@ func (f *fakeBackend) ListMailboxes(accountID string) ([]mail.Folder, error) {
 }
 
 func (f *fakeBackend) GetMessage(accountID string, id string) (*mail.FullMessage, error) {
+	if f.getMessageFunc != nil {
+		return f.getMessageFunc(accountID, id)
+	}
 	_, idPart, _, _ := parseMessageID(id)
 	if idPart == "" {
 		idPart = id
@@ -214,12 +287,45 @@ func (f *fakeBackend) GetMessage(accountID string, id string) (*mail.FullMessage
 	return &mail.FullMessage{Message: mail.Message{ID: idPart}}, nil
 }
 
-func (f *fakeBackend) GetMessages(accountID string, refs []MessageRef) ([]*mail.FullMessage, error) {
+func (f *fakeBackend) GetMessages(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error) {
+	if f.getMessagesFunc != nil {
+		return f.getMessagesFunc(accountID, refs)
+	}
 	var out []*mail.FullMessage
 	for _, r := range refs {
-		out = append(out, &mail.FullMessage{Message: mail.Message{ID: fmt.Sprint(r.UID), Folder: r.Folder}})
+		mailbox := r.Mailbox
+		if mailbox == "" {
+			mailbox = "INBOX"
+		}
+		ref := mail.MessageRef{
+			Provider:    "imap",
+			AccountID:   accountID,
+			Mailbox:     mailbox,
+			UIDValidity: r.UIDValidity,
+			UID:         r.UID,
+		}
+		msg := &mail.FullMessage{
+			Message: mail.Message{
+				ID:          fmt.Sprint(r.UID),
+				Folder:      mailbox,
+				UIDValidity: r.UIDValidity,
+				UID:         r.UID,
+				Provider:    "imap",
+				MessageRef:  ref.Encode(),
+			},
+			Provider: "imap",
+			Method:   "imap",
+		}
+		out = append(out, msg)
 	}
 	return out, nil
+}
+
+func (f *fakeBackend) GetMailboxBoundary(accountID, folder string) (string, uint32, uint32, error) {
+	if f.mailboxBoundaryFunc != nil {
+		return f.mailboxBoundaryFunc(accountID, folder)
+	}
+	return "imap", 1, 100, nil
 }
 
 func (f *fakeBackend) DeleteMessage(accountID string, uid uint32) error { return nil }
@@ -253,6 +359,18 @@ func newTestServer(f *fakeBackend) (*Server, *httptest.Server) {
 		SessionTTL:    12 * time.Hour,
 	}
 	s := newWithBackend(f, cfg)
+	ts := httptest.NewServer(s.Handler())
+	return s, ts
+}
+
+// newTestServerWithStore 构造注入特定 store 的测试 Server。
+func newTestServerWithStore(f *fakeBackend, st *store.Store) (*Server, *httptest.Server) {
+	cfg := Config{
+		Debug:         false,
+		AdminPassword: "admin-pass-2026-strong",
+		SessionTTL:    12 * time.Hour,
+	}
+	s := newWithBackendAndStore(f, cfg, st)
 	ts := httptest.NewServer(s.Handler())
 	return s, ts
 }
@@ -538,7 +656,7 @@ func TestDeleteMessageWebMailStringIDHandler(t *testing.T) {
 	if err := json.Unmarshal([]byte(respBody), &res); err != nil {
 		t.Fatalf("unmarshal error: %v", err)
 	}
-	if res.Success || res.Code != "WEBMAIL_DELETE_UNSUPPORTED" {
+	if res.Success || res.Code != "MAIL_DELETE_UNSUPPORTED" {
 		t.Fatalf("unexpected delete response: %+v body=%s", res, respBody)
 	}
 }
@@ -587,7 +705,10 @@ func TestListInboxWithBodyQuery(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("expected 200 OK, got %d", status)
 	}
-	if !fb.listInboxQuery.WithBody {
+	fb.mu.RLock()
+	withBody := fb.listInboxQuery.WithBody
+	fb.mu.RUnlock()
+	if !withBody {
 		t.Fatalf("expected WithBody=true in InboxQuery")
 	}
 }
