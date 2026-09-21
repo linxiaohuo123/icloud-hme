@@ -102,6 +102,60 @@ func TestExtractOTP(t *testing.T) {
 			body:         "다음 임시 인증 코드를 입력해 계속하세요: 576932 ChatGPT 계정을 생성하고자 하는 것이 본인이 아닌 경우 이 이메일을 무시하세요. 감사합니다. ChatGPT 팀 드림 ChatGPT ( https://chatgpt.com ) 도움말 센터 ( https://help.openai.com )",
 			expectedCode: "576932",
 		},
+		{
+			name:         "俄文验证码",
+			subject:      "Вход в аккаунт",
+			body:         "Ваш проверочный код: 491028. Никому не сообщайте этот код.",
+			expectedCode: "491028",
+		},
+		{
+			name:         "西班牙语验证码",
+			subject:      "Verificación de cuenta",
+			body:         "Su código de verificación es: 382910 para continuar.",
+			expectedCode: "382910",
+		},
+		{
+			name:         "德语验证码",
+			subject:      "Bestätigen Sie Ihre E-Mail-Adresse",
+			body:         "Ihr Bestätigungscode lautet: 829103.",
+			expectedCode: "829103",
+		},
+		{
+			name:         "法语验证码",
+			subject:      "Sécurité du compte",
+			body:         "Votre code de confirmation est : 719204 pour activer votre compte.",
+			expectedCode: "719204",
+		},
+		{
+			name:         "越南语验证码",
+			subject:      "Xác thực tài khoản",
+			body:         "Mã xác thực của bạn là: 629105. Hết hạn sau 5 phút.",
+			expectedCode: "629105",
+		},
+		{
+			name:         "土耳其语验证码",
+			subject:      "Hesap Güvenliği",
+			body:         "Doğrulama kodunuz: 839102 olarak belirlenmiştir.",
+			expectedCode: "839102",
+		},
+		{
+			name:         "阿拉伯语验证码",
+			subject:      "تأكيد الحساب",
+			body:         "رمز التحقق الخاص بك هو: 918234 للاستمرار.",
+			expectedCode: "918234",
+		},
+		{
+			name:         "日语确认代码",
+			subject:      "アカウントの確認",
+			body:         "お客様の確認コードは 576932 です。10分以内に入力してください。",
+			expectedCode: "576932",
+		},
+		{
+			name:         "标题括号验证码",
+			subject:      "[849201] Discord verification code",
+			body:         "Hi, here is your one-time verification link or code.",
+			expectedCode: "849201",
+		},
 	}
 
 	for _, tt := range tests {

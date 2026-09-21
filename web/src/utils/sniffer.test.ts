@@ -47,6 +47,28 @@ describe('extractVerifyCode', () => {
     expect(extractVerifyCode(koreanMail)).toBe('576932')
   })
 
+  it('提取全球多语种(俄/西/德/法/越/土/阿/日)验证码及括号直提', () => {
+    // 俄语
+    expect(extractVerifyCode('Ваш проверочный код: 491028')).toBe('491028')
+    // 西班牙语
+    expect(extractVerifyCode('Su código de verificación es: 382910')).toBe('382910')
+    // 德语
+    expect(extractVerifyCode('Ihr Bestätigungscode lautet: 829103')).toBe('829103')
+    // 法语
+    expect(extractVerifyCode('Votre code de confirmation est : 719204')).toBe('719204')
+    // 越南语
+    expect(extractVerifyCode('Mã xác thực của bạn là: 629105')).toBe('629105')
+    // 土耳其语
+    expect(extractVerifyCode('Doğrulama kodunuz: 839102')).toBe('839102')
+    // 阿拉伯语
+    expect(extractVerifyCode('رمز التحقق الخاص بك هو: 918234')).toBe('918234')
+    // 日语
+    expect(extractVerifyCode('お客様の確認コードは 576932 です')).toBe('576932')
+    // 标题/正文括号强标注
+    expect(extractVerifyCode('[849201] Discord code')).toBe('849201')
+    expect(extractVerifyCode('【392019】您的验证码')).toBe('392019')
+  })
+
   it('提取反向倒装语序的验证码', () => {
     expect(extractVerifyCode('123456 is your verification code')).toBe('123456')
     expect(extractVerifyCode('839201 为本次确认码')).toBe('839201')
