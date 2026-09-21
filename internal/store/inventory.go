@@ -676,6 +676,104 @@ func (s *Store) GetOperation(ctx context.Context, operationID, principalKind, pr
 	return &op, nil
 }
 
+var (
+	ErrConflictActiveRequest = errors.New("active verification request already exists for this lease")
+	ErrServerBusy            = errors.New("global active verification requests limit exceeded")
+	ErrTooManyRequests       = errors.New("per-principal active verification requests limit exceeded")
+)
+
+// CreateVerificationRequestAtomic 在单事务/临界区内原子完成过期清理、活跃冲突检查、容量判定与任务插入 (PR-08 Final Hardening §4)
+func (s *Store) CreateVerificationRequestAtomic(
+	ctx context.Context,
+	req *VerificationRequest,
+	maxGlobalActive int,
+	maxPerTokenActive int,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+
+	// 1. 清理已过期的任务状态 (不再阻塞同 lease 的新任务，也不占活跃配额)
+	_, err = tx.ExecContext(ctx, `
+		UPDATE verification_requests
+		SET status = 'expired'
+		WHERE status IN ('pending', 'ready') AND expires_at < ?
+	`, nowStr)
+	if err != nil {
+		return err
+	}
+
+	// 2. 检查同 lease 是否存在活跃任务 (保证并发请求不能在同 lease 创建两个 active request)
+	var leaseActiveCount int
+	err = tx.QueryRowContext(ctx, `
+		SELECT COUNT(1)
+		FROM verification_requests
+		WHERE lease_id = ? AND status IN ('pending', 'ready') AND expires_at >= ?
+	`, req.LeaseID, nowStr).Scan(&leaseActiveCount)
+	if err != nil {
+		return err
+	}
+	if leaseActiveCount > 0 {
+		return ErrConflictActiveRequest
+	}
+
+	// 3. 检查 principal 活跃任务上限 (不超过 maxPerTokenActive)
+	if maxPerTokenActive > 0 {
+		var tokenActiveCount int
+		err = tx.QueryRowContext(ctx, `
+			SELECT COUNT(1)
+			FROM verification_requests
+			WHERE principal_kind = ? AND principal_id = ? AND status IN ('pending', 'ready') AND expires_at >= ?
+		`, req.PrincipalKind, req.PrincipalID, nowStr).Scan(&tokenActiveCount)
+		if err != nil {
+			return err
+		}
+		if tokenActiveCount >= maxPerTokenActive {
+			return ErrTooManyRequests
+		}
+	}
+
+	// 4. 检查全局活跃任务上限 (不超过 maxGlobalActive)
+	if maxGlobalActive > 0 {
+		var globalActiveCount int
+		err = tx.QueryRowContext(ctx, `
+			SELECT COUNT(1)
+			FROM verification_requests
+			WHERE status IN ('pending', 'ready') AND expires_at >= ?
+		`, nowStr).Scan(&globalActiveCount)
+		if err != nil {
+			return err
+		}
+		if globalActiveCount >= maxGlobalActive {
+			return ErrServerBusy
+		}
+	}
+
+	// 5. 原子插入
+	q := `
+	INSERT INTO verification_requests (
+		request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
+		baseline_provider, baseline_uidvalidity, baseline_uid, matched_event_ref, code
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err = tx.ExecContext(ctx, q,
+		req.RequestID, req.PrincipalKind, req.PrincipalID, req.LeaseID, req.AliasEmail, req.Status, req.CreatedAt, req.ExpiresAt,
+		req.BaselineProvider, req.BaselineUIDValidity, req.BaselineUID, req.MatchedEventRef, req.Code,
+	)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
 // CreateVerificationRequest 创建持久化取码请求 (Section VI)
 func (s *Store) CreateVerificationRequest(ctx context.Context, req *VerificationRequest) error {
 	q := `

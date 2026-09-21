@@ -87,21 +87,7 @@ func (s *VerificationService) CreateVerificationRequest(ctx context.Context, p a
 		return nil, ErrVReqNotFound
 	}
 
-	// 2. 单 lease 互斥检查
-	activeReq, err := s.store.GetActiveVerificationRequestByLease(ctx, alloc.AllocationID)
-	if err == nil && activeReq != nil {
-		return nil, ErrConflictActiveRequest
-	}
-
-	// 3. 有界容量检查
-	if globalCount, err := s.store.CountActiveVerificationRequests(ctx); err == nil && globalCount >= maxGlobalActiveVerificationRequests {
-		return nil, ErrServerBusy
-	}
-	if tokenCount, err := s.store.CountActiveVerificationRequestsByPrincipal(ctx, string(p.Kind), p.ID); err == nil && tokenCount >= maxPerTokenActiveVerificationRequests {
-		return nil, ErrTooManyRequests
-	}
-
-	// 4. 采集基线游标
+	// 2. 采集基线游标
 	provider, uidValidity, uidNext, bErr := s.be.GetMailboxBoundary(alloc.AccountID, "INBOX")
 	if bErr != nil {
 		var be *BackendError
@@ -126,7 +112,17 @@ func (s *VerificationService) CreateVerificationRequest(ctx context.Context, p a
 		BaselineUID:         uidNext,
 	}
 
-	if err := s.store.CreateVerificationRequest(ctx, vreq); err != nil {
+	// 3. 原子化检查同 lease 冲突、容量上限与任务插入 (PR-08 Final Hardening §4: 消除 TOCTOU 竞争)
+	if err := s.store.CreateVerificationRequestAtomic(ctx, vreq, maxGlobalActiveVerificationRequests, maxPerTokenActiveVerificationRequests); err != nil {
+		if errors.Is(err, store.ErrConflictActiveRequest) {
+			return nil, ErrConflictActiveRequest
+		}
+		if errors.Is(err, store.ErrServerBusy) {
+			return nil, ErrServerBusy
+		}
+		if errors.Is(err, store.ErrTooManyRequests) {
+			return nil, ErrTooManyRequests
+		}
 		return nil, &BackendError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "创建持久化验证任务失败: " + err.Error()}
 	}
 

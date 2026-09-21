@@ -30,16 +30,19 @@ var (
 	ErrForbiddenRemoteCreation = errors.New("remote on-demand creation is forbidden for external tokens")
 	// ErrTagNotAllowed 业务标签越权
 	ErrTagNotAllowed = errors.New("specified tag is not allowed for this principal")
+	// ErrIdempotencyKeyRequired 强制要求幂等键
+	ErrIdempotencyKeyRequired = errors.New("idempotency key required")
 )
 
 // AllocationRequest 统一出号请求
 type AllocationRequest struct {
-	Tag            string
-	Label          string
-	AccountID      string
-	Mode           string // "pool", "pool_only", "create"
-	IdempotencyKey string
-	RequestHash    string
+	Tag                string
+	Label              string
+	AccountID          string
+	Mode               string // "pool", "pool_only", "create"
+	IdempotencyKey     string
+	RequestHash        string
+	RequireIdempotency bool
 }
 
 // AllocationResult 统一出号结果
@@ -65,10 +68,20 @@ func NewAliasAllocationService(st *store.Store, be Backend, sw *MailSyncWorker) 
 	}
 }
 
-// Allocate 执行统一出号逻辑
+// Allocate 执行统一出号逻辑 (PR-08 Final Hardening §2: 所有五个出号入口唯一领域应用入口)
 func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal, req AllocationRequest) (*AllocationResult, error) {
-	if s.store == nil {
-		return nil, ErrAllocationNotReady
+	if !p.CanAllocate() {
+		return nil, ErrScopeDenied
+	}
+
+	// 1. 外部令牌安全防护：绝不允许指定 account_id 或远程创号 (403 优先级高于参数校验)
+	if p.Kind == auth.PrincipalToken && !p.IsAdmin() {
+		if req.AccountID != "" {
+			return nil, ErrForbiddenAccountID
+		}
+		if req.Mode == "create" {
+			return nil, ErrForbiddenRemoteCreation
+		}
 	}
 
 	tag := strings.TrimSpace(req.Tag)
@@ -77,7 +90,7 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 	}
 	req.Tag = tag
 
-	// 1. 业务标签权限范围核验
+	// 2. 业务标签权限范围核验 (403)
 	if len(p.AllowedTags) > 0 {
 		allowed := false
 		for _, t := range p.AllowedTags {
@@ -91,14 +104,13 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		}
 	}
 
-	// 2. 外部令牌安全防护：绝不允许指定 account_id 或远程创号
-	if p.Kind == auth.PrincipalToken && !p.IsAdmin() {
-		if req.AccountID != "" {
-			return nil, ErrForbiddenAccountID
-		}
-		if req.Mode == "create" {
-			return nil, ErrForbiddenRemoteCreation
-		}
+	// 3. 参数校验与幂等键必须性
+	if req.RequireIdempotency && p.Kind == auth.PrincipalToken && strings.TrimSpace(req.IdempotencyKey) == "" {
+		return nil, ErrIdempotencyKeyRequired
+	}
+
+	if s.store == nil {
+		return nil, ErrAllocationNotReady
 	}
 
 	// 若指定了 account_id，前置核验该账号是否存在
@@ -113,12 +125,77 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		mode = "pool"
 	}
 
-	tokenName := p.TokenName
-	if tokenName == "" {
-		tokenName = p.ID
+	principalKind := string(p.Kind)
+	principalID := p.ID
+	tokenDisplayName := p.TokenName
+
+	switch p.Kind {
+	case auth.PrincipalToken:
+		principalKind = "token"
+		principalID = p.ID
+		if tokenDisplayName == "" {
+			tokenDisplayName = p.ID
+		}
+	case auth.PrincipalAdmin:
+		principalKind = "admin"
+		if principalID == "" {
+			principalID = "admin"
+		}
+		if tokenDisplayName == "" || tokenDisplayName == "admin_session" {
+			tokenDisplayName = "admin_console"
+		}
+	case auth.PrincipalSystem:
+		principalKind = "system"
+		if principalID == "" {
+			principalID = "system"
+		}
+		if tokenDisplayName == "" {
+			tokenDisplayName = "scheduler"
+		}
+	default:
+		principalKind = "admin"
+		principalID = "admin"
+		tokenDisplayName = "admin_console"
 	}
 
-	// 3. 收集并交错候选别名，保证跨母号负载均衡与预存池更新
+	if req.RequestHash == "" {
+		req.RequestHash = fmt.Sprintf("tag=%s&account_id=%s&label=%s", req.Tag, strings.TrimSpace(req.AccountID), strings.TrimSpace(req.Label))
+	}
+
+	// 3. 显式幂等分配分支 (如 external/v2 或携带 IdempotencyKey 的请求)
+	if req.IdempotencyKey != "" {
+		alloc, op, err := s.store.ClaimInventoryAlias(
+			ctx,
+			principalKind,
+			principalID,
+			"v2_allocate",
+			req.IdempotencyKey,
+			req.RequestHash,
+			req.Tag,
+			req.AccountID,
+		)
+		if err != nil {
+			if errors.Is(err, store.ErrNoAvailableInventory) {
+				return nil, ErrPoolEmpty
+			}
+			if errors.Is(err, store.ErrOperationPending) {
+				return &AllocationResult{Operation: op}, err
+			}
+			return nil, err
+		}
+		if alloc != nil {
+			if s.syncWorker != nil {
+				s.syncWorker.RegisterAliasAccount(alloc.AliasEmail, alloc.AccountID)
+			}
+			return &AllocationResult{
+				Allocation: alloc,
+				Operation:  op,
+				Source:     "pool",
+			}, nil
+		}
+	}
+
+	// 4. 普通出号链路：收集并交错候选别名，保证跨母号负载均衡与预存池更新
 	var poolAccountIDs []string
 	if req.AccountID != "" {
 		poolAccountIDs = []string{req.AccountID}
@@ -158,9 +235,8 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		}
 	}
 
-	// 4. 首选从交织候选池认领 (驱动底层 alias_inventory 与 alias_allocations 单一真相源)
 	if len(candidates) > 0 {
-		rec, err := s.store.ClaimPoolAlias(candidates, req.Tag, tokenName)
+		rec, err := s.store.ClaimPoolAlias(candidates, req.Tag, principalKind, principalID, tokenDisplayName)
 		if err != nil {
 			return nil, err
 		}
@@ -172,8 +248,8 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 				AllocationID: rec.ID,
 				AliasEmail:   rec.Email,
 				AccountID:    rec.AccountID,
-				OwnerKind:    string(p.Kind),
-				OwnerID:      p.ID,
+				OwnerKind:    principalKind,
+				OwnerID:      principalID,
 				BusinessTag:  rec.Tag,
 				AllocatedAt:  rec.AllocatedAt,
 				Status:       rec.Status,
@@ -187,8 +263,8 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		// 无外挂账号别名列表时，直接从底层 alias_inventory 认领
 		alloc, op, err := s.store.ClaimInventoryAlias(
 			ctx,
-			string(p.Kind),
-			p.ID,
+			principalKind,
+			principalID,
 			"allocate",
 			req.IdempotencyKey,
 			req.RequestHash,
@@ -252,13 +328,13 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 			AllocationID: allocID,
 			AliasEmail:   res.Email,
 			AccountID:    accountID,
-			OwnerKind:    string(p.Kind),
-			OwnerID:      p.ID,
+			OwnerKind:    principalKind,
+			OwnerID:      principalID,
 			BusinessTag:  req.Tag,
 			AllocatedAt:  now,
 			Status:       "allocated",
 		}
-		_ = s.store.RecordAllocation(alloc, tokenName)
+		_ = s.store.RecordAllocation(alloc, tokenDisplayName)
 		_ = s.store.UpsertAliasRoutes(accountID, []string{res.Email})
 		if s.syncWorker != nil {
 			s.syncWorker.RegisterAliasAccount(res.Email, accountID)

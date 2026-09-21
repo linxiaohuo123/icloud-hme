@@ -1,6 +1,6 @@
 /**
- * [INPUT]: 依赖 testing, path/filepath, sync, context, fmt, icloud-hme/internal/store, icloud-hme/internal/hme
- * [OUTPUT]: 对外提供 PR-03 别名库存状态机、SQLite 事务原子认领与幂等防重单元测试 (D01-D08)
+ * [INPUT]: 依赖 testing, path/filepath, sync, sync/atomic, time, context, fmt, icloud-hme/internal/store, icloud-hme/internal/hme
+ * [OUTPUT]: 对外提供 PR-03 别名库存状态机、SQLite 事务原子认领与幂等防重单元测试 (D01-D08) 及 PR-08 原子验证码创建并发压测
  * [POS]: internal/store 的领域状态与事务正确性回归防线
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -12,7 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"icloud-hme/internal/hme"
 )
@@ -336,5 +338,208 @@ func TestPR03_D08_RemoteSyncDoesNotOverwriteAllocated(t *testing.T) {
 	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_other", "allocate", "k_other", "h", "tag", "")
 	if !errors.Is(err, ErrNoAvailableInventory) {
 		t.Fatalf("expected ErrNoAvailableInventory after sync, got: %v", err)
+	}
+}
+
+// ============================================================================
+// PR-08 Final Hardening §4: VerificationRequest 创建原子操作并发压力测试
+// ============================================================================
+
+// 1. 100 并发抢同一个 lease，恰好 1 个成功，99 个返回 conflict
+func TestPR08_AtomicVerificationRequest_100ConcurrentSameLease(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	leaseID := "lease_same_100"
+	const concurrency = 100
+
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	successCount := int32(0)
+	conflictCount := int32(0)
+
+	for i := 0; i < concurrency; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			req := &VerificationRequest{
+				RequestID:     fmt.Sprintf("vreq_lease_%d", idx),
+				LeaseID:       leaseID,
+				AliasEmail:    "test@icloud.com",
+				PrincipalKind: "token",
+				PrincipalID:   "tok_test",
+				Status:        "pending",
+				ExpiresAt:     time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
+			}
+			err := st.CreateVerificationRequestAtomic(ctx, req, 1000, 50)
+			if err == nil {
+				atomic.AddInt32(&successCount, 1)
+			} else if errors.Is(err, ErrConflictActiveRequest) {
+				atomic.AddInt32(&conflictCount, 1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if successCount != 1 {
+		t.Fatalf("expected exactly 1 success, got %d", successCount)
+	}
+	if conflictCount != 99 {
+		t.Fatalf("expected 99 conflict errors, got %d", conflictCount)
+	}
+}
+
+// 2. 49 active 状态下并发 100 个同 token 请求，成功数加上已有 active 严格 <= 50
+func TestPR08_AtomicVerificationRequest_PerTokenLimit(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	principalID := "tok_limited_user"
+
+	// 先插入 49 个活跃请求 (每个 lease 独立)
+	for i := 0; i < 49; i++ {
+		req := &VerificationRequest{
+			RequestID:     fmt.Sprintf("vreq_pre_%d", i),
+			LeaseID:       fmt.Sprintf("lease_pre_%d", i),
+			AliasEmail:    fmt.Sprintf("test%d@icloud.com", i),
+			PrincipalKind: "token",
+			PrincipalID:   principalID,
+			Status:        "pending",
+			ExpiresAt:     time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
+		}
+		if err := st.CreateVerificationRequestAtomic(ctx, req, 1000, 50); err != nil {
+			t.Fatalf("pre-insert failed at %d: %v", i, err)
+		}
+	}
+
+	// 49 active 状态下并发 100 个同 token 请求 (每个 lease 独立)
+	const concurrency = 100
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	successCount := int32(0)
+	tooManyCount := int32(0)
+
+	for i := 0; i < concurrency; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			req := &VerificationRequest{
+				RequestID:     fmt.Sprintf("vreq_conc_%d", idx),
+				LeaseID:       fmt.Sprintf("lease_conc_%d", idx),
+				AliasEmail:    fmt.Sprintf("test_conc_%d@icloud.com", idx),
+				PrincipalKind: "token",
+				PrincipalID:   principalID,
+				Status:        "pending",
+				ExpiresAt:     time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
+			}
+			err := st.CreateVerificationRequestAtomic(ctx, req, 1000, 50)
+			if err == nil {
+				atomic.AddInt32(&successCount, 1)
+			} else if errors.Is(err, ErrTooManyRequests) {
+				atomic.AddInt32(&tooManyCount, 1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	totalActive := 49 + int(successCount)
+	if totalActive > 50 {
+		t.Fatalf("total active exceeded limit: expected <= 50, got %d (successCount=%d)", totalActive, successCount)
+	}
+	if successCount != 1 {
+		t.Fatalf("expected exactly 1 success out of 100 (49+1=50), got %d", successCount)
+	}
+	if tooManyCount != 99 {
+		t.Fatalf("expected 99 ErrTooManyRequests, got %d", tooManyCount)
+	}
+}
+
+// 3. 999 global active 状态下并发请求，最终 global active 严格 <= 1000
+func TestPR08_AtomicVerificationRequest_GlobalLimit(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	maxGlobal := 1000
+
+	// 批量准备 999 个 global active
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+	expStr := time.Now().Add(10 * time.Minute).UTC().Format(time.RFC3339)
+	tx, err := st.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO verification_requests (
+		request_id, lease_id, alias_email, principal_kind, principal_id,
+		status, expires_at, created_at
+	) VALUES (?, ?, ?, 'token', ?, 'pending', ?, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 999; i++ {
+		pID := fmt.Sprintf("tok_g_%d", i)
+		_, err := stmt.Exec(fmt.Sprintf("vreq_g_%d", i), fmt.Sprintf("lease_g_%d", i), fmt.Sprintf("g%d@icloud.com", i), pID, expStr, nowStr)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 999 global active 状态下并发 20 个不同 principal 的请求
+	const concurrency = 20
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	successCount := int32(0)
+	busyCount := int32(0)
+
+	for i := 0; i < concurrency; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			req := &VerificationRequest{
+				RequestID:     fmt.Sprintf("vreq_g_conc_%d", idx),
+				LeaseID:       fmt.Sprintf("lease_g_conc_%d", idx),
+				AliasEmail:    fmt.Sprintf("g_conc_%d@icloud.com", idx),
+				PrincipalKind: "token",
+				PrincipalID:   fmt.Sprintf("tok_diff_%d", idx),
+				Status:        "pending",
+				ExpiresAt:     time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
+			}
+			err := st.CreateVerificationRequestAtomic(ctx, req, maxGlobal, 50)
+			if err == nil {
+				atomic.AddInt32(&successCount, 1)
+			} else if errors.Is(err, ErrServerBusy) {
+				atomic.AddInt32(&busyCount, 1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	totalGlobal := 999 + int(successCount)
+	if totalGlobal > maxGlobal {
+		t.Fatalf("total global exceeded limit: expected <= %d, got %d", maxGlobal, totalGlobal)
+	}
+	if successCount != 1 {
+		t.Fatalf("expected exactly 1 success (999+1=1000), got %d", successCount)
+	}
+	if busyCount != 19 {
+		t.Fatalf("expected 19 ErrServerBusy, got %d", busyCount)
 	}
 }

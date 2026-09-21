@@ -9,13 +9,11 @@ package server
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"icloud-hme/internal/auth"
 	"icloud-hme/internal/store"
 )
 
@@ -29,11 +27,12 @@ type externalV2AllocateReq struct {
 	Tag       string `json:"tag"`
 	Label     string `json:"label"`
 	AccountID string `json:"account_id"`
+	Mode      string `json:"mode"`
 }
 
 func (s *Server) externalV2AllocateHandler(c *gin.Context) {
 	p, exists := getPrincipal(c)
-	if !exists || !p.CanAllocate() {
+	if !exists {
 		failCode(c, http.StatusForbidden, "SCOPE_DENIED", "主体无权调用分配接口")
 		return
 	}
@@ -44,65 +43,42 @@ func (s *Server) externalV2AllocateHandler(c *gin.Context) {
 		return
 	}
 
-	// 普通外部令牌禁止随意指定 account_id (403 优先级高于参数校验)
-	if req.AccountID != "" && p.Kind == auth.PrincipalToken && !p.IsAdmin() {
-		failCode(c, http.StatusForbidden, "FORBIDDEN", "普通外部令牌禁止指定母号 account_id")
-		return
-	}
-
 	idempKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
 	if idempKey == "" {
 		idempKey = strings.TrimSpace(c.Query("idempotency_key"))
 	}
 
-	// Section V: Idempotency-Key 对外部令牌必须必填
-	if p.Kind == auth.PrincipalToken && idempKey == "" {
-		failCode(c, http.StatusBadRequest, "IDEMPOTENCY_KEY_REQUIRED", "v2 分配接口对外部令牌强制要求 Idempotency-Key")
-		return
-	}
+	allocRes, err := s.allocService.Allocate(c.Request.Context(), p, AllocationRequest{
+		Tag:                req.Tag,
+		Label:              req.Label,
+		AccountID:          req.AccountID,
+		Mode:               req.Mode,
+		IdempotencyKey:     idempKey,
+		RequireIdempotency: true,
+	})
 
-	tag := strings.TrimSpace(req.Tag)
-	if tag == "" {
-		tag = "default"
-	}
-	req.Tag = tag
-
-	// 业务标签权限范围核验
-	if len(p.AllowedTags) > 0 {
-		allowed := false
-		for _, t := range p.AllowedTags {
-			if strings.EqualFold(t, tag) {
-				allowed = true
-				break
-			}
+	if err != nil {
+		if errors.Is(err, ErrScopeDenied) {
+			failCode(c, http.StatusForbidden, "SCOPE_DENIED", "主体无权调用分配接口")
+			return
 		}
-		if !allowed {
+		if errors.Is(err, ErrIdempotencyKeyRequired) {
+			failCode(c, http.StatusBadRequest, "IDEMPOTENCY_KEY_REQUIRED", "v2 分配接口对外部令牌强制要求 Idempotency-Key")
+			return
+		}
+		if errors.Is(err, ErrForbiddenAccountID) {
+			failCode(c, http.StatusForbidden, "FORBIDDEN", "普通外部令牌禁止指定母号 account_id")
+			return
+		}
+		if errors.Is(err, ErrTagNotAllowed) {
 			failCode(c, http.StatusForbidden, "FORBIDDEN", "指定的业务标签不在该主体授权范围内")
 			return
 		}
-	}
-
-	if s.store == nil {
-		failCode(c, http.StatusServiceUnavailable, "ALLOCATION_STATE_NOT_READY", "存储层未就绪")
-		return
-	}
-
-	// 规范化 request_hash：基于规范化字段组合，防重入与参数篡改
-	reqHash := fmt.Sprintf("tag=%s&account_id=%s&label=%s", tag, strings.TrimSpace(req.AccountID), strings.TrimSpace(req.Label))
-
-	alloc, op, err := s.store.ClaimInventoryAlias(
-		c.Request.Context(),
-		string(p.Kind),
-		p.ID,
-		"v2_allocate",
-		idempKey,
-		reqHash,
-		tag,
-		req.AccountID,
-	)
-
-	if err != nil {
-		if errors.Is(err, store.ErrNoAvailableInventory) {
+		if errors.Is(err, ErrForbiddenRemoteCreation) {
+			failCode(c, http.StatusServiceUnavailable, "ALLOCATION_STATE_NOT_READY", "现场按需创建能力未就绪，当前仅支持已验证库存池分配 (mode=pool)")
+			return
+		}
+		if errors.Is(err, ErrPoolEmpty) || errors.Is(err, store.ErrNoAvailableInventory) {
 			c.Header("Retry-After", "60")
 			failCode(c, http.StatusServiceUnavailable, "POOL_EMPTY", "暂无可用别名库存，请稍后重试")
 			return
@@ -113,8 +89,8 @@ func (s *Server) externalV2AllocateHandler(c *gin.Context) {
 		}
 		if errors.Is(err, store.ErrOperationPending) {
 			opID := ""
-			if op != nil {
-				opID = op.OperationID
+			if allocRes != nil && allocRes.Operation != nil {
+				opID = allocRes.Operation.OperationID
 			}
 			c.JSON(http.StatusAccepted, gin.H{
 				"code":    0,
@@ -126,29 +102,28 @@ func (s *Server) externalV2AllocateHandler(c *gin.Context) {
 			})
 			return
 		}
+		if errors.Is(err, ErrAllocationNotReady) {
+			failCode(c, http.StatusServiceUnavailable, "ALLOCATION_STATE_NOT_READY", "存储层未就绪")
+			return
+		}
 		failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", "认领别名失败: "+err.Error())
 		return
 	}
 
-	// 注册别名路由
-	if s.syncWorker != nil && alloc != nil {
-		s.syncWorker.RegisterAliasAccount(alloc.AliasEmail, alloc.AccountID)
-	}
-
 	opID := ""
-	if op != nil {
-		opID = op.OperationID
+	if allocRes.Operation != nil {
+		opID = allocRes.Operation.OperationID
 	}
 
 	ok(c, gin.H{
 		"operation_id": opID,
-		"lease_id":     alloc.AllocationID,
-		"email":        alloc.AliasEmail,
-		"alias_email":  alloc.AliasEmail,
-		"account_id":   alloc.AccountID,
-		"source":       "pool",
-		"allocated_at": alloc.AllocatedAt,
-		"status":       alloc.Status,
+		"lease_id":     allocRes.Allocation.AllocationID,
+		"email":        allocRes.Allocation.AliasEmail,
+		"alias_email":  allocRes.Allocation.AliasEmail,
+		"account_id":   allocRes.Allocation.AccountID,
+		"source":       allocRes.Source,
+		"allocated_at": allocRes.Allocation.AllocatedAt,
+		"status":       allocRes.Allocation.Status,
 	})
 }
 

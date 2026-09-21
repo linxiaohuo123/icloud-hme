@@ -8,6 +8,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -77,6 +78,30 @@ func webMailIDMatch(messageID, rawID, idPart string) bool {
 		return true
 	}
 	return idPart != "" && idPart != rawID && messageID == idPart
+}
+
+// ListInboxContext 读取收件箱摘要 (支持 context 上下文超时与取消控制)。
+func (b *managerBackend) ListInboxContext(ctx context.Context, q InboxQuery) (InboxResult, error) {
+	if err := ctx.Err(); err != nil {
+		return InboxResult{}, err
+	}
+
+	type fetchResult struct {
+		res InboxResult
+		err error
+	}
+	done := make(chan fetchResult, 1)
+	go func() {
+		res, err := b.ListInbox(q)
+		done <- fetchResult{res: res, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return InboxResult{}, ctx.Err()
+	case r := <-done:
+		return r.res, r.err
+	}
 }
 
 // ListInbox 读取收件箱摘要:IMAP (App Password) 优先,Web API (Cookie) 回退。

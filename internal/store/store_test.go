@@ -742,25 +742,25 @@ func TestClaimPoolAlias(t *testing.T) {
 	}
 
 	// 3. 第一次认领：应拿到 pool1
-	rec1, err := s.ClaimPoolAlias(candidates, "t1", "bot_alpha")
+	rec1, err := s.ClaimPoolAlias(candidates, "t1", "token", "tok_alpha", "bot_alpha")
 	if err != nil || rec1 == nil || rec1.Email != "pool1@icloud.com" {
 		t.Fatalf("ClaimPoolAlias 1 期望 pool1, 实际: %+v, err: %v", rec1, err)
 	}
 
 	// 4. 第二次认领：应拿到 pool2
-	rec2, err := s.ClaimPoolAlias(candidates, "t1", "bot_beta")
+	rec2, err := s.ClaimPoolAlias(candidates, "t1", "token", "tok_beta", "bot_beta")
 	if err != nil || rec2 == nil || rec2.Email != "pool2@icloud.com" {
 		t.Fatalf("ClaimPoolAlias 2 期望 pool2, 实际: %+v, err: %v", rec2, err)
 	}
 
 	// 5. 第三次认领：应拿到 fresh_apple_web
-	rec3, err := s.ClaimPoolAlias(candidates, "t1", "bot_gamma")
+	rec3, err := s.ClaimPoolAlias(candidates, "t1", "token", "tok_gamma", "bot_gamma")
 	if err != nil || rec3 == nil || rec3.Email != "fresh_apple_web@icloud.com" {
 		t.Fatalf("ClaimPoolAlias 3 期望 fresh_apple_web, 实际: %+v, err: %v", rec3, err)
 	}
 
 	// 6. 第四次认领：池已空，应返回 nil
-	rec4, err := s.ClaimPoolAlias(candidates, "t1", "bot_delta")
+	rec4, err := s.ClaimPoolAlias(candidates, "t1", "token", "tok_delta", "bot_delta")
 	if err != nil || rec4 != nil {
 		t.Fatalf("ClaimPoolAlias 4 期望 nil, 实际: %+v, err: %v", rec4, err)
 	}
@@ -801,7 +801,7 @@ func TestClaimPoolAliasConcurrency(t *testing.T) {
 	for i := 0; i < numGoroutines; i++ {
 		go func(workerID int) {
 			defer wg.Done()
-			rec, err := s.ClaimPoolAlias(candidates, "test_tag", fmt.Sprintf("bot_%d", workerID))
+			rec, err := s.ClaimPoolAlias(candidates, "test_tag", "token", fmt.Sprintf("tok_%d", workerID), fmt.Sprintf("bot_%d", workerID))
 			if err != nil {
 				t.Errorf("worker %d 报错: %v", workerID, err)
 				return

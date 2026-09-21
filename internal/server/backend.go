@@ -11,6 +11,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -62,6 +63,7 @@ type Backend interface {
 	BatchUpdateAliases(string, []string, string, string) (BatchUpdateResult, error)
 	DeleteAlias(string, string) error
 	ListInbox(InboxQuery) (InboxResult, error)
+	ListInboxContext(context.Context, InboxQuery) (InboxResult, error)
 	ListMailboxes(string) ([]mail.Folder, error)
 	GetMessage(string, string) (*mail.FullMessage, error)
 	GetMessages(string, []MessageRef) ([]*mail.FullMessage, error)

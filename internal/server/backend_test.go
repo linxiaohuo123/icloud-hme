@@ -8,6 +8,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -61,8 +62,9 @@ type fakeBackend struct {
 
 	onClose       func()
 	onCreateAlias func(accountID, label string) (*hme.CreateResult, error)
-	onListAliases func(accountID string) ([]hme.Alias, error)
-	onListInbox   func(q InboxQuery) (InboxResult, error)
+	onListAliases      func(accountID string) ([]hme.Alias, error)
+	onListInbox        func(q InboxQuery) (InboxResult, error)
+	onListInboxContext func(ctx context.Context, q InboxQuery) (InboxResult, error)
 
 	validateID   string
 	validateFunc func(id string) error
@@ -217,9 +219,33 @@ func (f *fakeBackend) BatchCreateAlias(accountID string, count int, labelPrefix 
 }
 
 func (f *fakeBackend) ListInbox(q InboxQuery) (InboxResult, error) {
+	return f.ListInboxContext(context.Background(), q)
+}
+
+func (f *fakeBackend) ListInboxContext(ctx context.Context, q InboxQuery) (InboxResult, error) {
 	f.listInboxQuery = q
+	if f.onListInboxContext != nil {
+		return f.onListInboxContext(ctx, q)
+	}
 	if f.onListInbox != nil {
-		return f.onListInbox(q)
+		if err := ctx.Err(); err != nil {
+			return InboxResult{}, err
+		}
+		type fetchRes struct {
+			res InboxResult
+			err error
+		}
+		ch := make(chan fetchRes, 1)
+		go func() {
+			res, err := f.onListInbox(q)
+			ch <- fetchRes{res, err}
+		}()
+		select {
+		case <-ctx.Done():
+			return InboxResult{}, ctx.Err()
+		case r := <-ch:
+			return r.res, r.err
+		}
 	}
 	return f.inbox, nil
 }

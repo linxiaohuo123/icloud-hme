@@ -55,7 +55,7 @@ func NewMailReadService(be Backend) *MailReadService {
 
 // ListInbox 读取收件箱列表
 func (s *MailReadService) ListInbox(ctx context.Context, q InboxQuery) (InboxResult, error) {
-	return s.be.ListInbox(q)
+	return s.be.ListInboxContext(ctx, q)
 }
 
 // ListMailboxes 读取邮箱文件夹列表

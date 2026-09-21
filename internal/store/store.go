@@ -916,15 +916,21 @@ type PoolCandidate struct {
 // 这仅在**单进程嵌入式 SQLite** 下成立。若未来迁移到多进程部署或 PostgreSQL，
 // 必须改用 SELECT ... FOR UPDATE 行锁或 INSERT ... WHERE NOT EXISTS 子查询，
 // 否则同一别名可能被多进程同时领用。
-func (s *Store) ClaimPoolAlias(candidates []PoolCandidate, tag, tokenName string) (*LeaseRecord, error) {
+func (s *Store) ClaimPoolAlias(candidates []PoolCandidate, tag, principalKind, principalID, tokenDisplayName string) (*LeaseRecord, error) {
 	if len(candidates) == 0 {
 		return nil, nil
 	}
 	if tag == "" {
 		tag = "default"
 	}
-	if tokenName == "" {
-		tokenName = "admin_console"
+	if principalKind == "" {
+		principalKind = "token"
+	}
+	if principalID == "" {
+		principalID = tokenDisplayName
+	}
+	if tokenDisplayName == "" {
+		tokenDisplayName = principalID
 	}
 
 	s.mu.Lock()
@@ -1003,26 +1009,13 @@ func (s *Store) ClaimPoolAlias(candidates []PoolCandidate, tag, tokenName string
 			continue
 		}
 
-		// 4. 解析归属身份
-		ownerKind := "token"
-		ownerID := tokenName
-		if tokenName == "admin_console" {
-			ownerKind = "admin"
-			ownerID = "admin"
-		} else if tokenName == "scheduler" {
-			ownerKind = "scheduler"
-			ownerID = "scheduler"
-		} else {
-			var realID string
-			_ = tx.QueryRow(`SELECT id FROM api_tokens WHERE LOWER(name) = LOWER(?) LIMIT 1`, tokenName).Scan(&realID)
-			if realID != "" {
-				ownerID = realID
-			}
-		}
+		// 4. 归属身份 (权威身份永远直接写 principalID，禁止通过 token name 反查)
+		ownerKind := principalKind
+		ownerID := principalID
 
 		allocID := fmt.Sprintf("lease_%d_%d", time.Now().UnixNano(), atomic.AddUint64(&leaseSeq, 1))
 
-		// 5. 写入 alias_allocations
+		// 5. 写入 alias_allocations (owner_id 永远直接写 principalID)
 		_, err = tx.Exec(`
 			INSERT INTO alias_allocations (allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status)
 			VALUES (?, ?, ?, ?, ?, ?, ?, 'allocated')
@@ -1035,7 +1028,7 @@ func (s *Store) ClaimPoolAlias(candidates []PoolCandidate, tag, tokenName string
 			return nil, fmt.Errorf("写入 alias_allocations 失败: %w", err)
 		}
 
-		// 6. 兼容写入 lease_records
+		// 6. 兼容写入 lease_records (tokenDisplayName 只允许写入审计字段 token_name)
 		rec := LeaseRecord{
 			ID:          allocID,
 			Email:       candEmail,
@@ -1044,7 +1037,7 @@ func (s *Store) ClaimPoolAlias(candidates []PoolCandidate, tag, tokenName string
 			Status:      "completed",
 			AllocatedAt: now,
 			CompletedAt: now,
-			TokenName:   tokenName,
+			TokenName:   tokenDisplayName,
 		}
 		insQuery := `INSERT INTO lease_records (id, email, account_id, tag, status, allocated_at, completed_at, token_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 		if _, insertErr := tx.Exec(insQuery, rec.ID, rec.Email, rec.AccountID, rec.Tag, rec.Status, rec.AllocatedAt, rec.CompletedAt, rec.TokenName); insertErr != nil {
@@ -1067,15 +1060,21 @@ func (s *Store) ClaimPoolAlias(candidates []PoolCandidate, tag, tokenName string
 }
 
 // ClaimPoolAliasByRoutes 直接从持久化库存表中查找未被消费的可用别名并原子认领。
-func (s *Store) ClaimPoolAliasByRoutes(accountIDs []string, tag, tokenName string) (*LeaseRecord, error) {
+func (s *Store) ClaimPoolAliasByRoutes(accountIDs []string, tag, principalKind, principalID, tokenDisplayName string) (*LeaseRecord, error) {
 	if len(accountIDs) == 0 {
 		return nil, nil
 	}
 	if tag == "" {
 		tag = "default"
 	}
-	if tokenName == "" {
-		tokenName = "admin_console"
+	if principalKind == "" {
+		principalKind = "token"
+	}
+	if principalID == "" {
+		principalID = tokenDisplayName
+	}
+	if tokenDisplayName == "" {
+		tokenDisplayName = principalID
 	}
 
 	s.mu.Lock()
@@ -1134,21 +1133,8 @@ func (s *Store) ClaimPoolAliasByRoutes(accountIDs []string, tag, tokenName strin
 			continue
 		}
 
-		ownerKind := "token"
-		ownerID := tokenName
-		if tokenName == "admin_console" {
-			ownerKind = "admin"
-			ownerID = "admin"
-		} else if tokenName == "scheduler" {
-			ownerKind = "scheduler"
-			ownerID = "scheduler"
-		} else {
-			var realID string
-			_ = tx.QueryRow(`SELECT id FROM api_tokens WHERE LOWER(name) = LOWER(?) LIMIT 1`, tokenName).Scan(&realID)
-			if realID != "" {
-				ownerID = realID
-			}
-		}
+		ownerKind := principalKind
+		ownerID := principalID
 
 		allocID := fmt.Sprintf("lease_%d_%d", time.Now().UnixNano(), atomic.AddUint64(&leaseSeq, 1))
 
@@ -1172,11 +1158,15 @@ func (s *Store) ClaimPoolAliasByRoutes(accountIDs []string, tag, tokenName strin
 			Status:      "completed",
 			AllocatedAt: now,
 			CompletedAt: now,
-			TokenName:   tokenName,
+			TokenName:   tokenDisplayName,
 		}
 		insQuery := `INSERT INTO lease_records (id, email, account_id, tag, status, allocated_at, completed_at, token_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 		if _, insertErr := tx.Exec(insQuery, rec.ID, rec.Email, rec.AccountID, rec.Tag, rec.Status, rec.AllocatedAt, rec.CompletedAt, rec.TokenName); insertErr != nil {
 			return nil, insertErr
+		}
+
+		if rec.AccountID != "" {
+			_, _ = tx.Exec(`INSERT INTO alias_routes (email, account_id, updated_at) VALUES (?, ?, ?) ON CONFLICT(email) DO UPDATE SET account_id=excluded.account_id`, rec.Email, rec.AccountID, now)
 		}
 
 		if err := tx.Commit(); err != nil {

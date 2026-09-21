@@ -8,6 +8,7 @@
 package server
 
 import (
+	"context"
 	"log"
 	stdmail "net/mail"
 	"strings"
@@ -44,9 +45,12 @@ type MailSyncWorker struct {
 	interval       time.Duration
 	triggerCh      chan struct{}
 	stopCh         chan struct{}
+	ctx            context.Context
+	cancel         context.CancelFunc
 	once           sync.Once
 	stopOnce       sync.Once
 	wg             sync.WaitGroup
+	fetchWg        sync.WaitGroup
 	mu             sync.RWMutex
 	aliasToAccount map[string]string    // alias (lower) -> accountID
 	published      map[string]time.Time // "account|folder|uid|recipient" -> 首次发布时间
@@ -58,6 +62,7 @@ func NewMailSyncWorker(be Backend, st *store.Store, eventBus *mail.EventBus, int
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
+	workerCtx, workerCancel := context.WithCancel(context.Background())
 	return &MailSyncWorker{
 		be:             be,
 		store:          st,
@@ -65,6 +70,8 @@ func NewMailSyncWorker(be Backend, st *store.Store, eventBus *mail.EventBus, int
 		interval:       interval,
 		triggerCh:      make(chan struct{}, 1),
 		stopCh:         make(chan struct{}),
+		ctx:            workerCtx,
+		cancel:         workerCancel,
 		aliasToAccount: make(map[string]string),
 		published:      make(map[string]time.Time),
 		probeMiss:      make(map[string]time.Time),
@@ -162,12 +169,16 @@ func (w *MailSyncWorker) Start() {
 	})
 }
 
-// Stop 停止同步协程并平稳等待在途轮次结束 (线程安全且幂等，PR-07 §10.4)。
+// Stop 停止同步协程并平稳等待在途轮次与网络调用完全结束 (线程安全且幂等，PR-07 §10.4 & PR-08 Final Hardening §3)。
 func (w *MailSyncWorker) Stop() {
 	w.stopOnce.Do(func() {
+		if w.cancel != nil {
+			w.cancel()
+		}
 		close(w.stopCh)
 	})
 	w.wg.Wait()
+	w.fetchWg.Wait()
 }
 
 // Trigger 立即唤醒同步器执行一轮同步 (非阻塞)。
@@ -265,7 +276,7 @@ func (w *MailSyncWorker) syncOnce() {
 		unknownAliases = remain
 	}
 
-	// 2. 对已知归属账号进行有界并发批量拉取与慢账号隔离 (PR-07 §10.2)
+	// 2. 对已知归属账号进行有界并发批量拉取与慢账号隔离 (PR-07 §10.2 & PR-08 Final Hardening §3)
 	sem := make(chan struct{}, maxConcurrentAccountSync)
 	var fetchWg sync.WaitGroup
 
@@ -273,30 +284,23 @@ func (w *MailSyncWorker) syncOnce() {
 		accID := accID
 		aliases := aliases
 		select {
-		case <-w.stopCh:
+		case <-w.ctx.Done():
 			break
 		case sem <- struct{}{}:
+			accountCtx, accountCancel := context.WithTimeout(w.ctx, accountSyncTimeout)
 			fetchWg.Add(1)
+			w.fetchWg.Add(1)
 			go func() {
 				defer func() {
+					accountCancel()
 					<-sem
+					w.fetchWg.Done()
 					fetchWg.Done()
 					if r := recover(); r != nil {
 						log.Printf("[PANIC RECOVER] mail_sync.fetchAndPublishBatch for %s: %v", accID, r)
 					}
 				}()
-				// 单账号隔离超时保护，慢账号超时不拖死整体
-				doneCh := make(chan struct{})
-				go func() {
-					w.fetchAndPublishBatch(accID, aliases)
-					close(doneCh)
-				}()
-				select {
-				case <-doneCh:
-				case <-time.After(accountSyncTimeout):
-					log.Printf("[WARN] mail_sync: 账号 %s 同步超时(%v)，已隔离跳过该轮", accID, accountSyncTimeout)
-				case <-w.stopCh:
-				}
+				w.fetchAndPublishBatch(accountCtx, accID, aliases)
 			}()
 		}
 	}
@@ -322,7 +326,10 @@ func (w *MailSyncWorker) syncOnce() {
 				}
 				probed++
 				for _, alias := range probeList {
-					if w.fetchAndPublish(acc.ID, alias) {
+					if err := w.ctx.Err(); err != nil {
+						break
+					}
+					if w.fetchAndPublish(w.ctx, acc.ID, alias) {
 						// 盲扫发现归属: 写穿路由表，此后不再需要盲扫
 						w.RegisterAliasAccounts(acc.ID, []string{alias})
 					}
@@ -338,9 +345,9 @@ func (w *MailSyncWorker) syncOnce() {
 	}
 }
 
-// fetchAndPublishBatch 按账号增量批量拉取邮件并分发给多个别名等待者 (PR-07 §10.2)。
-// 单账号仅发起 1 次 ListInbox，彻底消除 N 次全量重扫。
-func (w *MailSyncWorker) fetchAndPublishBatch(accountID string, aliases []string) bool {
+// fetchAndPublishBatch 按账号增量批量拉取邮件并分发给多个别名等待者 (PR-07 §10.2 & PR-08 Final Hardening §3)。
+// 单账号仅发起 1 次 ListInboxContext，真实支持上下文超时与取消。
+func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID string, aliases []string) bool {
 	if len(aliases) == 0 {
 		return false
 	}
@@ -360,7 +367,7 @@ func (w *MailSyncWorker) fetchAndPublishBatch(accountID string, aliases []string
 		}
 	}
 
-	res, err := w.be.ListInbox(q)
+	res, err := w.be.ListInboxContext(ctx, q)
 	if err != nil || len(res.Messages) == 0 {
 		return false
 	}
@@ -403,8 +410,8 @@ func (w *MailSyncWorker) fetchAndPublishBatch(accountID string, aliases []string
 	return hasMatch
 }
 
-func (w *MailSyncWorker) fetchAndPublish(accountID, alias string) bool {
-	return w.fetchAndPublishBatch(accountID, []string{alias})
+func (w *MailSyncWorker) fetchAndPublish(ctx context.Context, accountID, alias string) bool {
+	return w.fetchAndPublishBatch(ctx, accountID, []string{alias})
 }
 
 // resolveAccountFromStore 按「持久化路由表 → 出号流水」的顺序解析别名归属。

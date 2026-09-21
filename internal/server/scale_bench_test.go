@@ -8,6 +8,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -224,7 +225,11 @@ type countingInboxBackend struct {
 	calls int
 }
 
-func (c *countingInboxBackend) ListInbox(InboxQuery) (InboxResult, error) {
+func (c *countingInboxBackend) ListInbox(q InboxQuery) (InboxResult, error) {
+	return c.ListInboxContext(context.Background(), q)
+}
+
+func (c *countingInboxBackend) ListInboxContext(ctx context.Context, q InboxQuery) (InboxResult, error) {
 	c.mu.Lock()
 	c.calls++
 	c.mu.Unlock()
