@@ -7,9 +7,8 @@ services:
     container_name: icloud-hme
     restart: unless-stopped
     ports:
-      # 默认只绑定回环:公网暴露请在前面放 Nginx/Caddy 终止 TLS。
-      # 确需直接对外时改成 "8081:8081"，并把 ICLOUD_HME_SECURE_COOKIE 设为 true。
-      - "127.0.0.1:8081:8081"
+      # 默认直接对外暴露 8081 端口；若通过 Nginx/Caddy 反代，可在 .env 中配置 ICLOUD_HME_PORT_BINDING=127.0.0.1:8081:8081
+      - "${ICLOUD_HME_PORT_BINDING:-8081:8081}"
     environment:
       # 【必填】在 .env 里设置，缺失时 compose 会直接拒绝启动。
       # 不要在此处写死占位口令:占位值能通过长度校验，等同于把母号凭据交给任何读过本仓库的人。
