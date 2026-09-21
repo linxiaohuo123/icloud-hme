@@ -21,14 +21,14 @@ export function extractVerifyCode(text: string): string | null {
 
   // 1. 上下文强特征正则 (正向关键词优先，支持连字号与倒装语序)
   const contextualPatterns = [
-    // 正向: 关键词在前，数字在后 (例如: "验证码: 123456", "code is 1234", "code: 123456")
-    /(?:验证码|校验码|动态码|确认码|安全码|动态口令|口令)[^\d]{0,8}(?:为|是|:|：|\s)?\s*([0-9]{4,8})\b/i,
-    /(?:code|verification|verify|pin|otp|password|passcode)[^\d]{0,8}(?:is|:|：|\s)?\s*([0-9]{4,8})\b/i,
+    // 正向: 关键词在前，数字在后 (支持中文、英文、韩文、日文，容限扩充至 32 字符)
+    /(?:验证码|校验码|动态码|确认码|安全码|动态口令|口令|인증\s*코드|인증\s*번호|인증번호|임시\s*코드|확인\s*코드|보안\s*코드|認証コード|確認コード)[^\d]{0,32}(?:为|是|:|：|\s)?\s*([0-9]{4,8})\b/i,
+    /(?:code|verification|verify|pin|otp|password|passcode)[^\d]{0,12}(?:is|:|：|\s)?\s*([0-9]{4,8})\b/i,
     /(?:code|pin)\s*[:#：]\s*([0-9]{4,8})\b/i,
     // 连字号格式 (例: "code: 123-456", "验证码 839-201", "123 456")
-    /(?:验证码|校验码|动态码|确认码|code|verification|verify|pin|otp|password)[^\d]{0,12}(?:is|为|是|:|：|\s)?\s*([0-9]{3,4}[-\s][0-9]{3,4})\b/i,
+    /(?:验证码|校验码|动态码|确认码|인증\s*코드|인증\s*번호|임시\s*코드|code|verification|verify|pin|otp|password)[^\d]{0,32}(?:is|为|是|:|：|\s)?\s*([0-9]{3,4}[-\s][0-9]{3,4})\b/i,
     // 反向: 对齐后端 reverseContextCodeRegex，\bcode\b 与 \bpin\b 避免误伤，容许修饰定语
-    /\b([0-9]{4,8})\b[^\r\n\d]{0,20}?(?:is(?:\s+(?:your|the|a|an))?|为(?:您(?:的)?)?|是(?:你(?:的)?)?|为本次|作为)?[^\r\n\d]{0,20}?(?:验证码|校验码|动态码|确认码|安全码|动态口令|口令|one-time\s*password|temporary\s*password|verification\s*code|security\s*code|verify\s*code|auth\s*code|passcode|\bcode\b|otp|\bpin\b)/i,
+    /\b([0-9]{4,8})\b[^\r\n\d]{0,24}?(?:is(?:\s+(?:your|the|a|an))?|为(?:您(?:的)?)?|是(?:你(?:的)?)?|为本次|作为|입니다|입력)?[^\r\n\d]{0,24}?(?:验证码|校验码|动态码|确认码|安全码|动态口令|口令|인증\s*코드|인증\s*번호|인증번호|임시\s*코드|확인\s*코드|보안\s*코드|認証コード|確認コード|one-time\s*password|temporary\s*password|verification\s*code|security\s*code|verify\s*code|auth\s*code|passcode|\bcode\b|otp|\bpin\b)/i,
   ]
 
   for (const pattern of contextualPatterns) {
@@ -52,7 +52,7 @@ export function extractVerifyCode(text: string): string | null {
 }
 
 function hasVerifyKeyword(text: string): boolean {
-  return /(?:验证码|校验码|动态码|确认码|安全码|动态口令|\b口令\b|验证|激活|确认|one-time\s*password|temporary\s*password|verification(?:\s+code)?|verify(?:\s+code)?|security\s+code|auth\s+code|passcode|\bcode\b|\botp\b|\bpin\b|\bpassword\b)/i.test(text)
+  return /(?:验证码|校验码|动态码|确认码|安全码|动态口令|\b口令\b|验证|激活|确认|인증|코드|확인|보안|임시|認証|パスコード|one-time\s*password|temporary\s*password|verification(?:\s+code)?|verify(?:\s+code)?|security\s+code|auth\s+code|passcode|\bcode\b|\botp\b|\bpin\b|\bpassword\b)/i.test(text)
 }
 
 /**

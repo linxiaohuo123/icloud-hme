@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 regexp, strings 标准库
  * [OUTPUT]: 对外提供 OTPResult, ExtractOTP
- * [POS]: internal/mail 的验证码与激活链接嗅探器，供 server/verify_handler 消费；支持正反向语序与修饰定语容差提取，严格防守 \botp\b、\bpin\b 与 \bcode\b 词边界
+ * [POS]: internal/mail 的验证码与激活链接嗅探器，供 server/verify_handler 消费；支持正反向语序、中英韩日多语言与修饰定语容差提取，严格防守 \botp\b、\bpin\b 与 \bcode\b 词边界
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -19,14 +19,14 @@ type OTPResult struct {
 }
 
 var (
-	// contextCodeRegex 优先匹配带上下文关键词的 4-8 位纯数字验证码
-	contextCodeRegex = regexp.MustCompile(`(?i)(?:验证码|校验码|动态码|确认码|安全码|动态口令|口令|one-time\s*password|temporary\s*password|verification\s*code|security\s*code|verify\s*code|auth\s*code|passcode|\bcode\b|\botp\b|\bpin\b)[^\r\n\d]{0,12}?(?:is|为|是)?[:：\s-]*\b([0-9]{4,8})\b`)
+	// contextCodeRegex 优先匹配带上下文关键词的 4-8 位纯数字验证码 (扩充韩文/日文及长动词容限)
+	contextCodeRegex = regexp.MustCompile(`(?i)(?:验证码|校验码|动态码|确认码|安全码|动态口令|口令|인증\s*코드|인증\s*번호|인증번호|임시\s*코드|확인\s*코드|보안\s*코드|認証コード|確認コード|one-time\s*password|temporary\s*password|verification\s*code|security\s*code|verify\s*code|auth\s*code|passcode|\bcode\b|\botp\b|\bpin\b)[^\r\n\d]{0,32}?(?:is|为|是|:|：|\s)*[:：\s-]*\b([0-9]{4,8})\b`)
 
 	// contextHyphenCodeRegex 匹配带上下文关键词的连字号验证码 (例: "code: 123-456", "验证码 839-201", "pin is 123 456")
-	contextHyphenCodeRegex = regexp.MustCompile(`(?i)(?:验证码|校验码|动态码|确认码|安全码|动态口令|口令|one-time\s*password|temporary\s*password|verification\s*code|security\s*code|verify\s*code|auth\s*code|passcode|\bcode\b|\botp\b|\bpin\b)[^\r\n\d]{0,12}?(?:is|为|是)?[:：\s-]*\b([0-9]{3,4}[-\s][0-9]{3,4})\b`)
+	contextHyphenCodeRegex = regexp.MustCompile(`(?i)(?:验证码|校验码|动态码|确认码|安全码|动态口令|口令|인증\s*코드|인증\s*번호|인증번호|임시\s*코드|확인\s*코드|보안\s*코드|認証コード|確認コード|one-time\s*password|temporary\s*password|verification\s*code|security\s*code|verify\s*code|auth\s*code|passcode|\bcode\b|\botp\b|\bpin\b)[^\r\n\d]{0,32}?(?:is|为|是|:|：|\s)*[:：\s-]*\b([0-9]{3,4}[-\s][0-9]{3,4})\b`)
 
 	// reverseContextCodeRegex 匹配数字在前、关键词在后的 4-8 位纯数字验证码 (例: "123456 is your verification code", "839201 为本次确认码", "492019 is your AWS verification code")
-	reverseContextCodeRegex = regexp.MustCompile(`(?i)\b([0-9]{4,8})\b[^\r\n\d]{0,20}?(?:is(?:\s+(?:your|the|a|an))?|为(?:您(?:的)?)?|是(?:你(?:的)?)?|为本次|作为)?[^\r\n\d]{0,20}?(?:验证码|校验码|动态码|确认码|安全码|动态口令|口令|one-time\s*password|temporary\s*password|verification\s*code|security\s*code|verify\s*code|auth\s*code|passcode|\bcode\b|\botp\b|\bpin\b)`)
+	reverseContextCodeRegex = regexp.MustCompile(`(?i)\b([0-9]{4,8})\b[^\r\n\d]{0,24}?(?:is(?:\s+(?:your|the|a|an))?|为(?:您(?:的)?)?|是(?:你(?:的)?)?|为本次|作为|입니다|입력)?[^\r\n\d]{0,24}?(?:验证码|校验码|动态码|确认码|安全码|动态口令|口令|인증\s*코드|인증\s*번호|인증번호|임시\s*코드|확인\s*코드|보안\s*코드|認証コード|確認コード|one-time\s*password|temporary\s*password|verification\s*code|security\s*code|verify\s*code|auth\s*code|passcode|\bcode\b|\botp\b|\bpin\b)`)
 
 	// standaloneDigitRegex 兜底匹配独立的 4-8 位数字
 	standaloneDigitRegex = regexp.MustCompile(`\b([0-9]{4,8})\b`)
@@ -78,7 +78,11 @@ func cleanCode(s string) string {
 // isVerificationEmail 判定邮件是否属于验证类邮件。
 func isVerificationEmail(text string) bool {
 	lower := strings.ToLower(text)
-	keywords := []string{"验证码", "校验码", "动态码", "确认码", "安全码", "动态口令", "口令", "验证", "code", "verification", "verify", "activate", "激活", "确认", "one-time password", "password"}
+	keywords := []string{
+		"验证码", "校验码", "动态码", "确认码", "安全码", "动态口令", "口令", "验证",
+		"code", "verification", "verify", "activate", "激活", "确认", "one-time password", "password",
+		"인증", "코드", "확인", "보안", "임시", "認証", "パスコード",
+	}
 	for _, kw := range keywords {
 		if strings.Contains(lower, kw) {
 			return true

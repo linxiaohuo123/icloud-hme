@@ -34,7 +34,7 @@ const maxAliasRouteCache = 50000
 // PR-07 §10.2: 账号间有界并发与慢账号超时隔离常量
 const (
 	maxConcurrentAccountSync = 5
-	accountSyncTimeout       = 5 * time.Second
+	accountSyncTimeout       = 25 * time.Second
 )
 
 // MailSyncWorker 后台增量邮件同步器。
@@ -420,7 +420,13 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 	}
 
 	res, err := w.be.ListInboxContext(ctx, q)
-	if err != nil || len(res.Messages) == 0 {
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("[MailSync] 账号 %s 同步邮件失败: %v", accountID, err)
+		}
+		return false
+	}
+	if len(res.Messages) == 0 {
 		return false
 	}
 

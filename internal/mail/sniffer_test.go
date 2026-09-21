@@ -96,6 +96,12 @@ func TestExtractOTP(t *testing.T) {
 			body:         "Your OTP is 829104 for verification.",
 			expectedCode: "829104",
 		},
+		{
+			name:         "韩文ChatGPT认证邮件",
+			subject:      "ChatGPT 인증 코드",
+			body:         "다음 임시 인증 코드를 입력해 계속하세요: 576932 ChatGPT 계정을 생성하고자 하는 것이 본인이 아닌 경우 이 이메일을 무시하세요. 감사합니다. ChatGPT 팀 드림 ChatGPT ( https://chatgpt.com ) 도움말 센터 ( https://help.openai.com )",
+			expectedCode: "576932",
+		},
 	}
 
 	for _, tt := range tests {

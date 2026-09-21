@@ -42,6 +42,11 @@ describe('extractVerifyCode', () => {
     expect(extractVerifyCode('Your one-time password is: 987 654')).toBe('987654')
   })
 
+  it('提取韩文ChatGPT等外语上下文验证码', () => {
+    const koreanMail = '다음 임시 인증 코드를 입력해 계속하세요: 576932 ChatGPT 계정을 생성하고자 하는 것이 본인이 아닌 경우 이 이메일을 무시하세요. 감사합니다. ChatGPT 팀 드림 ChatGPT ( https://chatgpt.com ) 도움말 센터 ( https://help.openai.com )'
+    expect(extractVerifyCode(koreanMail)).toBe('576932')
+  })
+
   it('提取反向倒装语序的验证码', () => {
     expect(extractVerifyCode('123456 is your verification code')).toBe('123456')
     expect(extractVerifyCode('839201 为本次确认码')).toBe('839201')

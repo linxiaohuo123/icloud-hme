@@ -483,12 +483,26 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 		if sinceUID == 0 {
 			uids = newestUIDs(uids, limit)
 		}
-		for i := len(uids) - 1; i >= 0; i-- {
-			m, ferr := c.fetchOneUID(folder, uids[i])
-			if ferr != nil {
-				return ferr
+		seqset := new(imap.SeqSet)
+		for _, u := range uids {
+			seqset.AddNum(u)
+		}
+		section := &imap.BodySectionName{Peek: true}
+		items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate, imap.FetchFlags, section.FetchItem()}
+		messages := make(chan *imap.Message, len(uids))
+		done := make(chan error, 1)
+		go func() {
+			done <- c.cli.UidFetch(seqset, items, messages)
+		}()
+
+		var fetched []Message
+		for msg := range messages {
+			if msg == nil {
+				continue
 			}
+			m := toMessageWithBody(msg, folder)
 			m.UIDValidity = mbox.UidValidity
+			m.UID = msg.Uid
 			m.Provider = "imap"
 			ref := MessageRef{
 				Provider:    "imap",
@@ -497,6 +511,14 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 				UID:         m.UID,
 			}
 			m.MessageRef = ref.Encode()
+			fetched = append(fetched, m)
+		}
+		if err := <-done; err != nil {
+			return err
+		}
+		// 按 UID 从大到小 (新到旧) 排序触发回调
+		sort.SliceStable(fetched, func(i, j int) bool { return fetched[i].UID > fetched[j].UID })
+		for _, m := range fetched {
 			if !onMsg(m) {
 				return nil
 			}
