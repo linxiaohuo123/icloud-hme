@@ -541,3 +541,124 @@ func TestPR08_AtomicVerificationRequest_GlobalLimit(t *testing.T) {
 		t.Fatalf("expected 19 ErrServerBusy, got %d", busyCount)
 	}
 }
+
+// ============================================================================
+// P0-3: Verification 成功 CAS 必须原子包含 expires_at 判定
+// ============================================================================
+
+func TestVerificationCAS_CannotSucceedAfterExpiry(t *testing.T) {
+	// VERIFY-CAS-01: expires_at = now - 1ms, status=ready -> CompleteVerificationRequest -> won=false -> 最终不是 succeeded
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	reqID := "vreq_cas_expired"
+
+	vreq := &VerificationRequest{
+		RequestID:           reqID,
+		PrincipalKind:       "token",
+		PrincipalID:         "tok_cas",
+		LeaseID:             "lease_cas",
+		AliasEmail:          "cas_exp@icloud.com",
+		Status:              "ready",
+		CreatedAt:           now.Add(-10 * time.Minute).Format(time.RFC3339),
+		ExpiresAt:           now.Add(-1 * time.Millisecond).Format(time.RFC3339), // 已过期 1ms
+		BaselineProvider:    "imap",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         100,
+	}
+	if err := st.CreateVerificationRequest(ctx, vreq); err != nil {
+		t.Fatal(err)
+	}
+
+	// 尝试 Complete (由于当前尚未修复，expires_at 不在 WHERE 条件中，会导致 won=true 且变成 succeeded)
+	curReq, won, err := st.CompleteVerificationRequest(ctx, reqID, "123456", "ref_100")
+	if err != nil {
+		t.Fatalf("CompleteVerificationRequest unexpected err: %v", err)
+	}
+	if won {
+		t.Fatalf("VERIFY-CAS-01 失败: 已过 expires_at 的请求绝不能 won=true")
+	}
+	if curReq == nil || curReq.Status == "succeeded" {
+		t.Fatalf("VERIFY-CAS-01 失败: 已过期的请求状态绝不能变迁为 succeeded, 实际: %+v", curReq)
+	}
+}
+
+func TestVerificationCAS_ConcurrentExpiryVsSuccess(t *testing.T) {
+	// VERIFY-CAS-02: expiry 与 OTP completion 并发竞争，最终只能是 succeeded 或 expired，绝不能有非法中间态或逾期 succeeded
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	for round := 0; round < 30; round++ {
+		now := time.Now().UTC()
+		reqID := fmt.Sprintf("vreq_race_%d", round)
+		// 设置极短的过期时间 (2ms)
+		vreq := &VerificationRequest{
+			RequestID:           reqID,
+			PrincipalKind:       "token",
+			PrincipalID:         "tok_race",
+			LeaseID:             fmt.Sprintf("lease_race_%d", round),
+			AliasEmail:          fmt.Sprintf("race_%d@icloud.com", round),
+			Status:              "ready",
+			CreatedAt:           now.Format(time.RFC3339),
+			ExpiresAt:           now.Add(2 * time.Millisecond).Format(time.RFC3339),
+			BaselineProvider:    "imap",
+			BaselineMailbox:     "INBOX",
+			BaselineUIDValidity: 1,
+			BaselineUID:         100,
+		}
+		if err := st.CreateVerificationRequest(ctx, vreq); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			time.Sleep(1 * time.Millisecond)
+			_, _, _ = st.ExpireVerificationRequest(ctx, reqID)
+		}()
+
+		go func() {
+			defer wg.Done()
+			time.Sleep(1 * time.Millisecond)
+			_, _, _ = st.CompleteVerificationRequest(ctx, reqID, "666888", "ref_race")
+		}()
+
+		wg.Wait()
+
+		finalReq, err := st.GetVerificationRequest(ctx, reqID, "token", "tok_race")
+		if err != nil {
+			t.Fatalf("round %d: get req failed: %v", round, err)
+		}
+		if finalReq.Status != "succeeded" && finalReq.Status != "expired" {
+			t.Fatalf("round %d: 终态必须是 succeeded 或 expired, 实际: %s", round, finalReq.Status)
+		}
+		// 若为 succeeded，则再次尝试 Expire 必须无法修改终态
+		if finalReq.Status == "succeeded" {
+			_, won, _ := st.ExpireVerificationRequest(ctx, reqID)
+			if won {
+				t.Fatalf("round %d: succeeded 终态绝不可被修改为 expired", round)
+			}
+		}
+		// 若为 expired，则再次尝试 Complete 必须无法修改终态
+		if finalReq.Status == "expired" {
+			_, won, _ := st.CompleteVerificationRequest(ctx, reqID, "999999", "ref_late")
+			if won {
+				t.Fatalf("round %d: expired 终态绝不可被修改为 succeeded", round)
+			}
+		}
+	}
+}
+

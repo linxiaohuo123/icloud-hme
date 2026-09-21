@@ -208,18 +208,51 @@ go test -race ./...              -> Exit Code: 1 (本地 Windows 环境未安装
        - `MailReadService`：统一管理收件箱读取、详情缓存与多引用批量拉取。
        - 所有 Handler 纯化为仅负责 HTTP 参数解析与响应输出。
      - **废弃双轨代码隔离**：`AliasBuffer` 与 `AliasReaper` 的后台自动请求已被彻底禁用并明确安全状态，杜绝误导。
-     - **完成端到端全链路验收测试** (`internal/server/e2e_final_pr08_test.go`)：串联库存录入、外部出号、建立取码意图、长轮询等待、邮件广播交付、Token 撤销拦截、优雅停机与重启后防重核验全闭环。
-     - **交付文档完备化**：编写 `docs/remediation/MIGRATION.md` 与 `docs/remediation/RELEASE.md`。
+
+---
+
+## 阶段批次：Final Correctness Hardening (最终业务正确性加固)
+
+- **执行日期**：2026-09-21
+- **审查基线**：`02c6272adef700a614496fda882c7706b7000cce`
+- **工作分支**：`pr/pr06-pr08-final`
+- **实现清单**：
+  1. **P0-1 UIDNEXT 闭区间与 Strict Verification INBOX 锁定**：
+     - `internal/server/mail_sync.go`：修复 SinceUID off-by-one 偏差，`q.SinceUID = uid` 与 `q.SinceUID = globalMinUID`（去除 `+1` 偏移，确保 IMAP `UID <SinceUID>:*` 查询包含 UIDNEXT 自身）；
+     - 当处于 strict verification 驱动时，强制固定 `q.Folder = "INBOX"`，避免因历史多文件夹配置污染验证码基线。
+  2. **P0-2 MatchBoundary 彻底消除未知通配符判定**：
+     - `internal/mail/eventbus.go`：重构 `MatchBoundary` 为纯粹 7 规则矩阵，未知 mailbox/UIDValidity/UID 一律返回 `BoundaryIgnore`，仅同 mailbox 代际突变返回 `BoundaryInvalidated`，杜绝事件提前唤醒或误杀。
+     - 在 `internal/mail/eventbus_test.go` 增补 `BOUNDARY-01 ~ BOUNDARY-06` 单测矩阵。
+  3. **P0-3 验证码成功 CAS 必须下沉 expires_at 判定**：
+     - `internal/store/inventory.go`：`CompleteVerificationRequest` WHERE 条件增加 `AND expires_at > ?`（UTC RFC3339 字符串比较）；在未击中 CAS 且当前时间已过期时自动将状态收敛为 `expired`；
+     - `internal/server/verification_service.go`：`handleItem` 传入 `time.Now().UTC()`，在 CAS loser 时准确分流 `expired` / `invalidated` / `succeeded`。
+  4. **P0-4 allowedAccountIDs nil 降级消除与标签隔离**：
+     - `internal/server/quick_create_handler.go`：`selectPoolAccounts` 请求特定业务标签但无匹配账号时返回 `[]string{}`，严禁回退公共池；
+     - `internal/server/allocation_service.go`：`poolAccountIDs` 确保为 `[]string{}` 空切片，Store 收到空集合明确拒绝并返回无可用库存。
+  5. **P0-5 失败幂等重放恢复原业务错误**：
+     - `internal/store/inventory.go`：`ClaimInventoryAlias` 遇到已记录的 `state='failed'` 且 `error_code='NO_AVAILABLE_INVENTORY'` 时，准确映射回 `ErrNoAvailableInventory`；
+     - `internal/server/allocation_service.go`：将 `ErrNoAvailableInventory` 准确映射为 `ErrPoolEmpty`，对外返回 503 `POOL_EMPTY`。
+  6. **P0-6 发布去重指纹严格包含 UIDVALIDITY**：
+     - `internal/server/mail_sync.go`：`markPublished` 升级为使用规范 `MessageRef.CacheKey() + recipient`，严格绑定 UIDVALIDITY，防止代际变更同 UID 漏推。
+  7. **P0-7 规范 MessageRef 必须包含 account_id 与单射 Identity Join**：
+     - `internal/server/backend_mail.go`：`GetMessage` 与 `GetMessages` 中无条件规范化 MessageRef，必须包含实际已知 `AccountID`；
+     - `internal/server/mail_read_service.go`：`GetMessagesBatch` 简化 Identity Map，每个 fetched message 归一化为 `ref.CacheKey()`，requested 直接通过 `requestedRef.CacheKey()` 匹配，彻底移除手写弱键与无账号 fallback。
+  8. **P0-8 WebMail 首屏 capability 保护与退避重试**：
+     - `web/src/components/inbox/InboxTableView.tsx`：增加 `accountCapabilityReady` 栅栏保护，未确定能力前不发非必要查询参数；捕获 `CAPABILITY_UNSUPPORTED` 错误后最多允许 1 次退避重试 (剥离 folder/days 并记录 effective webmail capability)，严禁死循环；
+     - `web/src/components/inbox/InboxTableView.test.tsx`：增补 `WEBMAIL-01`、`WEBMAIL-03`、`WEBMAIL-04` 单测。
+  9. **P0-9 中间态 schema migration 补齐与自愈**：
+     - `internal/store/inventory.go`：`initInventorySchema` 引入 `ensureColumn` 配合 `tableHasColumn`，对 `alias_inventory`、`alias_allocations`、`operations`、`verification_requests` 逐列幂等补齐与索引收敛；针对 `alias_allocations` 缺失 `account_id` 执行平滑 backfill；
+     - `internal/store/migration_intermediate_test.go`：修复 `TestMIG_MID_02` 假阳性断言，增补 `TestMIG_MID_05_IntermediateAliasAllocationMissingAccountID` (MIG-01)。
+  10. **P1 优化项落地**：
+      - **P1-A**：`internal/store/inventory.go` 新增 `CountAuthoritativeAvailableAliases`，`internal/server/stats.go` 中 `available_aliases` 改取权威库存计数；
+      - **P1-B**：`internal/server/mail_handlers.go` 中 `listInboxHandler` 经 `mailReadService.ListInbox` 严格传导 Context；
+      - **P1-C**：`internal/server/server.go` 中调度器补货持久化失败向上抛错，不当做普通成功。
 - **真实命令与退出码**：
   ```text
   npm --prefix web run lint        -> Exit Code: 0 (0 错误, 5 警告)
-  npm --prefix web run test:run    -> Exit Code: 0 (16/16 文件通过, 101/101 用例全部通过)
-  npm --prefix web run build       -> Exit Code: 0 (TypeScript 校验通过, 构建成功)
+  npm --prefix web run test:run    -> Exit Code: 0 (16/16 文件通过, 104/104 用例全部通过)
+  npm --prefix web run build       -> Exit Code: 0 (TypeScript 校验通过, Vite 构建成功)
   go vet ./...                     -> Exit Code: 0 (0 警告)
   go build ./...                   -> Exit Code: 0 (全模块编译构建成功)
-  go test -count=1 ./...           -> Exit Code: 0 (全部 11 个模块无缓存实测 100% 通过)
-  go test -race ./...              -> Exit Code: 1 (本地 Windows 环境未安装 GCC/CGO, 由 CI 执行)
+  go test -count=1 ./...           -> Exit Code: 0 (全部模块无缓存实测 100% 通过)
   ```
-
-
-

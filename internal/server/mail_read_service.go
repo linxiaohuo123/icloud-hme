@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 context, errors, fmt, strings, sync, time, strconv, icloud-hme/internal/mail
+ * [INPUT]: 依赖 context, errors, strings, sync, time, strconv, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 MailReadService, NewMailReadService, BatchItemResult, batchMessageItemReq
  * [POS]: internal/server 的邮件读取与统一详情缓存应用服务，封装收件箱读取、基于 MessageRef 的规范身份 Join 与缓存对称隔离
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -10,7 +10,6 @@ package server
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -266,50 +265,46 @@ func (s *MailReadService) GetMessagesBatch(ctx context.Context, accountID string
 			}
 		} else {
 			// 构造规范身份查找表 (Identity Map)
+			// 每个 fetched message 规范化为 canonical MessageRef，以 ref.CacheKey() 为唯一主键
 			idMap := make(map[string]*mail.FullMessage)
 			for _, f := range fetched {
 				if f == nil {
 					continue
 				}
+				var ref mail.MessageRef
 				if f.MessageRef != "" {
-					idMap[f.MessageRef] = f
-				}
-				if f.Provider == "imap" {
-					fMailbox := f.Folder
-					if fMailbox == "" {
-						fMailbox = "INBOX"
+					if parsed, err := mail.ParseMessageRef(f.MessageRef, accountID); err == nil {
+						ref = parsed
 					}
-					// 规范 key 1: 带 accountID
-					k1 := fmt.Sprintf("imap:%s:%s:%d:%d", accountID, fMailbox, f.UIDValidity, f.UID)
-					idMap[k1] = f
-					// 规范 key 2: 文件夹与 UID
-					k2 := fmt.Sprintf("imap:%s:%d:%d", fMailbox, f.UIDValidity, f.UID)
-					idMap[k2] = f
 				}
+				if ref.AccountID == "" {
+					ref.AccountID = accountID
+				}
+				if ref.Provider == "" {
+					if f.Provider != "" {
+						ref.Provider = f.Provider
+					} else {
+						ref.Provider = "imap"
+					}
+				}
+				if ref.Mailbox == "" {
+					ref.Mailbox = f.Folder
+				}
+				if ref.UIDValidity == 0 {
+					ref.UIDValidity = f.UIDValidity
+				}
+				if ref.UID == 0 {
+					ref.UID = f.UID
+				}
+				if ref.ThreadID == "" {
+					ref.ThreadID = f.ThreadID
+				}
+				idMap[ref.CacheKey()] = f
 			}
 
-			// 严格按 requested ref 进行 Identity Join
+			// 严格按 requestedRef.CacheKey() 直接 join，严禁 accountless identity fallback
 			for _, pi := range pendingIMAP {
-				var matched *mail.FullMessage
-				encodedKey := pi.refObj.Encode()
-				if m, ok := idMap[encodedKey]; ok {
-					matched = m
-				} else if pi.refObj.Provider == "imap" {
-					piMailbox := pi.refObj.Mailbox
-					if piMailbox == "" {
-						piMailbox = "INBOX"
-					}
-					k1 := fmt.Sprintf("imap:%s:%s:%d:%d", accountID, piMailbox, pi.refObj.UIDValidity, pi.refObj.UID)
-					if m, ok := idMap[k1]; ok {
-						matched = m
-					} else {
-						k2 := fmt.Sprintf("imap:%s:%d:%d", piMailbox, pi.refObj.UIDValidity, pi.refObj.UID)
-						if m, ok := idMap[k2]; ok {
-							matched = m
-						}
-					}
-				}
-
+				matched := idMap[pi.refObj.CacheKey()]
 				if matched != nil {
 					provider := matched.Provider
 					if provider == "" {

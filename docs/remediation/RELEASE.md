@@ -57,3 +57,29 @@
      - 检查 SQLite 数据库无锁死（busy handler 自动等待 5s）；
      - 检查 `pool_only` 出号稳定，上游 Apple 调用计数为 0；
      - 检查邮件同步在有订阅者时即时唤醒，无订阅者时静默零请求。
+
+---
+
+## 5. 最终业务正确性加固 (Final Correctness Hardening)
+
+基线 `02c6272` 至最终交付版已完成如下 9 项关键业务不变量（Invariants）与正确性边界加固：
+
+1. **UIDNEXT 闭区间与 Strict INBOX 锁定 (P0-1)**：
+   - 修复 `SinceUID = uid` 导致的 `UIDNEXT + 1` 漏信缺陷；
+   - Strict Verification 模式收信强制锁定 `INBOX`，杜绝多文件夹混淆。
+2. **严格邮件边界断言 (P0-2)**：
+   - `MatchBoundary` 消除未知通配符假设；未知邮箱、未知 UIDVALIDITY 或缺失 UID 严格判为 `BoundaryIgnore`；同邮箱代际突变严格判定 `BoundaryInvalidated`。
+3. **CAS 原子截止时间下沉 (P0-3)**：
+   - `CompleteVerificationRequest` 在数据库层原子校验 `AND expires_at > ?`；CAS 失败且超时的请求严格收敛至 `expired` 状态。
+4. **号池标签严格隔离 (P0-4)**：
+   - `selectPoolAccounts` 请求指定 tag 但无账号时，立即返回空池并阻断，绝不退化回全局号池，防止跨租户标签污染。
+5. **失败幂等操作等价重放 (P0-5)**：
+   - 重放记录为 `failed` 且原因为 `NO_AVAILABLE_INVENTORY` 的幂等操作时，精准恢复 `ErrNoAvailableInventory`，向上映射为 503 `POOL_EMPTY`。
+6. **邮件去重指纹包含 UIDVALIDITY (P0-6)**：
+   - 去重发布指纹统一采用 `CacheKey() + recipient`，强制绑定 `UIDVALIDITY`，免疫邮箱重建后的 UID 重用冲突。
+7. **Canonical MessageRef 必须包含 AccountID (P0-7)**：
+   - 后端消息规范化无条件赋予主号 `AccountID`；批量读取 Identity Join 严格基于完整 `CacheKey` 匹配，废除弱 key 回退。
+8. **WebMail 首屏 Capability 竞态保护与单次退避 (P0-8)**：
+   - 前端增加能力就绪栅栏，在捕获 `CAPABILITY_UNSUPPORTED` 时自动降级剥离过滤参数并执行至多 1 次退避重试，彻底杜绝无限重试死循环。
+9. **中间态数据库 Schema 幂等自愈 (P0-9)**：
+   - 针对 PR-00 ~ PR-07 迭代期间遗留的中间态 SQLite 库，启动时自动检测并安全补齐 `account_id`、`lease_id`、`op_id` 等关键列与索引，自动从关联表回填历史缺失的 `account_id`。

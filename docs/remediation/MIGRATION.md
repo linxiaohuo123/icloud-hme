@@ -64,3 +64,20 @@
    升级前备份 `dataDir` 下的 `icloud_hme.db` 文件。
 2. **回滚**：
    若需紧急回滚至旧版本，新增加的表（`alias_inventory`, `alias_allocations`, `operations`, `verification_requests`）对旧版本代码完全透明（旧版不访问这四张表），只需恢复备份数据库即可。
+
+---
+
+## 5. 中间态 Schema 自愈与 Backfill 保证 (P0-9)
+
+针对从 PR-04 ~ PR-07 中间态版本升级的数据库：
+1. **精准字段探测 (`ensureColumn`)**：
+   - 彻底废除旧版无保护的 `_, _ = s.db.Exec("ALTER TABLE ...")` 盲吞错模式。
+   - 使用 `PRAGMA table_info` 预先探测列是否存在，字段已存在时安全跳过；真正执行 ALTER 失败时阻断 Store 初始化，杜绝半迁移静默运行。
+2. **`alias_allocations` 缺失 `account_id` 平滑补列与 Backfill**：
+   - 当历史中间态缺少 `account_id` 时，自动补充 `account_id TEXT NOT NULL DEFAULT ''`；
+   - 顺序从 `alias_inventory`、`alias_routes` 与 `lease_records` 权威关联回填真实母号 ID，保证通过 `GetPrincipalAllocation` 等接口查询时字段完整且不破坏所有权边界。
+3. **`operations` 与 `verification_requests` 终态对齐**：
+   - `operations` 幂等自愈补充 `request_hash`, `candidate_email`, `result_ref`, `error_code`；
+   - `verification_requests` 自愈补充基线五要素字段与匹配引用；
+   - 幂等建立覆盖索引 (`idx_alias_inv_acc_alloc`, `idx_alias_alloc_owner`, `idx_operations_lookup` 等)，确保全量查询走索引。
+

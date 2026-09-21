@@ -170,6 +170,9 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		poolAccountIDs = []string{req.AccountID}
 	} else if s.be != nil {
 		poolAccountIDs = selectPoolAccounts(s.be.ListAccounts(), req.Tag)
+		if poolAccountIDs == nil {
+			poolAccountIDs = []string{}
+		}
 		if len(poolAccountIDs) > 1 {
 			idx := int(atomic.AddUint64(&s.rrIndex, 1) - 1) % len(poolAccountIDs)
 			rotated := make([]string, len(poolAccountIDs))
@@ -178,6 +181,9 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 			}
 			poolAccountIDs = rotated
 		}
+	} else {
+		// 未指定母号且无 Backend 可路由，必须固定为空切片，严禁传 nil 退化成无界全局库存
+		poolAccountIDs = []string{}
 	}
 
 	// 3. 显式幂等分配分支 (如 external/v2 或携带 IdempotencyKey 的请求)

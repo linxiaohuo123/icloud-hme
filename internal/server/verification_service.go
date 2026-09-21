@@ -233,8 +233,9 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		}
 
 		code := item.OTP.Code
-		// 终态原子 CAS (Issue 6 & 7): 必须先落库再消费，非 winner 绝不消费
-		curReq, won, err := s.store.CompleteVerificationRequest(ctx, vreq.RequestID, code, item.EventID)
+		// 终态原子 CAS (P0-3): 必须将当前时间传入数据库原子校验 expires_at，非 winner 绝不消费
+		nowUTC := time.Now().UTC()
+		curReq, won, err := s.store.CompleteVerificationRequest(ctx, vreq.RequestID, code, item.EventID, nowUTC)
 		if err != nil {
 			return nil, &BackendError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "持久化验证码终态失败: " + err.Error()}
 		}
@@ -255,6 +256,14 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		if curReq != nil {
 			if curReq.Status == "invalidated" {
 				return nil, ErrUIDValidityChanged
+			}
+			if curReq.Status == "expired" {
+				return &VerificationResult{
+					RequestID:  curReq.RequestID,
+					LeaseID:    curReq.LeaseID,
+					AliasEmail: curReq.AliasEmail,
+					Status:     "expired",
+				}, nil
 			}
 			return &VerificationResult{
 				RequestID:  curReq.RequestID,

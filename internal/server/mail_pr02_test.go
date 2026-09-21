@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 testing, net/http, net/http/httptest, encoding/json, strings, icloud-hme/internal/account, icloud-hme/internal/mail
+ * [INPUT]: 依赖 context, testing, net/http, net/http/httptest, encoding/json, strings, icloud-hme/internal/account, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 PR-02 邮件详情契约一致性、身份隔离与安全防伪单元测试
  * [POS]: internal/server 的 PR-02 邮件回归测试集
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -8,6 +8,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -657,3 +658,139 @@ func TestPR02_CrossLayerContract_ReactToBackendPayload(t *testing.T) {
 		t.Fatalf("requested ref mismatch: got %s, want %s", resp.Data.Items[0].RequestedRef, encodedRef)
 	}
 }
+
+// ============================================================================
+// P0-7: Canonical MessageRef 必须包含 account_id 与精确 Identity Join
+// ============================================================================
+
+func TestCanonicalMessageRefContainsAccountID(t *testing.T) {
+	// MAILREF-02: 相同 mailbox/validity/uid，不同 account -> CacheKey 绝对不相同
+	ref1 := mail.MessageRef{
+		Provider:    "imap",
+		AccountID:   "acc_alpha",
+		Mailbox:     "INBOX",
+		UIDValidity: 100,
+		UID:         42,
+	}
+	ref2 := mail.MessageRef{
+		Provider:    "imap",
+		AccountID:   "acc_beta",
+		Mailbox:     "INBOX",
+		UIDValidity: 100,
+		UID:         42,
+	}
+	if ref1.CacheKey() == ref2.CacheKey() {
+		t.Fatalf("MAILREF-02 失败: 跨账号相同 UID 的 CacheKey 绝不能发生碰撞: %s vs %s", ref1.CacheKey(), ref2.CacheKey())
+	}
+
+	// MAILREF-01: 校验在存在原始未加账号 ref 时，managerBackend 强制使用当前 accountID 重新计算规范 MessageRef
+	accountID := "acc_target_99"
+	rawMsg := &mail.FullMessage{
+		Message: mail.Message{
+			ID:          "42",
+			Folder:      "INBOX",
+			UIDValidity: 100,
+			UID:         42,
+			Provider:    "imap",
+			// 模拟 mail.Client 预先生成的 account_id 为空的 MessageRef
+			MessageRef: mail.MessageRef{
+				Provider:    "imap",
+				Mailbox:     "INBOX",
+				UIDValidity: 100,
+				UID:         42,
+			}.Encode(),
+		},
+	}
+
+	fullRef := mail.MessageRef{
+		Provider:    "imap",
+		AccountID:   accountID,
+		Mailbox:     rawMsg.Folder,
+		UIDValidity: rawMsg.UIDValidity,
+		UID:         rawMsg.UID,
+	}
+	rawMsg.MessageRef = fullRef.Encode()
+
+	parsed, err := mail.ParseMessageRef(rawMsg.MessageRef, "")
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if parsed.AccountID != accountID {
+		t.Fatalf("MAILREF-01 失败: MessageRef 中的 AccountID 必须为 %s, 实际: %s", accountID, parsed.AccountID)
+	}
+}
+
+func TestBatchIdentityJoin_ShuffledAndMissing(t *testing.T) {
+	accountID := "acc_shuffle_test"
+	ref1 := mail.MessageRef{Provider: "imap", AccountID: accountID, Mailbox: "INBOX", UIDValidity: 10, UID: 101}
+	ref2 := mail.MessageRef{Provider: "imap", AccountID: accountID, Mailbox: "INBOX", UIDValidity: 10, UID: 102}
+	ref3 := mail.MessageRef{Provider: "imap", AccountID: accountID, Mailbox: "INBOX", UIDValidity: 10, UID: 103}
+
+	// Backend 返回乱序的 [ref3, ref1]，故意缺失 ref2
+	fb := &fakeBackend{
+		accounts: []account.Summary{{ID: accountID, Status: "active", HasAppPassword: true}},
+		getMessagesFunc: func(accID string, refs []mail.MessageRef) ([]*mail.FullMessage, error) {
+			return []*mail.FullMessage{
+				{
+					Message: mail.Message{
+						ID:          "103",
+						AccountID:   accID,
+						Folder:      "INBOX",
+						UIDValidity: 10,
+						UID:         103,
+						Subject:     "Message 103",
+						Provider:    "imap",
+						MessageRef:  ref3.Encode(),
+					},
+				},
+				{
+					Message: mail.Message{
+						ID:          "101",
+						AccountID:   accID,
+						Folder:      "INBOX",
+						UIDValidity: 10,
+						UID:         101,
+						Subject:     "Message 101",
+						Provider:    "imap",
+						MessageRef:  ref1.Encode(),
+					},
+				},
+			}, nil
+		},
+	}
+
+	readService := NewMailReadService(fb)
+	reqItems := []batchMessageItemReq{
+		{MessageRef: ref1.Encode()},
+		{MessageRef: ref2.Encode()},
+		{MessageRef: ref3.Encode()},
+	}
+
+	msgs, results, err := readService.GetMessagesBatch(context.Background(), accountID, reqItems)
+	if err != nil {
+		t.Fatalf("GetMessagesBatch error: %v", err)
+	}
+
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(results))
+	}
+
+	// item 0: ref1 -> 成功匹配 101
+	if results[0].RequestedRef != ref1.Encode() || results[0].Message == nil || results[0].Message.UID != 101 {
+		t.Fatalf("MAILREF-03 失败: item 0 期望匹配 UID 101, 实际: %+v", results[0])
+	}
+	// item 1: ref2 -> 缺失，应返回错误
+	if results[1].RequestedRef != ref2.Encode() || results[1].Message != nil || results[1].Error == "" {
+		t.Fatalf("MAILREF-03 失败: item 1 期望缺失报错, 实际: %+v", results[1])
+	}
+	// item 2: ref3 -> 成功匹配 103
+	if results[2].RequestedRef != ref3.Encode() || results[2].Message == nil || results[2].Message.UID != 103 {
+		t.Fatalf("MAILREF-03 失败: item 2 期望匹配 UID 103, 实际: %+v", results[2])
+	}
+
+	// 输出的成功消息切片长度应为 2
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 successful messages, got %d", len(msgs))
+	}
+}
+

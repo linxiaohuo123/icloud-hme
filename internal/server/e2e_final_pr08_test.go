@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"icloud-hme/internal/account"
 	"icloud-hme/internal/hme"
 	"icloud-hme/internal/mail"
 	"icloud-hme/internal/store"
@@ -50,6 +51,9 @@ func TestPR08_E2E_FullLifecycleIntegration(t *testing.T) {
 
 	// 3. 构建第一代服务实例
 	fb := &fakeBackend{
+		accounts: []account.Summary{
+			{ID: "acc_master_1", Status: "active", HasCookies: true, Tags: []string{"order_service"}},
+		},
 		mailboxBoundaryFunc: func(accountID, folder string) (string, uint32, uint32, error) {
 			return "imap", 12345, 100, nil
 		},

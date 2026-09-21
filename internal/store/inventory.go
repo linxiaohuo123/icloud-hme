@@ -109,6 +109,20 @@ type VerificationRequest struct {
 	Code                string `json:"code,omitempty"`
 }
 
+func ensureColumn(db *sql.DB, tableName, colName, colDef string) error {
+	has, err := tableHasColumn(db, tableName, colName)
+	if err != nil {
+		return fmt.Errorf("check column %s.%s failed: %w", tableName, colName, err)
+	}
+	if !has {
+		query := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, colName, colDef)
+		if _, err := db.Exec(query); err != nil {
+			return fmt.Errorf("add column %s.%s failed: %w", tableName, colName, err)
+		}
+	}
+	return nil
+}
+
 func (s *Store) initInventorySchema() error {
 	ddl := `
 	CREATE TABLE IF NOT EXISTS alias_inventory (
@@ -121,8 +135,6 @@ func (s *Store) initInventorySchema() error {
 		last_verified_at TEXT,
 		snapshot_version INTEGER NOT NULL DEFAULT 1
 	);
-	CREATE INDEX IF NOT EXISTS idx_alias_inv_acc_alloc ON alias_inventory (account_id, allocation_state);
-	CREATE INDEX IF NOT EXISTS idx_alias_inv_alloc_state ON alias_inventory (allocation_state);
 
 	CREATE TABLE IF NOT EXISTS alias_allocations (
 		allocation_id TEXT PRIMARY KEY,
@@ -134,8 +146,6 @@ func (s *Store) initInventorySchema() error {
 		allocated_at TEXT NOT NULL,
 		status TEXT NOT NULL DEFAULT 'allocated'
 	);
-	CREATE INDEX IF NOT EXISTS idx_alias_alloc_owner ON alias_allocations (owner_kind, owner_id);
-	CREATE INDEX IF NOT EXISTS idx_alias_alloc_email ON alias_allocations (alias_email);
 
 	CREATE TABLE IF NOT EXISTS operations (
 		operation_id TEXT PRIMARY KEY,
@@ -152,7 +162,6 @@ func (s *Store) initInventorySchema() error {
 		updated_at TEXT NOT NULL,
 		CONSTRAINT uq_op_idempotency UNIQUE (principal_kind, principal_id, operation_kind, idempotency_key)
 	);
-	CREATE INDEX IF NOT EXISTS idx_operations_lookup ON operations (principal_kind, principal_id, operation_kind, idempotency_key);
 
 	CREATE TABLE IF NOT EXISTS verification_requests (
 		request_id TEXT PRIMARY KEY,
@@ -170,19 +179,111 @@ func (s *Store) initInventorySchema() error {
 		matched_event_ref TEXT DEFAULT '',
 		code TEXT DEFAULT ''
 	);
-	CREATE INDEX IF NOT EXISTS idx_vreq_principal ON verification_requests (principal_kind, principal_id);
-	CREATE INDEX IF NOT EXISTS idx_vreq_lease ON verification_requests (lease_id);
-	CREATE INDEX IF NOT EXISTS idx_vreq_email ON verification_requests (alias_email);
 	`
 	if _, err := s.db.Exec(ddl); err != nil {
 		return err
 	}
-	_, _ = s.db.Exec("ALTER TABLE verification_requests ADD COLUMN baseline_provider TEXT DEFAULT ''")
-	_, _ = s.db.Exec("ALTER TABLE verification_requests ADD COLUMN baseline_mailbox TEXT DEFAULT 'INBOX'")
-	_, _ = s.db.Exec("ALTER TABLE verification_requests ADD COLUMN baseline_uidvalidity INTEGER DEFAULT 0")
-	_, _ = s.db.Exec("ALTER TABLE verification_requests ADD COLUMN baseline_uid INTEGER DEFAULT 0")
-	_, _ = s.db.Exec("ALTER TABLE verification_requests ADD COLUMN matched_event_ref TEXT DEFAULT ''")
-	_, _ = s.db.Exec("ALTER TABLE verification_requests ADD COLUMN code TEXT DEFAULT ''")
+
+	// 1. alias_inventory 补列 (容错与自愈)
+	invCols := [][2]string{
+		{"provider_alias_id", "TEXT DEFAULT ''"},
+		{"remote_state", "TEXT NOT NULL DEFAULT 'unknown'"},
+		{"allocation_state", "TEXT NOT NULL DEFAULT 'unknown'"},
+		{"source_type", "TEXT NOT NULL DEFAULT 'legacy_unknown'"},
+		{"last_verified_at", "TEXT"},
+		{"snapshot_version", "INTEGER NOT NULL DEFAULT 1"},
+	}
+	for _, col := range invCols {
+		if err := ensureColumn(s.db, "alias_inventory", col[0], col[1]); err != nil {
+			return err
+		}
+	}
+
+	// 2. alias_allocations 补列与 backfill (MIG-01)
+	allocCols := [][2]string{
+		{"account_id", "TEXT NOT NULL DEFAULT ''"},
+		{"business_tag", "TEXT DEFAULT ''"},
+		{"status", "TEXT NOT NULL DEFAULT 'allocated'"},
+	}
+	for _, col := range allocCols {
+		if err := ensureColumn(s.db, "alias_allocations", col[0], col[1]); err != nil {
+			return err
+		}
+	}
+	// 针对中间态无 account_id 补充时的平滑 backfill 策略
+	_, _ = s.db.Exec(`
+		UPDATE alias_allocations
+		SET account_id = (
+			SELECT account_id FROM alias_inventory WHERE alias_inventory.email = alias_allocations.alias_email
+		)
+		WHERE (account_id IS NULL OR account_id = '') AND EXISTS (
+			SELECT 1 FROM alias_inventory WHERE alias_inventory.email = alias_allocations.alias_email AND alias_inventory.account_id != ''
+		)
+	`)
+	_, _ = s.db.Exec(`
+		UPDATE alias_allocations
+		SET account_id = (
+			SELECT account_id FROM alias_routes WHERE LOWER(TRIM(alias_routes.email)) = alias_allocations.alias_email
+		)
+		WHERE (account_id IS NULL OR account_id = '') AND EXISTS (
+			SELECT 1 FROM alias_routes WHERE LOWER(TRIM(alias_routes.email)) = alias_allocations.alias_email AND alias_routes.account_id != ''
+		)
+	`)
+	_, _ = s.db.Exec(`
+		UPDATE alias_allocations
+		SET account_id = (
+			SELECT account_id FROM lease_records WHERE LOWER(TRIM(lease_records.email)) = alias_allocations.alias_email
+		)
+		WHERE (account_id IS NULL OR account_id = '') AND EXISTS (
+			SELECT 1 FROM lease_records WHERE LOWER(TRIM(lease_records.email)) = alias_allocations.alias_email AND lease_records.account_id != ''
+		)
+	`)
+
+	// 3. operations 补列
+	opCols := [][2]string{
+		{"request_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"candidate_email", "TEXT DEFAULT ''"},
+		{"result_ref", "TEXT DEFAULT ''"},
+		{"error_code", "TEXT DEFAULT ''"},
+	}
+	for _, col := range opCols {
+		if err := ensureColumn(s.db, "operations", col[0], col[1]); err != nil {
+			return err
+		}
+	}
+
+	// 4. verification_requests 补列
+	vreqCols := [][2]string{
+		{"baseline_provider", "TEXT DEFAULT ''"},
+		{"baseline_mailbox", "TEXT DEFAULT 'INBOX'"},
+		{"baseline_uidvalidity", "INTEGER DEFAULT 0"},
+		{"baseline_uid", "INTEGER DEFAULT 0"},
+		{"matched_event_ref", "TEXT DEFAULT ''"},
+		{"code", "TEXT DEFAULT ''"},
+	}
+	for _, col := range vreqCols {
+		if err := ensureColumn(s.db, "verification_requests", col[0], col[1]); err != nil {
+			return err
+		}
+	}
+
+	// 5. 索引收敛
+	indices := []string{
+		"CREATE INDEX IF NOT EXISTS idx_alias_inv_acc_alloc ON alias_inventory (account_id, allocation_state);",
+		"CREATE INDEX IF NOT EXISTS idx_alias_inv_alloc_state ON alias_inventory (allocation_state);",
+		"CREATE INDEX IF NOT EXISTS idx_alias_alloc_owner ON alias_allocations (owner_kind, owner_id);",
+		"CREATE INDEX IF NOT EXISTS idx_alias_alloc_email ON alias_allocations (alias_email);",
+		"CREATE INDEX IF NOT EXISTS idx_operations_lookup ON operations (principal_kind, principal_id, operation_kind, idempotency_key);",
+		"CREATE INDEX IF NOT EXISTS idx_vreq_principal ON verification_requests (principal_kind, principal_id);",
+		"CREATE INDEX IF NOT EXISTS idx_vreq_lease ON verification_requests (lease_id);",
+		"CREATE INDEX IF NOT EXISTS idx_vreq_email ON verification_requests (alias_email);",
+	}
+	for _, idx := range indices {
+		if _, err := s.db.Exec(idx); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -383,6 +484,12 @@ func (s *Store) ClaimInventoryAlias(
 				return nil, &op, ErrOperationPending
 			}
 			if op.State == "failed" {
+				if op.ErrorCode == "NO_AVAILABLE_INVENTORY" {
+					return nil, &op, ErrNoAvailableInventory
+				}
+				if op.ErrorCode != "" {
+					return nil, &op, fmt.Errorf("operation failed with code: %s", op.ErrorCode)
+				}
 				return nil, &op, errors.New("previous operation failed")
 			}
 		}
@@ -848,15 +955,21 @@ func (s *Store) getVerificationRequestByID(ctx context.Context, requestID string
 }
 
 // CompleteVerificationRequest 原子 CAS 将取码任务标记为成功 (Section VI, Issue 6 & 7)
-// 仅允许从 ready 或 pending 变迁为 succeeded；如果已经处于终态，返回当前终态与 won=false，绝不覆盖已有结果。
-func (s *Store) CompleteVerificationRequest(ctx context.Context, requestID, code, matchedEventRef string) (*VerificationRequest, bool, error) {
+// 仅允许从 ready 或 pending 变迁为 succeeded；如果已经处于终态或已过 expires_at，返回当前终态与 won=false，绝不覆盖已有结果。
+func (s *Store) CompleteVerificationRequest(ctx context.Context, requestID, code, matchedEventRef string, now ...time.Time) (*VerificationRequest, bool, error) {
 	requestID = strings.TrimSpace(requestID)
+	currentTime := time.Now().UTC()
+	if len(now) > 0 && !now[0].IsZero() {
+		currentTime = now[0].UTC()
+	}
+	nowStr := currentTime.Format(time.RFC3339)
+
 	q := `
 	UPDATE verification_requests
 	SET status = 'succeeded', code = ?, matched_event_ref = ?
-	WHERE request_id = ? AND status IN ('ready', 'pending')
+	WHERE request_id = ? AND status IN ('ready', 'pending') AND expires_at > ?
 	`
-	res, err := s.db.ExecContext(ctx, q, code, matchedEventRef, requestID)
+	res, err := s.db.ExecContext(ctx, q, code, matchedEventRef, requestID, nowStr)
 	if err != nil {
 		return nil, false, err
 	}
@@ -868,6 +981,13 @@ func (s *Store) CompleteVerificationRequest(ctx context.Context, requestID, code
 	if err != nil {
 		return nil, false, err
 	}
+
+	// CAS 未中且数据库仍为非终态但已过 expires_at 时，原子级收敛为 expired
+	if rows == 0 && req != nil && (req.Status == "ready" || req.Status == "pending") && req.ExpiresAt <= nowStr {
+		_, _, _ = s.ExpireVerificationRequest(ctx, requestID)
+		req, _ = s.getVerificationRequestByID(ctx, requestID)
+	}
+
 	return req, rows > 0, nil
 }
 
@@ -1016,3 +1136,17 @@ func (s *Store) GetMinBaselineUIDByEmail(ctx context.Context, email string) (uin
 	}
 	return minUID, nil
 }
+
+// CountAuthoritativeAvailableAliases 权威统计处于 active 且 available 的可用别名库存数 (PR-08 P1-A)
+func (s *Store) CountAuthoritativeAvailableAliases() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var count int
+	_ = s.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM alias_inventory
+		WHERE remote_state = 'active' AND allocation_state = 'available'
+	`).Scan(&count)
+	return count
+}
+

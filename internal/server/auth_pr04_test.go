@@ -218,7 +218,11 @@ func TestPR04_A07_V2LifecycleContract(t *testing.T) {
 
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "v2_flow@icloud.com", Active: true}, "replenish", true)
 
-	fb := &fakeBackend{}
+	fb := &fakeBackend{
+		accounts: []account.Summary{
+			{ID: "acc_1", Status: "active", HasCookies: true, Tags: []string{"sales"}},
+		},
+	}
 	_, ts := newTestServerWithStore(fb, st)
 	defer ts.Close()
 

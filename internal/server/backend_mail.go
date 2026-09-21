@@ -277,16 +277,14 @@ func (b *managerBackend) GetMessage(accountID string, rawID string) (*mail.FullM
 		message.Provider = "imap"
 		message.Method = "imap"
 		message.BodyComplete = true
-		if message.MessageRef == "" {
-			fullRef := mail.MessageRef{
-				Provider:    "imap",
-				AccountID:   accountID,
-				Mailbox:     message.Folder,
-				UIDValidity: message.UIDValidity,
-				UID:         message.UID,
-			}
-			message.MessageRef = fullRef.Encode()
+		fullRef := mail.MessageRef{
+			Provider:    "imap",
+			AccountID:   accountID,
+			Mailbox:     message.Folder,
+			UIDValidity: message.UIDValidity,
+			UID:         message.UID,
 		}
+		message.MessageRef = fullRef.Encode()
 		return message, nil
 	}
 
@@ -365,16 +363,14 @@ func (b *managerBackend) GetMessages(accountID string, refs []mail.MessageRef) (
 					m.Provider = "imap"
 					m.Method = "imap"
 					m.BodyComplete = true
-					if m.MessageRef == "" {
-						fullRef := mail.MessageRef{
-							Provider:    "imap",
-							AccountID:   accountID,
-							Mailbox:     m.Folder,
-							UIDValidity: m.UIDValidity,
-							UID:         m.UID,
-						}
-						m.MessageRef = fullRef.Encode()
+					fullRef := mail.MessageRef{
+						Provider:    "imap",
+						AccountID:   accountID,
+						Mailbox:     m.Folder,
+						UIDValidity: m.UIDValidity,
+						UID:         m.UID,
 					}
+					m.MessageRef = fullRef.Encode()
 					allMessages = append(allMessages, m)
 				}
 			}

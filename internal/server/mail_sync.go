@@ -84,10 +84,25 @@ func NewMailSyncWorker(be Backend, st *store.Store, eventBus *mail.EventBus, int
 // 若不做邮件级去重，worker 会在订阅者出现后 2 秒内把【上一次已经用过的验证码】
 // 重新广播出去——fresh=true 也挡不住(它只跳过内存缓存预填)。因此这里必须去重。
 //
-// 【BUG-03 修复】过期指纹清理已移至独立的 cleanupPublished 定时器(每 5 分钟),
-// 此处只做 O(1) 的查重与插入,避免在写锁内执行 O(N) 全表遍历拖垮并发吞吐。
-func (w *MailSyncWorker) markPublished(accountID, folder, msgID, email string) bool {
-	key := strings.Join([]string{accountID, folder, msgID, email}, "|")
+// 【P0-6 修复】去重指纹必须基于规范 MessageRef.CacheKey() + recipient 确定，
+// 严格包含 UIDVALIDITY，绝不可在邮箱重建后将新代际邮件误判为已发历史邮件。
+func (w *MailSyncWorker) markPublished(accountID, folder string, uidValidity, uid uint32, threadID, provider, email string) bool {
+	mailbox := strings.TrimSpace(folder)
+	if mailbox == "" {
+		mailbox = "INBOX"
+	}
+	if provider == "" {
+		provider = "imap"
+	}
+	ref := mail.MessageRef{
+		Provider:    provider,
+		AccountID:   accountID,
+		Mailbox:     mailbox,
+		UIDValidity: uidValidity,
+		UID:         uid,
+		ThreadID:    threadID,
+	}
+	key := ref.CacheKey() + "|" + strings.ToLower(strings.TrimSpace(email))
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.published == nil {
@@ -372,7 +387,8 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 		}
 		if w.store != nil {
 			if uid, err := w.store.GetMinBaselineUIDByEmail(ctx, aliases[0]); err == nil && uid > 0 {
-				q.SinceUID = uid + 1
+				q.SinceUID = uid
+				q.Folder = "INBOX"
 				q.Limit = 50
 			}
 		}
@@ -396,7 +412,8 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 				}
 			}
 			if allHaveBaseline && globalMinUID > 0 {
-				q.SinceUID = globalMinUID + 1
+				q.SinceUID = globalMinUID
+				q.Folder = "INBOX"
 				q.Limit = 50
 			}
 		}
@@ -424,7 +441,7 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 			if !msgMatchesRecipient(msg, target) {
 				continue
 			}
-			if !w.markPublished(accountID, msg.Folder, msg.ID, target) {
+			if !w.markPublished(accountID, msg.Folder, msg.UIDValidity, msg.UID, msg.ThreadID, msg.Provider, target) {
 				continue
 			}
 			w.eventBus.PublishEvent(&mail.CachedOTP{

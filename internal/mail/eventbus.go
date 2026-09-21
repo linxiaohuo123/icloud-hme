@@ -55,29 +55,43 @@ func MatchBoundary(ev *CachedOTP, baseline BaselineBoundary) BoundaryDecision {
 		return BoundaryIgnore
 	}
 
-	evMailbox := ev.Folder
+	// 1. event mailbox unknown -> BoundaryIgnore
+	evMailbox := strings.TrimSpace(ev.Folder)
 	if evMailbox == "" {
-		evMailbox = "INBOX"
+		return BoundaryIgnore
 	}
-	baseMailbox := baseline.Mailbox
+
+	baseMailbox := strings.TrimSpace(baseline.Mailbox)
 	if baseMailbox == "" {
 		baseMailbox = "INBOX"
 	}
-	// 非指定 mailbox 绝不参与当前基线比对
+
+	// 2. event mailbox != baseline mailbox -> BoundaryIgnore
 	if !strings.EqualFold(evMailbox, baseMailbox) {
 		return BoundaryIgnore
 	}
 
-	// UIDVALIDITY 代际检查
-	if baseline.UIDValidity != 0 && ev.UIDValidity != 0 && ev.UIDValidity != baseline.UIDValidity {
-		return BoundaryInvalidated
-	}
-
-	// UID 游标检查
-	if baseline.UID != 0 && ev.UID != 0 && ev.UID < baseline.UID {
+	// 3. baseline UIDValidity > 0 且 event UIDValidity == 0 -> BoundaryIgnore
+	if baseline.UIDValidity > 0 && ev.UIDValidity == 0 {
 		return BoundaryIgnore
 	}
 
+	// 4. event UIDValidity != baseline UIDValidity -> BoundaryInvalidated (仅限同 mailbox)
+	if baseline.UIDValidity > 0 && ev.UIDValidity != baseline.UIDValidity {
+		return BoundaryInvalidated
+	}
+
+	// 5. baseline UID > 0 且 event UID == 0 -> BoundaryIgnore
+	if baseline.UID > 0 && ev.UID == 0 {
+		return BoundaryIgnore
+	}
+
+	// 6. event UID < baseline UID -> BoundaryIgnore
+	if baseline.UID > 0 && ev.UID < baseline.UID {
+		return BoundaryIgnore
+	}
+
+	// 7. 其余 -> BoundaryMatch
 	return BoundaryMatch
 }
 

@@ -515,3 +515,215 @@ func TestIDEMP06_OperationOwnership(t *testing.T) {
 		t.Fatalf("IDEMP06 失败: 跨 token 窥探 operation 期望 404/403, 实际: %d", respOp.StatusCode)
 	}
 }
+
+// ============================================================================
+// P0-4: 标签路由隔离与空账号禁止全局 Fallback (TAG-01 ~ TAG-03)
+// ============================================================================
+
+func TestAllocation_NoTaggedAccountsDoesNotFallBackGlobal(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// 账号配置:
+	// acc_finance: 标签 ["finance"], 库存 10 个
+	// acc_default: 标签 [] (公共未标记), 库存 10 个
+	fb := &fakeBackend{
+		accounts: []account.Summary{
+			{ID: "acc_finance", Status: "active", HasAppPassword: true, Tags: []string{"finance"}},
+			{ID: "acc_default", Status: "active", HasAppPassword: true, Tags: []string{}},
+		},
+	}
+	cfg := Config{Debug: false, AdminPassword: "admin"}
+	s := newWithBackendAndStore(fb, cfg, st)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	_ = st.SaveToken(store.APIToken{ID: "tok_user", Token: "sec_user", Scopes: "allocate,verify"})
+
+	// 入库库存: acc_finance 有 1 个可用别名，acc_default 有 1 个可用别名
+	_ = st.AddInventoryAlias("acc_finance", hme.Alias{Email: "fin_1@icloud.com", Active: true}, "replenish", true)
+	_ = st.AddInventoryAlias("acc_default", hme.Alias{Email: "def_1@icloud.com", Active: true}, "replenish", true)
+
+	// TAG-01: requested tag="finance" 有匹配账号 -> 只能从 acc_finance 领取
+	req1, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"finance"}`))
+	req1.Header.Set("Authorization", "Bearer sec_user")
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("Idempotency-Key", "key_tag_01")
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil || resp1.StatusCode != http.StatusOK {
+		t.Fatalf("TAG-01 失败: 期望 200, 实际: %v, err: %v", resp1.StatusCode, err)
+	}
+	var res1 struct {
+		Data struct {
+			Email string `json:"email"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(resp1.Body).Decode(&res1)
+	resp1.Body.Close()
+	if res1.Data.Email != "fin_1@icloud.com" {
+		t.Fatalf("TAG-01 失败: 期望领取 finance 账号别名 fin_1@icloud.com, 实际: %s", res1.Data.Email)
+	}
+
+	// TAG-02: 请求不存在对应账号的 tag="marketing" (虽然 acc_default 还有可用库存 def_1@icloud.com)
+	// 绝对禁止跨业务盗领公共账号或其它标签账号的库存，必须返回 503 POOL_EMPTY
+	req2, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"marketing"}`))
+	req2.Header.Set("Authorization", "Bearer sec_user")
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Idempotency-Key", "key_tag_02")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("TAG-02 失败: 无匹配账号的业务标签严禁全局 fallback 盗领, 期望 503 POOL_EMPTY, 实际: %d", resp2.StatusCode)
+	}
+
+	// TAG-03: 请求 tag="default"，按照真实定义只能领公共未打标账号 acc_default 的库存
+	req3, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"default"}`))
+	req3.Header.Set("Authorization", "Bearer sec_user")
+	req3.Header.Set("Content-Type", "application/json")
+	req3.Header.Set("Idempotency-Key", "key_tag_03")
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil || resp3.StatusCode != http.StatusOK {
+		t.Fatalf("TAG-03 失败: 期望 200, 实际: %v", resp3.StatusCode)
+	}
+	var res3 struct {
+		Data struct {
+			Email string `json:"email"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(resp3.Body).Decode(&res3)
+	resp3.Body.Close()
+	if res3.Data.Email != "def_1@icloud.com" {
+		t.Fatalf("TAG-03 失败: 期望领取 default 账号别名 def_1@icloud.com, 实际: %s", res3.Data.Email)
+	}
+}
+
+// ============================================================================
+// P0-5: 失败幂等操作重放业务等价错误 (IDEMP-01 ~ IDEMP-03)
+// ============================================================================
+
+func TestIdempotency_FailedPoolEmptyReplaysSameError(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	fb := &fakeBackend{
+		accounts: []account.Summary{
+			{ID: "acc_1", Status: "active", HasAppPassword: true, Tags: []string{}},
+		},
+	}
+	s := newWithBackendAndStore(fb, Config{AdminPassword: "admin"}, st)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	_ = st.SaveToken(store.APIToken{ID: "tok_idemp", Token: "sec_idemp", Scopes: "allocate,verify"})
+
+	// 初始状态下无任何可用库存
+	// IDEMP-01: 第一次请求因无库存返回 503 POOL_EMPTY
+	req1, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"default"}`))
+	req1.Header.Set("Authorization", "Bearer sec_idemp")
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("Idempotency-Key", "key_empty_retry")
+
+	resp1, err := http.DefaultClient.Do(req1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body1 struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	_ = json.NewDecoder(resp1.Body).Decode(&body1)
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusServiceUnavailable || body1.Code != "POOL_EMPTY" {
+		t.Fatalf("IDEMP-01 首次请求期望 503 POOL_EMPTY, 实际: %d %s", resp1.StatusCode, body1.Code)
+	}
+
+	// 再次携带相同的 Idempotency-Key 与相同请求内容重放
+	req2, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"default"}`))
+	req2.Header.Set("Authorization", "Bearer sec_idemp")
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Idempotency-Key", "key_empty_retry")
+
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body2 struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	_ = json.NewDecoder(resp2.Body).Decode(&body2)
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusServiceUnavailable || body2.Code != "POOL_EMPTY" {
+		t.Fatalf("IDEMP-01 重放请求期望等价 503 POOL_EMPTY (绝不能退化为 500 INTERNAL_ERROR), 实际: %d %s (%s)", resp2.StatusCode, body2.Code, body2.Message)
+	}
+
+	// IDEMP-02: 同一 Idempotency-Key，但请求 hash 冲突 (例如 tag 改为 custom)
+	reqConflict, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"different_tag"}`))
+	reqConflict.Header.Set("Authorization", "Bearer sec_idemp")
+	reqConflict.Header.Set("Content-Type", "application/json")
+	reqConflict.Header.Set("Idempotency-Key", "key_empty_retry")
+
+	respConflict, err := http.DefaultClient.Do(reqConflict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	respConflict.Body.Close()
+	if respConflict.StatusCode != http.StatusConflict {
+		t.Fatalf("IDEMP-02 参数冲突期望 409 Conflict, 实际: %d", respConflict.StatusCode)
+	}
+
+	// IDEMP-03: 成功操作的幂等重放
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "succ_idemp@icloud.com", Active: true}, "replenish", true)
+	reqSucc1, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"default"}`))
+	reqSucc1.Header.Set("Authorization", "Bearer sec_idemp")
+	reqSucc1.Header.Set("Content-Type", "application/json")
+	reqSucc1.Header.Set("Idempotency-Key", "key_succ_retry")
+
+	respSucc1, err := http.DefaultClient.Do(reqSucc1)
+	if err != nil || respSucc1.StatusCode != http.StatusOK {
+		t.Fatalf("IDEMP-03 首次成功分配失败: %v", err)
+	}
+	var succ1Out struct {
+		Data struct {
+			AllocationID string `json:"allocation_id"`
+			Email        string `json:"email"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(respSucc1.Body).Decode(&succ1Out)
+	respSucc1.Body.Close()
+
+	// 重复请求 key_succ_retry -> 必须得到相同 allocation_id，不重复认领
+	reqSucc2, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"default"}`))
+	reqSucc2.Header.Set("Authorization", "Bearer sec_idemp")
+	reqSucc2.Header.Set("Content-Type", "application/json")
+	reqSucc2.Header.Set("Idempotency-Key", "key_succ_retry")
+
+	respSucc2, err := http.DefaultClient.Do(reqSucc2)
+	if err != nil || respSucc2.StatusCode != http.StatusOK {
+		t.Fatalf("IDEMP-03 重复请求失败: %v", err)
+	}
+	var succ2Out struct {
+		Data struct {
+			AllocationID string `json:"allocation_id"`
+			Email        string `json:"email"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(respSucc2.Body).Decode(&succ2Out)
+	respSucc2.Body.Close()
+
+	if succ2Out.Data.AllocationID != succ1Out.Data.AllocationID || succ2Out.Data.Email != succ1Out.Data.Email {
+		t.Fatalf("IDEMP-03 幂等重放未返回相同结果: 首次=%+v, 第二次=%+v", succ1Out.Data, succ2Out.Data)
+	}
+}
+

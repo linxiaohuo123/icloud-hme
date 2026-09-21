@@ -55,10 +55,7 @@ func (s *Server) systemStatsHandler(c *gin.Context) {
 			}
 		}
 		consumedAliases := s.store.CountConsumedPoolAliases()
-		availableAliases := totalActiveAliases - consumedAliases
-		if availableAliases < 0 {
-			availableAliases = 0
-		}
+		availableAliases := s.store.CountAuthoritativeAvailableAliases()
 		stats["alias_pool"] = gin.H{
 			"total_active_aliases": totalActiveAliases,
 			"consumed_aliases":     consumedAliases,

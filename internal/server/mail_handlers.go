@@ -45,7 +45,7 @@ func (s *Server) listInboxHandler(c *gin.Context) {
 	daysSpecified := c.Query("days") != ""
 	withBody := c.Query("body") == "1" || strings.EqualFold(c.Query("body"), "true")
 
-	result, err := s.be.ListInbox(InboxQuery{
+	query := InboxQuery{
 		AccountID:       accountID,
 		Alias:           alias,
 		Folder:          folder,
@@ -54,7 +54,14 @@ func (s *Server) listInboxHandler(c *gin.Context) {
 		WithBody:        withBody,
 		FolderSpecified: folderSpecified,
 		DaysSpecified:   daysSpecified,
-	})
+	}
+
+	var result InboxResult
+	if s.mailReadService != nil {
+		result, err = s.mailReadService.ListInbox(c.Request.Context(), query)
+	} else {
+		result, err = s.be.ListInboxContext(c.Request.Context(), query)
+	}
 	if err != nil {
 		backendFail(c, err)
 		return

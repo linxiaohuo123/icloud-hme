@@ -1,6 +1,6 @@
 /**
- * [INPUT]: 依赖 api/client (request, ApiError), api/types, components (AsyncState, ConfirmDialog, Select, ToastProvider), utils (clipboard, date, sniffer: extractVerifyCode, parseSenderInfo, buildSniffContext), ./InboxTableRow, ./MailDetailDialog
- * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；正文预取 POST /api/messages 使用 uid 并消费 data.messages
+ * [INPUT]: 依赖 api/client (request, ApiError, getMessageDetail), api/types, components (AsyncState, ConfirmDialog, Select, ToastProvider), utils (clipboard, date, mail, sniffer: extractVerifyCode, parseSenderInfo, buildSniffContext), ./InboxTableRow, ./MailDetailDialog
+ * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；正文预取 POST /api/messages 使用 uid 并消费 data.messages；首屏 capability 保护与 CAPABILITY_UNSUPPORTED 优雅退避重试
  * [POS]: web/src/components/inbox 的核心视图容器，统一单账号工作台与全局收件箱大盘的数据流与交互
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -49,6 +49,7 @@ export default function InboxTableView({
   const { show } = useToast()
 
   const [accounts, setAccounts] = useState<AccountSummary[]>([])
+  const [accountCapabilityReady, setAccountCapabilityReady] = useState(false)
   const [accountId, setAccountId] = useState(propAccountId || '')
   const [aliases, setAliases] = useState<Alias[]>([])
   const [folders, setFolders] = useState<MailboxFolder[]>([])
@@ -58,11 +59,16 @@ export default function InboxTableView({
   const [limit, setLimit] = useState(20)
   const [days, setDays] = useState(7)
 
+  // 记录通过 CAPABILITY_UNSUPPORTED 降级或静态推断为仅 WebMail 的账号集合
+  const [effectiveWebMailAccounts, setEffectiveWebMailAccounts] = useState<Record<string, boolean>>({})
+  const unsupportedRetryRef = useRef<Record<string, number>>({})
+
   const currentAccount = useMemo(() => accounts.find((a) => a.id === accountId), [accounts, accountId])
   const isWebMailOnly = useMemo(() => {
+    if (effectiveWebMailAccounts[accountId]) return true
     if (!currentAccount) return false
     return !currentAccount.has_app_password && !currentAccount.mailbox?.email
-  }, [currentAccount])
+  }, [currentAccount, effectiveWebMailAccounts, accountId])
 
   // 客户端分页
   const [page, setPage] = useState(1)
@@ -105,6 +111,7 @@ export default function InboxTableView({
       accountGenRef.current += 1
       abortRef.current?.abort()
       messageCacheRef.current.clear()
+      unsupportedRetryRef.current[propAccountId] = 0
       setAccountId(propAccountId)
     }
   }, [propAccountId, accountId])
@@ -118,13 +125,17 @@ export default function InboxTableView({
 
   // 1. 初始化账号列表（仅在非固定账号模式，或账号为空时拉取一次，防止 searchParams 诱发无限重拉）
   useEffect(() => {
-    if (hasAccountsLoadedRef.current) return
+    if (hasAccountsLoadedRef.current) {
+      setAccountCapabilityReady(true)
+      return
+    }
     let cancelled = false
     request<AccountSummary[]>('/api/accounts')
       .then((data) => {
         if (cancelled) return
         hasAccountsLoadedRef.current = true
         setAccounts(data)
+        setAccountCapabilityReady(true)
         if (!fixedAccount) {
           const queryId = searchParams.get('account_id')
           const valid = data.find((a) => a.id === queryId)
@@ -161,6 +172,8 @@ export default function InboxTableView({
       })
       .catch((err) => {
         if (cancelled) return
+        hasAccountsLoadedRef.current = true
+        setAccountCapabilityReady(true)
         setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
         setLoading(false)
       })
@@ -212,6 +225,9 @@ export default function InboxTableView({
   // 4. 查询收件箱邮件 (带代际保护 accountGenRef，防止切换账号后陈旧请求污染新账号视图与缓存)
   useEffect(() => {
     if (!accountId) return
+    // 首屏 capability 栅栏保护：未完成 capability 解析前暂缓发起带参数查询，防止 WebMail 模式被误传 folder/days 参数 (WEBMAIL-01)
+    if (!accountCapabilityReady) return
+
     const currentGen = ++accountGenRef.current
     setLoading(true)
     abortRef.current?.abort()
@@ -234,6 +250,7 @@ export default function InboxTableView({
         if (cancelled || currentGen !== accountGenRef.current) return
         setResult(data)
         setError('')
+        unsupportedRetryRef.current[accountId] = 0
         // 静默预取前 20 封邮件正文注入内存缓存 (基于规范 message_ref)
         if (data && Array.isArray(data.messages) && data.messages.length > 0) {
           const targets = data.messages
@@ -267,6 +284,15 @@ export default function InboxTableView({
       })
       .catch((err) => {
         if (cancelled || currentGen !== accountGenRef.current || (err instanceof ApiError && err.code === 'ABORTED')) return
+        // 捕获 CAPABILITY_UNSUPPORTED 错误后：最多允许 1 次退避重试 (剥离 folder/days 并记录 effective webmail capability)，严禁陷入无休止重试循环 (WEBMAIL-03, WEBMAIL-04)
+        if (err instanceof ApiError && err.code === 'CAPABILITY_UNSUPPORTED') {
+          const retried = unsupportedRetryRef.current[accountId] || 0
+          if (retried < 1) {
+            unsupportedRetryRef.current[accountId] = retried + 1
+            setEffectiveWebMailAccounts((prev) => ({ ...prev, [accountId]: true }))
+            return
+          }
+        }
         setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
         setResult(null)
       })
@@ -278,7 +304,7 @@ export default function InboxTableView({
       cancelled = true
       controller.abort()
     }
-  }, [accountId, alias, folder, limit, days, retryKey])
+  }, [accountId, accountCapabilityReady, isWebMailOnly, alias, folder, limit, days, retryKey])
 
   // 查询提交
   function handleSearch() {
@@ -303,6 +329,7 @@ export default function InboxTableView({
     setAlias('')
     setPage(1)
     messageCacheRef.current.clear()
+    unsupportedRetryRef.current[newAccountId] = 0
     setSearchParams({ account_id: newAccountId }, { replace: true })
   }
 

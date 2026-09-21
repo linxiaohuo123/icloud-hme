@@ -109,6 +109,7 @@ func TestPR06_V01_HistoricalOTPFilteredOut(t *testing.T) {
 	s.eventBus.PublishEvent(&mail.CachedOTP{
 		EventID:     "evt_hist_95",
 		Email:       "target_alias@icloud.com",
+		Folder:      "INBOX",
 		UIDValidity: 1,
 		UID:         95,
 		OTP:         &mail.OTPResult{Code: "999999"},
@@ -152,6 +153,7 @@ func TestPR06_V02_FreshOTPDelivered(t *testing.T) {
 	s.eventBus.PublishEvent(&mail.CachedOTP{
 		EventID:     "evt_fresh_100",
 		Email:       "target_alias@icloud.com",
+		Folder:      "INBOX",
 		UIDValidity: 1,
 		UID:         100,
 		OTP:         &mail.OTPResult{Code: "123456"},
@@ -208,6 +210,7 @@ func TestPR06_V03_RestartRecoveryPreservesBoundary(t *testing.T) {
 	sNew.eventBus.PublishEvent(&mail.CachedOTP{
 		EventID:     "evt_old_499",
 		Email:       "restart@icloud.com",
+		Folder:      "INBOX",
 		UIDValidity: 1,
 		UID:         499,
 		OTP:         &mail.OTPResult{Code: "000499"},
@@ -225,6 +228,7 @@ func TestPR06_V03_RestartRecoveryPreservesBoundary(t *testing.T) {
 	sNew.eventBus.PublishEvent(&mail.CachedOTP{
 		EventID:     "evt_new_501",
 		Email:       "restart@icloud.com",
+		Folder:      "INBOX",
 		UIDValidity: 1,
 		UID:         501,
 		OTP:         &mail.OTPResult{Code: "501501"},
@@ -245,6 +249,7 @@ func TestPR06_V04_ConsumeDoesNotDeleteLaterEvents(t *testing.T) {
 	bus.PublishEvent(&mail.CachedOTP{
 		EventID:     "evt_A",
 		Email:       email,
+		Folder:      "INBOX",
 		UIDValidity: 1,
 		UID:         100,
 		OTP:         &mail.OTPResult{Code: "111111"},
@@ -252,6 +257,7 @@ func TestPR06_V04_ConsumeDoesNotDeleteLaterEvents(t *testing.T) {
 	bus.PublishEvent(&mail.CachedOTP{
 		EventID:     "evt_B",
 		Email:       email,
+		Folder:      "INBOX",
 		UIDValidity: 1,
 		UID:         101,
 		OTP:         &mail.OTPResult{Code: "222222"},
@@ -294,6 +300,7 @@ func TestPR06_V05_IdempotentResultsAndCacheIsolation(t *testing.T) {
 	s.eventBus.PublishEvent(&mail.CachedOTP{
 		EventID:     "evt_100",
 		Email:       "target_alias@icloud.com",
+		Folder:      "INBOX",
 		UIDValidity: 1,
 		UID:         100,
 		OTP:         &mail.OTPResult{Code: "777888"},
@@ -312,6 +319,7 @@ func TestPR06_V05_IdempotentResultsAndCacheIsolation(t *testing.T) {
 	s.eventBus.PublishEvent(&mail.CachedOTP{
 		EventID:     "evt_101",
 		Email:       "target_alias@icloud.com",
+		Folder:      "INBOX",
 		UIDValidity: 1,
 		UID:         101,
 		OTP:         &mail.OTPResult{Code: "999999"},
@@ -419,6 +427,7 @@ func TestPR06_V09_RevocationExpiryAndUIDValidityChange(t *testing.T) {
 	s.eventBus.PublishEvent(&mail.CachedOTP{
 		EventID:     "evt_invalidated",
 		Email:       "target_alias@icloud.com",
+		Folder:      "INBOX",
 		UIDValidity: 999, // 突变！
 		UID:         100,
 		OTP:         &mail.OTPResult{Code: "000111"},
@@ -452,6 +461,7 @@ func TestPR06_V09_RevocationExpiryAndUIDValidityChange(t *testing.T) {
 		CreatedAt:           now.Add(-20 * time.Minute).Format(time.RFC3339),
 		ExpiresAt:           now.Add(-10 * time.Minute).Format(time.RFC3339), // 10分钟前已过期
 		BaselineProvider:    "imap",
+		BaselineMailbox:     "INBOX",
 		BaselineUIDValidity: 1,
 		BaselineUID:         100,
 	}
@@ -490,6 +500,7 @@ func TestPR06_V10_RaceBetweenBaselineAndArrival(t *testing.T) {
 	s.eventBus.PublishEvent(&mail.CachedOTP{
 		EventID:     "evt_race_200",
 		Email:       "target_alias@icloud.com",
+		Folder:      "INBOX",
 		UIDValidity: 1,
 		UID:         200,
 		OTP:         &mail.OTPResult{Code: "888200"},

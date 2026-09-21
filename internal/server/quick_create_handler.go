@@ -109,7 +109,7 @@ func selectAccountCandidates(accounts []account.Summary, tag string, st *store.S
 // selectPoolAccounts 筛选适合从别名池领号的母号 (对齐业务标签隔离；具备凭据；不受 500 上限限制因为已有别名无需新建)。
 func selectPoolAccounts(accounts []account.Summary, tag string) []string {
 	tag = strings.TrimSpace(strings.ToLower(tag))
-	var matched []string
+	matched := make([]string, 0)
 
 	if tag != "" && tag != "default" {
 		for _, acc := range accounts {
@@ -122,13 +122,22 @@ func selectPoolAccounts(accounts []account.Summary, tag string) []string {
 				}
 			}
 		}
+		// 业务标签隔离红线 (TAG-02): 若请求特定业务标签但无匹配账号，必须返回空切片，严禁回退至公共池造成跨业务盗领
+		return matched
 	}
 
-	// 回退到公共账号池 (未打任何业务标签的账号)
-	if len(matched) == 0 {
-		for _, acc := range accounts {
-			if acc.Status == "active" && (acc.HasCookies || acc.HasAppPassword) && len(acc.Tags) == 0 {
+	// tag == "" 或 tag == "default": 公共未打标账号或显式标为 default 的账号 (TAG-03)
+	for _, acc := range accounts {
+		if acc.Status == "active" && (acc.HasCookies || acc.HasAppPassword) {
+			if len(acc.Tags) == 0 {
 				matched = append(matched, acc.ID)
+				continue
+			}
+			for _, t := range acc.Tags {
+				if strings.EqualFold(t, "default") {
+					matched = append(matched, acc.ID)
+					break
+				}
 			}
 		}
 	}

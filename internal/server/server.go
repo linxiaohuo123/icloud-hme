@@ -9,6 +9,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -167,6 +168,7 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 					Active:    true,
 				}, "replenish", true); addErr != nil {
 					log.Printf("[Scheduler] 补货入库失败 email=%s: %v", res.Email, addErr)
+					return nil, fmt.Errorf("补货入库持久化失败 email=%s: %w", res.Email, addErr)
 				}
 				_ = st.UpsertAliasRoutes(accountID, []string{res.Email})
 			}
