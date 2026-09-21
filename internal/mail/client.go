@@ -45,15 +45,21 @@ const (
 
 // Message 是一封邮件的摘要信息。
 type Message struct {
-	ID      string `json:"id"`
-	Folder  string `json:"folder,omitempty"`
-	From    string `json:"from"`
-	To      string `json:"to"`
-	Subject string `json:"subject"`
-	Date    string `json:"date"`
-	Preview string `json:"preview"`
-	Unread  *bool  `json:"unread,omitempty"`
-	match   string
+	ID          string `json:"id"`
+	AccountID   string `json:"account_id,omitempty"`   // 归属母号 ID
+	MessageRef  string `json:"message_ref,omitempty"`  // 规范化全局唯一邮件引用
+	Folder      string `json:"folder,omitempty"`
+	From        string `json:"from"`
+	To          string `json:"to"`
+	Subject     string `json:"subject"`
+	Date        string `json:"date"`
+	Preview     string `json:"preview"`
+	Unread      *bool  `json:"unread,omitempty"`
+	Provider    string `json:"provider,omitempty"`     // "imap" 或 "webmail"
+	UIDValidity uint32 `json:"uid_validity,omitempty"` // IMAP 邮箱 UIDVALIDITY
+	UID         uint32 `json:"uid,omitempty"`          // IMAP UID
+	ThreadID    string `json:"thread_id,omitempty"`    // WebMail 线程 ID
+	match       string
 }
 
 // Folder describes a selectable IMAP mailbox.
@@ -65,19 +71,24 @@ type Folder struct {
 // FullMessage 是一封邮件的完整内容(含正文)。
 type FullMessage struct {
 	Message
-	Body        string `json:"body"`
-	ContentType string `json:"content_type"`
+	Body         string `json:"body"`
+	ContentType  string `json:"content_type"`
+	BodyComplete bool   `json:"body_complete"`      // 是否为完整邮件正文 (WebMail 预览为 false)
+	Provider     string `json:"provider,omitempty"` // 实际数据来源: "imap" 或 "webmail"
+	Method       string `json:"method,omitempty"`   // 实际调用方式: "imap" 或 "web_api"
 }
 
 // Client 是 iCloud 邮件 IMAP 客户端。
 type Client struct {
-	username string
-	password string
-	server   string
-	port     int
-	proxyURL string
-	cli      *client.Client
-	conn     net.Conn // 底层连接, 用于设置读写截止时间
+	username       string
+	password       string
+	server         string
+	port           int
+	proxyURL       string
+	cli            *client.Client
+	conn           net.Conn // 底层连接, 用于设置读写截止时间
+	curMailbox     string
+	curUIDValidity uint32
 }
 
 // SetDeadline 给底层连接设置绝对读写截止时间; 零值清除。
@@ -337,6 +348,16 @@ func (c *Client) listMailbox(folder string, limit int, days int) ([]Message, err
 	var out []Message
 	for msg := range messages {
 		m := toMessageWithBody(msg, folder)
+		m.UIDValidity = mbox.UidValidity
+		m.Provider = "imap"
+		ref := MessageRef{
+			Provider:    "imap",
+			Mailbox:     folder,
+			UIDValidity: mbox.UidValidity,
+			UID:         m.UID,
+		}
+		m.MessageRef = ref.Encode()
+
 		if days > 0 {
 			if t, err := time.Parse(time.RFC3339, m.Date); err == nil {
 				if time.Since(t) > time.Duration(days)*24*time.Hour {
@@ -399,7 +420,8 @@ func (c *Client) ForEachByRecipientInFolder(recipient string, folder string, lim
 }
 
 func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, limit int, days int, onMsg func(Message) bool) error {
-	if _, err := c.cli.Select(folder, true); err != nil {
+	mbox, err := c.cli.Select(folder, true)
+	if err != nil {
 		return err
 	}
 
@@ -426,6 +448,15 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 			if ferr != nil {
 				return ferr
 			}
+			m.UIDValidity = mbox.UidValidity
+			m.Provider = "imap"
+			ref := MessageRef{
+				Provider:    "imap",
+				Mailbox:     folder,
+				UIDValidity: mbox.UidValidity,
+				UID:         m.UID,
+			}
+			m.MessageRef = ref.Encode()
 			if !onMsg(m) {
 				return nil
 			}
@@ -548,6 +579,11 @@ func (c *Client) GetFull(uid uint32) (*FullMessage, error) {
 
 // GetFullInFolder 获取指定文件夹中单封邮件的完整内容。
 func (c *Client) GetFullInFolder(folder string, uid uint32) (*FullMessage, error) {
+	return c.GetFullInFolderWithValidity(folder, 0, uid)
+}
+
+// GetFullInFolderWithValidity 获取指定文件夹中单封邮件的完整内容，支持严格校验 UIDVALIDITY。
+func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, uid uint32) (*FullMessage, error) {
 	if c.cli == nil {
 		return nil, fmt.Errorf("未连接")
 	}
@@ -557,8 +593,12 @@ func (c *Client) GetFullInFolder(folder string, uid uint32) (*FullMessage, error
 	}
 
 	for _, name := range folders {
-		if _, err := c.cli.Select(name, true); err != nil {
+		status, err := c.cli.Select(name, true)
+		if err != nil {
 			continue
+		}
+		if uidValidity > 0 && status.UidValidity != uidValidity {
+			return nil, ErrUIDValidityMismatch
 		}
 		seqset := new(imap.SeqSet)
 		seqset.AddNum(uid)
@@ -576,7 +616,24 @@ func (c *Client) GetFullInFolder(folder string, uid uint32) (*FullMessage, error
 			}
 		}
 		if err := <-done; err == nil && msg != nil {
-			full := &FullMessage{Message: toMessage(msg, name)}
+			msgModel := toMessage(msg, name)
+			msgModel.UIDValidity = status.UidValidity
+			msgModel.UID = uid
+			msgModel.Provider = "imap"
+			ref := MessageRef{
+				Provider:    "imap",
+				Mailbox:     name,
+				UIDValidity: status.UidValidity,
+				UID:         uid,
+			}
+			msgModel.MessageRef = ref.Encode()
+
+			full := &FullMessage{
+				Message:      msgModel,
+				BodyComplete: true,
+				Provider:     "imap",
+				Method:       "imap",
+			}
 			if r := msg.GetBody(section); r != nil {
 				if em, err := mail.ReadMessage(r); err == nil {
 					body, _ := readBody(em)
@@ -601,7 +658,8 @@ func (c *Client) GetFullBatchInFolder(folder string, uids []uint32) ([]*FullMess
 	if folder == "" || strings.EqualFold(folder, "all") {
 		folder = "INBOX"
 	}
-	if _, err := c.cli.Select(folder, true); err != nil {
+	status, err := c.cli.Select(folder, true)
+	if err != nil {
 		return nil, err
 	}
 
@@ -624,7 +682,23 @@ func (c *Client) GetFullBatchInFolder(folder string, uids []uint32) ([]*FullMess
 			continue
 		}
 		message := toMessage(msg, folder)
-		full := &FullMessage{Message: message}
+		message.UIDValidity = status.UidValidity
+		message.UID = msg.Uid
+		message.Provider = "imap"
+		ref := MessageRef{
+			Provider:    "imap",
+			Mailbox:     folder,
+			UIDValidity: status.UidValidity,
+			UID:         msg.Uid,
+		}
+		message.MessageRef = ref.Encode()
+
+		full := &FullMessage{
+			Message:      message,
+			BodyComplete: true,
+			Provider:     "imap",
+			Method:       "imap",
+		}
 		if r := msg.GetBody(section); r != nil {
 			if em, err := mail.ReadMessage(r); err == nil {
 				if body, err := readBody(em); err == nil {

@@ -38,6 +38,8 @@ func toMessage(msg *imap.Message, folder ...string) Message {
 	}
 	if msg.Uid > 0 {
 		m.ID = fmt.Sprintf("%d", msg.Uid)
+		m.UID = msg.Uid
+		m.Provider = "imap"
 	}
 	if msg.Envelope != nil {
 		if len(msg.Envelope.From) > 0 {

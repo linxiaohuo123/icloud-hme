@@ -60,6 +60,9 @@ type fakeBackend struct {
 
 	validateID   string
 	validateFunc func(id string) error
+
+	getMessageFunc  func(accountID string, id string) (*mail.FullMessage, error)
+	getMessagesFunc func(accountID string, refs []MessageRef) ([]*mail.FullMessage, error)
 }
 
 func (f *fakeBackend) ListAccounts() []account.Summary { return f.accounts }
@@ -207,6 +210,9 @@ func (f *fakeBackend) ListMailboxes(accountID string) ([]mail.Folder, error) {
 }
 
 func (f *fakeBackend) GetMessage(accountID string, id string) (*mail.FullMessage, error) {
+	if f.getMessageFunc != nil {
+		return f.getMessageFunc(accountID, id)
+	}
 	_, idPart, _, _ := parseMessageID(id)
 	if idPart == "" {
 		idPart = id
@@ -215,6 +221,9 @@ func (f *fakeBackend) GetMessage(accountID string, id string) (*mail.FullMessage
 }
 
 func (f *fakeBackend) GetMessages(accountID string, refs []MessageRef) ([]*mail.FullMessage, error) {
+	if f.getMessagesFunc != nil {
+		return f.getMessagesFunc(accountID, refs)
+	}
 	var out []*mail.FullMessage
 	for _, r := range refs {
 		out = append(out, &mail.FullMessage{Message: mail.Message{ID: fmt.Sprint(r.UID), Folder: r.Folder}})

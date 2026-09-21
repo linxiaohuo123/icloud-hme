@@ -5,7 +5,7 @@
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
-import type { ApiResponse } from './types'
+import type { ApiResponse, MessageDetailResponse } from './types'
 
 /** CSRF token,仅存 React 内存状态 */
 let csrfToken: string | null = null
@@ -104,3 +104,20 @@ export async function request<T>(
   }
   return payload.data as T
 }
+
+/** 规范化邮件详情获取适配器 (PR-02)，校验服务端 MessageDetailResponse 并提取 .message */
+export async function getMessageDetail(
+  accountId: string,
+  messageRefOrId: string,
+  signal?: AbortSignal,
+): Promise<MessageDetailResponse> {
+  const resp = await request<MessageDetailResponse>(
+    `/api/inbox/${encodeURIComponent(messageRefOrId)}?account_id=${encodeURIComponent(accountId)}`,
+    { signal },
+  )
+  if (!resp || typeof resp !== 'object' || !resp.message || typeof resp.message !== 'object') {
+    throw new ApiError(500, 'INVALID_CONTRACT', '邮件详情响应契约异常: 缺失 message 字段')
+  }
+  return resp
+}
+

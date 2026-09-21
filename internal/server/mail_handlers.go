@@ -77,24 +77,39 @@ func (s *Server) listMailboxesHandler(c *gin.Context) {
 	})
 }
 
-func (s *Server) getMessageHandler(c *gin.Context) {
+func (s *Server) handleGetMessageDetail(c *gin.Context, rawID string) {
 	accountID := strings.TrimSpace(c.Query("account_id"))
-	rawID := strings.TrimSpace(c.Param("message_id"))
+	rawID = strings.TrimSpace(rawID)
 	if accountID == "" || rawID == "" {
-		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "account_id 或邮件 ID 无效")
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数缺失: account_id 或邮件 ID 无效")
 		return
 	}
 
-	cacheKey := fmt.Sprintf("%s:%s", accountID, rawID)
+	ref, err := mail.ParseMessageRef(rawID, accountID)
+	if err != nil {
+		if errors.Is(err, mail.ErrAccountMismatch) {
+			failCode(c, http.StatusForbidden, "FORBIDDEN", "跨账号邮件读取被拒绝")
+			return
+		}
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "邮件引用格式无效")
+		return
+	}
+	if ref.AccountID != "" && ref.AccountID != accountID {
+		failCode(c, http.StatusForbidden, "FORBIDDEN", "跨账号邮件读取被拒绝")
+		return
+	}
+
+	cacheKey := ref.CacheKey()
 	s.msgCacheMu.RLock()
 	entry, hit := s.msgCache[cacheKey]
 	s.msgCacheMu.RUnlock()
+
 	if hit && time.Now().Before(entry.expiresAt) {
-		// 【BUG-08 修复】响应包装对齐 getMessagePrimeHandler，包含 account_id/method/cached
 		ok(c, gin.H{
 			"account_id": accountID,
 			"message":    entry.msg,
-			"method":     "cache",
+			"provider":   entry.provider,
+			"method":     entry.method,
 			"cached":     true,
 		})
 		return
@@ -106,52 +121,41 @@ func (s *Server) getMessageHandler(c *gin.Context) {
 		return
 	}
 
-	s.putMessageCache([]string{cacheKey}, message)
+	provider := message.Provider
+	if provider == "" {
+		provider = message.Message.Provider
+	}
+	if provider == "" {
+		provider = "imap"
+	}
+	message.Provider = provider
+	message.Message.Provider = provider
+	method := message.Method
+	if method == "" {
+		if provider == "webmail" {
+			method = "web_api"
+		} else {
+			method = "imap"
+		}
+	}
+
+	s.putMessageCache([]string{cacheKey, fmt.Sprintf("%s:%s", accountID, rawID)}, message, provider, method)
 
 	ok(c, gin.H{
 		"account_id": accountID,
 		"message":    message,
-		"method":     "imap",
+		"provider":   provider,
+		"method":     method,
 		"cached":     false,
 	})
 }
 
+func (s *Server) getMessageHandler(c *gin.Context) {
+	s.handleGetMessageDetail(c, c.Param("message_id"))
+}
+
 func (s *Server) getMessagePrimeHandler(c *gin.Context) {
-	accountID := strings.TrimSpace(c.Query("account_id"))
-	rawID := strings.TrimSpace(c.Param("id"))
-	if accountID == "" || rawID == "" {
-		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数缺失: account_id 或邮件 ID")
-		return
-	}
-
-	cacheKey := fmt.Sprintf("%s:%s", accountID, rawID)
-	s.msgCacheMu.RLock()
-	entry, hit := s.msgCache[cacheKey]
-	s.msgCacheMu.RUnlock()
-	if hit && time.Now().Before(entry.expiresAt) {
-		ok(c, gin.H{
-			"account_id": accountID,
-			"message":    entry.msg,
-			"method":     "cache",
-			"cached":     true,
-		})
-		return
-	}
-
-	message, err := s.be.GetMessage(accountID, rawID)
-	if err != nil {
-		backendFail(c, err)
-		return
-	}
-
-	s.putMessageCache([]string{cacheKey}, message)
-
-	ok(c, gin.H{
-		"account_id": accountID,
-		"message":    message,
-		"method":     "imap",
-		"cached":     false,
-	})
+	s.handleGetMessageDetail(c, c.Param("id"))
 }
 
 type getMessagesReq struct {
@@ -228,7 +232,7 @@ func (s *Server) getMessagesHandler(c *gin.Context) {
 			s.putMessageCache([]string{
 				fmt.Sprintf("%s:%s:%s", req.AccountID, folder, msg.ID),
 				fmt.Sprintf("%s:%s", req.AccountID, msg.ID),
-			}, msg)
+			}, msg, msg.Provider, msg.Method)
 			out = append(out, msg)
 		}
 	}
@@ -242,7 +246,7 @@ func (s *Server) getMessagesHandler(c *gin.Context) {
 
 const maxMessageCacheEntries = 1000
 
-func (s *Server) putMessageCache(keys []string, msg *mail.FullMessage) {
+func (s *Server) putMessageCache(keys []string, msg *mail.FullMessage, provider, method string) {
 	s.msgCacheMu.Lock()
 	defer s.msgCacheMu.Unlock()
 	if s.msgCache == nil {
@@ -262,6 +266,8 @@ func (s *Server) putMessageCache(keys []string, msg *mail.FullMessage) {
 	entry := messageCacheEntry{
 		msg:       msg,
 		expiresAt: now.Add(10 * time.Minute),
+		provider:  provider,
+		method:    method,
 	}
 	for _, k := range keys {
 		s.msgCache[k] = entry

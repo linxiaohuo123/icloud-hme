@@ -65,6 +65,8 @@ type Config struct {
 type messageCacheEntry struct {
 	msg       *mail.FullMessage
 	expiresAt time.Time
+	provider  string
+	method    string
 }
 
 // Server 封装 Gin 引擎、账号后端与认证。

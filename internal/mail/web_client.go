@@ -320,13 +320,21 @@ func (c *WebClient) search(payload string) ([]Message, error) {
 		if t.Timestamp > 0 {
 			date = time.UnixMilli(t.Timestamp).UTC().Format(time.RFC3339)
 		}
+		ref := MessageRef{
+			Provider: "webmail",
+			ThreadID: t.ThreadID,
+		}
 		messages = append(messages, Message{
-			ID:      t.ThreadID,
-			From:    from,
-			To:      to,
-			Subject: t.Subject,
-			Preview: sanitizePreview(t.Preview),
-			Date:    date,
+			ID:         t.ThreadID,
+			MessageRef: ref.Encode(),
+			Folder:     "INBOX",
+			From:       from,
+			To:         to,
+			Subject:    t.Subject,
+			Preview:    sanitizePreview(t.Preview),
+			Date:       date,
+			Provider:   "webmail",
+			ThreadID:   t.ThreadID,
 		})
 	}
 	return messages, nil

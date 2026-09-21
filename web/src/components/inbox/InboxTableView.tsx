@@ -7,7 +7,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { request, ApiError } from '../../api/client'
+import { request, ApiError, getMessageDetail } from '../../api/client'
 import type { AccountSummary, Alias, FullMessage, InboxMessage, InboxResult, MailboxFolder } from '../../api/types'
 import AsyncState from '../AsyncState'
 import ConfirmDialog from '../ConfirmDialog'
@@ -15,6 +15,7 @@ import Select from '../Select'
 import { useToast } from '../ToastProvider'
 import { copyText } from '../../utils/clipboard'
 import { dateTimestamp } from '../../utils/date'
+import { buildMailCacheKey } from '../../utils/mail'
 import { buildSniffContext, extractVerifyCode, parseSenderInfo } from '../../utils/sniffer'
 import InboxTableRow from './InboxTableRow'
 import MailDetailDialog from './MailDetailDialog'
@@ -34,6 +35,7 @@ export interface InboxTableViewProps {
   showPageHeader?: boolean
   onCountChange?: (count: number) => void
 }
+
 
 export default function InboxTableView({
   accountId: propAccountId,
@@ -80,6 +82,7 @@ export default function InboxTableView({
   const copiedAliasTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const abortRef = useRef<AbortController | null>(null)
+  const accountGenRef = useRef(0)
   const messageCacheRef = useRef<Map<string, FullMessage>>(new Map())
   const hasAccountsLoadedRef = useRef(false)
 
@@ -90,12 +93,15 @@ export default function InboxTableView({
     }
   }, [])
 
-  // 监听外部 propAccountId 变更（工作台模式）
+  // 监听外部 propAccountId 变更（工作台模式），严格杜绝跨账号预取与详情污染
   useEffect(() => {
-    if (propAccountId) {
+    if (propAccountId && propAccountId !== accountId) {
+      accountGenRef.current += 1
+      abortRef.current?.abort()
+      messageCacheRef.current.clear()
       setAccountId(propAccountId)
     }
-  }, [propAccountId])
+  }, [propAccountId, accountId])
 
   // 监听外部 initialAlias 变更（工作台别名联动）
   useEffect(() => {
@@ -197,9 +203,10 @@ export default function InboxTableView({
     }
   }, [accountId])
 
-  // 4. 查询收件箱邮件
+  // 4. 查询收件箱邮件 (带代际保护 accountGenRef，防止切换账号后陈旧请求污染新账号视图与缓存)
   useEffect(() => {
     if (!accountId) return
+    const currentGen = ++accountGenRef.current
     setLoading(true)
     abortRef.current?.abort()
     const controller = new AbortController()
@@ -216,14 +223,16 @@ export default function InboxTableView({
       signal: controller.signal,
     })
       .then((data) => {
-        if (cancelled) return
+        if (cancelled || currentGen !== accountGenRef.current) return
         setResult(data)
         setError('')
-        // 静默预取前 20 封邮件正文注入内存缓存
+        // 静默预取前 20 封邮件正文注入内存缓存 (基于完整 message_ref 与文件夹隔离键)
         if (data && Array.isArray(data.messages) && data.messages.length > 0) {
           const targets = data.messages.slice(0, 20).map((m) => ({
             folder: m.folder || 'INBOX',
             uid: m.id,
+            id: m.id,
+            ref: m.message_ref,
           }))
           request<{ messages?: FullMessage[] }>('/api/messages', {
             method: 'POST',
@@ -231,12 +240,17 @@ export default function InboxTableView({
               account_id: accountId,
               messages: targets,
             },
+            signal: controller.signal,
           })
             .then((batch) => {
+              if (cancelled || currentGen !== accountGenRef.current) return
               const list = Array.isArray(batch?.messages) ? batch.messages : []
               list.forEach((fm) => {
-                if (fm?.id) {
-                  messageCacheRef.current.set(fm.id, fm)
+                if (fm) {
+                  messageCacheRef.current.set(buildMailCacheKey(accountId, fm), fm)
+                  if (fm.id) {
+                    messageCacheRef.current.set(`${accountId}:${fm.folder || 'INBOX'}:${fm.id}`, fm)
+                  }
                 }
               })
             })
@@ -244,12 +258,12 @@ export default function InboxTableView({
         }
       })
       .catch((err) => {
-        if (cancelled || (err instanceof ApiError && err.code === 'ABORTED')) return
+        if (cancelled || currentGen !== accountGenRef.current || (err instanceof ApiError && err.code === 'ABORTED')) return
         setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
         setResult(null)
       })
       .finally(() => {
-        if (!cancelled) setLoading(false)
+        if (!cancelled && currentGen === accountGenRef.current) setLoading(false)
       })
 
     return () => {
@@ -273,6 +287,8 @@ export default function InboxTableView({
   }
 
   function handleAccountChange(newAccountId: string) {
+    accountGenRef.current += 1
+    abortRef.current?.abort()
     setAccountId(newAccountId)
     setAlias('')
     setPage(1)
@@ -281,22 +297,35 @@ export default function InboxTableView({
   }
 
   async function openMessage(message: InboxMessage) {
-    const cached = messageCacheRef.current.get(message.id)
+    const currentGen = accountGenRef.current
+    const primaryKey = buildMailCacheKey(accountId, message)
+    const fallbackKey = `${accountId}:${message.folder || 'INBOX'}:${message.id}`
+    const cached = messageCacheRef.current.get(primaryKey) || messageCacheRef.current.get(fallbackKey)
     if (cached) {
       setDetail(cached)
       return
     }
     setDetailLoading(true)
+    const targetRefOrId = message.message_ref || message.id
     try {
-      const data = await request<FullMessage>(
-        `/api/inbox/${encodeURIComponent(message.id)}?account_id=${encodeURIComponent(accountId)}`,
-      )
-      messageCacheRef.current.set(message.id, data)
-      setDetail(data)
+      const resp = await getMessageDetail(accountId, targetRefOrId)
+      if (currentGen !== accountGenRef.current) return
+      // 【PR-02 契约】消费规范响应中的 response.message
+      const fullMsg = resp.message
+      messageCacheRef.current.set(primaryKey, fullMsg)
+      messageCacheRef.current.set(fallbackKey, fullMsg)
+      if (fullMsg.message_ref) {
+        messageCacheRef.current.set(buildMailCacheKey(accountId, fullMsg), fullMsg)
+      }
+      setDetail(fullMsg)
     } catch (err) {
-      show(err instanceof ApiError ? err.message : '读取邮件详情失败')
+      if (currentGen === accountGenRef.current) {
+        show(err instanceof ApiError ? err.message : '读取邮件详情失败')
+      }
     } finally {
-      setDetailLoading(false)
+      if (currentGen === accountGenRef.current) {
+        setDetailLoading(false)
+      }
     }
   }
 
@@ -304,11 +333,12 @@ export default function InboxTableView({
     if (!deleteFor) return
     setDeleting(true)
     try {
+      const targetRefOrId = deleteFor.message_ref || deleteFor.id
       await request(
-        `/api/inbox/${encodeURIComponent(deleteFor.id)}?account_id=${encodeURIComponent(accountId)}`,
+        `/api/inbox/${encodeURIComponent(targetRefOrId)}?account_id=${encodeURIComponent(accountId)}`,
         { method: 'DELETE' },
       )
-      messageCacheRef.current.delete(deleteFor.id)
+      messageCacheRef.current.delete(buildMailCacheKey(accountId, deleteFor))
       setDeleteFor(null)
       setDetail(null)
       show('邮件已删除')
