@@ -96,42 +96,85 @@ func toMessageWithBody(msg *imap.Message, folder ...string) Message {
 			continue
 		}
 		m.Preview = strings.TrimSpace(body)
-		m.match = strings.Join([]string{
-			m.From,
-			m.To,
-			m.Subject,
-			headersText(em.Header),
-			m.Preview,
-		}, "\n")
+		recipients := extractStructuralRecipients(m.To, em.Header)
+		m.match = strings.Join(recipients, "\n")
 		break
 	}
 	return m
 }
 
-func headersText(header mail.Header) string {
-	var builder strings.Builder
-	for key, values := range header {
-		builder.WriteString(key)
-		builder.WriteString(": ")
-		builder.WriteString(strings.Join(values, ", "))
-		builder.WriteByte('\n')
+// extractStructuralRecipients 提取真实的信封与投递收件人地址 (To, Cc, Delivered-To, X-Original-To, Envelope-To)。
+// 严禁纳入 From, Subject, Preview 等非收件人字段 (PR-06 Section 9.4, V06/V07)。
+func extractStructuralRecipients(toHeader string, header mail.Header) []string {
+	seen := make(map[string]struct{})
+	var recipients []string
+	add := func(raw string) {
+		if strings.TrimSpace(raw) == "" {
+			return
+		}
+		if list, err := mail.ParseAddressList(raw); err == nil && len(list) > 0 {
+			for _, a := range list {
+				norm := strings.ToLower(strings.TrimSpace(a.Address))
+				if norm != "" {
+					if _, ok := seen[norm]; !ok {
+						seen[norm] = struct{}{}
+						recipients = append(recipients, norm)
+					}
+				}
+			}
+			return
+		}
+		for _, part := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ';' || r == ' ' }) {
+			part = strings.Trim(part, "<>,;\"' \t\r\n")
+			if strings.Contains(part, "@") {
+				norm := strings.ToLower(strings.TrimSpace(part))
+				if norm != "" {
+					if _, ok := seen[norm]; !ok {
+						seen[norm] = struct{}{}
+						recipients = append(recipients, norm)
+					}
+				}
+			}
+		}
 	}
-	return builder.String()
+
+	add(toHeader)
+	if header != nil {
+		add(header.Get("To"))
+		add(header.Get("Cc"))
+		add(header.Get("Delivered-To"))
+		add(header.Get("X-Original-To"))
+		add(header.Get("Envelope-To"))
+	}
+	return recipients
 }
 
+// RecipientAddresses 返回本封邮件中所有经解析的结构化收件人地址。
+func (m Message) RecipientAddresses() []string {
+	if m.match != "" {
+		return strings.Split(m.match, "\n")
+	}
+	return extractStructuralRecipients(m.To, nil)
+}
+
+// matches 判断本邮件是否匹配指定目标收件人。
+// 严正约束：只能在结构化收件人头 (To, Cc, Delivered-To 等) 中核对，
+// 严禁匹配 Preview、Subject 或 From；缺少 To 绝不自动填补 (PR-06 Section 9.4, V06/V07)。
 func (m Message) matches(recipient string) bool {
 	needle := strings.ToLower(strings.TrimSpace(recipient))
 	if needle == "" {
 		return true
 	}
-	text := strings.ToLower(strings.Join([]string{
-		m.From,
-		m.To,
-		m.Subject,
-		m.Preview,
-		m.match,
-	}, "\n"))
-	return strings.Contains(text, needle)
+	recipients := m.RecipientAddresses()
+	for _, addr := range recipients {
+		if addr == needle {
+			return true
+		}
+		if strings.HasPrefix(needle, "@") && strings.HasSuffix(addr, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasAttr(attrs []string, attr string) bool {

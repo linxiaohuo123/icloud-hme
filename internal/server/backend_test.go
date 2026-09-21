@@ -59,11 +59,17 @@ type fakeBackend struct {
 	listInboxQuery   InboxQuery
 	reloadCount      int
 
+	onClose       func()
+	onCreateAlias func(accountID, label string) (*hme.CreateResult, error)
+	onListAliases func(accountID string) ([]hme.Alias, error)
+	onListInbox   func(q InboxQuery) (InboxResult, error)
+
 	validateID   string
 	validateFunc func(id string) error
 
-	getMessageFunc  func(accountID string, id string) (*mail.FullMessage, error)
-	getMessagesFunc func(accountID string, refs []MessageRef) ([]*mail.FullMessage, error)
+	getMessageFunc      func(accountID string, id string) (*mail.FullMessage, error)
+	getMessagesFunc     func(accountID string, refs []MessageRef) ([]*mail.FullMessage, error)
+	mailboxBoundaryFunc func(accountID, folder string) (string, uint32, uint32, error)
 }
 
 func (f *fakeBackend) ListAccounts() []account.Summary { return f.accounts }
@@ -137,11 +143,23 @@ func (f *fakeBackend) RemoveAccount(id string) bool {
 	return f.removedOK
 }
 
+func (f *fakeBackend) Close() {
+	if f.onClose != nil {
+		f.onClose()
+	}
+}
+
 func (f *fakeBackend) CreateAlias(accountID, label string) (*hme.CreateResult, error) {
+	if f.onCreateAlias != nil {
+		return f.onCreateAlias(accountID, label)
+	}
 	return f.created, nil
 }
 
 func (f *fakeBackend) ListAliases(accountID string) ([]hme.Alias, error) {
+	if f.onListAliases != nil {
+		return f.onListAliases(accountID)
+	}
 	return f.aliases, nil
 }
 
@@ -200,6 +218,9 @@ func (f *fakeBackend) BatchCreateAlias(accountID string, count int, labelPrefix 
 
 func (f *fakeBackend) ListInbox(q InboxQuery) (InboxResult, error) {
 	f.listInboxQuery = q
+	if f.onListInbox != nil {
+		return f.onListInbox(q)
+	}
 	return f.inbox, nil
 }
 
@@ -230,6 +251,13 @@ func (f *fakeBackend) GetMessages(accountID string, refs []MessageRef) ([]*mail.
 		out = append(out, &mail.FullMessage{Message: mail.Message{ID: fmt.Sprint(r.UID), Folder: r.Folder}})
 	}
 	return out, nil
+}
+
+func (f *fakeBackend) GetMailboxBoundary(accountID, folder string) (string, uint32, uint32, error) {
+	if f.mailboxBoundaryFunc != nil {
+		return f.mailboxBoundaryFunc(accountID, folder)
+	}
+	return "imap", 1, 100, nil
 }
 
 func (f *fakeBackend) DeleteMessage(accountID string, uid uint32) error { return nil }

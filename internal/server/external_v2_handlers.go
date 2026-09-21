@@ -13,11 +13,16 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"icloud-hme/internal/auth"
 	"icloud-hme/internal/store"
+)
+
+// PR-07 §10.2: 有界并发与防过载保护
+const (
+	maxGlobalActiveVerificationRequests   = 1000
+	maxPerTokenActiveVerificationRequests = 50
 )
 
 type externalV2AllocateReq struct {
@@ -139,6 +144,7 @@ func (s *Server) externalV2AllocateHandler(c *gin.Context) {
 		"operation_id": opID,
 		"lease_id":     alloc.AllocationID,
 		"email":        alloc.AliasEmail,
+		"alias_email":  alloc.AliasEmail,
 		"account_id":   alloc.AccountID,
 		"source":       "pool",
 		"allocated_at": alloc.AllocatedAt,
@@ -171,49 +177,37 @@ func (s *Server) externalV2CreateVerificationRequestHandler(c *gin.Context) {
 		return
 	}
 
-	if s.store == nil {
-		failCode(c, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "存储层未就绪")
-		return
+	if leaseID == "" && s.store != nil {
+		alloc, err := s.store.GetPrincipalAllocation(c.Request.Context(), email, string(p.Kind), p.ID)
+		if err != nil || alloc == nil {
+			failCode(c, http.StatusNotFound, "RESOURCE_NOT_FOUND", "未找到指定别名或无权访问")
+			return
+		}
+		leaseID = alloc.AllocationID
 	}
 
-	// 资源归属核验：必须确认该别名归属于当前调用主体 (使用单一真相源 alias_allocations)
-	var alloc *store.AliasAllocation
-	var err error
-	if email != "" {
-		alloc, err = s.store.GetPrincipalAllocation(c.Request.Context(), email, string(p.Kind), p.ID)
-	} else {
-		alloc, err = s.store.GetPrincipalAllocationByID(c.Request.Context(), leaseID, string(p.Kind), p.ID)
-	}
-
-	if err != nil || alloc == nil {
-		failCode(c, http.StatusNotFound, "RESOURCE_NOT_FOUND", "未找到指定别名或无权访问")
-		return
-	}
-
-	now := time.Now().UTC()
-	vreq := &store.VerificationRequest{
-		RequestID:     fmt.Sprintf("vreq_%d", now.UnixNano()),
-		PrincipalKind: string(p.Kind),
-		PrincipalID:   p.ID,
-		LeaseID:       alloc.AllocationID,
-		AliasEmail:    alloc.AliasEmail,
-		Status:        "ready",
-		CreatedAt:     now.Format(time.RFC3339),
-		ExpiresAt:     now.Add(10 * time.Minute).Format(time.RFC3339),
-	}
-
-	if err := s.store.CreateVerificationRequest(c.Request.Context(), vreq); err != nil {
-		failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", "创建持久化验证任务失败: "+err.Error())
+	vreq, err := s.verifyService.CreateVerificationRequest(c.Request.Context(), p, leaseID)
+	if err != nil {
+		var be *BackendError
+		if errors.As(err, &be) {
+			failCode(c, be.Status, be.Code, be.Message)
+			return
+		}
+		failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
 
 	ok(c, gin.H{
-		"request_id":  vreq.RequestID,
-		"lease_id":    vreq.LeaseID,
-		"alias_email": vreq.AliasEmail,
-		"status":      vreq.Status,
-		"created_at":  vreq.CreatedAt,
-		"expires_at":  vreq.ExpiresAt,
+		"request_id":           vreq.RequestID,
+		"lease_id":             vreq.LeaseID,
+		"alias_email":          vreq.AliasEmail,
+		"status":               vreq.Status,
+		"baseline_ready":       true,
+		"baseline_provider":    vreq.BaselineProvider,
+		"baseline_uidvalidity": vreq.BaselineUIDValidity,
+		"baseline_uid":         vreq.BaselineUID,
+		"created_at":           vreq.CreatedAt,
+		"expires_at":           vreq.ExpiresAt,
 	})
 }
 
@@ -230,98 +224,25 @@ func (s *Server) externalV2GetVerificationRequestHandler(c *gin.Context) {
 		return
 	}
 
-	if s.store == nil {
-		failCode(c, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "存储层未就绪")
-		return
-	}
-
-	// 必须从持久化 verification_requests 表查询，严格校验主体归属，绝对禁止 query 传 email 绕过
-	vreq, err := s.store.GetVerificationRequest(c.Request.Context(), requestID, string(p.Kind), p.ID)
-	if err != nil || vreq == nil {
-		failCode(c, http.StatusNotFound, "RESOURCE_NOT_FOUND", "未找到验证任务或无权访问")
-		return
-	}
-
-	// 若已完成直接返回
-	if vreq.Status == "succeeded" {
-		ok(c, gin.H{
-			"request_id":  vreq.RequestID,
-			"lease_id":    vreq.LeaseID,
-			"alias_email": vreq.AliasEmail,
-			"code":        vreq.Code,
-			"status":      "succeeded",
-		})
-		return
-	}
-
 	timeoutSec := 0
 	if raw := c.Query("timeout"); raw != "" {
 		if t, err := strconv.Atoi(raw); err == nil && t > 0 {
-			if t > 120 {
-				t = 120
-			}
 			timeoutSec = t
 		}
 	}
 
-	// 内存订阅与事件捕获
-	subID, ch := s.eventBus.SubscribeWithFresh(vreq.AliasEmail, false)
-	defer s.eventBus.Unsubscribe(vreq.AliasEmail, subID)
-
-	if s.syncWorker != nil {
-		s.syncWorker.Trigger()
-	}
-
-	if timeoutSec <= 0 {
-		select {
-		case item := <-ch:
-			code := item.OTP.Code
-			_ = s.store.UpdateVerificationRequestResult(c.Request.Context(), vreq.RequestID, "succeeded", code, "")
-			s.eventBus.ConsumeCache(vreq.AliasEmail)
-			ok(c, gin.H{
-				"request_id":  vreq.RequestID,
-				"lease_id":    vreq.LeaseID,
-				"alias_email": vreq.AliasEmail,
-				"code":        code,
-				"status":      "succeeded",
-			})
-			return
-		default:
-			ok(c, gin.H{
-				"request_id":  vreq.RequestID,
-				"lease_id":    vreq.LeaseID,
-				"alias_email": vreq.AliasEmail,
-				"status":      "pending",
-			})
+	res, err := s.verifyService.GetVerificationResult(c.Request.Context(), p, requestID, timeoutSec)
+	if err != nil {
+		var be *BackendError
+		if errors.As(err, &be) {
+			failCode(c, be.Status, be.Code, be.Message)
 			return
 		}
-	}
-
-	timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
-	defer timer.Stop()
-
-	select {
-	case item := <-ch:
-		code := item.OTP.Code
-		_ = s.store.UpdateVerificationRequestResult(c.Request.Context(), vreq.RequestID, "succeeded", code, "")
-		s.eventBus.ConsumeCache(vreq.AliasEmail)
-		ok(c, gin.H{
-			"request_id":  vreq.RequestID,
-			"lease_id":    vreq.LeaseID,
-			"alias_email": vreq.AliasEmail,
-			"code":        code,
-			"status":      "received",
-		})
-	case <-timer.C:
-		ok(c, gin.H{
-			"request_id":  vreq.RequestID,
-			"lease_id":    vreq.LeaseID,
-			"alias_email": vreq.AliasEmail,
-			"status":      "pending",
-		})
-	case <-c.Request.Context().Done():
+		failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
 	}
+
+	ok(c, res)
 }
 
 func (s *Server) externalV2GetOperationHandler(c *gin.Context) {

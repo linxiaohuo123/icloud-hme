@@ -177,9 +177,49 @@ go test -race ./...              -> Exit Code: 1 (本地 Windows 环境未安装
   npm --prefix web run test:run    -> Exit Code: 0 (16/16 文件通过, 101/101 用例全部通过)
   npm --prefix web run build       -> Exit Code: 0 (TypeScript 校验通过, 构建成功)
   go vet ./...                     -> Exit Code: 0 (0 警告)
+  ```
+
+---
+
+## 阶段批次：PR-06 ~ PR-08 (取码时效、有界并发、生命周期与最终工程收口)
+
+- **执行日期**：2026-09-21
+- **起始分支**：`pr/pr05-1-correctness-fix` (`c3d515d`)
+- **工作分支**：`pr/pr06-pr08-final`
+- **实现清单**：
+  1. **PR-06 验证码时效、事件身份与持久恢复**：
+     - **收件人判定严格收紧 (Section 9.4)**：`internal/mail/mime.go` 彻底移除在 `Preview`、`Subject`、`From` 中模糊匹配收件人的致命漏洞；仅核验 `To`、`Cc`、`Delivered-To`、`X-Original-To`、`Envelope-To`；缺失 `To` 绝不自动填补查询目标别名。
+     - **基线游标获取 (Section 9.2)**：`internal/mail/client.go` 为 `*Client` 实现 `GetMailboxBoundary`，通过 IMAP `Select` 提取真实的 `UidValidity` 与 `UidNext`；WebMail 模式显式返回 400 `CAPABILITY_UNSUPPORTED`。
+     - **事件总线边界与并发隔离 (Section 9.5)**：`internal/mail/eventbus.go` 扩展 `CachedOTP`；实现 `SubscribeWithBoundary` 与 `ConsumeEvent`，消费事件 A 绝不删除更晚到达的事件 B。
+     - **外部 v2 状态机与持久化**：`external_v2_handlers.go` 强校验租约归属、单 lease 并发冲突检查（409）、采集基线边界、持久化初始状态 `ready`、超时自动标记 `expired`、幂等读取、唤醒前原子复核 Token 撤销（401）、UIDVALIDITY 突变检测（409 `UIDVALIDITY_CHANGED`）。
+     - **完成 V01~V10 单元测试** (`internal/server/verification_pr06_test.go`)，覆盖历史信过滤、新信交付、重启保留边界、消费隔离、幂等不抢占、正文提及不跨租约、缺失 To 不补、WebMail 能力受限、突变/撤销阻断与竞态不丢信。
+  2. **PR-07 性能优化、有界并发与生命周期**：
+     - **稳态 0 上游调用**：`pool_only` 稳态请求仅查询 SQLite `alias_inventory`，上游调用严格为 0。
+     - **同账号增量批量查询**：`MailSyncWorker` 聚合同一账号下的多个别名，单轮仅调用 1 次 `ListInbox` 获取最新邮件并定向分发，彻底消除同账号 N 次全量重扫。
+     - **有界并发与慢账号隔离**：`MailSyncWorker` 采用信号量限制最大并发账号数（5），单账号设置 5s 超时隔离，慢账号被截断绝不卡死正常账号。
+     - **容量与单 Token 等待限制**：`external_v2_handlers.go` 增加全局活跃任务上限（1000，超限 503 `SERVER_BUSY`）与单 Token 活跃任务上限（50，超限 429 `TOO_MANY_REQUESTS`）。
+     - **Request Cancellation 释放资源**：客户端断开长轮询连接时，立即注销 EventBus 订阅，杜绝句柄与内存泄漏。
+     - **优雅停机生命周期 (Section 10.4)**：`Server.Close()` 严格按规范执行顺序：停止接收 -> 发送取消 -> 等待在途 worker 收敛 -> 关闭底层长连接池 (`mail.Pool` 与 `HMEClientPool`) -> 关闭 SQLite Store；全过程幂等无 panic。
+     - **完成 P01~P06 单元测试** (`internal/server/lifecycle_pr07_test.go`)。
+  3. **PR-08 工程收口与发布准备**：
+     - **三大领域应用服务收口**：
+       - `AliasAllocationService`：统一所有对外出号入口单一真相源。
+       - `VerificationService`：统一管理验证码任务生命周期、基线采集、边界事件唤醒与精准消费。
+       - `MailReadService`：统一管理收件箱读取、详情缓存与多引用批量拉取。
+       - 所有 Handler 纯化为仅负责 HTTP 参数解析与响应输出。
+     - **废弃双轨代码隔离**：`AliasBuffer` 与 `AliasReaper` 的后台自动请求已被彻底禁用并明确安全状态，杜绝误导。
+     - **完成端到端全链路验收测试** (`internal/server/e2e_final_pr08_test.go`)：串联库存录入、外部出号、建立取码意图、长轮询等待、邮件广播交付、Token 撤销拦截、优雅停机与重启后防重核验全闭环。
+     - **交付文档完备化**：编写 `docs/remediation/MIGRATION.md` 与 `docs/remediation/RELEASE.md`。
+- **真实命令与退出码**：
+  ```text
+  npm --prefix web run lint        -> Exit Code: 0 (0 错误, 5 警告)
+  npm --prefix web run test:run    -> Exit Code: 0 (16/16 文件通过, 101/101 用例全部通过)
+  npm --prefix web run build       -> Exit Code: 0 (TypeScript 校验通过, 构建成功)
+  go vet ./...                     -> Exit Code: 0 (0 警告)
   go build ./...                   -> Exit Code: 0 (全模块编译构建成功)
-  go test ./...                    -> Exit Code: 0 (全部模块通过)
+  go test -count=1 ./...           -> Exit Code: 0 (全部 11 个模块无缓存实测 100% 通过)
   go test -race ./...              -> Exit Code: 1 (本地 Windows 环境未安装 GCC/CGO, 由 CI 执行)
   ```
+
 
 

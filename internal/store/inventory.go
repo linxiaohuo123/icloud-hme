@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 database/sql, context, time, fmt, errors, strings
- * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation, VerificationRequest 模型及 ClaimInventoryAlias, SyncAliasInventory, GetPrincipalAllocation, CreateVerificationRequest, GetVerificationRequest, UpdateVerificationRequestResult 等原子持久化能力
+ * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation, VerificationRequest 模型及 ClaimInventoryAlias, SyncAliasInventory, GetPrincipalAllocation, CreateVerificationRequest, GetVerificationRequest, UpdateVerificationRequestResult, CountActiveVerificationRequests 等原子持久化能力
  * [POS]: internal/store 的领域状态与库存隔离层 (PR-03/PR-05-1)，分离 remote_state 与 allocation_state，提供 SQLite 事务级唯一约束、幂等认领与持久化取码请求
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -724,4 +724,56 @@ func (s *Store) UpdateVerificationRequestResult(ctx context.Context, requestID, 
 	`
 	_, err := s.db.ExecContext(ctx, q, status, code, matchedEventRef, requestID)
 	return err
+}
+
+// GetActiveVerificationRequestByLease 查询指定 lease 是否已有进行中的取码任务 (status IN ('ready', 'pending') 且未过期) (PR-06 Section 9.2)
+func (s *Store) GetActiveVerificationRequestByLease(ctx context.Context, leaseID string) (*VerificationRequest, error) {
+	leaseID = strings.TrimSpace(leaseID)
+	now := time.Now().UTC().Format(time.RFC3339)
+	var req VerificationRequest
+	q := `
+	SELECT request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
+	       baseline_provider, baseline_uidvalidity, baseline_uid, matched_event_ref, code
+	FROM verification_requests
+	WHERE lease_id = ? AND status IN ('ready', 'pending') AND expires_at > ?
+	ORDER BY created_at DESC
+	LIMIT 1
+	`
+	err := s.db.QueryRowContext(ctx, q, leaseID, now).Scan(
+		&req.RequestID, &req.PrincipalKind, &req.PrincipalID, &req.LeaseID, &req.AliasEmail, &req.Status, &req.CreatedAt, &req.ExpiresAt,
+		&req.BaselineProvider, &req.BaselineUIDValidity, &req.BaselineUID, &req.MatchedEventRef, &req.Code,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &req, nil
+}
+
+// CountActiveVerificationRequests 查询当前全局活跃进行中的取码任务数 (PR-07 §10.2)
+func (s *Store) CountActiveVerificationRequests(ctx context.Context) (int, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	var count int
+	q := `
+	SELECT count(*)
+	FROM verification_requests
+	WHERE status IN ('ready', 'pending') AND (expires_at IS NULL OR expires_at > ?)
+	`
+	err := s.db.QueryRowContext(ctx, q, now).Scan(&count)
+	return count, err
+}
+
+// CountActiveVerificationRequestsByPrincipal 查询指定主体当前活跃进行中的取码任务数 (PR-07 §10.2)
+func (s *Store) CountActiveVerificationRequestsByPrincipal(ctx context.Context, principalKind, principalID string) (int, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	var count int
+	q := `
+	SELECT count(*)
+	FROM verification_requests
+	WHERE principal_kind = ? AND principal_id = ? AND status IN ('ready', 'pending') AND (expires_at IS NULL OR expires_at > ?)
+	`
+	err := s.db.QueryRowContext(ctx, q, principalKind, principalID, now).Scan(&count)
+	return count, err
 }

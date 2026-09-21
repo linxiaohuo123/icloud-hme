@@ -719,6 +719,21 @@ func (c *Client) GetFullBatchInFolder(folder string, uids []uint32) ([]*FullMess
 	return out, nil
 }
 
+// GetMailboxBoundary 获取指定邮箱的 UIDVALIDITY 与 UIDNEXT 基线边界 (PR-06 Section 9.2)。
+func (c *Client) GetMailboxBoundary(folder string) (uint32, uint32, error) {
+	if c.cli == nil {
+		return 0, 0, fmt.Errorf("未连接")
+	}
+	if folder == "" || strings.EqualFold(folder, "all") {
+		folder = "INBOX"
+	}
+	status, err := c.cli.Select(folder, true)
+	if err != nil {
+		return 0, 0, err
+	}
+	return status.UidValidity, status.UidNext, nil
+}
+
 // Delete 删除收件箱中指定 UID 的邮件。
 func (c *Client) Delete(uid uint32) error {
 	return c.DeleteInFolder("INBOX", uid)

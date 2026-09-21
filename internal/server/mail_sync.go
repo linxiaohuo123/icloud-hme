@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 sync, time, net/mail, icloud-hme/internal/mail
+ * [INPUT]: 依赖 sync, time, net/mail, icloud-hme/internal/mail, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 MailSyncWorker, NewMailSyncWorker
- * [POS]: server 的后台单协程拉信同步器，独占 IMAP 连接，集中解析后向 EventBus 广播；支持 Trigger 即时事件唤醒消灭轮询盲等
+ * [POS]: server 的后台邮件同步器 (PR-07 §10.2 & §10.4)，实现同账号增量批量拉取、账号间有界并发、慢账号隔离与优雅停机平稳等待
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -22,21 +22,21 @@ import (
 const publishedWindow = 26 * time.Hour
 
 // maxUnknownAliasProbeAccounts 限制「别名归属未知」时盲扫的账号数上限。
-//
-// 盲扫是 O(账号数) 次上游 IMAP 拉取，而本函数每 2 秒跑一轮:
-// 2000 账号下单个未知别名就会变成每 2 秒 2000 次 IMAP 请求，必然触发 Apple 风控。
 const maxUnknownAliasProbeAccounts = 20
 
 // unknownAliasMissTTL 是盲扫失败的负缓存时长，避免每轮重复扫同一批账号。
 const unknownAliasMissTTL = 10 * time.Minute
 
 // maxAliasRouteCache 限制内存路由缓存的条目数。
-//
-// 内存表只是缓存，持久化的 alias_routes 才是真相源:超限直接重置，
-// 最坏代价是重置后每个别名多一次主键点查，不影响正确性却能避免几十万条常驻内存。
 const maxAliasRouteCache = 50000
 
-// MailSyncWorker 后台单协程邮件同步器。
+// PR-07 §10.2: 账号间有界并发与慢账号超时隔离常量
+const (
+	maxConcurrentAccountSync = 5
+	accountSyncTimeout       = 5 * time.Second
+)
+
+// MailSyncWorker 后台增量邮件同步器。
 type MailSyncWorker struct {
 	be             Backend
 	eventBus       *mail.EventBus
@@ -46,6 +46,7 @@ type MailSyncWorker struct {
 	stopCh         chan struct{}
 	once           sync.Once
 	stopOnce       sync.Once
+	wg             sync.WaitGroup
 	mu             sync.RWMutex
 	aliasToAccount map[string]string    // alias (lower) -> accountID
 	published      map[string]time.Time // "account|folder|uid|recipient" -> 首次发布时间
@@ -153,15 +154,20 @@ func (w *MailSyncWorker) GetAliasAccountOK(alias string) (string, bool) {
 // Start 启动后台拉信协程。
 func (w *MailSyncWorker) Start() {
 	w.once.Do(func() {
-		go w.loop()
+		w.wg.Add(1)
+		go func() {
+			defer w.wg.Done()
+			w.loop()
+		}()
 	})
 }
 
-// Stop 停止同步协程 (线程安全且幂等)。
+// Stop 停止同步协程并平稳等待在途轮次结束 (线程安全且幂等，PR-07 §10.4)。
 func (w *MailSyncWorker) Stop() {
 	w.stopOnce.Do(func() {
 		close(w.stopCh)
 	})
+	w.wg.Wait()
 }
 
 // Trigger 立即唤醒同步器执行一轮同步 (非阻塞)。
@@ -259,15 +265,45 @@ func (w *MailSyncWorker) syncOnce() {
 		unknownAliases = remain
 	}
 
-	// 2. 对已知归属的账号进行定向拉取
+	// 2. 对已知归属账号进行有界并发批量拉取与慢账号隔离 (PR-07 §10.2)
+	sem := make(chan struct{}, maxConcurrentAccountSync)
+	var fetchWg sync.WaitGroup
+
 	for accID, aliases := range accountQueries {
-		for _, alias := range aliases {
-			w.fetchAndPublish(accID, alias)
+		accID := accID
+		aliases := aliases
+		select {
+		case <-w.stopCh:
+			break
+		case sem <- struct{}{}:
+			fetchWg.Add(1)
+			go func() {
+				defer func() {
+					<-sem
+					fetchWg.Done()
+					if r := recover(); r != nil {
+						log.Printf("[PANIC RECOVER] mail_sync.fetchAndPublishBatch for %s: %v", accID, r)
+					}
+				}()
+				// 单账号隔离超时保护，慢账号超时不拖死整体
+				doneCh := make(chan struct{})
+				go func() {
+					w.fetchAndPublishBatch(accID, aliases)
+					close(doneCh)
+				}()
+				select {
+				case <-doneCh:
+				case <-time.After(accountSyncTimeout):
+					log.Printf("[WARN] mail_sync: 账号 %s 同步超时(%v)，已隔离跳过该轮", accID, accountSyncTimeout)
+				case <-w.stopCh:
+				}
+			}()
 		}
 	}
+	fetchWg.Wait()
 
 	// 3. 仍无法归属的野别名(纯粹在 Apple 侧手工创建、本系统从未见过):
-	//    做「有上限 + 负缓存」的盲扫兜底。路由表完备时这一步基本不会触发。
+	//    做「有上限 + 负缓存」的盲扫兜底。外部普通请求已在 HTTP 鉴权层拦截，无法触发未知别名。
 	if len(unknownAliases) > 0 {
 		var probeList []string
 		for _, alias := range unknownAliases {
@@ -302,8 +338,76 @@ func (w *MailSyncWorker) syncOnce() {
 	}
 }
 
+// fetchAndPublishBatch 按账号增量批量拉取邮件并分发给多个别名等待者 (PR-07 §10.2)。
+// 单账号仅发起 1 次 ListInbox，彻底消除 N 次全量重扫。
+func (w *MailSyncWorker) fetchAndPublishBatch(accountID string, aliases []string) bool {
+	if len(aliases) == 0 {
+		return false
+	}
+	var q InboxQuery
+	if len(aliases) == 1 {
+		q = InboxQuery{
+			AccountID: accountID,
+			Alias:     aliases[0],
+			Limit:     5,
+			Days:      1,
+		}
+	} else {
+		q = InboxQuery{
+			AccountID: accountID,
+			Limit:     10,
+			Days:      1,
+		}
+	}
+
+	res, err := w.be.ListInbox(q)
+	if err != nil || len(res.Messages) == 0 {
+		return false
+	}
+
+	aliasSet := make(map[string]struct{}, len(aliases))
+	for _, a := range aliases {
+		aliasSet[strings.ToLower(strings.TrimSpace(a))] = struct{}{}
+	}
+
+	hasMatch := false
+	for _, msg := range res.Messages {
+		otp := mail.ExtractOTP(msg.Subject, msg.Preview)
+		if otp == nil {
+			continue
+		}
+
+		for target := range aliasSet {
+			// 定向匹配：必须核验邮件收件人确实包含 target (PR-06 V06, V07)
+			if !msgMatchesRecipient(msg, target) {
+				continue
+			}
+			if !w.markPublished(accountID, msg.Folder, msg.ID, target) {
+				continue
+			}
+			w.eventBus.PublishEvent(&mail.CachedOTP{
+				EventID:     msg.MessageRef,
+				AccountID:   accountID,
+				Email:       target,
+				Folder:      msg.Folder,
+				UIDValidity: msg.UIDValidity,
+				UID:         msg.UID,
+				OTP:         otp,
+				Subject:     msg.Subject,
+				From:        msg.From,
+				Date:        msg.Date,
+			})
+			hasMatch = true
+		}
+	}
+	return hasMatch
+}
+
+func (w *MailSyncWorker) fetchAndPublish(accountID, alias string) bool {
+	return w.fetchAndPublishBatch(accountID, []string{alias})
+}
+
 // resolveAccountFromStore 按「持久化路由表 → 出号流水」的顺序解析别名归属。
-// 两者都是索引点查，绝不会遍历账号列表。
 func (w *MailSyncWorker) resolveAccountFromStore(alias string) (string, bool) {
 	if w.store == nil {
 		return "", false
@@ -311,7 +415,6 @@ func (w *MailSyncWorker) resolveAccountFromStore(alias string) (string, bool) {
 	if accountID, ok := w.store.FindAliasRoute(alias); ok {
 		return accountID, true
 	}
-	// 兜底: 路由表尚未覆盖的历史数据(如回填前的流水)，命中后补写路由表
 	if accountID, ok := w.store.FindLeaseAccount(alias); ok {
 		_ = w.store.UpsertAliasRoutes(accountID, []string{alias})
 		return accountID, true
@@ -343,45 +446,18 @@ func (w *MailSyncWorker) noteProbeMiss(alias string) {
 	w.probeMiss[alias] = now
 }
 
-func (w *MailSyncWorker) fetchAndPublish(accountID, alias string) bool {
-	res, err := w.be.ListInbox(InboxQuery{
-		AccountID: accountID,
-		Alias:     alias,
-		Limit:     3,
-		Days:      1,
-	})
-	if err != nil || len(res.Messages) == 0 {
+// msgMatchesRecipient 核验邮件是否明确发给目标别名 (通过 To 或信封收件人头)。
+func msgMatchesRecipient(msg mail.Message, target string) bool {
+	target = strings.ToLower(strings.TrimSpace(target))
+	if target == "" {
 		return false
 	}
-
-	hasMatch := false
-	for _, msg := range res.Messages {
-		otp := mail.ExtractOTP(msg.Subject, msg.Preview)
-		if otp == nil {
-			continue
-		}
-
-		target := strings.ToLower(strings.TrimSpace(alias))
-		if target != "" {
-			// 定向匹配：仅向当前待查别名广播，绝不向 To 头中包含的其它无关主号或抄送地址交叉泄露 OTP
-			if !w.markPublished(accountID, msg.Folder, msg.ID, target) {
-				continue
-			}
-			w.eventBus.Publish(target, accountID, msg.Subject, msg.From, msg.Date, otp)
-			hasMatch = true
-		} else {
-			recipients := parseRecipientEmails(msg.To)
-			for _, email := range recipients {
-				// 同一封历史邮件绝不重复广播(否则二次取码会拿到已消费的陈旧 OTP)
-				if !w.markPublished(accountID, msg.Folder, msg.ID, email) {
-					continue
-				}
-				w.eventBus.Publish(email, accountID, msg.Subject, msg.From, msg.Date, otp)
-				hasMatch = true
-			}
+	for _, r := range msg.RecipientAddresses() {
+		if r == target {
+			return true
 		}
 	}
-	return hasMatch
+	return false
 }
 
 // parseRecipientEmails 从收件人字段中解析所有邮箱地址。

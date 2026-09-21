@@ -65,6 +65,7 @@ type Backend interface {
 	ListMailboxes(string) ([]mail.Folder, error)
 	GetMessage(string, string) (*mail.FullMessage, error)
 	GetMessages(string, []MessageRef) ([]*mail.FullMessage, error)
+	GetMailboxBoundary(string, string) (string, uint32, uint32, error)
 	DeleteMessage(string, uint32) error
 	ValidateAccount(string) error
 	CheckProxy(string) (bool, int64, string, error)
@@ -423,4 +424,11 @@ func (b *managerBackend) CheckProxy(proxyURL string) (bool, int64, string, error
 		msg = fmt.Sprintf("出口 IP: %s (Apple 网关响应 %d)", exitIP, resp.StatusCode)
 	}
 	return true, latency, msg, nil
+}
+
+// Close 释放底层 Manager 的长连接池与客户端池 (PR-07 §10.4)。
+func (b *managerBackend) Close() {
+	if b.mgr != nil {
+		b.mgr.Close()
+	}
 }

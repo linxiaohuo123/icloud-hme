@@ -338,6 +338,38 @@ func (b *managerBackend) DeleteMessage(accountID string, uid uint32) error {
 	return nil
 }
 
+func (b *managerBackend) GetMailboxBoundary(accountID, folder string) (string, uint32, uint32, error) {
+	var uidValidity, uidNext uint32
+	var imapErr error
+	poolErr := b.mgr.WithMailClient(accountID, func(mc *mail.Client) error {
+		v, n, err := mc.GetMailboxBoundary(folder)
+		if err != nil {
+			imapErr = err
+			return err
+		}
+		uidValidity = v
+		uidNext = n
+		return nil
+	})
+	if poolErr == nil && imapErr == nil {
+		return "imap", uidValidity, uidNext, nil
+	}
+
+	acc, ok := b.mgr.GetAccount(accountID)
+	if ok && (len(acc.Cookies) > 0 || acc.AppPassword != "") {
+		return "webmail", 0, 0, &BackendError{
+			Status:  http.StatusBadRequest,
+			Code:    "CAPABILITY_UNSUPPORTED",
+			Message: "WebMail 不支持严格时效验证码基线 (无单邮件稳定游标)",
+		}
+	}
+	return "", 0, 0, &BackendError{
+		Status:  http.StatusServiceUnavailable,
+		Code:    "BASELINE_UNAVAILABLE",
+		Message: "无法获取邮件基线边界: 邮箱客户端未就绪",
+	}
+}
+
 // classifyInboxErr 映射收件箱读取错误, 特殊处理未开通 iCloud 邮件的账号。
 func classifyInboxErr(err error) *BackendError {
 	if err == nil {

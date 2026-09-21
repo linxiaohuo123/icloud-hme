@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 sync, sync/atomic, time, mail.OTPResult
- * [OUTPUT]: 对外提供 EventBus, NewEventBus
- * [POS]: internal/mail 的内存事件分发总线，解耦邮件接收与 HTTP 长轮询，彻底消除 IMAP 锁争用
+ * [OUTPUT]: 对外提供 EventBus, NewEventBus, CachedOTP
+ * [POS]: internal/mail 的内存事件分发总线，解耦邮件接收与 HTTP 长轮询，提供基于 UID/UIDVALIDITY 边界的严格过滤与多事件并发隔离
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -14,21 +14,34 @@ import (
 	"time"
 )
 
-// CachedOTP 包装带过期时间的验证码缓存。
+// CachedOTP 包装带精确来源、UID 边界与过期时间的验证码事件。
 type CachedOTP struct {
-	OTP       *OTPResult
-	Subject   string
-	From      string
-	Date      string
-	AccountID string
-	ExpiresAt time.Time
+	EventID     string     `json:"event_id,omitempty"`
+	AccountID   string     `json:"account_id,omitempty"`
+	Email       string     `json:"email,omitempty"`
+	Folder      string     `json:"folder,omitempty"`
+	UIDValidity uint32     `json:"uid_validity,omitempty"`
+	UID         uint32     `json:"uid,omitempty"`
+	OTP         *OTPResult `json:"otp"`
+	Subject     string     `json:"subject"`
+	From        string     `json:"from"`
+	Date        string     `json:"date"`
+	ReceivedAt  time.Time  `json:"received_at"`
+	ExpiresAt   time.Time  `json:"expires_at"`
+}
+
+type subscriberEntry struct {
+	ch                  chan *CachedOTP
+	baselineUIDValidity uint32
+	baselineUID         uint32
+	hasBoundary         bool
 }
 
 // EventBus 是收信内存发布/订阅总线。
 type EventBus struct {
 	mu          sync.RWMutex
-	subscribers map[string]map[uint64]chan *CachedOTP // email -> subID -> chan
-	cache       map[string]*CachedOTP                 // email -> CachedOTP
+	subscribers map[string]map[uint64]*subscriberEntry // email -> subID -> subscriberEntry
+	cache       map[string][]*CachedOTP                // email -> []*CachedOTP
 	subCounter  uint64
 	cacheTTL    time.Duration
 }
@@ -39,22 +52,18 @@ func NewEventBus(cacheTTL time.Duration) *EventBus {
 		cacheTTL = 5 * time.Minute
 	}
 	return &EventBus{
-		subscribers: make(map[string]map[uint64]chan *CachedOTP),
-		cache:       make(map[string]*CachedOTP),
+		subscribers: make(map[string]map[uint64]*subscriberEntry),
+		cache:       make(map[string][]*CachedOTP),
 		cacheTTL:    cacheTTL,
 	}
 }
 
 // Subscribe 订阅指定邮箱别名的验证码到达事件。
-// 返回唯一的 subID 和带缓冲的通信 channel。
-// 内部原子检查近期缓存：若已有未过期验证码，直接预填至 channel，彻底消除 TOCTOU 竞态漏洞。
 func (b *EventBus) Subscribe(email string) (uint64, chan *CachedOTP) {
 	return b.SubscribeWithFresh(email, false)
 }
 
 // SubscribeWithFresh 订阅指定邮箱别名的验证码到达事件。
-// 若 fresh 为 true，则跳过历史缓存检查，只等待最新到达的邮件；
-// 若 fresh 为 false，若已有未过期缓存，原子预填至 channel。
 func (b *EventBus) SubscribeWithFresh(email string, fresh bool) (uint64, chan *CachedOTP) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	b.mu.Lock()
@@ -63,28 +72,164 @@ func (b *EventBus) SubscribeWithFresh(email string, fresh bool) (uint64, chan *C
 	subID := atomic.AddUint64(&b.subCounter, 1)
 	ch := make(chan *CachedOTP, 1)
 
-	// 非 fresh 模式下，原子检查近期缓存：存在且未过期则立即注入 channel
 	if !fresh {
-		if cached, ok := b.cache[email]; ok {
-			if time.Now().Before(cached.ExpiresAt) {
-				ch <- cached
-			} else {
-				delete(b.cache, email)
+		now := time.Now()
+		var unexpired []*CachedOTP
+		var matched *CachedOTP
+		for _, ev := range b.cache[email] {
+			if now.Before(ev.ExpiresAt) {
+				unexpired = append(unexpired, ev)
+				if matched == nil {
+					matched = ev
+				}
 			}
+		}
+		b.cache[email] = unexpired
+		if matched != nil {
+			ch <- matched
 		}
 	}
 
 	subs, ok := b.subscribers[email]
 	if !ok {
-		subs = make(map[uint64]chan *CachedOTP)
+		subs = make(map[uint64]*subscriberEntry)
 		b.subscribers[email] = subs
 	}
-	subs[subID] = ch
+	subs[subID] = &subscriberEntry{
+		ch:          ch,
+		hasBoundary: false,
+	}
 	return subID, ch
 }
 
-// ConsumeCache 显式将指定邮箱的验证码缓存标记为已消费并清除，
-// 杜绝后续重发验证码或二次提取时错误获取陈旧历史 OTP。
+// SubscribeWithBoundary 订阅满足 UIDVALIDITY 和 UIDNEXT 边界的验证码到达事件 (PR-06 Section 9.2, 9.5)。
+// 只有在满足 UIDValidity == baselineUIDValidity 且 UID >= baselineUID 时才匹配交付。
+func (b *EventBus) SubscribeWithBoundary(email string, baselineUIDValidity, baselineUID uint32) (uint64, chan *CachedOTP) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	subID := atomic.AddUint64(&b.subCounter, 1)
+	ch := make(chan *CachedOTP, 1)
+
+	now := time.Now()
+	var unexpired []*CachedOTP
+	var matched *CachedOTP
+	for _, ev := range b.cache[email] {
+		if now.Before(ev.ExpiresAt) {
+			unexpired = append(unexpired, ev)
+			if matched == nil {
+				if baselineUIDValidity != 0 && ev.UIDValidity != 0 && ev.UIDValidity != baselineUIDValidity {
+					matched = ev
+					break
+				}
+				validMatch := (baselineUIDValidity == 0 || ev.UIDValidity == 0 || ev.UIDValidity == baselineUIDValidity)
+				uidMatch := (baselineUID == 0 || ev.UID >= baselineUID)
+				if validMatch && uidMatch {
+					matched = ev
+				}
+			}
+		}
+	}
+	b.cache[email] = unexpired
+
+	if matched != nil {
+		ch <- matched
+	}
+
+	subs, ok := b.subscribers[email]
+	if !ok {
+		subs = make(map[uint64]*subscriberEntry)
+		b.subscribers[email] = subs
+	}
+	subs[subID] = &subscriberEntry{
+		ch:                  ch,
+		baselineUIDValidity: baselineUIDValidity,
+		baselineUID:         baselineUID,
+		hasBoundary:         true,
+	}
+	return subID, ch
+}
+
+// Publish 广播新到达的验证码。
+func (b *EventBus) Publish(email, accountID, subject, from, date string, otp *OTPResult) {
+	b.PublishEvent(&CachedOTP{
+		AccountID: accountID,
+		Email:     email,
+		Subject:   subject,
+		From:      from,
+		Date:      date,
+		OTP:       otp,
+	})
+}
+
+// PublishEvent 广播包含精准身份和 UID 边界的新验证码事件。
+func (b *EventBus) PublishEvent(ev *CachedOTP) {
+	if ev == nil || ev.OTP == nil {
+		return
+	}
+	email := strings.ToLower(strings.TrimSpace(ev.Email))
+	if email == "" {
+		return
+	}
+	now := time.Now()
+	if ev.ReceivedAt.IsZero() {
+		ev.ReceivedAt = now
+	}
+	if ev.ExpiresAt.IsZero() {
+		ev.ExpiresAt = now.Add(b.cacheTTL)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	var unexpired []*CachedOTP
+	for _, old := range b.cache[email] {
+		if now.Before(old.ExpiresAt) {
+			unexpired = append(unexpired, old)
+		}
+	}
+	unexpired = append(unexpired, ev)
+	b.cache[email] = unexpired
+
+	if subs, ok := b.subscribers[email]; ok {
+		for _, sub := range subs {
+			if sub.hasBoundary {
+				if sub.baselineUIDValidity != 0 && ev.UIDValidity != 0 && sub.baselineUIDValidity != ev.UIDValidity {
+					continue
+				}
+				if sub.baselineUID != 0 && ev.UID < sub.baselineUID {
+					continue
+				}
+			}
+			select {
+			case sub.ch <- ev:
+			default:
+			}
+		}
+	}
+}
+
+// ConsumeEvent 消费特定事件，绝不清除更晚到达的其它新事件 (PR-06 V04)。
+func (b *EventBus) ConsumeEvent(email string, eventID string) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	eventID = strings.TrimSpace(eventID)
+	if email == "" || eventID == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	var remaining []*CachedOTP
+	for _, ev := range b.cache[email] {
+		if ev.EventID != eventID {
+			remaining = append(remaining, ev)
+		}
+	}
+	b.cache[email] = remaining
+}
+
+// ConsumeCache 清除该别名的所有缓存 (兼容旧接口)。
 func (b *EventBus) ConsumeCache(email string) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	b.mu.Lock()
@@ -124,64 +269,23 @@ func (b *EventBus) SubscribedEmails() []string {
 	return emails
 }
 
-// Publish 广播新到达的验证码。
-// 写入内存缓存并通知所有正在挂起的订阅者。
-func (b *EventBus) Publish(email, accountID, subject, from, date string, otp *OTPResult) {
-	email = strings.ToLower(strings.TrimSpace(email))
-	if email == "" || otp == nil {
-		return
-	}
-
-	item := &CachedOTP{
-		OTP:       otp,
-		Subject:   subject,
-		From:      from,
-		Date:      date,
-		AccountID: accountID,
-		ExpiresAt: time.Now().Add(b.cacheTTL),
-	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// 0. 顺带淘汰已过期缓存，防止长期运行内存无界膨胀
-	now := time.Now()
-	for k, v := range b.cache {
-		if now.After(v.ExpiresAt) {
-			delete(b.cache, k)
-		}
-	}
-
-	// 1. 存入近期缓存 (覆盖旧验证码)
-	b.cache[email] = item
-
-	// 2. 唤醒所有挂起的订阅者 (非阻塞投递)
-	if subs, ok := b.subscribers[email]; ok {
-		for _, ch := range subs {
-			select {
-			case ch <- item:
-			default:
-			}
-		}
-	}
-}
-
-// GetCached 获取过去有效期内收到的验证码缓存。
-// 若存在且未过期则返回，否则返回 nil。
+// GetCached 获取过去有效期内收到的最新验证码缓存。
 func (b *EventBus) GetCached(email string) *CachedOTP {
 	email = strings.ToLower(strings.TrimSpace(email))
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	item, ok := b.cache[email]
-	if !ok {
-		return nil
+	now := time.Now()
+	var unexpired []*CachedOTP
+	var latest *CachedOTP
+	for _, ev := range b.cache[email] {
+		if now.Before(ev.ExpiresAt) {
+			unexpired = append(unexpired, ev)
+			latest = ev
+		}
 	}
-	if time.Now().After(item.ExpiresAt) {
-		delete(b.cache, email)
-		return nil
-	}
-	return item
+	b.cache[email] = unexpired
+	return latest
 }
 
 // CleanupCache 清理已过期的验证码缓存。
@@ -190,9 +294,17 @@ func (b *EventBus) CleanupCache() {
 	defer b.mu.Unlock()
 
 	now := time.Now()
-	for email, item := range b.cache {
-		if now.After(item.ExpiresAt) {
+	for email, list := range b.cache {
+		var unexpired []*CachedOTP
+		for _, ev := range list {
+			if now.Before(ev.ExpiresAt) {
+				unexpired = append(unexpired, ev)
+			}
+		}
+		if len(unexpired) == 0 {
 			delete(b.cache, email)
+		} else {
+			b.cache[email] = unexpired
 		}
 	}
 }

@@ -8,6 +8,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -616,6 +617,22 @@ func (s *Store) ValidateTokenPrincipal(tokenStr string) (id, name, scopes string
 	default:
 	}
 	return id, name, scopes, true
+}
+
+// GetToken 按 ID 查询 API 令牌 (未被撤销则返回) (PR-06 V09)。
+func (s *Store) GetToken(ctx context.Context, id string) (*APIToken, error) {
+	id = strings.TrimSpace(id)
+	var tok APIToken
+	err := s.db.QueryRowContext(ctx, `SELECT id, name, token, created_at, COALESCE(last_used_at, ''), COALESCE(scopes, '') FROM api_tokens WHERE id = ?`, id).Scan(
+		&tok.ID, &tok.Name, &tok.Token, &tok.CreatedAt, &tok.LastUsedAt, &tok.Scopes,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errors.New("token not found")
+		}
+		return nil, err
+	}
+	return &tok, nil
 }
 
 // ────────────────────────────────────────────────────────────────
