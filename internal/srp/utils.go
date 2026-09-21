@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 encoding/hex, hash, math/big, regexp
+ * [OUTPUT]: 对外提供 padTo, padToN, hashToInt, intFromBytes, bytesFromHexString 等辅助工具函数
+ * [POS]: internal/srp 的大数与字节流对齐辅助模块
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 package srp
 
 import (
@@ -9,7 +16,10 @@ import (
 
 func padTo(bytes []byte, length int) []byte {
 	paddingLength := length - len(bytes)
-	padding := make([]byte, paddingLength, paddingLength)
+	if paddingLength <= 0 {
+		return bytes
+	}
+	padding := make([]byte, paddingLength)
 
 	return append(padding, bytes...)
 }

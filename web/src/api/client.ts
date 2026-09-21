@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 api/types 的 ApiResponse 契约
+ * [OUTPUT]: 导出 request 请求函数、ApiError、CSRF 与 401 统一处理器
+ * [POS]: web/src/api 的通信中枢，所有前端请求的唯一出口
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 import type { ApiResponse } from './types'
 
 /** CSRF token,仅存 React 内存状态 */
@@ -44,7 +51,8 @@ export async function request<T>(
   path: string,
   init?: RequestOptions,
   onUnauthorized?: () => void,
-): Promise<T> {  const headers = new Headers(init?.headers)
+): Promise<T> {
+  const headers = new Headers(init?.headers)
   headers.set('Accept', 'application/json')
   headers.set('Content-Type', 'application/json')
 
@@ -68,12 +76,10 @@ export async function request<T>(
       credentials: 'same-origin',
     })
   } catch {
+    if (init?.signal?.aborted) {
+      throw new ApiError(0, 'ABORTED', '请求已中止')
+    }
     throw new ApiError(0, 'NETWORK_ERROR', '网络连接失败，请检查服务状态')
-  }
-
-  if (resp.status === 401) {
-    onUnauthorized?.()
-    unauthorizedHandler?.()
   }
 
   let payload: ApiResponse<T>
@@ -81,6 +87,12 @@ export async function request<T>(
     payload = (await resp.json()) as ApiResponse<T>
   } catch {
     throw new ApiError(resp.status, 'INVALID_RESPONSE', '网络连接失败，请检查服务状态')
+  }
+
+  // 只有当服务端明确返回 AUTH_REQUIRED 且不是管理登录接口时，才判定为管理台会话过期
+  if (resp.status === 401 && payload.code === 'AUTH_REQUIRED' && path !== '/api/auth/login') {
+    onUnauthorized?.()
+    unauthorizedHandler?.()
   }
 
   if (!resp.ok || payload.success === false) {

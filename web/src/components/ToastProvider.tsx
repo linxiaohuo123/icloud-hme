@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 react 的 context/hooks、icons 的矢量图标、utils/clipboard 的 copyText 复制能力
+ * [OUTPUT]: 对外提供 ToastProvider 容器组件与 useToast hook (包含 show 与 showCopyable 接口，内置智能去重队列)
+ * [POS]: components 的全局反馈层，为所有页面与弹窗提供原子化通知与防重轻提示
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 import {
   createContext,
   useCallback,
@@ -122,15 +129,21 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 
   const enqueue = useCallback((message: string, copyValue?: string) => {
     const id = nextId.current++
-    setToasts((prev) => [
-      ...prev,
-      {
-        id,
-        message,
-        copyValue,
-        duration: copyValue ? COPYABLE_DURATION : DEFAULT_DURATION,
-      },
-    ])
+    setToasts((prev) => {
+      // 智能防重: 若当前已有完全相同的通知正在展示，则忽略重复叠加
+      if (prev.some((t) => t.message === message && t.copyValue === copyValue)) {
+        return prev
+      }
+      return [
+        ...prev,
+        {
+          id,
+          message,
+          copyValue,
+          duration: copyValue ? COPYABLE_DURATION : DEFAULT_DURATION,
+        },
+      ]
+    })
   }, [])
 
   const show = useCallback((message: string) => enqueue(message), [enqueue])

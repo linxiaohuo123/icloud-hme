@@ -1,4 +1,10 @@
-// Package server - 安全中间件:请求上限、安全响应头、CSRF 校验。
+/**
+ * [INPUT]: 依赖 gin, internal/auth, net/http
+ * [OUTPUT]: 对外提供 securityHeadersMiddleware, apiCacheControlMiddleware, bodyLimitMiddleware, csrfCheck
+ * [POS]: internal/server 的安全与防御中间件层 (API Key 请求自动跳过 CSRF 检查，请求体限制 1MB 防 OOM)
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 package server
 
 import (
@@ -9,6 +15,16 @@ import (
 
 // maxBodyBytes 是 JSON 请求体上限。
 const maxBodyBytes = 1 << 20 // 1 MiB
+
+// bodyLimitMiddleware 限制请求体最大字节数，阻断恶意超大 payload 耗尽内存导致 OOM。
+func bodyLimitMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+		}
+		c.Next()
+	}
+}
 
 // securityHeaders 是全局安全响应头。
 var securityHeaders = map[string]string{
@@ -36,9 +52,13 @@ func apiCacheControlMiddleware() gin.HandlerFunc {
 	}
 }
 
-// csrfCheck 校验状态变更请求的 CSRF token。
+// csrfCheck 校验状态变更请求的 CSRF token。API Key 认证时自动跳过。
 func csrfCheck(mgr *authManager) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if c.GetBool("is_api_key_auth") {
+			c.Next()
+			return
+		}
 		sessionID := sessionIDFromCookie(c)
 		if sessionID == "" {
 			failCode(c, http.StatusForbidden, "CSRF_INVALID", "缺少会话")

@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 testing, net/http, net/http/httptest, testing/fstest
+ * [OUTPUT]: 对外提供 TestSPAAPI404JSON, TestSPAIndexServed
+ * [POS]: internal/server 的 SPA 单页回退与 API 404 JSON 保护单元测试
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 package server
 
 import (
@@ -30,6 +37,9 @@ func TestSPAAPI404JSON(t *testing.T) {
 	}
 	if !strings.HasPrefix(rec.Body.String(), `{"success":false`) {
 		t.Fatalf("API 404 应返回 JSON: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"code":"NOT_FOUND"`) {
+		t.Fatalf("API 404 错误码应为 NOT_FOUND: %s", rec.Body.String())
 	}
 	if strings.Contains(rec.Body.String(), "<html") {
 		t.Fatalf("API 404 不应返回 HTML: %s", rec.Body.String())

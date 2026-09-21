@@ -1,5 +1,13 @@
-import { useState } from 'react'
+/**
+ * [INPUT]: 依赖 api/client 的 request/ApiError，依赖 components/Dialog, components/Select
+ * [OUTPUT]: 对外提供 AccountFormDialog 账号创建与编辑对话框组件
+ * [POS]: web/src/components 的业务对话框，用于添加和修改账号基础信息
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
+import { useCallback, useEffect, useState } from 'react'
 import Dialog from './Dialog'
+import Select from './Select'
 import { request, ApiError } from '../api/client'
 
 interface AccountFormDialogProps {
@@ -29,6 +37,17 @@ export default function AccountFormDialog({
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
+  useEffect(() => {
+    if (!open) return
+    setName(editing?.name ?? '')
+    setIcloudEmail(editing?.icloudEmail ?? '')
+    setHost(editing?.host ?? 'icloud.com')
+    setCookies('')
+    setProxy('')
+    setError('')
+    setSubmitting(false)
+  }, [open, editing])
+
   function reset() {
     setName('')
     setIcloudEmail('')
@@ -55,12 +74,18 @@ export default function AccountFormDialog({
       if (editing) {
         await request(`/api/accounts/${editing.id}`, {
           method: 'PATCH',
-          body: JSON.stringify({ name, icloud_email: icloudEmail, host }),
+          body: JSON.stringify({ name: name.trim(), icloud_email: icloudEmail.trim(), host }),
         })
       } else {
         await request('/api/accounts', {
           method: 'POST',
-          body: JSON.stringify({ name, icloud_email: icloudEmail, host, proxy, cookies }),
+          body: JSON.stringify({
+            name: name.trim(),
+            icloud_email: icloudEmail.trim(),
+            host,
+            proxy: proxy.trim(),
+            cookies: cookies.trim(),
+          }),
         })
       }
       reset()
@@ -72,14 +97,16 @@ export default function AccountFormDialog({
     }
   }
 
+  const handleClose = useCallback(() => {
+    reset()
+    onClose()
+  }, [onClose])
+
   return (
     <Dialog
       title={editing ? '编辑账号' : '添加账号'}
       open={open}
-      onClose={() => {
-        reset()
-        onClose()
-      }}
+      onClose={handleClose}
     >
       {error && (
         <div className="alert-error" role="alert">
@@ -107,15 +134,16 @@ export default function AccountFormDialog({
       </div>
       <div className="form-field">
         <label htmlFor="acc-host">区域</label>
-        <select
+        <Select
           id="acc-host"
           value={host}
-          onChange={(e) => setHost(e.target.value)}
+          onChange={setHost}
           disabled={Boolean(editing)}
-        >
-          <option value="icloud.com">全球区 (icloud.com)</option>
-          <option value="icloud.com.cn">中国区 (icloud.com.cn)</option>
-        </select>
+          options={[
+            { value: 'icloud.com', label: '全球区 (icloud.com)' },
+            { value: 'icloud.com.cn', label: '中国区 (icloud.com.cn)' },
+          ]}
+        />
       </div>
       {!editing && (
         <>
@@ -126,9 +154,9 @@ export default function AccountFormDialog({
               value={cookies}
               onChange={(e) => setCookies(e.target.value)}
               spellCheck={false}
-              placeholder="a=1; b=2"
+              placeholder="支持全格式智能识别：&#10;1. 键值对: key1=value1; key2=value2 (支持带 Cookie: 前缀)&#10;2. JSON 数组: [{'name':'...', 'value':'...'}] (Chrome 插件导出)&#10;3. JSON 对象: {'key': 'value'}&#10;4. Netscape 格式: 制表符分隔的 .txt 文件内容"
             />
-            <p className="hint">可粘贴 Cookie Header 字符串或 JSON。</p>
+            <p className="hint">支持粘贴 Header 字符串、Chrome 插件 JSON 数组或 Netscape 文本，系统自动识别提纯。</p>
           </div>
           <div className="form-field">
             <label htmlFor="acc-proxy">代理（可选）</label>

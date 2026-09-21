@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 gin, net/http, encoding/json, icloud-hme/internal/account
+ * [OUTPUT]: 对外提供 listAccountsHandler, addAccountHandler, updateAccountHandler 等 HTTP 端点
+ * [POS]: internal/server 的账号层路由适配器，负责请求反序列化、入参校验与安全 Summary 响应包装
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 // Package server - 账号管理 handler。
 //
 // 只做绑定、校验、调用 Backend 和响应映射;账号接口统一返回无秘密的
@@ -7,23 +14,75 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"icloud-hme/internal/account"
 )
 
 // listAccountsHandler 处理 GET /api/accounts。
+// 支持可选的分页参数: ?limit=50&offset=0
+// 未指定 limit 时，返回全量数组（向后兼容）。
+// 指定 limit 时，返回分页包: { items: [...], total: n, limit: l, offset: o }
 func (s *Server) listAccountsHandler(c *gin.Context) {
-	ok(c, s.be.ListAccounts())
+	limitStr := c.Query("limit")
+	if limitStr == "" {
+		ok(c, s.be.ListAccounts())
+		return
+	}
+	limit, _ := strconv.Atoi(limitStr)
+	// 封顶:既防超大 limit 一次性把全量账号拉进内存，也避免 offset+limit 整数溢出
+	// 变成负数导致切片越界 panic(如 ?limit=9223372036854775807&offset=1)。
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	offset, _ := strconv.Atoi(c.Query("offset"))
+	if offset < 0 {
+		offset = 0
+	}
+
+	all := s.be.ListAccounts()
+	total := len(all)
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	paged := all[offset:end]
+
+	ok(c, gin.H{
+		"items":  paged,
+		"total":  total,
+		"limit":  limit,
+		"offset": offset,
+	})
+}
+
+// getAccountHandler 处理 GET /api/accounts/:id。
+func (s *Server) getAccountHandler(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" {
+		failCode(c, http.StatusBadRequest, "INVALID_ID", "缺少账号 ID")
+		return
+	}
+	sum, err := s.be.GetAccount(id)
+	if err != nil {
+		backendFail(c, err)
+		return
+	}
+	ok(c, sum)
 }
 
 // addAccountReq 是 POST /api/accounts 请求体。
 type addAccountReq struct {
-	Name        string `json:"name"`
-	ICloudEmail string `json:"icloud_email"`
-	Cookies     string `json:"cookies"`
-	Host        string `json:"host"`
-	Proxy       string `json:"proxy"`
+	Name        string   `json:"name"`
+	ICloudEmail string   `json:"icloud_email"`
+	Cookies     string   `json:"cookies"`
+	Host        string   `json:"host"`
+	Proxy       string   `json:"proxy"`
+	Tags        []string `json:"tags"`
 }
 
 // addAccountHandler 处理 POST /api/accounts。
@@ -39,6 +98,7 @@ func (s *Server) addAccountHandler(c *gin.Context) {
 		CookieInput: req.Cookies,
 		Host:        req.Host,
 		Proxy:       req.Proxy,
+		Tags:        req.Tags,
 	})
 	if err != nil {
 		backendFail(c, err)
@@ -49,9 +109,10 @@ func (s *Server) addAccountHandler(c *gin.Context) {
 
 // updateAccountReq 是 PATCH /api/accounts/:id 请求体。
 type updateAccountReq struct {
-	Name        *string `json:"name"`
-	ICloudEmail *string `json:"icloud_email"`
-	Host        *string `json:"host"`
+	Name        *string   `json:"name"`
+	ICloudEmail *string   `json:"icloud_email"`
+	Host        *string   `json:"host"`
+	Tags        *[]string `json:"tags"`
 }
 
 // updateAccountHandler 处理 PATCH /api/accounts/:id。
@@ -66,6 +127,7 @@ func (s *Server) updateAccountHandler(c *gin.Context) {
 		Name:        req.Name,
 		ICloudEmail: req.ICloudEmail,
 		Host:        req.Host,
+		Tags:        req.Tags,
 	})
 	if err != nil {
 		backendFail(c, err)
@@ -205,6 +267,9 @@ func (s *Server) removeAccountHandler(c *gin.Context) {
 	if !s.be.RemoveAccount(id) {
 		failCode(c, http.StatusNotFound, "ACCOUNT_NOT_FOUND", "账号不存在")
 		return
+	}
+	if s.store != nil {
+		_ = s.store.DeleteScheduleConfig(id)
 	}
 	ok(c, gin.H{"id": id})
 }

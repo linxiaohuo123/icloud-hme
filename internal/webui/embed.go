@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 embed, io/fs, net/http
+ * [OUTPUT]: 对外提供 Embedded, Handler 等静态资源内嵌与 SPA fallback 能力
+ * [POS]: internal/webui 的静态资源服务层
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 // Package webui 提供内嵌前端静态资源服务与 SPA 路由 fallback。
 //
 // 生产产物写入 internal/webui/dist/ 并由 embed.FS 内嵌,随单个 Go 二进制分发。
@@ -104,6 +111,7 @@ func Handler(fsys fs.FS) http.Handler {
 			if info, statErr := file.Stat(); statErr == nil && !info.IsDir() {
 				if strings.HasSuffix(name, ".html") || name == "index.html" {
 					w.Header().Set("Cache-Control", "no-cache")
+					w.Header().Set("Pragma", "no-cache")
 				} else if hashedAsset(name) {
 					w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 				}
@@ -136,6 +144,7 @@ func Handler(fsys fs.FS) http.Handler {
 		}
 		defer index.Close()
 		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		// 显式写状态,避免继承外层(如 gin NoRoute)预设的状态码
 		w.WriteHeader(http.StatusOK)

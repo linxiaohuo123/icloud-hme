@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 components/icons 的 IconAlert/IconInboxEmpty
+ * [OUTPUT]: 对外提供 AsyncState 统一异步状态组件 (骨架屏 loading / error+retry / empty+引导动作 emptyAction / content)
+ * [POS]: web/src/components 的列表页三态渲染基建，被 AliasesPage, UsedAliasesPage 消费
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 import type { ReactNode } from 'react'
 import { IconAlert, IconInboxEmpty } from './icons'
 
@@ -6,6 +13,8 @@ interface AsyncStateProps {
   error: string
   empty: boolean
   emptyText?: string
+  /** 空态下方的引导动作 (如"前往生成别名"链接)；不传则只显示文案 */
+  emptyAction?: ReactNode
   onRetry: () => void
   children: ReactNode
 }
@@ -16,6 +25,7 @@ export default function AsyncState({
   error,
   empty,
   emptyText = '暂无数据',
+  emptyAction,
   onRetry,
   children,
 }: AsyncStateProps) {
@@ -32,21 +42,24 @@ export default function AsyncState({
   }
   if (error) {
     return (
-      <div>
-        <div className="alert-error" role="alert" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+      <div className="async-error" role="alert">
+        <div className="alert-error" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <IconAlert size={18} style={{ flexShrink: 0 }} />
           <span>{error}</span>
         </div>
-        <button onClick={onRetry}>重试</button>
+        <button type="button" className="btn btn-sm btn-secondary" onClick={onRetry}>
+          重试
+        </button>
       </div>
     )
   }
   if (empty) {
     return (
-      <p className="empty-state">
+      <div className="empty-state">
         <IconInboxEmpty className="empty-icon" />
         {emptyText}
-      </p>
+        {emptyAction && <div className="empty-state-action">{emptyAction}</div>}
+      </div>
     )
   }
   return <>{children}</>

@@ -4,7 +4,6 @@ import {
   useContext,
   useEffect,
   useMemo,
-  useRef,
   useState,
   type ReactNode,
 } from 'react'
@@ -31,11 +30,8 @@ export function useAuth(): AuthContextValue {
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>('checking')
-  const checkRef = useRef(false)
 
   useEffect(() => {
-    if (checkRef.current) return
-    checkRef.current = true
     let cancelled = false
     request<LoginResult>('/api/auth/session', undefined, () => {
       // session 探测本身 401 不算"会话过期",交给状态判断
@@ -53,6 +49,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       cancelled = true
     }
   }, [])
+
 
   const logout = useCallback(async () => {
     try {

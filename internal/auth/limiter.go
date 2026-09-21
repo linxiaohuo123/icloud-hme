@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 sync, time
+ * [OUTPUT]: 对外提供 Limiter, NewLimiter 等客户端 IP 限流能力
+ * [POS]: internal/auth 的登录防暴力破解与内存防 DoS 限流组件
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 package auth
 
 import (

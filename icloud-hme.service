@@ -1,0 +1,49 @@
+[Unit]
+Description=iCloud Hide My Email Automation Service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 专用系统用户:进程持有 iCloud 母号 Cookie 与 App 专用密码，不应以 root 运行。
+# 部署前先执行:
+#   useradd --system --home /opt/icloud-hme --shell /usr/sbin/nologin icloud-hme
+#   chown -R icloud-hme:icloud-hme /opt/icloud-hme
+User=icloud-hme
+Group=icloud-hme
+
+# 将工作目录替换为你在服务器上的实际安装路径
+WorkingDirectory=/opt/icloud-hme
+
+# 可执行文件路径 (对齐标准架构中立的 icloud-hme 二进制/软链)
+ExecStart=/opt/icloud-hme/icloud-hme -addr 127.0.0.1:8081 -data /opt/icloud-hme/data
+
+# 凭据放到独立文件，不要内联在单元里(systemctl cat 与 journal 都能看到)。
+#   install -m 600 -o root -g root /dev/null /etc/icloud-hme.env
+#   # 写入内容:
+#   #   ICLOUD_HME_ADMIN_PASSWORD=<强口令>
+#   #   ICLOUD_HME_SECURE_COOKIE=true
+#   #   ICLOUD_HME_TRUSTED_PROXIES=127.0.0.1   # 经 Nginx/Caddy 反代时必填，否则限流退化为全局单桶
+#   #   TZ=Asia/Shanghai
+EnvironmentFile=/etc/icloud-hme.env
+
+# 进程异常退出自动重启
+Restart=always
+RestartSec=5s
+
+# 资源限制防爆
+LimitNOFILE=65535
+
+# ── 沙箱收敛 ──────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# 仅放行数据目录写入
+ReadWritePaths=/opt/icloud-hme/data
+
+[Install]
+WantedBy=multi-user.target

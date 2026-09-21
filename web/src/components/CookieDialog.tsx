@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 api/client 的 request/ApiError，依赖 components/Dialog
+ * [OUTPUT]: 对外提供 CookieDialog 对话框组件 (Cookie 文本录入、保存成功自动清空)
+ * [POS]: web/src/components 的凭据更新弹窗，用于向指定账号提交 iCloud Cookie 字符串
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 import { useState } from 'react'
 import Dialog from './Dialog'
 import { request, ApiError } from '../api/client'
@@ -58,7 +65,7 @@ export default function CookieDialog({ accountId, open, onClose, onSaved }: Cook
           value={cookies}
           onChange={(e) => setCookies(e.target.value)}
           spellCheck={false}
-          placeholder="a=1; b=2"
+          placeholder="支持全格式智能识别：&#10;1. 键值对: key1=value1; key2=value2 (支持带 Cookie: 前缀)&#10;2. JSON 数组: [{'name':'...', 'value':'...'}] (Chrome 插件导出)&#10;3. JSON 对象: {'key': 'value'}&#10;4. Netscape 格式: 制表符分隔的 .txt 文件内容"
         />
       </div>
       <div className="form-actions">

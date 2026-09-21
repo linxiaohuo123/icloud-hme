@@ -1,5 +1,13 @@
+/**
+ * [INPUT]: 依赖 api/client 的 request/ApiError，依赖 components/Dialog, components/Select
+ * [OUTPUT]: 对外提供 MailboxDialog 外部收件邮箱接入对话框组件
+ * [POS]: web/src/components 的业务对话框，用于绑定和校验第三方 IMAP 收件邮箱
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 import { useEffect, useState } from 'react'
 import Dialog from './Dialog'
+import Select from './Select'
 import { request, ApiError } from '../api/client'
 import type { MailboxSummary } from '../api/types'
 
@@ -65,12 +73,17 @@ export default function MailboxDialog({ accountId, current, open, onClose, onSav
       {error && <div className="alert-error" role="alert">{error}</div>}
       <div className="form-field">
         <label htmlFor="mailbox-provider">邮箱服务商</label>
-        <select id="mailbox-provider" value={provider} onChange={(e) => changeProvider(e.target.value)}>
-          <option value="qq">QQ 邮箱</option>
-          <option value="gmail">Gmail</option>
-          <option value="outlook">Outlook</option>
-          <option value="custom">其他</option>
-        </select>
+        <Select
+          id="mailbox-provider"
+          value={provider}
+          onChange={(val) => changeProvider(val)}
+          options={[
+            { value: 'qq', label: 'QQ 邮箱' },
+            { value: 'gmail', label: 'Gmail' },
+            { value: 'outlook', label: 'Outlook' },
+            { value: 'custom', label: '其他' },
+          ]}
+        />
       </div>
       <div className="form-field"><label htmlFor="mailbox-email">收件邮箱</label><input id="mailbox-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></div>
       <div className="form-field"><label htmlFor="mailbox-host">IMAP 服务器</label><input id="mailbox-host" value={host} onChange={(e) => setHost(e.target.value)} /></div>

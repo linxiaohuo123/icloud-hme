@@ -58,6 +58,22 @@ describe('api client', () => {
     await vi.waitFor(() => expect(onUnauthorized).toHaveBeenCalled())
   })
 
+  it('业务 401 (非 AUTH_REQUIRED) 不触发全局回调', async () => {
+    const onUnauthorized = vi.fn()
+    server.use(
+      http.post('/api/accounts/acc_1/login', () =>
+        HttpResponse.json(
+          { success: false, code: 'UPSTREAM_UNAUTHORIZED', message: 'iCloud 会话失效' },
+          { status: 401 },
+        ),
+      ),
+    )
+    await expect(
+      request('/api/accounts/acc_1/login', { method: 'POST' }, onUnauthorized),
+    ).rejects.toThrow()
+    expect(onUnauthorized).not.toHaveBeenCalled()
+  })
+
   it('GET 不带 CSRF,POST 自动带 CSRF', async () => {
     setCSRFToken('csrf-token-123')
     let getHeaders: Headers | undefined

@@ -29,3 +29,37 @@ func TestSanitizePreviewKeepsNormalText(t *testing.T) {
 		t.Fatalf("sanitizePreview() = %q, want %q", got, raw)
 	}
 }
+
+func TestDecodeAppleRelay(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{
+			in:   "noreply_at_email_openai_com_beqe84f0f0ndc7_gcph8541@icloud.com",
+			want: "noreply@email.openai.com",
+		},
+		{
+			in:   "service_at_domain_com_cn_hash123456@icloud.com",
+			want: "service@domain.com.cn",
+		},
+		{
+			in:   "notify_at_github_com_token99@icloud.com",
+			want: "notify@github.com",
+		},
+		{
+			in:   "direct@gmail.com",
+			want: "direct@gmail.com",
+		},
+		{
+			in:   "user@icloud.com",
+			want: "user@icloud.com",
+		},
+	}
+
+	for _, tc := range cases {
+		if got := decodeAppleRelay(tc.in); got != tc.want {
+			t.Errorf("decodeAppleRelay(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

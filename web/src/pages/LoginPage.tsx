@@ -1,13 +1,21 @@
+/**
+ * [INPUT]: 依赖 react-router-dom 的 useNavigate, auth/AuthProvider 的 useAuth, api/client 的 ApiError, components/icons 的 IconLock/IconShield/IconEye/IconEyeOff
+ * [OUTPUT]: 对外提供 LoginPage 管理员登录页面组件
+ * [POS]: web/src/pages 的公开受限路由入口，负责单密码鉴权表单提交
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 import { useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/AuthProvider'
 import { ApiError } from '../api/client'
-import { IconLock, IconShield } from '../components/icons'
+import { IconEye, IconEyeOff, IconLock, IconShield } from '../components/icons'
 
 export default function LoginPage() {
   const { login } = useAuth()
   const navigate = useNavigate()
   const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
@@ -32,7 +40,7 @@ export default function LoginPage() {
     <div className="login-page">
       <div className="login-brand">
         <span className="logo" aria-hidden="true">
-          <IconShield size={28} />
+          <IconShield size={30} />
         </span>
         <h1>iCloud HME 管理台</h1>
         <p>管理你的 iCloud 隐藏邮箱别名与邮件</p>
@@ -45,10 +53,10 @@ export default function LoginPage() {
         )}
         <div className="form-field">
           <label htmlFor="admin-password">管理员密码</label>
-          <div style={{ position: 'relative' }}>
+          <div style={{ position: 'relative', width: '100%' }}>
             <input
               id="admin-password"
-              type="password"
+              type={showPassword ? 'text' : 'password'}
               autoComplete="current-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
@@ -56,25 +64,25 @@ export default function LoginPage() {
               placeholder="请输入管理员密码"
               style={{ paddingRight: 40 }}
             />
-            <span
-              aria-hidden="true"
-              style={{
-                position: 'absolute',
-                right: 12,
-                top: '50%',
-                transform: 'translateY(-50%)',
-                color: 'var(--color-text-tertiary)',
-                display: 'flex',
-              }}
+            <button
+              type="button"
+              className="login-password-toggle"
+              onClick={() => setShowPassword((prev) => !prev)}
+              aria-label={showPassword ? '隐藏密码' : '显示密码'}
+              tabIndex={-1}
             >
-              <IconLock size={18} />
-            </span>
+              {showPassword ? <IconEyeOff size={18} /> : <IconEye size={18} />}
+            </button>
           </div>
         </div>
         <div className="form-actions">
           <button type="submit" className="primary" disabled={submitting}>
             {submitting ? '登录中…' : '登录'}
           </button>
+        </div>
+        <div className="login-security-tag" aria-hidden="true">
+          <IconLock size={13} />
+          <span>本地内存加密会话 · 杜绝泄露</span>
         </div>
       </form>
     </div>

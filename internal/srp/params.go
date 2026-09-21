@@ -79,6 +79,9 @@ func createParams(G int64, nBitLength int, hash crypto.Hash, NHex string) *SRPPa
 		N:           new(big.Int),
 		NLengthBits: nBitLength,
 		Hash:        hash,
+		// s2k_fo 协议要求。GetParams 返回的是全局共享指针,
+		// 该标志必须在初始化时定型,登录流程不得并发写它
+		NoUserNameInX: true,
 	}
 
 	b := bytesFromHexString(NHex)

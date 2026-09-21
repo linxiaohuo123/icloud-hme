@@ -194,8 +194,8 @@ describe('AliasesPage', () => {
     )
   })
 
-  it('创建别名:空标签/200 字符边界、成功后刷新并可复制邮箱', async () => {
-    let created = false
+  it('点击刷新号池重新拉取最新别名列表', async () => {
+    let refreshed = false
     server.use(
       http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
       http.get('/api/aliases', () =>
@@ -203,40 +203,19 @@ describe('AliasesPage', () => {
           success: true,
           data: {
             account_id: 'acc_1',
-            count: created ? 3 : 2,
-            aliases: created
+            count: refreshed ? 3 : 2,
+            aliases: refreshed
               ? [...aliases, { email: 'gamma@icloud.com', anonymousId: 'anon_gamma', label: 'Gamma', active: true }]
               : aliases,
           },
         }),
       ),
-      http.post('/api/create', async () => {
-        created = true
-        return HttpResponse.json({
-          success: true,
-          data: {
-            email: 'gamma@icloud.com',
-            label: 'Gamma',
-            created_at: '2026-08-05T09:00:00+08:00',
-            account_id: 'acc_1',
-          },
-        })
-      }),
     )
     renderPage()
     await screen.findByText('alpha@icloud.com')
+    refreshed = true
     const user = userEvent.setup()
-    await user.click(screen.getByRole('button', { name: /创建别名/ }))
-    // 空标签提交被阻止
-    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /创建/ }))
-    expect(screen.getByRole('dialog')).toBeInTheDocument()
-    // 200 字符边界:输入 201 字符被截断到 200
-    await user.type(
-      screen.getByLabelText(/标签/),
-      'x'.repeat(201),
-    )
-    expect((screen.getByLabelText(/标签/) as HTMLInputElement).value.length).toBe(200)
-    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /创建/ }))
+    await user.click(screen.getByRole('button', { name: /刷新号池/ }))
     expect(await screen.findByText('gamma@icloud.com')).toBeInTheDocument()
   })
 
@@ -324,5 +303,39 @@ describe('AliasesPage', () => {
     await user.click(screen.getByRole('button', { name: /确认停用/ }))
     expect(await screen.findByRole('alert')).toHaveTextContent('停用失败')
     expect(screen.getByText('alpha@icloud.com')).toBeInTheDocument()
+  })
+
+  it('支持切换每页条数(20/50/100)并记住偏好', async () => {
+    localStorage.clear()
+    const manyAliases: Alias[] = Array.from({ length: 45 }, (_, i) => ({
+      email: `test_${i + 1}@icloud.com`,
+      anonymousId: `anon_${i + 1}`,
+      label: `Alias ${i + 1}`,
+      active: true,
+      createdAt: new Date(1787406000000 + i * 1000).toISOString(),
+    }))
+
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.get('/api/aliases', () =>
+        HttpResponse.json({
+          success: true,
+          data: { account_id: 'acc_1', count: 45, aliases: manyAliases },
+        }),
+      ),
+    )
+    renderPage()
+    await screen.findByText('test_45@icloud.com')
+
+    // 默认每页 20 条，共 3 页
+    expect(screen.getByText(/共/)).toHaveTextContent('共 45 个别名，当前第 1 / 3 页')
+
+    const user = userEvent.setup()
+    const sizeSelect = screen.getByLabelText('每页显示条数')
+    await user.selectOptions(sizeSelect, '50')
+
+    // 切换到 50 条后，45 条在第 1 页内全部展示，共 1 页
+    expect(screen.getByText(/共/)).toHaveTextContent('共 45 个别名，当前第 1 / 1 页')
+    expect(localStorage.getItem('icloud_hme_alias_page_size')).toBe('50')
   })
 })

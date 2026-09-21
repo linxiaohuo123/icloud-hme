@@ -1,29 +1,47 @@
-# Binary
-/grok2api.exe
-/grok2api.exe~
-
-# Runtime data
+# Runtime data (含明文 Apple Cookie / App 专用密码)
 /data/
 /logs/
 
 # Environment
 /.env
-CLAUDE.md
-# Claude sessions
-/.claude/
-docs/
-.ccg/
-.superpowers/
+/.env.*
+!/.env.example
+
+# Build artifacts
+/build/
+*.exe
+*.exe~
+/icloud-hme
+/icloud-hme-linux-amd64
+# 发布产物命名用下划线(release.yml / systemd 单元按此命名)，必须逐个列出:
+# 用 /icloud-hme* 通配会连 icloud-hme.service 一起误忽略。
+/icloud-hme_linux_amd64
+/icloud-hme_linux_arm64
+/icloud-hme_darwin_amd64
+/icloud-hme_darwin_arm64
+
 # Web frontend build output & deps
 /web/node_modules/
 /internal/webui/dist/*
 !/internal/webui/dist/placeholder.txt
-!capture_statsig_pair.js
-!capture_statsig_pair_v5.js
-# Temp / test files
-/fresh-req.json
-reverse_task/
-js
+
+# Legacy account files
 accounts.json
-*.exe
-build/
+accounts.json.bak
+accounts.json.migrated
+*.db
+*.db-wal
+*.db-shm
+
+# Agent / tooling
+CLAUDE.md
+/.claude/
+.agents/
+docs/
+.ccg/
+.superpowers/
+
+# Temp / scratch files
+/fresh-req.json
+/scratch_check.js
+reverse_task/

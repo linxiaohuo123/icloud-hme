@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 net/mail, net/url, strings, fmt
+ * [OUTPUT]: 对外提供 Summary, AddAccountInput, UpdateAccountInput 等安全 DTO 与校验器
+ * [POS]: internal/account 的安全公开边界，对外暴露脱敏后的账号模型与输入校验
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 // Package account - 公开账号 DTO 与输入校验。
 //
 // HTTP 层只能序列化 account.Summary;内部 Account(含 Cookies、AppPassword、
@@ -28,10 +35,14 @@ type Summary struct {
 	LastValidated  string          `json:"last_validated"`
 	StatusMessage  string          `json:"status_message,omitempty"`
 	CreatedAt      string          `json:"created_at"`
+	Tags           []string        `json:"tags,omitempty"`
 }
 
 // Summary 返回账号的安全快照,忽略内部 LastError。
 func (a *Account) Summary() Summary {
+	if a == nil {
+		return Summary{}
+	}
 	s := Summary{
 		ID:             a.ID,
 		Name:           a.Name,
@@ -46,6 +57,7 @@ func (a *Account) Summary() Summary {
 		HasProxy:       a.Proxy != "",
 		LastValidated:  a.LastValidated,
 		CreatedAt:      a.CreatedAt,
+		Tags:           a.Tags,
 	}
 	if a.Mailbox != nil {
 		s.Mailbox = &MailboxSummary{Provider: a.Mailbox.Provider, Email: a.Mailbox.Email, IMAPHost: a.Mailbox.IMAPHost, IMAPPort: a.Mailbox.IMAPPort}
@@ -73,6 +85,7 @@ type AddAccountInput struct {
 	CookieInput string
 	Host        string
 	Proxy       string
+	Tags        []string
 }
 
 // UpdateAccountInput 是编辑账号基本信息的输入,指针字段表示可选。
@@ -80,6 +93,7 @@ type UpdateAccountInput struct {
 	Name        *string
 	ICloudEmail *string
 	Host        *string
+	Tags        *[]string
 }
 
 // validateName 校验名称:去空白后 1–64 字符。
@@ -94,16 +108,35 @@ func validateName(name string) (string, error) {
 	return name, nil
 }
 
-// validateHost 校验主机:只能是 icloud.com 或 icloud.com.cn。
+// normalizeHost 归一化主机地址，剥离 URL 前缀与路径，并归一化为标准域名。
+func normalizeHost(host string) string {
+	h := strings.TrimSpace(strings.ToLower(host))
+	if u, err := url.Parse(h); err == nil && u.Hostname() != "" {
+		h = u.Hostname()
+	} else if !strings.Contains(h, "://") {
+		if u, err := url.Parse("https://" + h); err == nil && u.Hostname() != "" {
+			h = u.Hostname()
+		}
+	}
+	if strings.HasSuffix(h, ".icloud.com.cn") || h == "icloud.com.cn" {
+		return "icloud.com.cn"
+	}
+	if strings.HasSuffix(h, ".icloud.com") || h == "icloud.com" {
+		return "icloud.com"
+	}
+	return h
+}
+
+// validateHost 校验主机: 经归一化后只能是 icloud.com 或 icloud.com.cn。
 func validateHost(host string) (string, error) {
-	host = strings.TrimSpace(strings.ToLower(host))
-	if host == "" {
+	norm := normalizeHost(host)
+	if norm == "" {
 		return "icloud.com", nil
 	}
-	if host != "icloud.com" && host != "icloud.com.cn" {
+	if norm != "icloud.com" && norm != "icloud.com.cn" {
 		return "", fmt.Errorf("主机只能是 icloud.com 或 icloud.com.cn")
 	}
-	return host, nil
+	return norm, nil
 }
 
 // validateEmail 校验邮箱:用 net/mail.ParseAddress 并要求地址值等于输入。
@@ -133,9 +166,9 @@ func validateProxy(proxy string) (string, error) {
 		return "", fmt.Errorf("代理地址格式无效")
 	}
 	switch u.Scheme {
-	case "http", "https", "socks5":
+	case "http", "https", "socks5", "socks5h", "socks4":
 	default:
-		return "", fmt.Errorf("代理地址格式无效")
+		return "", fmt.Errorf("代理地址格式无效 (仅支持 http, https, socks5, socks5h, socks4)")
 	}
 	return proxy, nil
 }

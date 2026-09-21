@@ -1,10 +1,18 @@
+/**
+ * [INPUT]: 依赖 crypto/hmac, crypto/sha256, golang.org/x/crypto/argon2
+ * [OUTPUT]: 对外提供 Manager, NewManager, Session, Options 等会话管理与 CSRF 防御能力
+ * [POS]: internal/auth 的管理员认证与会话签名核心
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 // Package auth 实现管理员密码校验、内存会话、CSRF 与登录限流。
 //
 // 不依赖 Gin:HTTP 中间件只负责 Cookie/Header 与 HTTP 状态映射。
-// 会话只存内存,进程重启即失效;session ID 与 CSRF 永不落盘或写日志。
+// 会话采用基于管理员密码派生密钥的 HMAC 签名，既不落盘写日志，又能安全跨越服务端重启。
 package auth
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -12,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,13 +58,15 @@ type sessionRecord struct {
 
 // Manager 管理管理员会话,线程安全。
 type Manager struct {
-	mu       sync.Mutex
-	salt     []byte
-	password []byte
-	ttl      time.Duration
-	now      func() time.Time
-	random   io.Reader
-	sessions map[[32]byte]sessionRecord
+	mu          sync.Mutex
+	salt        []byte
+	password    []byte
+	signKey     []byte
+	ttl         time.Duration
+	now         func() time.Time
+	random      io.Reader
+	sessions    map[[32]byte]sessionRecord
+	blacklisted map[[32]byte]time.Time
 }
 
 // NewManager 创建会话管理器。
@@ -82,13 +94,18 @@ func NewManager(opts Options) (*Manager, error) {
 	// argon2id: time=1, memory=64*1024 KiB, threads=4, keyLen=32
 	derived := argon2.IDKey([]byte(opts.Password), salt, 1, 64*1024, 4, 32)
 
+	signKeyHash := sha256.Sum256([]byte("icloud-hme-session-sign-key:" + opts.Password))
+	signKey := signKeyHash[:]
+
 	return &Manager{
-		salt:     salt,
-		password: derived,
-		ttl:      opts.TTL,
-		now:      opts.Now,
-		random:   opts.Random,
-		sessions: make(map[[32]byte]sessionRecord),
+		salt:        salt,
+		password:    derived,
+		signKey:     signKey,
+		ttl:         opts.TTL,
+		now:         opts.Now,
+		random:      opts.Random,
+		sessions:    make(map[[32]byte]sessionRecord),
+		blacklisted: make(map[[32]byte]time.Time),
 	}, nil
 }
 
@@ -99,18 +116,19 @@ func (m *Manager) Login(password string) (sessionID string, session Session, ok 
 		return "", Session{}, false
 	}
 
-	idBytes := make([]byte, 32)
+	idBytes := make([]byte, 24)
 	if _, err := io.ReadFull(m.random, idBytes); err != nil {
 		return "", Session{}, false
 	}
-	csrf := make([]byte, 32)
-	if _, err := io.ReadFull(m.random, csrf); err != nil {
-		return "", Session{}, false
-	}
-
-	sessionID = base64.RawURLEncoding.EncodeToString(idBytes)
-	token := base64.RawURLEncoding.EncodeToString(csrf)
 	expiresAt := m.now().Add(m.ttl)
+	expStr := strconv.FormatInt(expiresAt.Unix(), 10)
+	rawPayload := base64.RawURLEncoding.EncodeToString(idBytes) + "." + expStr
+	mac := hmac.New(sha256.New, m.signKey)
+	mac.Write([]byte(rawPayload))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+	sessionID = rawPayload + "." + sig
+	token := deriveCSRFToken(m.signKey, sessionID)
 
 	key := sha256.Sum256([]byte(sessionID))
 	m.mu.Lock()
@@ -121,7 +139,6 @@ func (m *Manager) Login(password string) (sessionID string, session Session, ok 
 		m.evictOldestLocked()
 	}
 	if _, exists := m.sessions[key]; exists {
-		// 碰撞概率可忽略;保守起见拒绝本次登录
 		return "", Session{}, false
 	}
 	m.sessions[key] = sessionRecord{
@@ -133,17 +150,64 @@ func (m *Manager) Login(password string) (sessionID string, session Session, ok 
 	return sessionID, Session{CSRFToken: token, ExpiresAt: expiresAt}, true
 }
 
-// Validate 校验会话是否有效;每次调用先清理过期会话。
+// Validate 校验会话是否有效;支持服务重启后的签名自愈。
 func (m *Manager) Validate(sessionID string) (Session, bool) {
 	key := sha256.Sum256([]byte(sessionID))
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pruneLocked()
+
+	// 1. 检查登出黑名单
+	if exp, black := m.blacklisted[key]; black {
+		if m.now().Before(exp) {
+			return Session{}, false
+		}
+		delete(m.blacklisted, key)
+	}
+
+	// 2. 内存命中
 	rec, exists := m.sessions[key]
-	if !exists {
+	if exists {
+		return Session{CSRFToken: rec.csrfToken, ExpiresAt: rec.expiresAt}, true
+	}
+
+	// 3. 服务端重启自愈：校验密码派生密钥的 HMAC 签名
+	parts := strings.Split(sessionID, ".")
+	if len(parts) != 3 {
 		return Session{}, false
 	}
-	return Session{CSRFToken: rec.csrfToken, ExpiresAt: rec.expiresAt}, true
+	expUnix, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return Session{}, false
+	}
+	expiresAt := time.Unix(expUnix, 0)
+	if !m.now().Before(expiresAt) {
+		return Session{}, false
+	}
+
+	rawPayload := parts[0] + "." + parts[1]
+	mac := hmac.New(sha256.New, m.signKey)
+	mac.Write([]byte(rawPayload))
+	expectedSig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if subtle.ConstantTimeCompare([]byte(parts[2]), []byte(expectedSig)) != 1 {
+		return Session{}, false
+	}
+
+	// 签名合法，派生确定性 CSRF Token 并写回内存缓存
+	csrfToken := deriveCSRFToken(m.signKey, sessionID)
+
+	m.sessions[key] = sessionRecord{
+		csrfHash:  sha256.Sum256([]byte(csrfToken)),
+		csrfToken: csrfToken,
+		expiresAt: expiresAt,
+	}
+	return Session{CSRFToken: csrfToken, ExpiresAt: expiresAt}, true
+}
+
+func deriveCSRFToken(signKey []byte, sessionID string) string {
+	csrfMac := hmac.New(sha256.New, signKey)
+	csrfMac.Write([]byte("csrf:" + sessionID))
+	return base64.RawURLEncoding.EncodeToString(csrfMac.Sum(nil))
 }
 
 // ValidateCSRF 校验 CSRF token(常量时间比较)。
@@ -165,7 +229,12 @@ func (m *Manager) Logout(sessionID string) {
 	key := sha256.Sum256([]byte(sessionID))
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.sessions, key)
+	if rec, exists := m.sessions[key]; exists {
+		m.blacklisted[key] = rec.expiresAt
+		delete(m.sessions, key)
+	} else {
+		m.blacklisted[key] = m.now().Add(m.ttl)
+	}
 }
 
 // pruneLocked 清理所有过期会话,须持锁调用。
@@ -174,6 +243,11 @@ func (m *Manager) pruneLocked() {
 	for key, rec := range m.sessions {
 		if !now.Before(rec.expiresAt) {
 			delete(m.sessions, key)
+		}
+	}
+	for key, exp := range m.blacklisted {
+		if !now.Before(exp) {
+			delete(m.blacklisted, key)
 		}
 	}
 }
@@ -189,6 +263,7 @@ func (m *Manager) evictOldestLocked() {
 		}
 	}
 	if !oldest.IsZero() {
+		m.blacklisted[oldestKey] = oldest
 		delete(m.sessions, oldestKey)
 	}
 }

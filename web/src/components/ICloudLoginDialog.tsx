@@ -4,6 +4,8 @@ import { request, ApiError } from '../api/client'
 
 interface ICloudLoginDialogProps {
   accountId: string
+  accountEmail?: string
+  accountName?: string
   open: boolean
   onClose: () => void
   onSaved: () => void
@@ -12,6 +14,8 @@ interface ICloudLoginDialogProps {
 /** iCloud 密码登录对话框:支持 OTP 两阶段 */
 export default function ICloudLoginDialog({
   accountId,
+  accountEmail,
+  accountName,
   open,
   onClose,
   onSaved,
@@ -51,7 +55,7 @@ export default function ICloudLoginDialog({
 
   return (
     <Dialog
-      title="iCloud 登录"
+      title="Apple ID 账号授权登录"
       open={open}
       onClose={() => {
         setPassword('')
@@ -61,24 +65,33 @@ export default function ICloudLoginDialog({
         onClose()
       }}
     >
+      {accountEmail && (
+        <div className="alert-info" style={{ marginBottom: 12 }}>
+          正在为账号 <strong>{accountName ? `${accountName} (${accountEmail})` : accountEmail}</strong> 进行 Apple 官方认证
+        </div>
+      )}
       {error && (
         <div className="alert-error" role="alert">
           {error}
         </div>
       )}
       {otpRequired && (
-        <div className="alert-info">该账号启用了双重认证，请输入验证码。</div>
+        <div className="alert-info">该 Apple ID 已启用双重认证，请输入发往受信任设备的 6 位验证码。</div>
       )}
       {!otpRequired && (
         <div className="form-field">
-          <label htmlFor="icloud-login-password">密码</label>
+          <label htmlFor="icloud-login-password">Apple ID 密码</label>
           <input
             id="icloud-login-password"
             type="password"
             autoComplete="current-password"
+            placeholder="请输入该 Apple ID 的官方密码"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
           />
+          <span className="field-hint" style={{ fontSize: 12, color: 'var(--color-text-secondary, #64748b)', marginTop: 4 }}>
+            说明：系统将通过 SRP 安全握手向 Apple 服务器申请会话凭据。
+          </span>
         </div>
       )}
       {otpRequired && (

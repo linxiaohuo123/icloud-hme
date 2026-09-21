@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 crypto/sha256, golang.org/x/crypto/pbkdf2, bogdanfinn/fhttp, icloud-hme/internal/srp
+ * [OUTPUT]: 对外提供 Login, OTPProvider, Validate 等 iCloud SRP 认证与会话提取能力
+ * [POS]: internal/hme 的身份认证与会话握手层
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 // Package hme - iCloud 认证模块
 //
 // 基于 Go-iClient 项目实现完整的 SRP (Secure Remote Password) 登录流程,
@@ -8,8 +15,10 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 
@@ -44,6 +53,7 @@ type authState struct {
 	password   string
 	frameId    string
 	clientId   string
+	challenge  string
 	authAttr   string
 	sessionID  string
 	scnt       string
@@ -72,16 +82,15 @@ func (c *Client) Login(username, password string, otpProvider OTPProvider) error
 		return fmt.Errorf("auth federate: %w", err)
 	}
 
-	// 3. SRP 协议初始化
-	params := srp.GetParams(2048)
-	params.NoUserNameInX = true
-	srpClient := srp.NewSRPClient(params, nil)
+	// 3. SRP 协议初始化 (NoUserNameInX 已在 srp 包初始化时定型,避免并发写共享参数)
+	srpClient := srp.NewSRPClient(srp.GetParams(2048), nil)
 
 	// 4. 获取 salt 和 B
 	authInitResp, err := c.authInit(state, base64.StdEncoding.EncodeToString(srpClient.GetABytes()))
 	if err != nil {
 		return fmt.Errorf("auth init: %w", err)
 	}
+	state.challenge = authInitResp.C
 
 	// 5. 解码 salt 和 B
 	bDec, err := base64.StdEncoding.DecodeString(authInitResp.B)
@@ -95,10 +104,16 @@ func (c *Client) Login(username, password string, otpProvider OTPProvider) error
 
 	// 6. 生成密码密钥
 	passHash := sha256.Sum256([]byte(password))
-	passKey := pbkdf2.Key(passHash[:], saltDec, authInitResp.Iteration, 32, sha256.New)
+	passwordInput := passHash[:]
+	if authInitResp.Protocol == "s2k_fo" {
+		passwordInput = []byte(hex.EncodeToString(passwordInput))
+	}
+	passKey := pbkdf2.Key(passwordInput, saltDec, authInitResp.Iteration, 32, sha256.New)
 
 	// 7. 处理挑战
-	srpClient.ProcessClientChanllenge([]byte(username), passKey, saltDec, bDec)
+	if err := srpClient.ProcessClientChanllenge([]byte(username), passKey, saltDec, bDec); err != nil {
+		return fmt.Errorf("invalid SRP challenge: %w", err)
+	}
 
 	// 8. 提交 SRP 响应 (可能触发 2FA)
 	if err := c.authComplete(state, base64.StdEncoding.EncodeToString(srpClient.M1), base64.StdEncoding.EncodeToString(srpClient.M2), otpProvider); err != nil {
@@ -117,7 +132,9 @@ func (c *Client) Login(username, password string, otpProvider OTPProvider) error
 
 	// 11. 保存 Cookie 到 Client
 	cookies := c.extractSessionCookies()
+	c.cookieMu.Lock()
 	c.Cookies = cookies
+	c.cookieMu.Unlock()
 	c.log("登录成功,获取到 %d 个 Cookie", len(cookies))
 	return nil
 }
@@ -153,8 +170,15 @@ func (c *Client) authStart(state *authState) error {
 
 // authFederate 提交用户名
 func (c *Client) authFederate(state *authState) error {
-	data := `{"accountName":"` + state.username + `","rememberMe":true}`
-	req, err := http.NewRequest("POST", authFederate, bytes.NewReader([]byte(data)))
+	// 用户名来自用户输入,必须走 JSON 编码而非字符串拼接,防止畸形 JSON 请求
+	data, err := json.Marshal(map[string]interface{}{
+		"accountName": state.username,
+		"rememberMe":  true,
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", authFederate, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -210,9 +234,19 @@ func (c *Client) authInit(state *authState, a string) (*authInitResp, error) {
 	}
 	defer resp.Body.Close()
 
+	// Apple 限流/风控时返回 4xx + JSON 错误体:必须检查状态码,
+	// 否则 Decode "成功"得到全零值 Iteration/Salt/B,后续 SRP 计算直接 panic
+	if resp.StatusCode != 200 {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
+		return nil, fmt.Errorf("authInit: unexpected status %d: %s", resp.StatusCode, string(snippet))
+	}
+
 	var result authInitResp
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if result.Iteration <= 0 || result.Salt == "" || result.B == "" || result.C == "" {
+		return nil, fmt.Errorf("authInit: 响应缺少 SRP 参数 (iteration=%d)", result.Iteration)
 	}
 	return &result, nil
 }
@@ -224,7 +258,7 @@ func (c *Client) authComplete(state *authState, m1, m2 string, otpProvider OTPPr
 		"rememberMe":  true,
 		"trustTokens": []string{},
 		"m1":          m1,
-		"c":           state.clientId,
+		"c":           state.challenge,
 		"m2":          m2,
 	}
 
@@ -249,6 +283,13 @@ func (c *Client) authComplete(state *authState, m1, m2 string, otpProvider OTPPr
 
 	switch resp.StatusCode {
 	case 200:
+		// 未启用 2FA 的账号走这里:200 响应同样携带会话头,不采集会导致 getTrust 缺少会话上下文
+		if sid := resp.Header.Get("X-Apple-ID-Session-Id"); sid != "" {
+			state.sessionID = sid
+		}
+		if scnt := resp.Header.Get("scnt"); scnt != "" {
+			state.scnt = scnt
+		}
 		return nil
 	case 409:
 		// 需要 2FA
@@ -362,11 +403,20 @@ func (c *Client) authenticateWeb(state *authState) error {
 	json.NewDecoder(resp.Body).Decode(&result)
 	state.dsid = result.DsInfo.Dsid
 
-	// 复制 idmsa.apple.com 的 Cookie 到 icloud.com
+	// 复制 idmsa.apple.com 的 Cookie 到 icloud.com 与相关域名
 	u1, _ := url.Parse("https://idmsa.apple.com")
-	u2, _ := url.Parse("https://icloud.com")
 	cookies := c.httpc.GetCookies(u1)
-	c.httpc.SetCookies(u2, cookies)
+	for _, domain := range []string{
+		"https://icloud.com",
+		"https://www.icloud.com",
+		"https://setup.icloud.com",
+		"https://icloud.com.cn",
+		"https://www.icloud.com.cn",
+		"https://setup.icloud.com.cn",
+	} {
+		u, _ := url.Parse(domain)
+		c.httpc.SetCookies(u, cookies)
+	}
 
 	return nil
 }
@@ -374,9 +424,23 @@ func (c *Client) authenticateWeb(state *authState) error {
 // extractSessionCookies 提取 session token Cookie
 func (c *Client) extractSessionCookies() map[string]string {
 	cookies := make(map[string]string)
-	u, _ := url.Parse(c.Origin())
-	for _, cookie := range c.httpc.GetCookies(u) {
-		cookies[cookie.Name] = cookie.Value
+	urls := []string{
+		c.Origin(),
+		"https://icloud.com",
+		"https://www.icloud.com",
+		"https://setup.icloud.com",
+		"https://idmsa.apple.com",
+	}
+	if c.Host == "icloud.com.cn" {
+		urls = append(urls, "https://icloud.com.cn", "https://www.icloud.com.cn", "https://setup.icloud.com.cn")
+	}
+	for _, raw := range urls {
+		u, _ := url.Parse(raw)
+		for _, cookie := range c.httpc.GetCookies(u) {
+			if cookie.Name != "" && cookie.Value != "" {
+				cookies[cookie.Name] = cookie.Value
+			}
+		}
 	}
 	return cookies
 }
@@ -402,7 +466,10 @@ func (c *Client) updateAuthHeaders(header http.Header, state *authState) http.He
 
 // Validate 验证当前 Cookie 是否有效
 func (c *Client) Validate() (bool, error) {
-	if len(c.Cookies) == 0 {
+	c.cookieMu.RLock()
+	count := len(c.Cookies)
+	c.cookieMu.RUnlock()
+	if count == 0 {
 		return false, fmt.Errorf("无 Cookie")
 	}
 	// 简单实现：尝试调用 validate 端点

@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 testing, net/http, net/http/httptest, icloud-hme/internal/account, icloud-hme/internal/hme, icloud-hme/internal/mail
+ * [OUTPUT]: 对外提供 fakeBackend 测试桩与 Backend 相关集成单元测试
+ * [POS]: internal/server 的 Backend 接口门面、双模邮件读取、parseMessageID 与 WebMail 删除 400 单元测试
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 package server
 
 import (
@@ -36,16 +43,35 @@ type fakeBackend struct {
 	removedID    string
 	removedOK    bool
 
-	aliasActID     string
-	aliasActActive bool
-	aliasActErr    error
-	aliasDeleteID  string
-	aliasDeleteErr error
-	listInboxQuery InboxQuery
-	reloadCount    int
+	aliasActID       string
+	aliasActActive   bool
+	aliasActErr      error
+	aliasUpdateID    string
+	aliasUpdateLabel string
+	aliasUpdateErr   error
+	batchUpdateIDs   []string
+	batchUpdateLabel string
+	batchUpdateRes   BatchUpdateResult
+	batchUpdateErr   error
+	aliasDeleteID    string
+	aliasDeleteErr   error
+	listInboxQuery   InboxQuery
+	reloadCount      int
+
+	validateID   string
+	validateFunc func(id string) error
 }
 
 func (f *fakeBackend) ListAccounts() []account.Summary { return f.accounts }
+
+func (f *fakeBackend) GetAccount(id string) (account.Summary, error) {
+	for _, a := range f.accounts {
+		if a.ID == id {
+			return a, nil
+		}
+	}
+	return account.Summary{}, &BackendError{Status: http.StatusNotFound, Code: "ACCOUNT_NOT_FOUND", Message: "账号不存在"}
+}
 
 func (f *fakeBackend) AddAccount(in account.AddAccountInput) (account.Summary, error) {
 	f.addedInput = in
@@ -115,9 +141,35 @@ func (f *fakeBackend) ListAliases(accountID string) ([]hme.Alias, error) {
 	return f.aliases, nil
 }
 
+func (f *fakeBackend) RefreshAliases(accountID string) ([]hme.Alias, error) {
+	return f.ListAliases(accountID)
+}
+
 func (f *fakeBackend) SetAliasActive(accountID, anonymousID string, active bool) (bool, error) {
 	f.aliasActID, f.aliasActActive = anonymousID, active
 	return true, f.aliasActErr
+}
+
+func (f *fakeBackend) UpdateAlias(accountID, anonymousID, label, note string) error {
+	f.aliasUpdateID = anonymousID
+	f.aliasUpdateLabel = label
+	return f.aliasUpdateErr
+}
+
+func (f *fakeBackend) BatchUpdateAliases(accountID string, anonymousIDs []string, label, note string) (BatchUpdateResult, error) {
+	f.batchUpdateIDs = anonymousIDs
+	f.batchUpdateLabel = label
+	if f.batchUpdateErr != nil {
+		return BatchUpdateResult{}, f.batchUpdateErr
+	}
+	if f.batchUpdateRes.Total > 0 || len(f.batchUpdateRes.Succeeded) > 0 {
+		return f.batchUpdateRes, nil
+	}
+	return BatchUpdateResult{
+		Total:     len(anonymousIDs),
+		Succeeded: anonymousIDs,
+		Failed:    []string{},
+	}, nil
 }
 
 func (f *fakeBackend) DeleteAlias(accountID, anonymousID string) error {
@@ -125,16 +177,68 @@ func (f *fakeBackend) DeleteAlias(accountID, anonymousID string) error {
 	return f.aliasDeleteErr
 }
 
+func (f *fakeBackend) BatchCreateAlias(accountID string, count int, labelPrefix string) (*BatchCreateResult, error) {
+	created := make([]hme.CreateResult, 0, count)
+	for i := 0; i < count; i++ {
+		created = append(created, hme.CreateResult{
+			Email:     fmt.Sprintf("alias%d@icloud.com", i+1),
+			Label:     fmt.Sprintf("%s %d", labelPrefix, i+1),
+			CreatedAt: "2026-09-20T12:00:00Z",
+		})
+	}
+	return &BatchCreateResult{
+		AccountID:    accountID,
+		Requested:    count,
+		Created:      created,
+		CreatedCount: count,
+	}, nil
+}
+
 func (f *fakeBackend) ListInbox(q InboxQuery) (InboxResult, error) {
 	f.listInboxQuery = q
 	return f.inbox, nil
 }
 
-func (f *fakeBackend) GetMessage(accountID string, uid uint32) (*mail.FullMessage, error) {
-	return &mail.FullMessage{Message: mail.Message{ID: fmt.Sprint(uid)}}, nil
+func (f *fakeBackend) ListMailboxes(accountID string) ([]mail.Folder, error) {
+	return []mail.Folder{
+		{Name: "INBOX", Role: "inbox"},
+		{Name: "Junk", Role: "junk"},
+	}, nil
+}
+
+func (f *fakeBackend) GetMessage(accountID string, id string) (*mail.FullMessage, error) {
+	_, idPart, _, _ := parseMessageID(id)
+	if idPart == "" {
+		idPart = id
+	}
+	return &mail.FullMessage{Message: mail.Message{ID: idPart}}, nil
+}
+
+func (f *fakeBackend) GetMessages(accountID string, refs []MessageRef) ([]*mail.FullMessage, error) {
+	var out []*mail.FullMessage
+	for _, r := range refs {
+		out = append(out, &mail.FullMessage{Message: mail.Message{ID: fmt.Sprint(r.UID), Folder: r.Folder}})
+	}
+	return out, nil
 }
 
 func (f *fakeBackend) DeleteMessage(accountID string, uid uint32) error { return nil }
+
+// ValidateAccount 记录被校验的账号;validateFunc 非空时委托其决定返回结果。
+func (f *fakeBackend) ValidateAccount(id string) error {
+	f.validateID = id
+	if f.validateFunc != nil {
+		return f.validateFunc(id)
+	}
+	return nil
+}
+
+func (f *fakeBackend) CheckProxy(proxyURL string) (bool, int64, string, error) {
+	if strings.Contains(proxyURL, "invalid") {
+		return false, 0, "", fmt.Errorf("fake: 代理连接失败")
+	}
+	return true, 120, "连接成功", nil
+}
 
 func (f *fakeBackend) Reload() error {
 	f.reloadCount++
@@ -210,4 +314,313 @@ func do(t *testing.T, req *http.Request) (int, string, []*http.Cookie) {
 		t.Fatal(err)
 	}
 	return resp.StatusCode, string(raw), resp.Cookies()
+}
+
+func TestGetMessagesBatchHandler(t *testing.T) {
+	fb := &fakeBackend{
+		accounts: []account.Summary{{ID: "acc_1", Name: "测试号"}},
+	}
+	_, ts := newTestServer(fb)
+	defer ts.Close()
+
+	cookie, csrf := login(t, ts, "admin-pass-2026-strong")
+
+	// 批量请求 2 封邮件
+	body := `{"account_id":"acc_1","messages":[{"folder":"INBOX","uid":"101"},{"folder":"INBOX","uid":"102"}]}`
+	req := authedReq(t, ts, "POST", "/api/messages", body)
+	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+	req.Header.Set("X-CSRF-Token", csrf)
+
+	status, respBody, _ := do(t, req)
+	if status != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", status, respBody)
+	}
+
+	var res struct {
+		Success bool `json:"success"`
+		Data    struct {
+			AccountID string              `json:"account_id"`
+			Count     int                 `json:"count"`
+			Messages  []*mail.FullMessage `json:"messages"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(respBody), &res); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if !res.Success || res.Data.Count != 2 {
+		t.Fatalf("expected count 2, got %d", res.Data.Count)
+	}
+
+	// id 作为 uid 别名（前端预取曾误发 id）
+	bodyID := `{"account_id":"acc_1","messages":[{"folder":"INBOX","id":"201"}]}`
+	reqID := authedReq(t, ts, "POST", "/api/messages", bodyID)
+	reqID.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+	reqID.Header.Set("X-CSRF-Token", csrf)
+	statusID, respID, _ := do(t, reqID)
+	if statusID != http.StatusOK {
+		t.Fatalf("id alias expected 200, got %d: %s", statusID, respID)
+	}
+	if !strings.Contains(respID, `"count":1`) {
+		t.Fatalf("id alias expected count 1, got: %s", respID)
+	}
+}
+
+func TestCheckProxyHandler(t *testing.T) {
+	fb := &fakeBackend{}
+	_, ts := newTestServer(fb)
+	defer ts.Close()
+
+	cookie, csrf := login(t, ts, "admin-pass-2026-strong")
+
+	// 1. 正常代理
+	body := `{"proxy":"socks5://127.0.0.1:1080"}`
+	req := authedReq(t, ts, "POST", "/api/proxy/check", body)
+	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+	req.Header.Set("X-CSRF-Token", csrf)
+
+	status, respBody, _ := do(t, req)
+	if status != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", status, respBody)
+	}
+	if !strings.Contains(respBody, `"ok":true`) {
+		t.Fatalf("expected ok:true, got: %s", respBody)
+	}
+
+	// 2. 异常代理
+	bodyFail := `{"proxy":"socks5://invalid.proxy:1080"}`
+	reqFail := authedReq(t, ts, "POST", "/api/proxy/check", bodyFail)
+	reqFail.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+	reqFail.Header.Set("X-CSRF-Token", csrf)
+
+	statusFail, respBodyFail, _ := do(t, reqFail)
+	if statusFail != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway, got %d: %s", statusFail, respBodyFail)
+	}
+}
+
+func TestExportAliasesHandler(t *testing.T) {
+	fb := &fakeBackend{
+		accounts: []account.Summary{{ID: "acc_1", Name: "测试号"}},
+		aliases: []hme.Alias{
+			{Email: "test1@icloud.com", Label: "标签1", Active: true, CreatedAt: "2026-09-20"},
+			{Email: "test2@icloud.com", Label: "标签2", Active: false, CreatedAt: "2026-09-20"},
+		},
+	}
+	_, ts := newTestServer(fb)
+	defer ts.Close()
+
+	cookie, _ := login(t, ts, "admin-pass-2026-strong")
+
+	// 1. 导出 CSV
+	reqCSV := authedReq(t, ts, "GET", "/api/aliases/export?account_id=acc_1&format=csv", "")
+	reqCSV.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+	respCSV, err := http.DefaultClient.Do(reqCSV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer respCSV.Body.Close()
+	rawCSV, _ := io.ReadAll(respCSV.Body)
+	respBody := string(rawCSV)
+	if respCSV.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", respCSV.StatusCode)
+	}
+	if !strings.Contains(respCSV.Header.Get("Content-Type"), "text/csv") {
+		t.Fatalf("expected text/csv, got %s", respCSV.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(respBody, "test1@icloud.com") || !strings.Contains(respBody, "已启用") {
+		t.Fatalf("CSV content invalid: %s", respBody)
+	}
+
+	// 2. 导出 JSON
+	reqJSON := authedReq(t, ts, "GET", "/api/aliases/export?account_id=acc_1&format=json", "")
+	reqJSON.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+	statusJ, respBodyJ, _ := do(t, reqJSON)
+	if statusJ != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", statusJ)
+	}
+	if !strings.Contains(respBodyJ, "test1@icloud.com") {
+		t.Fatalf("JSON content invalid: %s", respBodyJ)
+	}
+}
+
+func TestGetMessagePrimeHandler(t *testing.T) {
+	fb := &fakeBackend{
+		accounts: []account.Summary{{ID: "acc_1", Name: "测试号"}},
+	}
+	_, ts := newTestServer(fb)
+	defer ts.Close()
+
+	cookie, _ := login(t, ts, "admin-pass-2026-strong")
+
+	req := authedReq(t, ts, "GET", "/api/messages/INBOX:42?account_id=acc_1", "")
+	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+
+	status, respBody, _ := do(t, req)
+	if status != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", status, respBody)
+	}
+
+	var res struct {
+		Success bool `json:"success"`
+		Data    struct {
+			AccountID string `json:"account_id"`
+			Message   struct {
+				ID string `json:"id"`
+			} `json:"message"`
+			Method string `json:"method"`
+			Cached bool   `json:"cached"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(respBody), &res); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if res.Data.AccountID != "acc_1" || res.Data.Message.ID != "42" {
+		t.Fatalf("unexpected prime message response: %+v", res.Data)
+	}
+}
+
+func TestGetMessageWebMailStringIDHandler(t *testing.T) {
+	fb := &fakeBackend{
+		accounts: []account.Summary{{ID: "acc_1", Name: "测试号"}},
+	}
+	_, ts := newTestServer(fb)
+	defer ts.Close()
+
+	cookie, _ := login(t, ts, "admin-pass-2026-strong")
+
+	req := authedReq(t, ts, "GET", "/api/inbox/thread_abcdef123?account_id=acc_1", "")
+	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+
+	status, respBody, _ := do(t, req)
+	if status != http.StatusOK {
+		t.Fatalf("expected 200 OK for WebMail string ThreadID, got %d: %s", status, respBody)
+	}
+
+	var res struct {
+		Success bool `json:"success"`
+		Data    struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(respBody), &res); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if res.Data.ID != "thread_abcdef123" {
+		t.Fatalf("expected thread_abcdef123, got: %+v", res.Data)
+	}
+}
+
+func TestDeleteMessageWebMailStringIDHandler(t *testing.T) {
+	fb := &fakeBackend{
+		accounts: []account.Summary{{ID: "acc_1", Name: "测试号"}},
+	}
+	_, ts := newTestServer(fb)
+	defer ts.Close()
+
+	cookie, csrf := login(t, ts, "admin-pass-2026-strong")
+
+	req := authedReq(t, ts, "DELETE", "/api/inbox/thread_abcdef123?account_id=acc_1", "")
+	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+	req.Header.Set("X-CSRF-Token", csrf)
+
+	status, respBody, _ := do(t, req)
+	if status != http.StatusBadRequest {
+		t.Fatalf("expected 400 for WebMail string ThreadID delete, got %d: %s", status, respBody)
+	}
+
+	var res struct {
+		Success bool   `json:"success"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(respBody), &res); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if res.Success || res.Code != "WEBMAIL_DELETE_UNSUPPORTED" {
+		t.Fatalf("unexpected delete response: %+v body=%s", res, respBody)
+	}
+}
+
+func TestParseMessageID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		raw    string
+		folder string
+		idPart string
+		uid    uint32
+		hasUID bool
+	}{
+		{"1042", "", "1042", 1042, true},
+		{"INBOX:1042", "INBOX", "1042", 1042, true},
+		{"Junk:7", "Junk", "7", 7, true},
+		{"thread_abcdef123", "", "thread_abcdef123", 0, false},
+		{"thread:abc", "", "thread:abc", 0, false},
+		{"INBOX:", "", "INBOX:", 0, false},
+		{":42", "", ":42", 0, false},
+		{"", "", "", 0, false},
+		{"  99  ", "", "99", 99, true},
+	}
+	for _, tc := range cases {
+		folder, idPart, uid, hasUID := parseMessageID(tc.raw)
+		if folder != tc.folder || idPart != tc.idPart || uid != tc.uid || hasUID != tc.hasUID {
+			t.Fatalf("parseMessageID(%q) = (%q, %q, %d, %v), want (%q, %q, %d, %v)",
+				tc.raw, folder, idPart, uid, hasUID, tc.folder, tc.idPart, tc.uid, tc.hasUID)
+		}
+	}
+}
+
+func TestListInboxWithBodyQuery(t *testing.T) {
+	fb := &fakeBackend{
+		accounts: []account.Summary{{ID: "acc_1", Name: "测试号"}},
+	}
+	_, ts := newTestServer(fb)
+	defer ts.Close()
+
+	cookie, _ := login(t, ts, "admin-pass-2026-strong")
+
+	req := authedReq(t, ts, "GET", "/api/inbox?account_id=acc_1&body=1", "")
+	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+
+	status, _, _ := do(t, req)
+	if status != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", status)
+	}
+	if !fb.listInboxQuery.WithBody {
+		t.Fatalf("expected WithBody=true in InboxQuery")
+	}
+}
+
+func TestManagerBackendRemoveAccountInvalidatesCache(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr, err := account.NewManager(tempDir, nil)
+	if err != nil {
+		t.Fatalf("创建 manager 失败: %v", err)
+	}
+	acc, err := mgr.AddAccount("test_acc", "", "", "")
+	if err != nil {
+		t.Fatalf("添加账号失败: %v", err)
+	}
+
+	be := &managerBackend{
+		mgr:        mgr,
+		aliasCache: make(map[string]*aliasCacheItem),
+	}
+	be.setCachedAliases(acc.ID, []hme.Alias{
+		{Email: "cached@icloud.com", AnonymousID: "anon_1", Active: true},
+	})
+
+	// 确认缓存已写入
+	if _, ok := be.getCachedAliases(acc.ID); !ok {
+		t.Fatalf("预期别名缓存存在")
+	}
+
+	// 删除账号
+	if ok := be.RemoveAccount(acc.ID); !ok {
+		t.Fatalf("删除账号失败")
+	}
+
+	// 验证缓存已被彻底驱逐
+	if _, ok := be.getCachedAliases(acc.ID); ok {
+		t.Fatalf("删除账号后别名缓存必须被立即销毁")
+	}
 }

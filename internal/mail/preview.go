@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 html, regexp, strings
+ * [OUTPUT]: 对外提供 sanitizePreview, sanitizePlainPreview 等邮件内容清洗与 CSS 剥离能力
+ * [POS]: internal/mail 的正文解析与摘要脱敏工具
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 package mail
 
 import (

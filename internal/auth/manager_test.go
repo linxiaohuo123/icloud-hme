@@ -254,3 +254,45 @@ func TestManagerBadReader(t *testing.T) {
 		t.Fatal("随机源失败时构造器应报错")
 	}
 }
+
+// TestManagerRestartResilience 验证服务重启后旧会话自动恢复，用户无需重新登录。
+func TestManagerRestartResilience(t *testing.T) {
+	opts := Options{
+		Password: "admin-pass-2026-strong",
+		TTL:      12 * time.Hour,
+		Now:      func() time.Time { return fixedNow },
+		Random:   &fixedRandom{},
+	}
+	m1, err := NewManager(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, sess, ok := m1.Login("admin-pass-2026-strong")
+	if !ok {
+		t.Fatal("登录失败")
+	}
+
+	// 模拟服务进程重启：新建 m2 实例（sessions 内存 map 为空）
+	m2, err := NewManager(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m2.sessions) != 0 {
+		t.Fatal("新实例初始 sessions map 应为空")
+	}
+
+	// 校验旧 sessionID 应通过自愈验证
+	gotSess, ok := m2.Validate(id)
+	if !ok {
+		t.Fatal("服务重启后合法 sessionID 应通过自愈验证")
+	}
+	if !gotSess.ExpiresAt.Equal(sess.ExpiresAt) {
+		t.Fatalf("过期时间不一致: got %v, want %v", gotSess.ExpiresAt, sess.ExpiresAt)
+	}
+	if gotSess.CSRFToken != sess.CSRFToken {
+		t.Fatalf("自愈后 CSRF Token 发生变化: got %s, want %s", gotSess.CSRFToken, sess.CSRFToken)
+	}
+	if !m2.ValidateCSRF(id, sess.CSRFToken) {
+		t.Fatal("客户端保存的原 CSRF 应在服务重启后继续通过校验")
+	}
+}

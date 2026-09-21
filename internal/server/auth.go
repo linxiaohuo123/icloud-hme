@@ -1,37 +1,78 @@
-// Package server - 登录/会话/退出 handler 与认证中间件。
-//
-// auth.Manager 不依赖 Gin;此处只负责 Cookie/Header 与 HTTP 状态映射。
+/**
+ * [INPUT]: 依赖 internal/auth, gin
+ * [OUTPUT]: 对外提供 requireSession 中间件 (支持 API Key 旁路), handleLogin, handleSession, handleLogout
+ * [POS]: internal/server 的鉴权与会话管理层
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 package server
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"icloud-hme/internal/auth"
+	"icloud-hme/internal/store"
 )
 
 // authManager 是 auth.Manager 的别名,便于 handler 签名。
 type authManager = auth.Manager
 
-// sessionCookieName 是管理员会话 Cookie 名称。
 const sessionCookieName = "hme_session"
 
-// sessionIDFromCookie 从请求 Cookie 提取 session ID。
+// sessionIDFromCookie 从请求 Cookie 中提取 session_id。
 func sessionIDFromCookie(c *gin.Context) string {
-	if cookie, err := c.Request.Cookie(sessionCookieName); err == nil {
+	cookie, err := c.Request.Cookie(sessionCookieName)
+	if err == nil && cookie.Value != "" {
 		return cookie.Value
 	}
 	return ""
 }
 
-// requireSession 校验会话,失败返回 401/AUTH_REQUIRED。
-func requireSession(mgr *authManager) gin.HandlerFunc {
+// requireSession 校验会话,失败返回 401/AUTH_REQUIRED。支持全局 API Key 及动态 Tokens 旁路。
+//
+// 通过后写入两个上下文键:
+//
+//	is_api_key_auth: 是否为令牌/Key 认证(决定是否跳过 CSRF)
+//	auth_scopes:     授权作用域;浏览器会话恒为 "admin",令牌取库中 scopes
+func requireSession(mgr *authManager, apiKey string, st *store.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		reqKey := c.GetHeader("X-API-Key")
+		if reqKey == "" {
+			authHeader := c.GetHeader("Authorization")
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				reqKey = strings.TrimPrefix(authHeader, "Bearer ")
+			}
+		}
+		if reqKey != "" {
+			// 恒时比较, 避免环境变量 Key 的时序侧信道
+			if apiKey != "" && subtle.ConstantTimeCompare([]byte(reqKey), []byte(apiKey)) == 1 {
+				c.Set("is_api_key_auth", true)
+				c.Set("token_name", "global_api_key")
+				c.Set("auth_scopes", store.ScopeAdmin)
+				c.Next()
+				return
+			}
+			if st != nil {
+				if tokName, scopes, ok := st.ValidateTokenWithName(reqKey); ok {
+					c.Set("is_api_key_auth", true)
+					c.Set("token_name", tokName)
+					c.Set("auth_scopes", scopes)
+					c.Next()
+					return
+				}
+			}
+			failCode(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
+			return
+		}
+
 		sessionID := sessionIDFromCookie(c)
 		if sessionID == "" {
-			failCode(c, http.StatusUnauthorized, "AUTH_REQUIRED", "请先登录")
+			failCode(c, http.StatusUnauthorized, "AUTH_REQUIRED", "请先登录或提供有效的 API Key")
 			return
 		}
 		if _, ok := mgr.Validate(sessionID); !ok {
@@ -39,6 +80,23 @@ func requireSession(mgr *authManager) gin.HandlerFunc {
 			return
 		}
 		c.Set("session_id", sessionID)
+		// 浏览器管理员会话拥有全部作用域
+		c.Set("auth_scopes", store.ScopeAdmin)
+		c.Next()
+	}
+}
+
+// requireScope 在 requireSession 之后做最小权限校验。
+// 对外发放的令牌可收窄为 "allocate,verify"，从而无法触达账号/令牌/设置等管理面接口。
+func requireScope(scope string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		scopes, _ := c.Get("auth_scopes")
+		scopesStr, _ := scopes.(string)
+		if !store.HasScope(scopesStr, scope) {
+			failCode(c, http.StatusForbidden, "SCOPE_DENIED", "当前令牌不具备该接口的授权作用域")
+			c.Abort()
+			return
+		}
 		c.Next()
 	}
 }
@@ -56,13 +114,14 @@ func setSessionCookie(c *gin.Context, sessionID string, expiresAt time.Time, sec
 	})
 }
 
-// clearSessionCookie 清除会话 Cookie。
-func clearSessionCookie(c *gin.Context) {
+// clearSessionCookie 清除会话 Cookie(属性须与设置时一致,含 Secure)。
+func clearSessionCookie(c *gin.Context, secure bool) {
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   -1,
 	})
@@ -132,6 +191,6 @@ func (s *Server) handleLogout(c *gin.Context) {
 	if sessionID != "" {
 		s.auth.Logout(sessionID)
 	}
-	clearSessionCookie(c)
+	clearSessionCookie(c, s.cfg.SecureCookie)
 	ok(c, gin.H{"logged_out": true})
 }

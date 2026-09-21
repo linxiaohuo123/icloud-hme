@@ -13,6 +13,8 @@
 - ✅ **双路径读信** — 邮件读取优先走 IMAP (App Password),无 App Password 时回退 Web API (Cookie)
 - ✅ **多账号管理** — 支持多个 iCloud 账号并行管理
 - ✅ **双认证模式** — Cookie (创建别名 + 读邮件回退) 和 App Password (IMAP 优先)
+- ✅ **Cookie 健康监控** — 后台周期校验账号会话，凭据失效自动标记 error 并让调度器跳过，杜绝出号链路静默停摆
+- ✅ **系统设置 + 通知推送** — 管理台「系统设置」页配置飞书/Bark/Telegram 渠道，Cookie 失效/恢复、配额水位告警实时送达手机与 IM
 - ✅ **安全模型** — 单管理员会话、CSRF 校验、登录限流、响应脱敏
 
 ## 快速开始
@@ -79,12 +81,31 @@ go build -o icloud-hme .
 
 | 环境变量 | 说明 | 默认 |
 |---|---|---|
-| `ICLOUD_HME_ADMIN_PASSWORD` | 管理员密码，**必填**，至少 8 字符 | 无（缺失时拒绝启动） |
+| `ICLOUD_HME_ADMIN_PASSWORD` | 管理员密码，**必填**，至少 8 字符，且不得使用仓库模板里的占位值 | 无（缺失时拒绝启动） |
+| `ICLOUD_HME_API_KEY` | 自动化 API Key，**等同管理员权限**，请勿下发给第三方 | 无（不启用） |
+| `ICLOUD_HME_ADDR` | HTTP 监听地址 | `127.0.0.1:8081`（仅本机） |
 | `ICLOUD_HME_SESSION_TTL` | 会话有效期 | `12h`（范围 `15m`–`168h`） |
 | `ICLOUD_HME_SECURE_COOKIE` | 通过 TLS 反向代理部署时设为 `true` | `false` |
+| `ICLOUD_HME_COOKIE_MONITOR_INTERVAL` | Cookie 健康监控周期 | `30m`（范围 `5m`–`24h`） |
+| `ICLOUD_HME_COOKIE_THROTTLE` | Cookie 校验的账号间节流；留空自动摊平到监控周期内 | 自动（范围 `50ms`–`5m`） |
+| `ICLOUD_HME_STARTUP_SYNC_INTERVAL` | 启动预热账号间提交间隔；留空自动摊平到约 10 分钟 | 自动（范围 `50ms`–`5m`） |
+| `ICLOUD_HME_MAIL_POLL_INTERVAL` | 取码长轮询期间的邮件轮询周期 | `2s`（范围 `500ms`–`1m`） |
+| `ICLOUD_HME_LEASE_RETENTION` | 已用别名流水保留期，支持 `180d` 写法；清理不影响别名路由表 | 永久保留 |
+| `ICLOUD_HME_ALLOW_PRIVATE_WEBHOOK` | 允许通知 Webhook 指向内网地址 | `false`（默认拒绝内网，防盲 SSRF） |
 
 > **Breaking Change（v0.3+）**：升级后未设置 `ICLOUD_HME_ADMIN_PASSWORD` 将拒绝启动；
 > 原有匿名 API 调用将收到 `401 AUTH_REQUIRED`。管理员会话只存内存，进程重启即失效。
+
+> **上线前三条硬性检查**
+>
+> 1. **口令必须替换**。`your_strong_password_here`、`admin123456` 等模板占位值会被启动校验直接拒绝。
+> 2. **必须由 TLS 反代暴露**。程序自身不提供 HTTPS；直接以 HTTP 暴露到公网时，管理员口令与会话 Cookie 均为明文传输。
+>    建议保持 `ICLOUD_HME_ADDR=127.0.0.1:8081` 并用 Nginx/Caddy 终止 TLS，同时设置 `ICLOUD_HME_SECURE_COOKIE=true`。
+> 3. **数据目录含明文凭据**（Apple 会话 Cookie、App 专用密码、代理密码）。程序会以 `0700` 创建目录、`0600` 收紧
+>    SQLite 及其 WAL/SHM 文件；**Windows 部署需自行收紧目录 ACL**（`os.Chmod` 在 Windows 上只映射只读位）。
+
+> **对外分发令牌请用作用域**：`GET /api/tokens` 仅回显掩码，`POST /api/tokens` 未指定 `scopes` 时默认只发放
+> `allocate,verify`（出号 + 取码），这类令牌**无法触达账号/令牌/设置等管理面**。详见 `API.md` 的「作用域模型」。
 
 ### 3. 配置账号
 
@@ -575,6 +596,8 @@ A local management tool for Apple iCloud Hide My Email (HME) aliases, supporting
 - Read emails sent to HME aliases via IMAP or Web API
 - Manage multiple iCloud accounts
 - Dual authentication: Cookie and App Password
+- Cookie health monitor: periodic session checks mark dead cookies as error so the scheduler skips them automatically
+- Settings panel with push notifications (Feishu / Bark / Telegram) for cookie expiry, recovery and alias quota alerts
 - Security: single-admin session, CSRF checks, login rate limiting, redacted API responses
 
 ### Quick Start
@@ -635,6 +658,7 @@ go build -o icloud-hme .
 | `ICLOUD_HME_ADMIN_PASSWORD` | Admin password, **required**, min 8 chars | none (refuses to start) |
 | `ICLOUD_HME_SESSION_TTL` | Session TTL | `12h` (range `15m`–`168h`) |
 | `ICLOUD_HME_SECURE_COOKIE` | Set `true` when deployed behind TLS | `false` |
+| `ICLOUD_HME_COOKIE_MONITOR_INTERVAL` | Cookie health monitor interval | `30m` (range `5m`–`24h`) |
 
 > **Breaking change (v0.3+)**: without `ICLOUD_HME_ADMIN_PASSWORD` the server refuses to start; all API endpoints now require login (`401 AUTH_REQUIRED`). Admin sessions are in-memory only and are lost on restart.
 

@@ -1,0 +1,44 @@
+services:
+  icloud-hme:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: icloud-hme:latest
+    container_name: icloud-hme
+    restart: unless-stopped
+    ports:
+      # 默认只绑定回环:公网暴露请在前面放 Nginx/Caddy 终止 TLS。
+      # 确需直接对外时改成 "8081:8081"，并把 ICLOUD_HME_SECURE_COOKIE 设为 true。
+      - "127.0.0.1:8081:8081"
+    environment:
+      # 【必填】在 .env 里设置，缺失时 compose 会直接拒绝启动。
+      # 不要在此处写死占位口令:占位值能通过长度校验，等同于把母号凭据交给任何读过本仓库的人。
+      - ICLOUD_HME_ADMIN_PASSWORD=${ICLOUD_HME_ADMIN_PASSWORD:?请在 .env 中设置强口令}
+      # 可选:外部自动化统一鉴权 Key(等同管理员权限)。留空则不启用。
+      - ICLOUD_HME_API_KEY=${ICLOUD_HME_API_KEY:-}
+      # 生产经 HTTPS 反代时务必为 true
+      - ICLOUD_HME_SECURE_COOKIE=${ICLOUD_HME_SECURE_COOKIE:-false}
+      - ICLOUD_HME_SESSION_TTL=${ICLOUD_HME_SESSION_TTL:-12h}
+      - ICLOUD_HME_COOKIE_MONITOR_INTERVAL=${ICLOUD_HME_COOKIE_MONITOR_INTERVAL:-30m}
+      # 账号数上千时的三处节流。留空 = 自动摊平(推荐)，详见 .env.example 说明。
+      - ICLOUD_HME_COOKIE_THROTTLE=${ICLOUD_HME_COOKIE_THROTTLE:-}
+      - ICLOUD_HME_STARTUP_SYNC_INTERVAL=${ICLOUD_HME_STARTUP_SYNC_INTERVAL:-}
+      - ICLOUD_HME_MAIL_POLL_INTERVAL=${ICLOUD_HME_MAIL_POLL_INTERVAL:-}
+      # 流水保留期(如 180d)。留空 = 永久保留；清理不影响别名路由表。
+      - ICLOUD_HME_LEASE_RETENTION=${ICLOUD_HME_LEASE_RETENTION:-}
+      # 可信反代地址。留空 = 不信任代理头(XFF 不可伪造，但反代下限流退化为全局单桶)。
+      - ICLOUD_HME_TRUSTED_PROXIES=${ICLOUD_HME_TRUSTED_PROXIES:-}
+      # 时区设置
+      - TZ=${TZ:-Asia/Shanghai}
+    volumes:
+      # 持久化存储账号凭据与 SQLite 数据库 (icloud_hme.db)
+      # 注意: SQLite WAL 依赖共享内存映射，请确保该路径落在本地块设备文件系统上，
+      # 不要使用 NFS/SMB 或 Docker Desktop 的 virtiofs，否则可能 SQLITE_IOERR_SHMOPEN。
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/api/auth/session"]
+      # 未登录返回 401 属正常，只要能连上就说明进程存活
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -158,6 +158,20 @@ describe('InboxPage', () => {
     expect(await screen.findByText(/暂无邮件/)).toBeInTheDocument()
   })
 
+  it('后端返回 messages 为 null 时安全显示暂无邮件而不崩溃', async () => {
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.get('/api/inbox', () =>
+        HttpResponse.json({
+          success: true,
+          data: { account_id: 'acc_1', count: 0, messages: null, method: 'imap' },
+        }),
+      ),
+    )
+    renderPage()
+    expect(await screen.findByText(/暂无邮件/)).toBeInTheDocument()
+  })
+
   it('恶意 HTML 只作为文本显示,不产生 img 节点', async () => {
     const evil = {
       ...inboxResult,
@@ -271,4 +285,29 @@ describe('InboxPage', () => {
     renderPage()
     expect(await screen.findByText('—')).toBeInTheDocument()
   })
+
+  it('智能识别验证码并显示高亮复制徽章', async () => {
+    const codeMsg = {
+      ...inboxResult,
+      messages: [
+        {
+          id: '10',
+          from: 'service@apple.com',
+          to: 'alpha@icloud.com',
+          subject: '您的 Apple 验证码',
+          date: '2026-08-04T12:00:00+08:00',
+          preview: '您的验证码是 683921，有效期为 10 分钟。',
+        },
+      ],
+    }
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.get('/api/inbox', () => HttpResponse.json({ success: true, data: codeMsg })),
+    )
+    renderPage()
+    const badge = await screen.findByRole('button', { name: /683921/ })
+    expect(badge).toBeInTheDocument()
+    expect(badge).toHaveClass('badge-code')
+  })
 })
+

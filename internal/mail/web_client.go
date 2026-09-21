@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 bogdanfinn/tls-client, bogdanfinn/fhttp 进行 TLS 指纹伪造，依赖 Google UUID
+ * [OUTPUT]: 对外提供 WebClient、NewWebClient、ListInbox、SearchMails、FindByAlias
+ * [POS]: internal/mail 的 Web 邮件读取客户端，当账号未配置 App 专用密码时作为回退通道
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 // Package mail - iCloud Web 邮件客户端
 //
 // 使用 Cookie 认证通过 iCloud Web API 读取邮件，
@@ -11,6 +18,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
@@ -19,7 +27,7 @@ import (
 )
 
 // WebClientBuildNumber 是与浏览器一致的 mccgateway 邮件接口构建号。
-const WebClientBuildNumber = "2624Build13"
+const WebClientBuildNumber = "2626Build21"
 
 // WebClient 是 iCloud Web 邮件客户端。
 type WebClient struct {
@@ -28,11 +36,20 @@ type WebClient struct {
 	clientID      string
 	mccGatewayURL string
 	host          string // "icloud.com" 或 "icloud.com.cn"
+	proxy         string
 	httpc         tls_client.HttpClient
 }
 
-// NewWebClient 创建一个 Web 邮件客户端。
-func NewWebClient(cookies map[string]string, dsid, host string) *WebClient {
+// Proxy 返回客户端当前配置的代理地址。
+func (c *WebClient) Proxy() string {
+	return c.proxy
+}
+
+// NewWebClient 创建一个 Web 邮件客户端，支持独立代理隧道。
+//
+// 返回 error:代理地址非法(如缺少 scheme / 不支持的协议)时 tls-client 会返回 nil 客户端，
+// 若沿用旧签名吞掉错误，后续 c.httpc.Do 会直接 nil 解引用 panic。
+func NewWebClient(cookies map[string]string, dsid, host, proxy string) (*WebClient, error) {
 	jar := tls_client.NewCookieJar()
 	options := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(30),
@@ -40,8 +57,17 @@ func NewWebClient(cookies map[string]string, dsid, host string) *WebClient {
 		tls_client.WithCookieJar(jar),
 		tls_client.WithNotFollowRedirects(),
 	}
+	if proxy != "" {
+		options = append(options, tls_client.WithProxyUrl(proxy))
+	}
 
-	httpc, _ := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	httpc, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	if err != nil {
+		return nil, fmt.Errorf("创建 Web 邮件客户端失败: %w", err)
+	}
+	if httpc == nil {
+		return nil, fmt.Errorf("创建 Web 邮件客户端失败: 客户端为空(通常是代理地址不合法)")
+	}
 
 	if host == "" {
 		host = "icloud.com"
@@ -52,10 +78,11 @@ func NewWebClient(cookies map[string]string, dsid, host string) *WebClient {
 		dsid:     dsid,
 		clientID: uuid.New().String(),
 		host:     host,
+		proxy:    proxy,
 		httpc:    httpc,
 	}
 
-	// 设置 Cookie 到所有相关域名(确保跨域请求能传递 Cookie)
+	// 设置 Cookie 到基础域名
 	if len(cookies) > 0 {
 		suffix := "icloud.com"
 		if host == "icloud.com.cn" {
@@ -81,7 +108,41 @@ func NewWebClient(cookies map[string]string, dsid, host string) *WebClient {
 		}
 	}
 
-	return c
+	return c, nil
+}
+
+// maxWebResponseBytes 是 Web 邮件接口响应体读取上限。
+//
+// 该响应来自 iCloud 网关(且可能经由用户配置的第三方代理)，
+// 不加限制地 io.ReadAll 会让不可信上游用超大响应把进程内存打满。
+const maxWebResponseBytes = 10 << 20 // 10 MiB
+
+// readAllLimited 读取响应体但设硬上限，超限即报错而不是无限膨胀。
+func readAllLimited(r io.Reader) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, maxWebResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxWebResponseBytes {
+		return nil, fmt.Errorf("响应体超过 %d 字节上限，已中止读取", maxWebResponseBytes)
+	}
+	return body, nil
+}
+
+func (c *WebClient) updateCookies(resp *http.Response) {
+	if resp == nil {
+		return
+	}
+	if c.cookies == nil {
+		c.cookies = make(map[string]string)
+	}
+	for _, cookie := range resp.Cookies() {
+		if cookie.MaxAge < 0 {
+			delete(c.cookies, cookie.Name)
+		} else if cookie.Value != "" {
+			c.cookies[cookie.Name] = cookie.Value
+		}
+	}
 }
 
 // origin 返回当前账号对应的 Web Origin。
@@ -99,6 +160,19 @@ func (c *WebClient) setCommonHeaders(req *http.Request) {
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "same-site")
+
+	// 手动添加 Cookie 头，确保即使跨分区或非标准域名也能稳定携带凭据
+	if len(c.cookies) > 0 {
+		cookieParts := make([]string, 0, len(c.cookies))
+		for k, v := range c.cookies {
+			if strings.HasPrefix(v, `"`) {
+				cookieParts = append(cookieParts, k+"="+v)
+			} else {
+				cookieParts = append(cookieParts, k+`="`+v+`"`)
+			}
+		}
+		req.Header.Set("Cookie", strings.Join(cookieParts, "; "))
+	}
 }
 
 // withParams 给 URL 追加 clientBuildNumber / clientId / dsid 查询参数。
@@ -129,8 +203,12 @@ func (c *WebClient) resolveMccGateway() error {
 		return err
 	}
 	defer resp.Body.Close()
+	c.updateCookies(resp)
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := readAllLimited(resp.Body)
+	if err != nil {
+		return err
+	}
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("validate 失败: HTTP %d - %s", resp.StatusCode, truncate(string(body), 200))
 	}
@@ -160,6 +238,19 @@ func (c *WebClient) resolveMccGateway() error {
 		mccURL = u.String()
 	}
 	c.mccGatewayURL = strings.TrimRight(mccURL, "/")
+
+	// 动态解析出 mccGatewayURL 后，设置 Cookie 到该 URL
+	if u, err := url.Parse(c.mccGatewayURL); err == nil && len(c.cookies) > 0 {
+		httpCookies := make([]*http.Cookie, 0, len(c.cookies))
+		for k, v := range c.cookies {
+			httpCookies = append(httpCookies, &http.Cookie{
+				Name:  k,
+				Value: v,
+				Path:  "/",
+			})
+		}
+		c.httpc.GetCookieJar().SetCookies(u, httpCookies)
+	}
 	return nil
 }
 
@@ -167,11 +258,14 @@ func (c *WebClient) resolveMccGateway() error {
 type threadSearchResp struct {
 	TotalThreadsReturned int `json:"totalThreadsReturned"`
 	ThreadList           []struct {
-		ThreadID  string   `json:"threadId"`
-		Subject   string   `json:"subject"`
-		Senders   []string `json:"senders"`
-		Preview   string   `json:"preview"`
-		Timestamp int64    `json:"timestamp"`
+		ThreadID     string          `json:"threadId"`
+		Subject      string          `json:"subject"`
+		Senders      []string        `json:"senders"`
+		To           json.RawMessage `json:"to"`
+		ToRecipients json.RawMessage `json:"toRecipients"`
+		Recipients   json.RawMessage `json:"recipients"`
+		Preview      string          `json:"preview"`
+		Timestamp    int64           `json:"timestamp"`
 	} `json:"threadList"`
 }
 
@@ -193,10 +287,18 @@ func (c *WebClient) search(payload string) ([]Message, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	c.updateCookies(resp)
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := readAllLimited(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("获取邮件失败: HTTP %d - %s", resp.StatusCode, truncate(string(body), 300))
+		snippet := string(body)
+		if strings.Contains(snippet, "Non iCloud Mail user") || strings.Contains(snippet, "Empty Mail ID") {
+			return nil, fmt.Errorf("账号未开通 iCloud 邮件功能 (Non iCloud Mail user)")
+		}
+		return nil, fmt.Errorf("获取邮件失败: HTTP %d - %s", resp.StatusCode, truncate(snippet, 300))
 	}
 	if strings.Contains(string(body), `"success":false`) {
 		return nil, fmt.Errorf("获取邮件失败: %s", truncate(string(body), 300))
@@ -213,19 +315,55 @@ func (c *WebClient) search(payload string) ([]Message, error) {
 		if len(t.Senders) > 0 {
 			from = t.Senders[0]
 		}
+		to := parseWebRecipients(t.To, t.ToRecipients, t.Recipients)
 		date := ""
 		if t.Timestamp > 0 {
-			date = time.UnixMilli(t.Timestamp).Format(time.RFC3339)
+			date = time.UnixMilli(t.Timestamp).UTC().Format(time.RFC3339)
 		}
 		messages = append(messages, Message{
 			ID:      t.ThreadID,
 			From:    from,
+			To:      to,
 			Subject: t.Subject,
 			Preview: sanitizePreview(t.Preview),
 			Date:    date,
 		})
 	}
 	return messages, nil
+}
+
+func parseWebRecipients(toRaw, toRecipientsRaw, recipientsRaw json.RawMessage) string {
+	for _, raw := range []json.RawMessage{toRecipientsRaw, recipientsRaw, toRaw} {
+		if len(raw) == 0 {
+			continue
+		}
+		var strList []string
+		if json.Unmarshal(raw, &strList) == nil && len(strList) > 0 {
+			return strings.Join(strList, ", ")
+		}
+		var objList []struct {
+			Email   string `json:"email"`
+			Address string `json:"address"`
+		}
+		if json.Unmarshal(raw, &objList) == nil && len(objList) > 0 {
+			var emails []string
+			for _, item := range objList {
+				if item.Email != "" {
+					emails = append(emails, item.Email)
+				} else if item.Address != "" {
+					emails = append(emails, item.Address)
+				}
+			}
+			if len(emails) > 0 {
+				return strings.Join(emails, ", ")
+			}
+		}
+		var singleStr string
+		if json.Unmarshal(raw, &singleStr) == nil && singleStr != "" {
+			return singleStr
+		}
+	}
+	return ""
 }
 
 // ListInbox 列出收件箱邮件。
@@ -243,9 +381,20 @@ func (c *WebClient) SearchMails(query string, limit int) ([]Message, error) {
 	return c.search(payload)
 }
 
-// FindByAlias 查找发给指定别名的邮件——在本地过滤(Web API 不支持收件人搜索)。
+// FindByAlias 查找发给指定别名的邮件——优先使用服务端搜索,并回退本地过滤。
 func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
-	// 拉取收件箱全部邮件(最多取 2*limit),本地过滤
+	// 优先使用服务端检索
+	messages, err := c.SearchMails(alias, limit)
+	if err == nil && len(messages) > 0 {
+		for i := range messages {
+			if messages[i].To == "" {
+				messages[i].To = alias
+			}
+		}
+		return messages, nil
+	}
+
+	// 回退到拉取收件箱并在本地过滤
 	batchSize := limit * 2
 	if batchSize < 50 {
 		batchSize = 50
@@ -261,6 +410,9 @@ func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
 		if strings.Contains(strings.ToLower(m.Subject), strings.ToLower(alias)) ||
 			strings.Contains(strings.ToLower(m.From), strings.ToLower(alias)) ||
 			strings.Contains(strings.ToLower(m.To), strings.ToLower(alias)) {
+			if m.To == "" {
+				m.To = alias
+			}
 			filtered = append(filtered, m)
 			if len(filtered) >= limit {
 				break
@@ -273,6 +425,10 @@ func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	// 回退到 UTF-8 字符边界，避免把多字节字符截成乱码
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n]
 }

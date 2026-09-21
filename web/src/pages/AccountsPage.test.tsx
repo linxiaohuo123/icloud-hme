@@ -147,12 +147,14 @@ describe('AccountsPage', () => {
     renderPage()
     await screen.findByText('活跃号')
     const user = userEvent.setup()
-    await user.click(screen.getAllByRole('button', { name: /更新 Cookie/ })[0])
+    await user.click(screen.getAllByRole('button', { name: /更多操作/ })[0])
+    await user.click(screen.getByRole('button', { name: /更新 Cookie/ }))
     const textarea = screen.getByLabelText('Cookie') as HTMLTextAreaElement
     await user.type(textarea, 'a=1; b=2')
     await user.click(screen.getByRole('button', { name: /保存/ }))
     await waitFor(() => expect(cookieBody).toContain('a=1; b=2'))
-    expect((screen.getByLabelText('Cookie') as HTMLTextAreaElement).value).toBe('')
+    // 保存成功后弹窗自动关闭（组件卸载）
+    await waitFor(() => expect(screen.queryByLabelText('Cookie')).toBeNull())
   })
 
   it('iCloud 登录收到 OTP_REQUIRED 后只显示 OTP 输入并可重试', async () => {
@@ -173,7 +175,8 @@ describe('AccountsPage', () => {
     renderPage()
     await screen.findByText('活跃号')
     const user = userEvent.setup()
-    await user.click(screen.getAllByRole('button', { name: /iCloud 登录/ })[0])
+    await user.click(screen.getAllByRole('button', { name: /更多操作/ })[0])
+    await user.click(screen.getByRole('button', { name: /iCloud 登录/ }))
     await user.type(screen.getByLabelText(/密码/), 'p@ssw0rd')
     let dialog = screen.getByRole('dialog')
     await user.click(within(dialog).getByRole('button', { name: /登录/ }))
@@ -198,12 +201,14 @@ describe('AccountsPage', () => {
     renderPage()
     await screen.findByText('活跃号')
     const user = userEvent.setup()
-    await user.click(screen.getAllByRole('button', { name: /设置 App 密码/ })[0])
+    await user.click(screen.getAllByRole('button', { name: /更多操作/ })[0])
+    await user.click(screen.getByRole('button', { name: /设置 App 密码/ }))
     await user.type(screen.getByLabelText(/邮箱/), 'app@icloud.com')
     await user.type(screen.getByLabelText('App 专用密码'), 'xxxx-xxxx-xxxx-xxxx')
     await user.click(screen.getByRole('button', { name: /保存/ }))
     await waitFor(() => expect(pwdBody).toContain('app@icloud.com'))
-    expect((screen.getByLabelText('App 专用密码') as HTMLInputElement).value).toBe('')
+    // 保存成功后弹窗自动关闭（组件卸载）
+    await waitFor(() => expect(screen.queryByLabelText('App 专用密码')).toBeNull())
   })
 
   it('代理从不回显:保存后输入清空,关闭再打开仍为空', async () => {
@@ -220,16 +225,17 @@ describe('AccountsPage', () => {
     renderPage()
     await screen.findByText('活跃号')
     const user = userEvent.setup()
-    await user.click(screen.getAllByRole('button', { name: /设置代理/ })[0])
+    await user.click(screen.getAllByRole('button', { name: /更多操作/ })[0])
+    await user.click(screen.getByRole('button', { name: /设置代理/ }))
     const input = screen.getByLabelText(/代理地址/) as HTMLInputElement
     expect(input.value).toBe('')
     await user.type(input, 'http://u:p@proxy.example.com:8080')
     await user.click(screen.getByRole('button', { name: /保存/ }))
-    // 保存后输入清空
-    await waitFor(() => expect(input.value).toBe(''))
-    // 关闭后重新打开:仍为空(从不回显)
-    await user.click(screen.getByRole('button', { name: /取消/ }))
-    await user.click(screen.getAllByRole('button', { name: /设置代理/ })[0])
+    // 保存成功后弹窗自动关闭（组件卸载）
+    await waitFor(() => expect(screen.queryByLabelText(/代理地址/)).toBeNull())
+    // 重新打开:仍为空(从不回显)
+    await user.click(screen.getAllByRole('button', { name: /更多操作/ })[0])
+    await user.click(screen.getByRole('button', { name: /设置代理/ }))
     expect((screen.getByLabelText(/代理地址/) as HTMLInputElement).value).toBe('')
   })
 
@@ -245,7 +251,8 @@ describe('AccountsPage', () => {
     renderPage()
     await screen.findByText('活跃号')
     const user = userEvent.setup()
-    await user.click(screen.getAllByRole('button', { name: /删除/ })[0])
+    await user.click(screen.getAllByRole('button', { name: /更多操作/ })[0])
+    await user.click(screen.getByRole('button', { name: /删除/ }))
     expect(screen.getByRole('dialog')).toBeInTheDocument()
     // 名称不匹配时按钮禁用
     await user.type(screen.getByLabelText(/输入账号名称/), '错误名称')
@@ -254,4 +261,37 @@ describe('AccountsPage', () => {
     await user.click(screen.getByRole('button', { name: /取消/ }))
     expect(deleted).toBe(false)
   })
+
+  it('编辑账号:正确回显当前名称与邮箱,修改后提交成功', async () => {
+    let patchedBody: Record<string, string> = {}
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.patch('/api/accounts/:id', async ({ request }) => {
+        patchedBody = (await request.json()) as Record<string, string>
+        return HttpResponse.json({
+          success: true,
+          data: { ...accounts[0], name: patchedBody.name },
+        })
+      }),
+    )
+    renderPage()
+    await screen.findByText('活跃号')
+    const user = userEvent.setup()
+    await user.click(screen.getAllByRole('button', { name: /更多操作/ })[0])
+    await user.click(screen.getByRole('button', { name: /编辑/ }))
+
+    // 验证数据正确回显
+    const nameInput = screen.getByLabelText(/名称/) as HTMLInputElement
+    const emailInput = screen.getByLabelText(/iCloud 邮箱/) as HTMLInputElement
+    expect(nameInput.value).toBe('活跃号')
+    expect(emailInput.value).toBe('active@icloud.com')
+    expect(emailInput).toBeDisabled()
+
+    // 修改名称并保存
+    await user.clear(nameInput)
+    await user.type(nameInput, '活跃号-修改后')
+    await user.click(screen.getByRole('button', { name: /保存/ }))
+    await waitFor(() => expect(patchedBody.name).toBe('活跃号-修改后'))
+  })
 })
+

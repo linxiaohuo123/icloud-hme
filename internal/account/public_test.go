@@ -52,7 +52,7 @@ func TestSummaryMapsStatusMessage(t *testing.T) {
 // TestAddAccountWithInputValidation 验证添加账号输入校验。
 func TestAddAccountWithInputValidation(t *testing.T) {
 	dir := t.TempDir()
-	m, err := NewManager(dir)
+	m, err := NewManager(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +68,8 @@ func TestAddAccountWithInputValidation(t *testing.T) {
 		{"非法邮箱", AddAccountInput{Name: "主号", ICloudEmail: "not-an-email"}, "邮箱"},
 		{"非法代理", AddAccountInput{Name: "主号", ICloudEmail: "a@icloud.com", Proxy: "ftp://user:pass@host:21"}, "代理"},
 		{"合法最小输入", AddAccountInput{Name: "主号", ICloudEmail: "a@icloud.com"}, ""},
+		{"合法socks5h代理", AddAccountInput{Name: "主号", ICloudEmail: "a@icloud.com", Proxy: "socks5h://127.0.0.1:1080"}, ""},
+		{"合法socks4代理", AddAccountInput{Name: "主号", ICloudEmail: "a@icloud.com", Proxy: "socks4://127.0.0.1:1080"}, ""},
 	}
 	for _, tc := range cases {
 		_, err := m.AddAccountWithInput(tc.input)
@@ -86,7 +88,7 @@ func TestAddAccountWithInputValidation(t *testing.T) {
 // TestAddAccountWithInputValidatesEmailFormat 验证邮箱必须等于解析后的地址。
 func TestAddAccountWithInputValidatesEmailFormat(t *testing.T) {
 	dir := t.TempDir()
-	m, err := NewManager(dir)
+	m, err := NewManager(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +105,7 @@ func TestAddAccountWithInputValidatesEmailFormat(t *testing.T) {
 // TestUpdateMetadataValidation 验证编辑账号校验与行为。
 func TestUpdateMetadataValidation(t *testing.T) {
 	dir := t.TempDir()
-	m, err := NewManager(dir)
+	m, err := NewManager(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +143,7 @@ func TestUpdateMetadataValidation(t *testing.T) {
 // TestUpdateProxyClearsProxy 验证代理清除。
 func TestUpdateProxyClearsProxy(t *testing.T) {
 	dir := t.TempDir()
-	m, err := NewManager(dir)
+	m, err := NewManager(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +166,7 @@ func TestUpdateProxyClearsProxy(t *testing.T) {
 // TestListSummariesStableOrder 验证 active → pending → error 排序及同状态稳定排序。
 func TestListSummariesStableOrder(t *testing.T) {
 	dir := t.TempDir()
-	m, err := NewManager(dir)
+	m, err := NewManager(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +193,7 @@ func TestListSummariesStableOrder(t *testing.T) {
 // TestAddAccountWithInputNoNetwork 验证无 Cookie 的添加不访问网络。
 func TestAddAccountWithInputNoNetwork(t *testing.T) {
 	dir := t.TempDir()
-	m, err := NewManager(dir)
+	m, err := NewManager(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +212,7 @@ func TestAddAccountWithInputNoNetwork(t *testing.T) {
 // TestUpdateProxyInvalid 验证非法代理报固定文案且不泄露 URL。
 func TestUpdateProxyInvalid(t *testing.T) {
 	dir := t.TempDir()
-	m, err := NewManager(dir)
+	m, err := NewManager(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,5 +226,63 @@ func TestUpdateProxyInvalid(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "proxy-secret") || strings.Contains(err.Error(), "ftp://") {
 		t.Fatalf("错误不应泄露代理内容: %v", err)
+	}
+}
+
+// TestParseCookieInputArray 验证浏览器插件导出的 Cookie 数组能正确解析。
+func TestParseCookieInputArray(t *testing.T) {
+	input := `[
+		{"name": "X-APPLE-WEBAUTH-TOKEN", "value": "token_val"},
+		{"name": "X-APPLE-WEBAUTH-USER", "value": "user_val"},
+		{"name": "", "value": "empty_key"}
+	]`
+	cookies, err := ParseCookieInput(input)
+	if err != nil {
+		t.Fatalf("解析 JSON 数组失败: %v", err)
+	}
+	if cookies["X-APPLE-WEBAUTH-TOKEN"] != "token_val" || cookies["X-APPLE-WEBAUTH-USER"] != "user_val" {
+		t.Fatalf("解析结果错误: %+v", cookies)
+	}
+	if len(cookies) != 2 {
+		t.Fatalf("期望过滤空字段后有 2 个条目, 实际得到 %d 个", len(cookies))
+	}
+}
+
+// TestParseCookieInputNetscapeAndPrefix 验证 Netscape 文本与带 Cookie 前缀的 Header 解析。
+func TestParseCookieInputNetscapeAndPrefix(t *testing.T) {
+	// 1. 带 Cookie: 前缀
+	headerWithPrefix := "Cookie: X-APPLE-WEBAUTH-TOKEN=token123; X-APPLE-WEBAUTH-USER=user456"
+	c1, err := ParseCookieInput(headerWithPrefix)
+	if err != nil || c1["X-APPLE-WEBAUTH-TOKEN"] != "token123" {
+		t.Fatalf("Cookie 前缀解析失败: %v, %+v", err, c1)
+	}
+
+	// 2. Netscape 制表符格式
+	netscapeText := "# Netscape HTTP Cookie File\n" +
+		".icloud.com\tTRUE\t/\tTRUE\t1799999999\tX-APPLE-WEBAUTH-TOKEN\ttoken_netscape\n" +
+		".icloud.com\tTRUE\t/\tTRUE\t1799999999\tdslang\tUS-EN\n"
+	c2, err := ParseCookieInput(netscapeText)
+	if err != nil || c2["X-APPLE-WEBAUTH-TOKEN"] != "token_netscape" || c2["dslang"] != "US-EN" {
+		t.Fatalf("Netscape 格式解析失败: %v, %+v", err, c2)
+	}
+}
+
+// TestNormalizeHost 验证主机归一化与云上贵州识别。
+func TestNormalizeHost(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"https://setup.icloud.com/", "icloud.com"},
+		{"HTTP://ICLOUD.COM.CN", "icloud.com.cn"},
+		{"p120-mailws.icloud.com:443", "icloud.com"},
+		{"https://setup.icloud.com.cn/path", "icloud.com.cn"},
+		{"custom.domain.com", "custom.domain.com"},
+	}
+	for _, tc := range cases {
+		got := normalizeHost(tc.in)
+		if got != tc.want {
+			t.Errorf("normalizeHost(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

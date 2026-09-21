@@ -1,25 +1,42 @@
-import { useState } from 'react'
+/**
+ * [INPUT]: 依赖 api/client 的 request/ApiError，依赖 components/Dialog
+ * [OUTPUT]: 对外提供 AppPasswordDialog 对话框组件
+ * [POS]: web/src/components 的凭据配置弹窗，用于配置 iCloud App 专用密码
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
+import { useEffect, useState } from 'react'
 import Dialog from './Dialog'
 import { request, ApiError } from '../api/client'
 
 interface AppPasswordDialogProps {
   accountId: string
+  defaultEmail?: string
   open: boolean
   onClose: () => void
   onSaved: () => void
 }
 
-/** 设置 App 专用密码对话框:提交后清空 */
+/** 设置 App 专用密码对话框:支持邮箱默认预填 */
 export default function AppPasswordDialog({
   accountId,
+  defaultEmail = '',
   open,
   onClose,
   onSaved,
 }: AppPasswordDialogProps) {
-  const [email, setEmail] = useState('')
+  const [email, setEmail] = useState(defaultEmail)
   const [appPassword, setAppPassword] = useState('')
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+
+  useEffect(() => {
+    if (!open) return
+    setEmail(defaultEmail || '')
+    setAppPassword('')
+    setError('')
+    setSubmitting(false)
+  }, [open, defaultEmail])
 
   async function handleSubmit() {
     if (submitting) return
@@ -32,7 +49,7 @@ export default function AppPasswordDialog({
     try {
       await request(`/api/accounts/${accountId}/password`, {
         method: 'POST',
-        body: JSON.stringify({ icloud_email: email, app_password: appPassword }),
+        body: JSON.stringify({ icloud_email: email.trim(), app_password: appPassword.trim() }),
       })
       setEmail('')
       setAppPassword('')
@@ -67,6 +84,7 @@ export default function AppPasswordDialog({
           type="email"
           value={email}
           onChange={(e) => setEmail(e.target.value)}
+          placeholder="your_apple_id@icloud.com"
         />
       </div>
       <div className="form-field">
@@ -77,6 +95,7 @@ export default function AppPasswordDialog({
           autoComplete="off"
           value={appPassword}
           onChange={(e) => setAppPassword(e.target.value)}
+          placeholder="xxxx-xxxx-xxxx-xxxx"
         />
       </div>
       <div className="form-actions">
