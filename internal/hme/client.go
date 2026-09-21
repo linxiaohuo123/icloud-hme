@@ -13,6 +13,7 @@ package hme
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -266,6 +267,11 @@ func requestOrigin(rawURL string) string {
 
 // request 执行带重试的 HTTP 请求,返回响应体字符串。
 func (c *Client) request(method, rawURL string, body any, timeout time.Duration, maxAttempts int) (string, error) {
+	return c.RequestWithContext(context.Background(), method, rawURL, body, timeout, maxAttempts)
+}
+
+// RequestWithContext 执行带 context 贯穿与重试预算的 HTTP 请求 (PR-05)。
+func (c *Client) RequestWithContext(ctx context.Context, method, rawURL string, body any, timeout time.Duration, maxAttempts int) (string, error) {
 	if timeout == 0 {
 		timeout = RequestTimeout
 	}
@@ -287,6 +293,12 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+
 		var reqBody io.Reader
 		if body != nil {
 			buf, err := json.Marshal(body)
@@ -296,7 +308,7 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 			reqBody = bytes.NewReader(buf)
 		}
 
-		req, err := http.NewRequest(method, fullURL, reqBody)
+		req, err := http.NewRequestWithContext(ctx, method, fullURL, reqBody)
 		if err != nil {
 			return "", err
 		}
@@ -316,7 +328,6 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
 
 		// 手动添加 Cookie 头（确保跨域也能传递）
-		// 浏览器发送的 Cookie 值带双引号,iCloud 严格匹配
 		var cookieHeader string
 		c.cookieMu.RLock()
 		if len(c.Cookies) > 0 {
@@ -336,7 +347,6 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 			req.Header.Set("Cookie", cookieHeader)
 			if c.Verbose {
 				c.log(">>> URL: %s", fullURL)
-				// 凭据类头部一律打码:verbose 日志会进 journal/docker logs，绝不能落明文会话令牌
 				c.log(">>> Cookie: %s", redactSecret(cookieHeader))
 				for k, vv := range req.Header {
 					for _, v := range vv {
@@ -354,25 +364,28 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 		if err != nil {
 			lastErr = fmt.Errorf("连接失败: %w", err)
 			if attempt < maxAttempts {
-				c.sleepRetry(attempt)
+				if sleepErr := c.sleepRetry(ctx, attempt); sleepErr != nil {
+					return "", sleepErr
+				}
 				continue
 			}
 			return "", lastErr
 		}
 
-		// 读取上限防御: 异常响应不至于把内存吃满
+		// 读取上限防御
 		text, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 		_ = resp.Body.Close()
 		if err != nil {
 			lastErr = fmt.Errorf("读取响应失败: %w", err)
 			if attempt < maxAttempts {
-				c.sleepRetry(attempt)
+				if sleepErr := c.sleepRetry(ctx, attempt); sleepErr != nil {
+					return "", sleepErr
+				}
 				continue
 			}
 			return "", lastErr
 		}
 
-		// 从 Set-Cookie 响应头更新 Cookie（模拟浏览器行为,iCloud 会刷新或吊销 token）
 		respCookies := resp.Cookies()
 		if len(respCookies) > 0 {
 			now := time.Now()
@@ -395,13 +408,19 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 			if len(snippet) > 200 {
 				snippet = snippet[:200]
 			}
-			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, snippet)
 			// 401/403 说明 Cookie 失效,不重试直接返回。
 			if resp.StatusCode == 401 || resp.StatusCode == 403 {
-				return "", lastErr
+				return "", fmt.Errorf("%w: HTTP %d: %s", ErrAuthFailed, resp.StatusCode, snippet)
+			}
+			if resp.StatusCode == 429 {
+				lastErr = fmt.Errorf("%w: HTTP 429: %s", ErrRateLimited, snippet)
+			} else {
+				lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, snippet)
 			}
 			if attempt < maxAttempts {
-				c.sleepRetry(attempt)
+				if sleepErr := c.sleepRetry(ctx, attempt); sleepErr != nil {
+					return "", sleepErr
+				}
 				continue
 			}
 			return "", lastErr
@@ -415,12 +434,17 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 	return "", fmt.Errorf("未知错误")
 }
 
-func (c *Client) sleepRetry(attempt int) {
+func (c *Client) sleepRetry(ctx context.Context, attempt int) error {
 	idx := attempt - 1
 	if idx >= len(retryDelays) {
 		idx = len(retryDelays) - 1
 	}
-	time.Sleep(retryDelays[idx])
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(retryDelays[idx]):
+		return nil
+	}
 }
 
 // validationURLs 返回会话校验端点。

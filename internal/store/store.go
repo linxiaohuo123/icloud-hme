@@ -196,6 +196,9 @@ func NewStore(dataDir string) (*Store, error) {
 	// 用出号流水回填别名路由(覆盖本功能上线前已分配的别名)
 	s.backfillAliasRoutes()
 
+	// 自动迁移历史别名库存与唯一分配关系 (PR-03)
+	_ = s.migrateInventory()
+
 	// 启动令牌活跃度异步批量刷新器
 	go s.activityFlusher()
 
@@ -386,7 +389,7 @@ func (s *Store) initSchema() error {
 	_, _ = s.db.Exec(`ALTER TABLE schedules ADD COLUMN end_time TEXT DEFAULT ''`)
 	_, _ = s.db.Exec(`ALTER TABLE schedules ADD COLUMN duration_hours INTEGER DEFAULT 0`)
 	_, _ = s.db.Exec(`ALTER TABLE schedules ADD COLUMN started_at TEXT DEFAULT ''`)
-	return nil
+	return s.initInventorySchema()
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -544,6 +547,19 @@ func (s *Store) ValidateTokenWithName(tokenStr string) (name string, scopes stri
 	default:
 	}
 	return name, scopes, true
+}
+
+// ValidateTokenPrincipal 校验令牌并返回 ID、名称与作用域集合 (PR-04)。
+func (s *Store) ValidateTokenPrincipal(tokenStr string) (id, name, scopes string, ok bool) {
+	err := s.db.QueryRow(`SELECT id, name, COALESCE(scopes, '') FROM api_tokens WHERE token = ?`, tokenStr).Scan(&id, &name, &scopes)
+	if err != nil {
+		return "", "", "", false
+	}
+	select {
+	case s.activityCh <- id:
+	default:
+	}
+	return id, name, scopes, true
 }
 
 // ────────────────────────────────────────────────────────────────

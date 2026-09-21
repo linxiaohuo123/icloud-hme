@@ -77,26 +77,67 @@ go test -race ./...              -> Exit Code: 1 (本地 Windows 环境未安装
   2. 普通外部 API 令牌（非管理员）直接调用 `GET /api/inbox*` 或 `GET /api/mailboxes` 由 200 变为 `403 SCOPE_DENIED`。外部自动化应使用标准的 `/api/verify-code` 或 `/api/external/v1/verify-code`。
   3. 普通外部 API 令牌在 `/api/allocate` 中传 `account_id` 由允许变为 `403 FORBIDDEN`（防范跨账号窃取或突破负载均衡策略）。
 - **当前仍关闭的能力**：
-  - 物理邮件删除（无论是 IMAP 还是 WebMail）：已全面关闭，等待 PR-02 建立可靠邮件引用模型与 UID EXPUNGE 支持后重新评估。
-  - 历史流水物理删除：已暂停，等待 PR-03 独立库存防重模型分离。
-  - 外部令牌直接现场并发批量创建：已暂停，等待 PR-05 写入恢复状态机。
+  - 物理邮件删除（无论是 IMAP 还是 WebMail）：已在 PR-02 完成 RFC 4315 UID EXPUNGE 评估并保持安全阻断与能力探测支持。
+  - 历史流水物理删除：已由 PR-03 独立领域库存 (alias_inventory, alias_allocations, operations) 分离。
+  - 外部令牌现场批量建号：已由 PR-04/PR-05 幂等操作状态机与上游核对恢复机制完备支持。
 
 ---
 
 ### 5. 提交/推送/部署状态
 
-- **提交状态**：本地工作区修改就绪，遵循“不得直接推送 main、不得覆盖未提交已有改动”的铁律，等待人工核验或创建特性分支。
-- **推送状态**：未推送。
-- **部署状态**：未自动部署，未连接生产数据库与生产环境。
+- **PR-00 / PR-01 分支**：`pr/pr00-pr01-hardening` (已推送到远端 `origin/pr/pr00-pr01-hardening`)
+- **PR-02 分支**：`pr/pr02-mail-correctness` (已推送到远端 `origin/pr/pr02-mail-correctness`)
+- **PR-03 ~ PR-05 分支**：`pr/pr03-pr05-domain-correctness` (本地全量测试 100% 通过，准备提交并推送)
+- **部署状态**：未直接推 main，未自动发布上线。
 
 ---
 
-### 6. 下一轮 PR-02 任务展望
+## 阶段批次：PR-02 (邮件身份、详情前后端契约与防污染隔离)
 
-- 主题：**邮件身份、详情契约及安全删除**
-- 任务重点：
-  1. 详情包装结构规范化（保留 `{success, data: {message: ...}}`，前端使用 `MessageDetailResponse` 严格读取）；
-  2. 引入规范化邮件引用（`MessageRef`），包含 `provider`、`account_id`、`mailbox`、`uid_validity`、`uid`，杜绝跨文件夹/跨账号覆盖与串信；
-  3. 前端缓存竞态消除（切换账号/文件夹取消未完成请求）；
-  4. 批量拉取响应对齐（每项保留 `requested_ref`，明确成功与失败，杜绝拿最近邮件冒充成功）；
-  5. 安全物理删除能力探针与 RFC 4315 UID EXPUNGE 支持核验。
+- **执行日期**：2026-09-21
+- **分支**：`pr/pr02-mail-correctness`
+- **实现清单**：
+  1. 统一前后端邮件详情契约，统一为 `{success: true, data: {message: ...}}`。
+  2. 统一邮件对象引用身份 `MessageRef` (`provider`, `account_id`, `mailbox`, `uid_validity`, `uid`, `thread_id`)，杜绝裸 UID 充当全局唯一 ID。
+  3. 前端收件箱组件 `InboxTableView` 增加跨账号切换竞态消除、Generation 递增防污染与缓存对称性隔离。
+  4. 邮件物理删除严格核验 UIDVALIDITY，不可靠或不支持时明确返回友好错误。
+  5. 新增前后端回归测试套件（`internal/server/mail_pr02_test.go`、`web/src/utils/mail.test.ts`、`web/src/components/inbox/InboxTableView.test.tsx`），全部 11 项用例 PASS。
+
+---
+
+## 阶段批次：PR-03 ~ PR-05 (领域库存、主体授权与上游可靠核对)
+
+- **执行日期**：2026-09-21
+- **分支**：`pr/pr03-pr05-domain-correctness`
+- **实现清单**：
+  1. **PR-03 领域级独立库存与分配表**：
+     - 新建 `alias_inventory`（别名物理库存）、`alias_allocations`（租用分配记录）、`operations`（幂等操作日志）。
+     - 实现 `ClaimInventoryAlias`，通过行级排他锁、CAS 状态原子流转与跨表事务，杜绝并发重分配。
+     - 实现 D01-D08 单元测试（`internal/store/inventory_test.go`），覆盖原子分配、幂等重放、配额仲裁与冲突隔离。
+  2. **PR-04 统一主体身份与外部 v2 契约**：
+     - 新建 `internal/auth/principal.go`，统领 `admin`, `token`, `system` 主体身份模型与资源授权。
+     - 在验证码长轮询与缓存提取前强制核验主体资源归属权限 (`IsEmailOwnedByToken`)，杜绝凭 Token 跨权嗅探其他业务验证码。
+     - 长轮询唤醒后原子复查令牌有效性，已撤销令牌立即阻断。
+     - 开放外部标准 v2 路由：
+       - `POST /api/external/v2/allocate` (显式 lease_id, idempotent_key, operation_id)
+       - `GET /api/external/v2/operations/:operation_id` (操作状态查询与重试追踪)
+       - `POST /api/external/v2/verification-requests` (显式取码意图请求)
+       - `GET /api/external/v2/verification-requests/:request_id` (按请求ID提取验证码)
+     - 实现 A01-A07 单元测试（`internal/server/auth_pr04_test.go`）。
+  3. **PR-05 可靠上游调用与写入恢复**：
+     - HTTP Client、别名操作与重试等待全链路 Context 贯穿，超时立即响应取消。
+     - 引入分类错误 `ErrInvalidResponseSchema`, `ErrOutcomeUnknown`, `ErrAuthFailed`, `ErrRateLimited`。
+     - `parseAliasList` 严格防御 HTML 登录拦截页、无效 JSON、success=false 与结构漂移，严禁将格式异常伪装为空库存。
+     - `ReserveWithContext` 实现写入结果不明核对恢复（U04），网络异常时自动调用列表核对候选是否已成功落盘，避免重复占号。
+     - 实现 U01-U10 单元测试（`internal/hme/hme_pr05_test.go`）。
+- **真实命令与退出码**：
+  ```text
+  npm --prefix web run lint        -> Exit Code: 0 (0 错误)
+  npm --prefix web run test:run    -> Exit Code: 0 (16/16 文件通过, 101/101 用例全部通过)
+  npm --prefix web run build       -> Exit Code: 0 (TypeScript 校验通过, 构建成功)
+  go vet ./...                     -> Exit Code: 0 (0 警告)
+  go build ./...                   -> Exit Code: 0 (全模块编译构建成功)
+  go test ./...                    -> Exit Code: 0 (全部模块通过)
+  go test -race ./...              -> Exit Code: 1 (本地 Windows 环境未安装 GCC/CGO, 由 CI 执行)
+  ```
+

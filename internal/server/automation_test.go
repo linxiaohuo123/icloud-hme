@@ -245,8 +245,8 @@ func TestExternalAllocateAndVerifyRoutes(t *testing.T) {
 		t.Fatalf("POST /api/external/v1/allocate 期望 200, 实际得到: %d", resp2.StatusCode)
 	}
 
-	// 4. 测试 GET /api/external/v1/verify-code (使用 API Key)
-	req3, _ := http.NewRequest("GET", ts.URL+"/api/external/v1/verify-code?email=target@icloud.com&timeout=1", nil)
+	// 4. 测试 GET /api/external/v1/verify-code (使用 Token 查询自己租用的别名)
+	req3, _ := http.NewRequest("GET", ts.URL+"/api/external/v1/verify-code?email="+out.Data.Email+"&timeout=1", nil)
 	req3.Header.Set("Authorization", "Bearer faka-token-secret-12345")
 	resp3, err := http.DefaultClient.Do(req3)
 	if err != nil {

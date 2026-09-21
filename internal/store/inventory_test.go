@@ -1,0 +1,340 @@
+/**
+ * [INPUT]: 依赖 testing, path/filepath, sync, context, fmt, icloud-hme/internal/store, icloud-hme/internal/hme
+ * [OUTPUT]: 对外提供 PR-03 别名库存状态机、SQLite 事务原子认领与幂等防重单元测试 (D01-D08)
+ * [POS]: internal/store 的领域状态与事务正确性回归防线
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+
+	"icloud-hme/internal/hme"
+)
+
+// D01: 100 个并发相同幂等请求仅产生一个 allocation，响应结果完全一致
+func TestPR03_D01_ConcurrentIdenticalIdempotentClaim(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	// 准备可用库存
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "pool1@icloud.com", Active: true}, "replenish", true)
+
+	ctx := context.Background()
+	const concurrency = 100
+	idempKey := "idemp_same_key_100"
+	reqHash := "hash_abc_123"
+
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	results := make([]*AliasAllocation, concurrency)
+	errorsList := make([]error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			alloc, err := st.ClaimInventoryAlias(ctx, "token", "tok_test", "allocate", idempKey, reqHash, "test_tag", "")
+			results[idx] = alloc
+			errorsList[idx] = err
+		}(i)
+	}
+
+	wg.Wait()
+
+	var firstAlloc *AliasAllocation
+	for i := 0; i < concurrency; i++ {
+		// 只要有结果，要么成功获得 allocation，要么报告 operation pending
+		if errorsList[i] == nil {
+			if firstAlloc == nil {
+				firstAlloc = results[i]
+			} else {
+				if results[i].AllocationID != firstAlloc.AllocationID || results[i].AliasEmail != firstAlloc.AliasEmail {
+					t.Fatalf("idempotent results diverged: first=%+v, other=%+v", firstAlloc, results[i])
+				}
+			}
+		} else if !errors.Is(errorsList[i], ErrOperationPending) {
+			t.Fatalf("unexpected error: %v", errorsList[i])
+		}
+	}
+
+	if firstAlloc == nil {
+		t.Fatal("at least one claim must succeed")
+	}
+
+	// 再次以相同 key 和 hash 查询，必须返回相同的 allocation
+	repeatAlloc, err := st.ClaimInventoryAlias(ctx, "token", "tok_test", "allocate", idempKey, reqHash, "test_tag", "")
+	if err != nil || repeatAlloc.AllocationID != firstAlloc.AllocationID {
+		t.Fatalf("subsequent claim with same idempKey must return exact same allocation, got %+v, err=%v", repeatAlloc, err)
+	}
+}
+
+// D02: 100 个并发不同幂等请求不会重复认领同一别名
+func TestPR03_D02_ConcurrentDifferentClaimsNoDuplicate(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	const poolSize = 30
+	for i := 0; i < poolSize; i++ {
+		email := fmt.Sprintf("pool_%d@icloud.com", i)
+		_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: email, Active: true}, "replenish", true)
+	}
+
+	ctx := context.Background()
+	const concurrency = 100
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	claimedEmails := make([]string, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			idempKey := fmt.Sprintf("idemp_diff_%d", idx)
+			alloc, err := st.ClaimInventoryAlias(ctx, "token", fmt.Sprintf("tok_%d", idx), "allocate", idempKey, "hash", "tag", "")
+			if err == nil && alloc != nil {
+				claimedEmails[idx] = alloc.AliasEmail
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	seen := make(map[string]bool)
+	successCount := 0
+	for _, email := range claimedEmails {
+		if email != "" {
+			if seen[email] {
+				t.Fatalf("CRITICAL: duplicate allocation detected for email: %s", email)
+			}
+			seen[email] = true
+			successCount++
+		}
+	}
+
+	if successCount != poolSize {
+		t.Fatalf("expected exactly %d successful claims, got %d", poolSize, successCount)
+	}
+}
+
+// D03: 两个独立 Store 连接访问同一数据库文件，依然具备防重能力
+func TestPR03_D03_TwoIndependentStoreConnections(t *testing.T) {
+	tempDir := t.TempDir()
+	st1, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("store 1 init failed: %v", err)
+	}
+	defer st1.Close()
+
+	// 存入仅有的一封可用别名
+	_ = st1.AddInventoryAlias("acc_1", hme.Alias{Email: "single_stock@icloud.com", Active: true}, "replenish", true)
+
+	// 创建第二个独立的 Store 实例连接同一个 SQLite 文件
+	st2, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("store 2 init failed: %v", err)
+	}
+	defer st2.Close()
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var alloc1, alloc2 *AliasAllocation
+	var err1, err2 error
+
+	go func() {
+		defer wg.Done()
+		alloc1, err1 = st1.ClaimInventoryAlias(ctx, "token", "tok_conn1", "allocate", "key_conn1", "h1", "tag", "")
+	}()
+
+	go func() {
+		defer wg.Done()
+		alloc2, err2 = st2.ClaimInventoryAlias(ctx, "token", "tok_conn2", "allocate", "key_conn2", "h2", "tag", "")
+	}()
+
+	wg.Wait()
+
+	// 必须且仅有一个成功，另一个必须失败为 ErrNoAvailableInventory
+	successes := 0
+	if err1 == nil && alloc1 != nil {
+		successes++
+	}
+	if err2 == nil && alloc2 != nil {
+		successes++
+	}
+
+	if successes != 1 {
+		t.Fatalf("expected exactly 1 success between independent store connections, got %d (err1=%v, err2=%v)", successes, err1, err2)
+	}
+}
+
+// D04: 令牌改名或删除不影响库存的已分配状态
+func TestPR03_D04_TokenRenameDeleteDoesNotResetInventory(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	tok := APIToken{ID: NewAPITokenID(), Name: "OriginalName", Token: "tok_secret_123", Scopes: DefaultExternalScopes}
+	_ = st.SaveToken(tok)
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "d04@icloud.com", Active: true}, "replenish", true)
+
+	alloc, err := st.ClaimInventoryAlias(context.Background(), "token", tok.ID, "allocate", "k_d04", "h", "tag", "")
+	if err != nil || alloc.AliasEmail != "d04@icloud.com" {
+		t.Fatalf("initial claim failed: %v", err)
+	}
+
+	// 1. 令牌改名
+	tok.Name = "RenamedToken"
+	_ = st.SaveToken(tok)
+	// 2. 验证库存仍然为 allocated，绝不可被再次认领
+	_, err = st.ClaimInventoryAlias(context.Background(), "token", "another_tok", "allocate", "k_diff", "h", "tag", "")
+	if !errors.Is(err, ErrNoAvailableInventory) {
+		t.Fatalf("inventory must remain allocated after token rename, got: %v", err)
+	}
+
+	// 3. 删除令牌
+	_, _ = st.DeleteToken(tok.ID)
+	// 4. 验证库存仍然为 allocated
+	_, err = st.ClaimInventoryAlias(context.Background(), "token", "another_tok", "allocate", "k_diff2", "h", "tag", "")
+	if !errors.Is(err, ErrNoAvailableInventory) {
+		t.Fatalf("inventory must remain allocated after token deletion, got: %v", err)
+	}
+}
+
+// D05: 清理 lease_records 不使已分配别名再次可用
+func TestPR03_D05_PruningLeaseRecordsDoesNotResetInventory(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "d05@icloud.com", Active: true}, "replenish", true)
+	_, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_d05", "allocate", "k_d05", "h", "tag", "")
+	if err != nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+
+	// 模拟旧代码物理清空 lease_records 审计历史
+	_, _ = st.db.Exec("DELETE FROM lease_records")
+
+	// 确认即使 lease_records 为空，alias_inventory 的 allocated 状态仍永久存在！
+	_, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_new", "allocate", "k_new", "h", "tag", "")
+	if !errors.Is(err, ErrNoAvailableInventory) {
+		t.Fatalf("pruning lease_records must NOT reset inventory to available, got err: %v", err)
+	}
+}
+
+// D06: 相同幂等键不同参数返回 409 冲突
+func TestPR03_D06_IdempotencyConflictOnDifferentHash(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "d06@icloud.com", Active: true}, "replenish", true)
+
+	// 第一次调用: hash1
+	_, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_d06", "allocate", "key_d06", "hash1", "tag", "")
+	if err != nil {
+		t.Fatalf("first claim failed: %v", err)
+	}
+
+	// 第二次调用: 相同 key 但 hash2
+	_, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_d06", "allocate", "key_d06", "hash2", "tag", "")
+	if !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("expected ErrIdempotencyConflict, got: %v", err)
+	}
+}
+
+// D07: 迁移历史未知别名保持 unknown，不可被认领
+func TestPR03_D07_MigrationUnknownRemainsQuarantined(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("init store failed: %v", err)
+	}
+
+	// 模拟旧系统仅有 alias_routes
+	_, _ = st.db.Exec("INSERT INTO alias_routes (email, account_id, updated_at) VALUES ('legacy_route@icloud.com', 'acc_1', '2026-09-20T00:00:00Z')")
+	_ = st.migrateInventory()
+
+	// 尝试认领此历史别名，必须返回无库存，因为其 allocation_state 必须为 unknown
+	_, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_1", "allocate", "key_legacy", "h", "tag", "")
+	if !errors.Is(err, ErrNoAvailableInventory) {
+		t.Fatalf("legacy route without allocation history must NOT be available, got: %v", err)
+	}
+	st.Close()
+
+	// 重新打开 Store，验证重启后重入迁移幂等安全
+	stReopen, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("reopen store failed: %v", err)
+	}
+	defer stReopen.Close()
+
+	_, err = stReopen.ClaimInventoryAlias(context.Background(), "token", "tok_1", "allocate", "key_legacy2", "h", "tag", "")
+	if !errors.Is(err, ErrNoAvailableInventory) {
+		t.Fatalf("reopened store must still preserve quarantined state, got: %v", err)
+	}
+}
+
+// D08: Apple 远端同步 active 不会把 allocated 覆盖回 available
+func TestPR03_D08_RemoteSyncDoesNotOverwriteAllocated(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "d08@icloud.com", Active: true}, "replenish", true)
+	_, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_d08", "allocate", "k_d08", "h", "tag", "")
+	if err != nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+
+	// 模拟从 Apple 同步到该别名当前仍然为 Active
+	err = st.SyncAliasInventory("acc_1", []hme.Alias{
+		{Email: "d08@icloud.com", AnonymousID: "anon_d08", Active: true},
+	})
+	if err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+
+	// 校验 allocation_state 仍然是 allocated，绝不变成 available
+	var allocState, remoteState string
+	_ = st.db.QueryRow("SELECT allocation_state, remote_state FROM alias_inventory WHERE email = 'd08@icloud.com'").Scan(&allocState, &remoteState)
+	if allocState != "allocated" {
+		t.Fatalf("expected allocation_state to remain allocated, got %s", allocState)
+	}
+	if remoteState != "active" {
+		t.Fatalf("expected remote_state to be active, got %s", remoteState)
+	}
+
+	// 再次认领必须依然无库存
+	_, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_other", "allocate", "k_other", "h", "tag", "")
+	if !errors.Is(err, ErrNoAvailableInventory) {
+		t.Fatalf("expected ErrNoAvailableInventory after sync, got: %v", err)
+	}
+}

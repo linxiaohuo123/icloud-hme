@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"icloud-hme/internal/auth"
 )
 
 // verifyCodeHandler 处理 GET /api/verify-code。
@@ -47,6 +48,20 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "UNSUPPORTED_PARAMETER", "GET verify-code 不再支持 auto_delete 参数，不可通过 GET 请求产生停用别名副作用")
 		return
 	}
+
+	// 【PR-04 资源归属核验】在命中缓存与开启订阅前强制核验主体权限，杜绝越权读取
+	p, exists := getPrincipal(c)
+	if !exists || !p.CanVerify() {
+		failCode(c, http.StatusForbidden, "SCOPE_DENIED", "当前主体无权读取验证码")
+		return
+	}
+	if p.Kind == auth.PrincipalToken && s.store != nil {
+		if !s.store.IsEmailOwnedByToken(c.Request.Context(), email, p.ID, p.TokenName) {
+			failCode(c, http.StatusNotFound, "RESOURCE_NOT_FOUND", "未找到该别名或无权访问")
+			return
+		}
+	}
+
 	fresh := c.Query("fresh") == "true" || c.Query("nocache") == "true"
 
 	// 内存订阅与原子缓存捕获 (缓存命中直接返回, 邮件到达触发事件唤醒, 避免 TOCTOU 竞态)
@@ -63,6 +78,20 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 
 	select {
 	case item := <-ch:
+		// 【PR-04】长轮询唤醒后、完成交付前复查令牌状态 (防止等待期间令牌被撤销)
+		if p.Kind == auth.PrincipalToken && s.store != nil {
+			reqKey := c.GetHeader("X-API-Key")
+			if reqKey == "" {
+				authHeader := c.GetHeader("Authorization")
+				if strings.HasPrefix(authHeader, "Bearer ") {
+					reqKey = strings.TrimPrefix(authHeader, "Bearer ")
+				}
+			}
+			if _, _, _, ok := s.store.ValidateTokenPrincipal(reqKey); !ok {
+				failCode(c, http.StatusUnauthorized, "REVOKED_TOKEN", "令牌已被撤销")
+				return
+			}
+		}
 		// 成功返回后原子消费清除该别名缓存，杜绝后续重发验证码或二次登录误采陈旧历史 OTP
 		s.eventBus.ConsumeCache(email)
 		ok(c, gin.H{

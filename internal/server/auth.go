@@ -51,17 +51,42 @@ func requireSession(mgr *authManager, apiKey string, st *store.Store) gin.Handle
 		if reqKey != "" {
 			// 恒时比较, 避免环境变量 Key 的时序侧信道
 			if apiKey != "" && subtle.ConstantTimeCompare([]byte(reqKey), []byte(apiKey)) == 1 {
+				p := auth.Principal{
+					Kind:      auth.PrincipalAdmin,
+					ID:        "admin",
+					TokenName: "global_api_key",
+					Scopes:    []string{store.ScopeAdmin},
+				}
 				c.Set("is_api_key_auth", true)
 				c.Set("token_name", "global_api_key")
 				c.Set("auth_scopes", store.ScopeAdmin)
+				c.Set("principal", p)
 				c.Next()
 				return
 			}
 			if st != nil {
-				if tokName, scopes, ok := st.ValidateTokenWithName(reqKey); ok {
+				if id, tokName, scopes, ok := st.ValidateTokenPrincipal(reqKey); ok {
+					var scopeList []string
+					if strings.TrimSpace(scopes) == "" || strings.TrimSpace(scopes) == store.ScopeAdmin {
+						scopeList = []string{store.ScopeAdmin}
+					} else {
+						for _, sc := range strings.Split(scopes, ",") {
+							sc = strings.TrimSpace(sc)
+							if sc != "" {
+								scopeList = append(scopeList, sc)
+							}
+						}
+					}
+					p := auth.Principal{
+						Kind:      auth.PrincipalToken,
+						ID:        id,
+						TokenName: tokName,
+						Scopes:    scopeList,
+					}
 					c.Set("is_api_key_auth", true)
 					c.Set("token_name", tokName)
 					c.Set("auth_scopes", scopes)
+					c.Set("principal", p)
 					c.Next()
 					return
 				}
@@ -79,11 +104,28 @@ func requireSession(mgr *authManager, apiKey string, st *store.Store) gin.Handle
 			failCode(c, http.StatusUnauthorized, "AUTH_REQUIRED", "会话已失效,请重新登录")
 			return
 		}
+		p := auth.Principal{
+			Kind:      auth.PrincipalAdmin,
+			ID:        "admin",
+			TokenName: "admin_session",
+			Scopes:    []string{store.ScopeAdmin},
+		}
 		c.Set("session_id", sessionID)
 		// 浏览器管理员会话拥有全部作用域
 		c.Set("auth_scopes", store.ScopeAdmin)
+		c.Set("principal", p)
 		c.Next()
 	}
+}
+
+// getPrincipal 从 Gin 上下文中获取当前已认证的统一主体 (PR-04)
+func getPrincipal(c *gin.Context) (auth.Principal, bool) {
+	v, exists := c.Get("principal")
+	if !exists {
+		return auth.Principal{}, false
+	}
+	p, ok := v.(auth.Principal)
+	return p, ok
 }
 
 // requireScope 在 requireSession 之后做最小权限校验。

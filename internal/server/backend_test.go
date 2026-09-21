@@ -20,6 +20,7 @@ import (
 	"icloud-hme/internal/account"
 	"icloud-hme/internal/hme"
 	"icloud-hme/internal/mail"
+	"icloud-hme/internal/store"
 )
 
 // fakeBackend 是测试用内存 Backend,记录调用,不访问网络。
@@ -262,6 +263,18 @@ func newTestServer(f *fakeBackend) (*Server, *httptest.Server) {
 		SessionTTL:    12 * time.Hour,
 	}
 	s := newWithBackend(f, cfg)
+	ts := httptest.NewServer(s.Handler())
+	return s, ts
+}
+
+// newTestServerWithStore 构造注入特定 store 的测试 Server。
+func newTestServerWithStore(f *fakeBackend, st *store.Store) (*Server, *httptest.Server) {
+	cfg := Config{
+		Debug:         false,
+		AdminPassword: "admin-pass-2026-strong",
+		SessionTTL:    12 * time.Hour,
+	}
+	s := newWithBackendAndStore(f, cfg, st)
 	ts := httptest.NewServer(s.Handler())
 	return s, ts
 }

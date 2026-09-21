@@ -370,6 +370,8 @@ func (s *Server) register() {
 				alloc.POST("/alias/lease", csrfCheck(s.auth), s.quickCreateHandler)
 				alloc.POST("/allocate", csrfCheck(s.auth), s.quickCreateHandler)
 				alloc.POST("/external/v1/allocate", csrfCheck(s.auth), s.quickCreateHandler)
+				alloc.POST("/external/v2/allocate", s.externalV2AllocateHandler)
+				alloc.GET("/external/v2/operations/:operation_id", s.externalV2GetOperationHandler)
 			}
 
 			// ===== 最小权限: 取码作用域 =====
@@ -378,6 +380,8 @@ func (s *Server) register() {
 			{
 				verify.GET("/verify-code", s.verifyCodeHandler)
 				verify.GET("/external/v1/verify-code", s.verifyCodeHandler)
+				verify.POST("/external/v2/verification-requests", s.externalV2CreateVerificationRequestHandler)
+				verify.GET("/external/v2/verification-requests/:request_id", s.externalV2GetVerificationRequestHandler)
 			}
 
 			// ===== 管理面: 仅管理员会话 / admin 作用域令牌可达 =====
