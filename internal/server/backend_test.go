@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 testing, net/http, net/http/httptest, icloud-hme/internal/account, icloud-hme/internal/hme, icloud-hme/internal/mail
+ * [INPUT]: 依赖 testing, sync, net/http, net/http/httptest, icloud-hme/internal/account, icloud-hme/internal/hme, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 fakeBackend 测试桩与 Backend 相关集成单元测试
  * [POS]: internal/server 的 Backend 接口门面、双模邮件读取、parseMessageID 与 WebMail 删除 400 单元测试
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 
 // fakeBackend 是测试用内存 Backend,记录调用,不访问网络。
 type fakeBackend struct {
+	mu       sync.RWMutex
 	accounts []account.Summary
 	aliases  []hme.Alias
 	inbox    InboxResult
@@ -74,9 +76,17 @@ type fakeBackend struct {
 	mailboxBoundaryFunc func(accountID, folder string) (string, uint32, uint32, error)
 }
 
-func (f *fakeBackend) ListAccounts() []account.Summary { return f.accounts }
+func (f *fakeBackend) ListAccounts() []account.Summary {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	res := make([]account.Summary, len(f.accounts))
+	copy(res, f.accounts)
+	return res
+}
 
 func (f *fakeBackend) GetAccount(id string) (account.Summary, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	for _, a := range f.accounts {
 		if a.ID == id {
 			return a, nil
@@ -146,8 +156,11 @@ func (f *fakeBackend) RemoveAccount(id string) bool {
 }
 
 func (f *fakeBackend) Close() {
-	if f.onClose != nil {
-		f.onClose()
+	f.mu.RLock()
+	onClose := f.onClose
+	f.mu.RUnlock()
+	if onClose != nil {
+		onClose()
 	}
 }
 
@@ -223,11 +236,17 @@ func (f *fakeBackend) ListInbox(q InboxQuery) (InboxResult, error) {
 }
 
 func (f *fakeBackend) ListInboxContext(ctx context.Context, q InboxQuery) (InboxResult, error) {
+	f.mu.Lock()
 	f.listInboxQuery = q
-	if f.onListInboxContext != nil {
-		return f.onListInboxContext(ctx, q)
+	onCtx := f.onListInboxContext
+	onList := f.onListInbox
+	inbox := f.inbox
+	f.mu.Unlock()
+
+	if onCtx != nil {
+		return onCtx(ctx, q)
 	}
-	if f.onListInbox != nil {
+	if onList != nil {
 		if err := ctx.Err(); err != nil {
 			return InboxResult{}, err
 		}
@@ -237,7 +256,7 @@ func (f *fakeBackend) ListInboxContext(ctx context.Context, q InboxQuery) (Inbox
 		}
 		ch := make(chan fetchRes, 1)
 		go func() {
-			res, err := f.onListInbox(q)
+			res, err := onList(q)
 			ch <- fetchRes{res, err}
 		}()
 		select {
@@ -247,7 +266,7 @@ func (f *fakeBackend) ListInboxContext(ctx context.Context, q InboxQuery) (Inbox
 			return r.res, r.err
 		}
 	}
-	return f.inbox, nil
+	return inbox, nil
 }
 
 func (f *fakeBackend) ListMailboxes(accountID string) ([]mail.Folder, error) {
@@ -663,7 +682,10 @@ func TestListInboxWithBodyQuery(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("expected 200 OK, got %d", status)
 	}
-	if !fb.listInboxQuery.WithBody {
+	fb.mu.RLock()
+	withBody := fb.listInboxQuery.WithBody
+	fb.mu.RUnlock()
+	if !withBody {
 		t.Fatalf("expected WithBody=true in InboxQuery")
 	}
 }
