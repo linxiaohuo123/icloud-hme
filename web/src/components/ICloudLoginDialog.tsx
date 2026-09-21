@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 components/Dialog, api/client 的 request/ApiError
+ * [OUTPUT]: 对外提供 ICloudLoginDialog 苹果账号官方密码与 OTP 两阶段认证弹窗
+ * [POS]: web/src/components 的凭据认证层，供账号列表与快捷操作消费
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 import { useState } from 'react'
 import Dialog from './Dialog'
 import { request, ApiError } from '../api/client'
@@ -109,8 +116,8 @@ export default function ICloudLoginDialog({
         </div>
       )}
       <div className="form-actions">
-        <button onClick={onClose}>取消</button>
-        <button className="primary" onClick={() => void handleSubmit()} disabled={submitting}>
+        <button type="button" onClick={onClose}>取消</button>
+        <button type="button" className="primary" onClick={() => void handleSubmit()} disabled={submitting}>
           {submitting ? '登录中…' : otpRequired ? '验证' : '登录'}
         </button>
       </div>

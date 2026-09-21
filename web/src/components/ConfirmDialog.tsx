@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 components/Dialog 容器
+ * [OUTPUT]: 对外提供 ConfirmDialog 通用破坏性操作二阶段确认弹窗 (支持关键字校验与异步锁定)
+ * [POS]: web/src/components 的确认反馈层，供全站账号/别名删除等高危操作消费
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 import { useState } from 'react'
 import Dialog from './Dialog'
 
@@ -51,6 +58,7 @@ export default function ConfirmDialog({
       )}
       <div className="form-actions">
         <button
+          type="button"
           onClick={() => {
             setInput('')
             onClose()
@@ -59,6 +67,7 @@ export default function ConfirmDialog({
           取消
         </button>
         <button
+          type="button"
           className="danger"
           disabled={!matched || busy}
           onClick={() => {
@@ -72,3 +81,4 @@ export default function ConfirmDialog({
     </Dialog>
   )
 }
+

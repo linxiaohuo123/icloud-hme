@@ -87,8 +87,8 @@ export default function AccountWorkspace() {
           prev && prev.id === requestedId
             ? {
                 ...prev,
-                alias_total: aliasList.length > 0 ? aliasList.length : prev.alias_total,
-                alias_active: aliasList.length > 0 ? activeCount : prev.alias_active,
+                alias_total: aliasList.length,
+                alias_active: activeCount,
               }
             : prev,
         )

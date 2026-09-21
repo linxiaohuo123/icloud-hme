@@ -34,12 +34,21 @@ export const ScheduleAccountRow = memo(function ScheduleAccountRow({
   onUpdateMode,
   onApplyPreset,
 }: ScheduleAccountRowProps) {
-  // 单行内聚草稿状态，防止全局 3 秒轮询重绘打断用户输入
+  // 单行内聚草稿状态，防止全局 3 秒轮询重绘打断用户输入与高频网络请求
   const [quotaInput, setQuotaInput] = useState(String(cfg.hourly_quota))
   const [isEditingQuota, setIsEditingQuota] = useState(false)
 
   const [labelInput, setLabelInput] = useState(cfg.alias_label || 'scheduled')
   const [isEditingLabel, setIsEditingLabel] = useState(false)
+
+  const [startTimeInput, setStartTimeInput] = useState(cfg.start_time || '09:00')
+  const [isEditingStartTime, setIsEditingStartTime] = useState(false)
+
+  const [endTimeInput, setEndTimeInput] = useState(cfg.end_time || '18:00')
+  const [isEditingEndTime, setIsEditingEndTime] = useState(false)
+
+  const [durationInput, setDurationInput] = useState(String(cfg.duration_hours || 12))
+  const [isEditingDuration, setIsEditingDuration] = useState(false)
 
   useEffect(() => {
     if (!isEditingQuota) {
@@ -54,6 +63,27 @@ export const ScheduleAccountRow = memo(function ScheduleAccountRow({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cfg.alias_label])
+
+  useEffect(() => {
+    if (!isEditingStartTime) {
+      setStartTimeInput(cfg.start_time || '09:00')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cfg.start_time])
+
+  useEffect(() => {
+    if (!isEditingEndTime) {
+      setEndTimeInput(cfg.end_time || '18:00')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cfg.end_time])
+
+  useEffect(() => {
+    if (!isEditingDuration) {
+      setDurationInput(String(cfg.duration_hours || 12))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cfg.duration_hours])
 
   const meterClass =
     cfg.enabled && cfg.hourly_quota > 0 && cfg.current_hour_count >= cfg.hourly_quota
@@ -148,9 +178,15 @@ export const ScheduleAccountRow = memo(function ScheduleAccountRow({
               <input
                 type="time"
                 className="schedule-time-input"
-                value={cfg.start_time || '09:00'}
-                onChange={(e) => {
-                  void onUpdateMode(acc.id, { start_time: e.target.value })
+                value={startTimeInput}
+                onFocus={() => setIsEditingStartTime(true)}
+                onChange={(e) => setStartTimeInput(e.target.value)}
+                onBlur={(e) => {
+                  setIsEditingStartTime(false)
+                  const val = e.target.value
+                  if (val && val !== (cfg.start_time || '09:00')) {
+                    void onUpdateMode(acc.id, { start_time: val })
+                  }
                 }}
                 title="开始时间"
               />
@@ -158,9 +194,15 @@ export const ScheduleAccountRow = memo(function ScheduleAccountRow({
               <input
                 type="time"
                 className="schedule-time-input"
-                value={cfg.end_time || '18:00'}
-                onChange={(e) => {
-                  void onUpdateMode(acc.id, { end_time: e.target.value })
+                value={endTimeInput}
+                onFocus={() => setIsEditingEndTime(true)}
+                onChange={(e) => setEndTimeInput(e.target.value)}
+                onBlur={(e) => {
+                  setIsEditingEndTime(false)
+                  const val = e.target.value
+                  if (val && val !== (cfg.end_time || '18:00')) {
+                    void onUpdateMode(acc.id, { end_time: val })
+                  }
                 }}
                 title="结束时间"
               />
@@ -174,10 +216,21 @@ export const ScheduleAccountRow = memo(function ScheduleAccountRow({
                 min="1"
                 max="72"
                 className="schedule-duration-input"
-                value={cfg.duration_hours || 12}
-                onChange={(e) => {
-                  const num = Math.max(1, Math.min(72, Number(e.target.value) || 1))
-                  void onUpdateMode(acc.id, { duration_hours: num })
+                value={durationInput}
+                onFocus={() => setIsEditingDuration(true)}
+                onChange={(e) => setDurationInput(e.target.value)}
+                onBlur={(e) => {
+                  setIsEditingDuration(false)
+                  const raw = e.target.value.trim()
+                  if (raw === '') {
+                    setDurationInput(String(cfg.duration_hours || 12))
+                    return
+                  }
+                  const safe = Math.max(1, Math.min(72, Number(raw) || 12))
+                  setDurationInput(String(safe))
+                  if (safe !== (cfg.duration_hours || 12)) {
+                    void onUpdateMode(acc.id, { duration_hours: safe })
+                  }
                 }}
               />
               <span className="schedule-duration-unit">小时后停机</span>

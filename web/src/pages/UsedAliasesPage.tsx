@@ -194,6 +194,7 @@ export default function UsedAliasesPage() {
   }, [page, pageSize, selectedTag, search, retryKey])
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const safePage = Math.min(Math.max(1, page), totalPages)
 
   const copyEmail = useCallback(
     async (email: string) => {
@@ -386,7 +387,7 @@ export default function UsedAliasesPage() {
             {total > 0 && (
               <div className="pagination-bar">
                 <span className="pagination-info">
-                  共 <b>{total}</b> 条流水，当前第 <b>{page}</b> / <b>{totalPages}</b> 页
+                  共 <b>{total}</b> 条流水，当前第 <b>{safePage}</b> / <b>{totalPages}</b> 页
                 </span>
                 <div className="pagination-controls">
                   <Select
@@ -401,8 +402,8 @@ export default function UsedAliasesPage() {
                   <button
                     type="button"
                     className="pagination-btn"
-                    disabled={page <= 1}
-                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    disabled={safePage <= 1}
+                    onClick={() => setPage(safePage - 1)}
                   >
                     <IconChevronLeft size={13} />
                     <span>上一页</span>
@@ -410,8 +411,8 @@ export default function UsedAliasesPage() {
                   <button
                     type="button"
                     className="pagination-btn"
-                    disabled={page >= totalPages}
-                    onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                    disabled={safePage >= totalPages}
+                    onClick={() => setPage(safePage + 1)}
                   >
                     <span>下一页</span>
                     <IconChevronRight size={13} />

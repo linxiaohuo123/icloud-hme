@@ -103,11 +103,10 @@ function AccountActions({
 }: AccountActionsProps) {
   const [open, setOpen] = useState(false)
   const moreRef = useRef<HTMLButtonElement>(null)
-  const popoverRef = useRef<HTMLDivElement>(null)
-  const [pos, setPos] = useState<{ top: number; right: number } | null>(null)
+  const [pos, setPos] = useState<{ top?: number; bottom?: number; right: number; maxHeight: number } | null>(null)
 
   // 表格容器 overflow 裁剪会截断 absolute 弹层，改用 Portal + fixed 挂在 body 上
-  // 单次 Layout 计算：结合 DOM 高度与安全预估，一步到位判定向上翻转，消除级联重绘与残影
+  // 通过 CSS 锚定顶底边缘自然流式展开，彻底消除未挂载时测高的死代码与残影
   useLayoutEffect(() => {
     if (!open) {
       setPos(null)
@@ -116,13 +115,14 @@ function AccountActions({
     const btn = moreRef.current
     if (!btn) return
     const rect = btn.getBoundingClientRect()
-    const menuHeight = popoverRef.current?.offsetHeight || 280
     const spaceBelow = window.innerHeight - rect.bottom
-    const openUpward = spaceBelow < menuHeight + 8 && rect.top > menuHeight + 8
+    const openUpward = spaceBelow < 280 && rect.top > spaceBelow
 
     setPos({
-      top: openUpward ? rect.top - menuHeight - 4 : rect.bottom + 4,
+      top: openUpward ? undefined : rect.bottom + 4,
+      bottom: openUpward ? window.innerHeight - rect.top + 4 : undefined,
       right: window.innerWidth - rect.right,
+      maxHeight: Math.max(120, openUpward ? rect.top - 16 : spaceBelow - 16),
     })
   }, [open])
 
@@ -181,9 +181,15 @@ function AccountActions({
           <>
             <div className="dropdown-backdrop" role="presentation" onClick={() => setOpen(false)} />
             <div
-              ref={popoverRef}
               className="dropdown-popover"
-              style={{ position: 'fixed', top: pos.top, right: pos.right }}
+              style={{
+                position: 'fixed',
+                top: pos.top,
+                bottom: pos.bottom,
+                right: pos.right,
+                maxHeight: pos.maxHeight,
+                overflowY: 'auto',
+              }}
             >
               <div className="dropdown-section-title">凭据与认证</div>
               <button type="button" onClick={() => { setOpen(false); onCookie() }}>
@@ -262,24 +268,8 @@ export default function AccountsPage() {
   }, [])
 
   useEffect(() => {
-    let cancelled = false
-    request<AccountSummary[]>('/api/accounts')
-      .then((data) => {
-        if (cancelled) return
-        setAccounts(data)
-        setError('')
-      })
-      .catch((err) => {
-        if (cancelled) return
-        setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [retryKey])
+    void load()
+  }, [load, retryKey])
 
   function handleRetry() {
     setLoading(true)

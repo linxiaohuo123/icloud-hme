@@ -358,15 +358,11 @@ export default function InboxTableView({
 
   const rawMessages = useMemo(() => (Array.isArray(result?.messages) ? result.messages : []), [result])
 
-  // 工作台模式下支持别名包含过滤
+  // 服务端按多 Header (To, Delivered-To, X-Original-To, Envelope-To) 检索并返回权威结果；
+  // 客户端仅负责时间倒序排序，绝不按单一 m.to 再次过滤，消除转发邮件被误杀的幽灵丢信 Bug
   const filteredMessages = useMemo(() => {
-    let list = rawMessages
-    if (fixedAccount && alias) {
-      const q = alias.toLowerCase()
-      list = list.filter((m) => (m.to || '').toLowerCase().includes(q))
-    }
-    return list.slice().sort((a, b) => (dateTimestamp(b.date) ?? 0) - (dateTimestamp(a.date) ?? 0))
-  }, [rawMessages, fixedAccount, alias])
+    return rawMessages.slice().sort((a, b) => (dateTimestamp(b.date) ?? 0) - (dateTimestamp(a.date) ?? 0))
+  }, [rawMessages])
 
   useEffect(() => {
     if (onCountChange) {

@@ -99,8 +99,8 @@ export default function AppPasswordDialog({
         />
       </div>
       <div className="form-actions">
-        <button onClick={onClose}>取消</button>
-        <button className="primary" onClick={() => void handleSubmit()} disabled={submitting}>
+        <button type="button" onClick={onClose}>取消</button>
+        <button type="button" className="primary" onClick={() => void handleSubmit()} disabled={submitting}>
           {submitting ? '保存中…' : '保存'}
         </button>
       </div>

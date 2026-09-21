@@ -207,12 +207,13 @@ export default function AliasesPage() {
       .map(({ alias }) => alias)
   }, [aliases, search, filter, sortDirection])
 
-  // 分页切片
+  // 分页切片 (引入 safePage 立即约束下溢/上溢，杜绝删除或筛选后切片越界导致的空表假死与闪烁)
   const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize))
+  const safePage = Math.min(Math.max(1, page), totalPages)
   const pagedAliases = useMemo(() => {
-    const start = (page - 1) * pageSize
+    const start = (safePage - 1) * pageSize
     return filtered.slice(start, start + pageSize)
-  }, [filtered, page, pageSize])
+  }, [filtered, safePage, pageSize])
 
   // 筛选条件变化时复位页码
   useEffect(() => {
@@ -697,7 +698,7 @@ export default function AliasesPage() {
         {filtered.length > 0 && (
           <div className="pagination-bar">
             <span className="pagination-info">
-              共 <b>{filtered.length}</b> 个别名，当前第 <b>{page}</b> / <b>{totalPages}</b> 页
+              共 <b>{filtered.length}</b> 个别名，当前第 <b>{safePage}</b> / <b>{totalPages}</b> 页
             </span>
             <div className="pagination-controls">
               <Select
@@ -712,8 +713,8 @@ export default function AliasesPage() {
               <button
                 type="button"
                 className="pagination-btn"
-                disabled={page <= 1}
-                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={safePage <= 1}
+                onClick={() => setPage(safePage - 1)}
               >
                 <IconChevronLeft size={13} />
                 <span>上一页</span>
@@ -721,8 +722,8 @@ export default function AliasesPage() {
               <button
                 type="button"
                 className="pagination-btn"
-                disabled={page >= totalPages}
-                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                disabled={safePage >= totalPages}
+                onClick={() => setPage(safePage + 1)}
               >
                 <span>下一页</span>
                 <IconChevronRight size={13} />

@@ -101,9 +101,12 @@ export default function SchedulePage() {
     if (nearBottom) el.scrollTop = el.scrollHeight
   }, [logs])
 
+  const configsRef = useRef(configs)
+  configsRef.current = configs
+
   const handleToggleAccount = useCallback(
     async (acc: AccountSummary) => {
-      const cur = configs[acc.id] || {
+      const cur = configsRef.current[acc.id] || {
         account_id: acc.id,
         enabled: false,
         hourly_quota: 5,
@@ -127,12 +130,12 @@ export default function SchedulePage() {
         show(err instanceof ApiError ? err.message : '更新配置失败')
       }
     },
-    [configs, show],
+    [show],
   )
 
   const handleUpdateScheduleMode = useCallback(
     async (accId: string, patch: Partial<ScheduleConfig>) => {
-      const cur = configs[accId] || {
+      const cur = configsRef.current[accId] || {
         account_id: accId,
         enabled: false,
         hourly_quota: 5,
@@ -151,12 +154,12 @@ export default function SchedulePage() {
         show(err instanceof ApiError ? err.message : '更新调度策略失败')
       }
     },
-    [configs, show],
+    [show],
   )
 
   const handleUpdateQuota = useCallback(
     async (accId: string, quota: number) => {
-      const cur = configs[accId] || {
+      const cur = configsRef.current[accId] || {
         account_id: accId,
         enabled: false,
         hourly_quota: 5,
@@ -174,12 +177,12 @@ export default function SchedulePage() {
         show(err instanceof ApiError ? err.message : '更新配额失败')
       }
     },
-    [configs, show],
+    [show],
   )
 
   const handleUpdateLabel = useCallback(
     async (accId: string, label: string) => {
-      const cur = configs[accId] || {
+      const cur = configsRef.current[accId] || {
         account_id: accId,
         enabled: false,
         hourly_quota: 5,
@@ -199,12 +202,12 @@ export default function SchedulePage() {
         show(err instanceof ApiError ? err.message : '更新别名备注模板失败')
       }
     },
-    [configs, show],
+    [show],
   )
 
   const handleApplyPreset = useCallback(
     (accountId: string, presetVal: string) => {
-      const cfg = configs[accountId]
+      const cfg = configsRef.current[accountId]
       const updated = {
         ...(cfg || {
           account_id: accountId,
@@ -220,7 +223,7 @@ export default function SchedulePage() {
       }))
       void handleUpdateLabel(accountId, presetVal)
     },
-    [configs, handleUpdateLabel],
+    [handleUpdateLabel],
   )
 
   const handleTriggerNow = async () => {

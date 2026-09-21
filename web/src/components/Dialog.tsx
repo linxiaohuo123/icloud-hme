@@ -7,8 +7,9 @@
 
 import { useEffect, useRef, type ReactNode } from 'react'
 
-// 模块级弹窗栈:嵌套弹窗(如详情上叠删除确认)时只有最顶层响应 Escape,避免一次按键全关
+// 模块级弹窗栈:嵌套弹窗(如详情上叠删除确认)时只有最顶层响应 Escape，且采用引用计数管理 body 滚动锁
 const dialogStack: symbol[] = []
+let rootOriginalOverflow = ''
 
 interface DialogProps {
   title: string
@@ -17,7 +18,7 @@ interface DialogProps {
   children: ReactNode
 }
 
-/** 可访问 Dialog:Escape 关闭、焦点圈定、关闭后回到触发按钮 */
+/** 可访问 Dialog:Escape 关闭、焦点圈定、关闭后回到触发按钮、防滚动穿透死锁 */
 export default function Dialog({ title, open, onClose, children }: DialogProps) {
   const ref = useRef<HTMLDivElement>(null)
   const lastFocused = useRef<Element | null>(null)
@@ -39,15 +40,17 @@ export default function Dialog({ title, open, onClose, children }: DialogProps) 
     }
   }, [open])
 
-  // 2. 键盘 Tab 循环焦点与 Escape 监听；锁定背景滚动
+  // 2. 键盘 Tab 循环焦点与 Escape 监听；锁定背景滚动（基于全局栈引用计数，杜绝嵌套弹窗踩踏）
   useEffect(() => {
     if (!open) return
 
+    if (dialogStack.length === 0) {
+      rootOriginalOverflow = document.body.style.overflow
+      document.body.style.overflow = 'hidden'
+    }
+
     const dialogId = Symbol('dialog')
     dialogStack.push(dialogId)
-
-    const originalOverflow = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
 
     const node = ref.current
     const focusables = () =>
@@ -84,7 +87,9 @@ export default function Dialog({ title, open, onClose, children }: DialogProps) 
       const idx = dialogStack.indexOf(dialogId)
       if (idx >= 0) dialogStack.splice(idx, 1)
       document.removeEventListener('keydown', handleKey)
-      document.body.style.overflow = originalOverflow
+      if (dialogStack.length === 0) {
+        document.body.style.overflow = rootOriginalOverflow
+      }
       if (lastFocused.current instanceof HTMLElement) {
         lastFocused.current.focus()
       }

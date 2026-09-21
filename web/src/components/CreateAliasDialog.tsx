@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 components/Dialog, api/client 的 request/ApiError
+ * [OUTPUT]: 对外提供 CreateAliasDialog 单个别名创建弹窗 (带表单校验与异步状态)
+ * [POS]: web/src/components 的别名操作层，供工作台别名列表消费
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 import { useState } from 'react'
 import Dialog from './Dialog'
 import { request, ApiError } from '../api/client'
@@ -69,8 +76,8 @@ export default function CreateAliasDialog({
         <p className="hint">标签最长 200 字符；创建后会自动生成新的隐私邮箱。</p>
       </div>
       <div className="form-actions">
-        <button onClick={onClose}>取消</button>
-        <button className="primary" onClick={() => void handleSubmit()} disabled={submitting}>
+        <button type="button" onClick={onClose}>取消</button>
+        <button type="button" className="primary" onClick={() => void handleSubmit()} disabled={submitting}>
           {submitting ? '创建中…' : '创建'}
         </button>
       </div>

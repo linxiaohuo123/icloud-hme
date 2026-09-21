@@ -90,8 +90,8 @@ export default function MailboxDialog({ accountId, current, open, onClose, onSav
       <div className="form-field"><label htmlFor="mailbox-port">SSL 端口</label><input id="mailbox-port" type="number" min="1" max="65535" value={port} onChange={(e) => setPort(e.target.value)} /></div>
       <div className="form-field"><label htmlFor="mailbox-code">邮箱授权码</label><input id="mailbox-code" type="password" autoComplete="off" value={code} onChange={(e) => setCode(e.target.value)} /></div>
       <div className="form-actions">
-        <button onClick={onClose}>取消</button>
-        <button className="primary" onClick={() => void handleSubmit()} disabled={submitting}>{submitting ? '验证中…' : '验证并接入'}</button>
+        <button type="button" onClick={onClose}>取消</button>
+        <button type="button" className="primary" onClick={() => void handleSubmit()} disabled={submitting}>{submitting ? '验证中…' : '验证并接入'}</button>
       </div>
     </Dialog>
   )

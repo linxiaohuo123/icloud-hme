@@ -5,7 +5,7 @@
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { FullMessage } from '../../api/types'
 import Dialog from '../Dialog'
 import { IconCheck, IconCopy, IconKey } from '../icons'
@@ -29,6 +29,12 @@ export default function MailDetailDialog({
   const [copiedCode, setCopiedCode] = useState(false)
   const [copiedAlias, setCopiedAlias] = useState(false)
   const [showRawHtml, setShowRawHtml] = useState(false)
+
+  useEffect(() => {
+    setShowRawHtml(false)
+    setCopiedCode(false)
+    setCopiedAlias(false)
+  }, [detail?.id])
 
   if (!detail && !loading) return null
 

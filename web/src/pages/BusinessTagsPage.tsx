@@ -27,7 +27,7 @@ import {
   IconTrash,
 } from '../components/icons'
 import { copyText } from '../utils/clipboard'
-import { formatDate, formatFullDate, formatRelativeTime, isWithinWindow } from '../utils/date'
+import { dateTimestamp, formatDate, formatFullDate, formatRelativeTime, isWithinWindow } from '../utils/date'
 import { buildCurlSnippet, buildLeaseCommand, buildPythonSnippet } from '../utils/snippets'
 
 /** 活跃判定窗口：24 小时内有调用/领用活动视为活跃 */
@@ -147,7 +147,7 @@ export default function BusinessTagsPage() {
     ...tokens.map((t) => t.last_used_at || ''),
   ]
     .filter(Boolean)
-    .sort()
+    .sort((a, b) => (dateTimestamp(a) ?? 0) - (dateTimestamp(b) ?? 0))
     .pop()
   // 与出号记录页同一口径：24 小时内有调用视为活跃
   const recentActive = isWithinWindow(lastActivity, ACTIVE_WINDOW_MS)
