@@ -26,7 +26,14 @@
    - 读取该测试账号收件箱消息列表。
 
 5. **验证 INBOX MessageRef 正常**
-   - 核验返回数据中的每封邮件实体，其 `MessageRef` 均合法且必须包含 `account_id`、`mailbox=INBOX` 以及合法 `uid`（`AccountID:Mailbox:UID`）。
+   - 核验返回数据中的每封邮件实体，其邮件身份严格符合生产 identity 规范：
+     - **IMAP 模式**：`provider` + `account_id` + `mailbox` + `uid_validity` + `uid`
+       - `account_id` 正确对应母号；
+       - `mailbox=INBOX`；
+       - `uid_validity > 0`；
+       - `uid > 0`；
+       - `canonical message_ref` 可以成功解析并与这些字段完全一致。
+     - **WebMail 模式**：`provider` + `account_id` + `thread_id`。
 
 6. **创建/准备一个明确的测试库存 alias**
    - 在该测试母号下，通过管理界面或补货流程准备一个明确可用的测试别名（`status=available`）。
@@ -58,7 +65,7 @@
     - 再次调用 `GET /api/external/v2/verification-requests/:id`。
 
 15. **必须返回同一个 code**
-    - 核验返回状态为终态 `completed`，提取到的验证码与步骤 13 完全一致。
+    - 核验返回状态为终态 `succeeded`，提取到的验证码与步骤 13 完全一致。
 
 16. **重启服务**
     - 向当前运行进程发送 `SIGTERM` 触发优雅关机，确认 Worker 收敛并关闭数据库后重新启动服务。
@@ -67,10 +74,10 @@
     - 重启后，其他 Token 或无幂等键的请求调用 allocate，绝不能再次分配该别名。
 
 18. **同 verification terminal result 不得改变**
-    - 重启后，再次 GET 步骤 10 的 `request_id`，结果必须依然为 `completed` 终态且 `code` 不变。
+    - 重启后，再次 GET 步骤 10 的 `request_id`，结果必须依然为 `succeeded` 终态且 `code` 不变。
 
 19. **查看 stats**
-    - 调用 `GET /api/stats`。
+    - 调用 `GET /api/system/stats`。
     - 确认号池已用/可用统计口径与数据库实际数据严格对齐。
 
 20. **审计日志无泄漏**
