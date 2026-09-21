@@ -280,12 +280,16 @@ func (w *MailSyncWorker) syncOnce() {
 	sem := make(chan struct{}, maxConcurrentAccountSync)
 	var fetchWg sync.WaitGroup
 
+accountLoop:
 	for accID, aliases := range accountQueries {
+		if w.ctx.Err() != nil {
+			break accountLoop
+		}
 		accID := accID
 		aliases := aliases
 		select {
 		case <-w.ctx.Done():
-			break
+			break accountLoop
 		case sem <- struct{}{}:
 			accountCtx, accountCancel := context.WithTimeout(w.ctx, accountSyncTimeout)
 			fetchWg.Add(1)
@@ -309,6 +313,9 @@ func (w *MailSyncWorker) syncOnce() {
 	// 3. 仍无法归属的野别名(纯粹在 Apple 侧手工创建、本系统从未见过):
 	//    做「有上限 + 负缓存」的盲扫兜底。外部普通请求已在 HTTP 鉴权层拦截，无法触发未知别名。
 	if len(unknownAliases) > 0 {
+		if w.ctx.Err() != nil {
+			return
+		}
 		var probeList []string
 		for _, alias := range unknownAliases {
 			if !w.isRecentProbeMiss(alias) {
@@ -317,7 +324,11 @@ func (w *MailSyncWorker) syncOnce() {
 		}
 		if len(probeList) > 0 {
 			probed := 0
+		probeAccLoop:
 			for _, acc := range accounts {
+				if w.ctx.Err() != nil {
+					break probeAccLoop
+				}
 				if probed >= maxUnknownAliasProbeAccounts {
 					break
 				}
@@ -327,7 +338,7 @@ func (w *MailSyncWorker) syncOnce() {
 				probed++
 				for _, alias := range probeList {
 					if err := w.ctx.Err(); err != nil {
-						break
+						break probeAccLoop
 					}
 					if w.fetchAndPublish(w.ctx, acc.ID, alias) {
 						// 盲扫发现归属: 写穿路由表，此后不再需要盲扫
