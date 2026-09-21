@@ -220,6 +220,11 @@ func (c *Client) Disconnect() {
 	c.conn = nil
 }
 
+// ForceClose 不发 LOGOUT, 直接掐断底层网络连接 (坏连接/取消时用，Issue 13)。
+func (c *Client) ForceClose() {
+	c.forceClose()
+}
+
 // forceClose 不发 LOGOUT, 直接掐断(坏连接/池丢弃时用)。
 func (c *Client) forceClose() {
 	if c.cli != nil {
@@ -389,6 +394,16 @@ func (c *Client) FindByRecipientInFolder(recipient string, folder string, limit 
 	return out, err
 }
 
+// FindByRecipientInFolderSince 在指定文件夹中按 UID lower bound 增量查找邮件 (Issue 14)。
+func (c *Client) FindByRecipientInFolderSince(recipient string, folder string, limit int, days int, sinceUID uint32) ([]Message, error) {
+	var out []Message
+	err := c.ForEachByRecipientInFolderSince(recipient, folder, limit, days, sinceUID, func(m Message) bool {
+		out = append(out, m)
+		return true
+	})
+	return out, err
+}
+
 // ForEachByRecipient 按新→旧遍历发给 recipient 的最近 limit 封邮件 (默认在 all 文件夹查找)。
 func (c *Client) ForEachByRecipient(recipient string, limit int, days int, onMsg func(Message) bool) error {
 	return c.ForEachByRecipientInFolder(recipient, "all", limit, days, onMsg)
@@ -396,6 +411,11 @@ func (c *Client) ForEachByRecipient(recipient string, limit int, days int, onMsg
 
 // ForEachByRecipientInFolder 在指定文件夹中按新→旧遍历发给 recipient 的邮件。
 func (c *Client) ForEachByRecipientInFolder(recipient string, folder string, limit int, days int, onMsg func(Message) bool) error {
+	return c.ForEachByRecipientInFolderSince(recipient, folder, limit, days, 0, onMsg)
+}
+
+// ForEachByRecipientInFolderSince 在指定文件夹中按 UID lower bound 增量遍历邮件 (Issue 14)。
+func (c *Client) ForEachByRecipientInFolderSince(recipient string, folder string, limit int, days int, sinceUID uint32, onMsg func(Message) bool) error {
 	if c.cli == nil {
 		return fmt.Errorf("未连接")
 	}
@@ -411,38 +431,58 @@ func (c *Client) ForEachByRecipientInFolder(recipient string, folder string, lim
 		return err
 	}
 
+	var folderErrors []string
+	successFolders := 0
 	for _, name := range folders {
-		if err := c.forEachByRecipientInMailbox(recipient, name, limit, days, onMsg); err != nil {
+		if err := c.forEachByRecipientInMailbox(recipient, name, limit, days, sinceUID, onMsg); err != nil {
+			folderErrors = append(folderErrors, fmt.Sprintf("%s: %v", name, err))
 			continue
 		}
+		successFolders++
+	}
+	if len(folders) > 0 && successFolders == 0 {
+		return fmt.Errorf("所有文件夹检索均失败: %s", strings.Join(folderErrors, "; "))
 	}
 	return nil
 }
 
-func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, limit int, days int, onMsg func(Message) bool) error {
+func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, limit int, days int, sinceUID uint32, onMsg func(Message) bool) error {
 	mbox, err := c.cli.Select(folder, true)
 	if err != nil {
 		return err
 	}
 
-	// 1) 服务端按多 Header 检索: To, Delivered-To, X-Original-To, Envelope-To
+	// 1) 服务端按多 Header 检索并 Union 去重: To, Delivered-To, X-Original-To, Envelope-To
 	headers := []string{"To", "Delivered-To", "X-Original-To", "Envelope-To"}
-	var uids []uint32
+	seen := make(map[uint32]struct{})
+	var allUIDs []uint32
 	for _, header := range headers {
 		criteria := imap.NewSearchCriteria()
 		criteria.Header.Add(header, recipient)
 		if days > 0 {
 			criteria.Since = time.Now().AddDate(0, 0, -days)
 		}
+		if sinceUID > 0 {
+			criteria.Uid = new(imap.SeqSet)
+			criteria.Uid.AddRange(sinceUID, 0) // IMAP: UID sinceUID:*
+		}
 		found, err := c.cli.UidSearch(criteria)
-		if err == nil && len(found) > 0 {
-			uids = found
-			break
+		if err == nil {
+			for _, u := range found {
+				if _, ok := seen[u]; !ok {
+					seen[u] = struct{}{}
+					allUIDs = append(allUIDs, u)
+				}
+			}
 		}
 	}
+	sort.Slice(allUIDs, func(i, j int) bool { return allUIDs[i] < allUIDs[j] })
+	uids := allUIDs
 
 	if len(uids) > 0 {
-		uids = newestUIDs(uids, limit)
+		if sinceUID == 0 {
+			uids = newestUIDs(uids, limit)
+		}
 		for i := len(uids) - 1; i >= 0; i-- {
 			m, ferr := c.fetchOneUID(folder, uids[i])
 			if ferr != nil {
@@ -465,7 +505,7 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 	}
 
 	// 2) fallback: 扫最近 N 封信, 本地全文与 Header 深度比对 (解决 Apple 内部转寄重写 To 导致的漏信)
-	return c.forEachRecentMatching(folder, recipient, limit, days, onMsg)
+	return c.forEachRecentMatching(folder, recipient, limit, days, sinceUID, onMsg)
 }
 
 // newestUIDs 保留 UID 列表中最新的 limit 个(假定 UID 升序)。
@@ -477,7 +517,7 @@ func newestUIDs(uids []uint32, limit int) []uint32 {
 }
 
 // forEachRecentMatching 拉取 folder 最近 scan 封信件, 本地比对 To/Headers/Body/Subject。
-func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days int, onMsg func(Message) bool) error {
+func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days int, sinceUID uint32, onMsg func(Message) bool) error {
 	mbox, err := c.cli.Select(folder, true)
 	if err != nil {
 		return err
@@ -526,6 +566,9 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 					continue
 				}
 			}
+		}
+		if sinceUID > 0 && m.UID < sinceUID {
+			continue
 		}
 		if m.matches(recipient) {
 			cands = append(cands, m)
@@ -649,6 +692,11 @@ func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, 
 
 // GetFullBatchInFolder 批量获取指定文件夹中的完整邮件内容 (单次 IMAP 命令往返)。
 func (c *Client) GetFullBatchInFolder(folder string, uids []uint32) ([]*FullMessage, error) {
+	return c.GetFullBatchInFolderWithValidity(folder, 0, uids)
+}
+
+// GetFullBatchInFolderWithValidity 批量获取指定文件夹中的完整邮件内容，并校验 UIDVALIDITY。
+func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uint32, uids []uint32) ([]*FullMessage, error) {
 	if c.cli == nil {
 		return nil, fmt.Errorf("未连接")
 	}
@@ -661,6 +709,9 @@ func (c *Client) GetFullBatchInFolder(folder string, uids []uint32) ([]*FullMess
 	status, err := c.cli.Select(folder, true)
 	if err != nil {
 		return nil, err
+	}
+	if uidValidity > 0 && status.UidValidity != uidValidity {
+		return nil, ErrUIDValidityMismatch
 	}
 
 	seqset := new(imap.SeqSet)

@@ -108,6 +108,7 @@ func (s *VerificationService) CreateVerificationRequest(ctx context.Context, p a
 		CreatedAt:           now.Format(time.RFC3339),
 		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
 		BaselineProvider:    provider,
+		BaselineMailbox:     "INBOX",
 		BaselineUIDValidity: uidValidity,
 		BaselineUID:         uidNext,
 	}
@@ -155,14 +156,26 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		return nil, ErrVReqNotFound
 	}
 
-	// 1. 检查过期
+	// 1. 计算受限等待窗口 (PR-06 §9.3, Issue 8: 等待时间严格受限于 expires_at)
+	maxTimeout := 120 * time.Second
+	waitDuration := time.Duration(timeoutSec) * time.Second
+	if waitDuration < 0 {
+		waitDuration = 0
+	}
+	if waitDuration > maxTimeout {
+		waitDuration = maxTimeout
+	}
+
 	if vreq.ExpiresAt != "" {
 		if expTime, parseErr := time.Parse(time.RFC3339, vreq.ExpiresAt); parseErr == nil {
-			if time.Now().UTC().After(expTime) {
+			remaining := time.Until(expTime)
+			if remaining <= 0 {
 				if vreq.Status != "succeeded" && vreq.Status != "expired" {
-					_ = s.store.UpdateVerificationRequestResult(ctx, vreq.RequestID, "expired", "", "")
+					_, _, _ = s.store.ExpireVerificationRequest(ctx, vreq.RequestID)
 					vreq.Status = "expired"
 				}
+			} else if remaining < waitDuration {
+				waitDuration = remaining
 			}
 		}
 	}
@@ -188,15 +201,16 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		}, nil
 	}
 
-	if timeoutSec < 0 {
-		timeoutSec = 0
-	}
-	if timeoutSec > 120 {
-		timeoutSec = 120
+	if vreq.Status == "invalidated" {
+		return nil, ErrUIDValidityChanged
 	}
 
-	// 3. 基于 UIDVALIDITY 与 UIDNEXT 边界订阅事件
-	subID, ch := s.eventBus.SubscribeWithBoundary(vreq.AliasEmail, uint32(vreq.BaselineUIDValidity), uint32(vreq.BaselineUID))
+	// 3. 基于 INBOX Mailbox、UIDVALIDITY 与 UIDNEXT 边界订阅事件 (PR-06 §9.2, 9.5, Issue 4 & 5)
+	mailbox := vreq.BaselineMailbox
+	if mailbox == "" {
+		mailbox = "INBOX"
+	}
+	subID, ch := s.eventBus.SubscribeWithBoundary(vreq.AliasEmail, mailbox, uint32(vreq.BaselineUIDValidity), uint32(vreq.BaselineUID))
 	defer s.eventBus.Unsubscribe(vreq.AliasEmail, subID)
 
 	if s.syncWorker != nil {
@@ -211,26 +225,55 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 				return nil, ErrTokenRevoked
 			}
 		}
-		// UIDVALIDITY 突变检测
+		// UIDVALIDITY 突变检测 (Issue 5 & 6)
 		if item.UIDValidity != 0 && vreq.BaselineUIDValidity != 0 && item.UIDValidity != uint32(vreq.BaselineUIDValidity) {
-			_ = s.store.UpdateVerificationRequestResult(ctx, vreq.RequestID, "invalidated", "", "")
+			_, _, _ = s.store.InvalidateVerificationRequest(ctx, vreq.RequestID)
+			// 注意：代际突变不消费该事件，保留在 cache 中供新基线消费
 			return nil, ErrUIDValidityChanged
 		}
 
 		code := item.OTP.Code
-		_ = s.store.UpdateVerificationRequestResult(ctx, vreq.RequestID, "succeeded", code, item.EventID)
-		s.eventBus.ConsumeEvent(vreq.AliasEmail, item.EventID)
+		// 终态原子 CAS (Issue 6 & 7): 必须先落库再消费，非 winner 绝不消费
+		curReq, won, err := s.store.CompleteVerificationRequest(ctx, vreq.RequestID, code, item.EventID)
+		if err != nil {
+			return nil, &BackendError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "持久化验证码终态失败: " + err.Error()}
+		}
+		if won {
+			// 仅在明确落库成功后才消费事件
+			s.eventBus.ConsumeEvent(vreq.AliasEmail, item.EventID)
+			return &VerificationResult{
+				RequestID:  vreq.RequestID,
+				LeaseID:    vreq.LeaseID,
+				AliasEmail: vreq.AliasEmail,
+				Code:       code,
+				MessageRef: item.EventID,
+				Status:     "succeeded",
+			}, nil
+		}
+
+		// CAS 未中(已被并发完成或已过期/失效)
+		if curReq != nil {
+			if curReq.Status == "invalidated" {
+				return nil, ErrUIDValidityChanged
+			}
+			return &VerificationResult{
+				RequestID:  curReq.RequestID,
+				LeaseID:    curReq.LeaseID,
+				AliasEmail: curReq.AliasEmail,
+				Code:       curReq.Code,
+				MessageRef: curReq.MatchedEventRef,
+				Status:     curReq.Status,
+			}, nil
+		}
 		return &VerificationResult{
 			RequestID:  vreq.RequestID,
 			LeaseID:    vreq.LeaseID,
 			AliasEmail: vreq.AliasEmail,
-			Code:       code,
-			MessageRef: item.EventID,
-			Status:     "succeeded",
+			Status:     "pending",
 		}, nil
 	}
 
-	if timeoutSec <= 0 {
+	if waitDuration <= 0 {
 		select {
 		case item := <-ch:
 			return handleItem(item)
@@ -244,13 +287,27 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		}
 	}
 
-	timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
+	timer := time.NewTimer(waitDuration)
 	defer timer.Stop()
 
 	select {
 	case item := <-ch:
 		return handleItem(item)
 	case <-timer.C:
+		// 定时器触发后再次校验是否超时过期 (Issue 8)
+		if vreq.ExpiresAt != "" {
+			if expTime, parseErr := time.Parse(time.RFC3339, vreq.ExpiresAt); parseErr == nil {
+				if time.Now().UTC().After(expTime) {
+					_, _, _ = s.store.ExpireVerificationRequest(ctx, vreq.RequestID)
+					return &VerificationResult{
+						RequestID:  vreq.RequestID,
+						LeaseID:    vreq.LeaseID,
+						AliasEmail: vreq.AliasEmail,
+						Status:     "expired",
+					}, nil
+				}
+			}
+		}
 		return &VerificationResult{
 			RequestID:  vreq.RequestID,
 			LeaseID:    vreq.LeaseID,

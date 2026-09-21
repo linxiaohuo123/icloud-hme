@@ -62,13 +62,6 @@ type Config struct {
 	TrustedProxies []string
 }
 
-type messageCacheEntry struct {
-	msg       *mail.FullMessage
-	expiresAt time.Time
-	provider  string
-	method    string
-}
-
 // Server 封装 Gin 引擎、账号后端与认证。
 type Server struct {
 	be          Backend
@@ -88,8 +81,6 @@ type Server struct {
 	verifyService   *VerificationService
 	mailReadService *MailReadService
 	scheduler       *scheduler.Scheduler
-	msgCacheMu  sync.RWMutex
-	msgCache    map[string]messageCacheEntry
 	startedAt   time.Time
 	ctx         context.Context    // 【BUG-11】停机信号,由 Close() 触发 cancel
 	cancel      context.CancelFunc // 【BUG-11】停机信号取消函数
@@ -161,13 +152,24 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 		ctx:             ctx,
 		cancel:          cancel,
 	}
-	// 调度器在 Server 组装完成后注入，使 creator 能复用统一的流水入账口径
+	// 调度器在 Server 组装完成后注入，语义闭环为可用库存补货 (PR-06 §9.4, Issue 10)
 	s.scheduler = scheduler.NewScheduler(st, func(accountID, label string) (*hme.CreateResult, error) {
 		res, err := be.CreateAlias(accountID, label)
 		if err == nil && res != nil {
 			syncWorker.RegisterAliasAccount(res.Email, accountID)
-			// 调度产出的别名同样必须入流水，否则审计账本与 tag 对账会漏统计全部定时产出
-			s.recordLease(accountID, res.Email, s.scheduledTag(accountID), "scheduler")
+			// 补货只做：AddInventoryAlias(source_type='replenish', allocation_state='available')
+			// 严禁在补货时创建 consumer allocation / lease，确保普通出号能原子认领
+			if st != nil {
+				if addErr := st.AddInventoryAlias(accountID, hme.Alias{
+					Email:     res.Email,
+					Label:     res.Label,
+					CreatedAt: res.CreatedAt,
+					Active:    true,
+				}, "replenish", true); addErr != nil {
+					log.Printf("[Scheduler] 补货入库失败 email=%s: %v", res.Email, addErr)
+				}
+				_ = st.UpsertAliasRoutes(accountID, []string{res.Email})
+			}
 		}
 		return res, err
 	}, be.ListAccounts)
@@ -391,8 +393,6 @@ func (s *Server) register() {
 				alloc.POST("/alias/lease", csrfCheck(s.auth), s.quickCreateHandler)
 				alloc.POST("/allocate", csrfCheck(s.auth), s.quickCreateHandler)
 				alloc.POST("/external/v1/allocate", csrfCheck(s.auth), s.quickCreateHandler)
-				alloc.POST("/external/v2/allocate", s.externalV2AllocateHandler)
-				alloc.GET("/external/v2/operations/:operation_id", s.externalV2GetOperationHandler)
 			}
 
 			// ===== 最小权限: 取码作用域 =====
@@ -401,8 +401,6 @@ func (s *Server) register() {
 			{
 				verify.GET("/verify-code", s.verifyCodeHandler)
 				verify.GET("/external/v1/verify-code", s.verifyCodeHandler)
-				verify.POST("/external/v2/verification-requests", s.externalV2CreateVerificationRequestHandler)
-				verify.GET("/external/v2/verification-requests/:request_id", s.externalV2GetVerificationRequestHandler)
 			}
 
 			// ===== 管理面: 仅管理员会话 / admin 作用域令牌可达 =====
@@ -481,6 +479,25 @@ func (s *Server) register() {
 				// ===== 系统 =====
 				adm.POST("/reload", csrfCheck(s.auth), s.reloadConfigHandler)
 				adm.GET("/system/stats", s.systemStatsHandler)
+			}
+		}
+
+		// ===== 外部 v2 独立路由组：仅允许 Bearer Token / API Key 认证，彻底拒绝 Cookie 会话，杜绝 CSRF (Issue 19 方案 A) =====
+		v2 := api.Group("/external/v2")
+		v2.Use(requireExternalV2Auth(s.cfg.APIKey, s.store))
+		{
+			v2Alloc := v2.Group("")
+			v2Alloc.Use(requireScope(store.ScopeAllocate))
+			{
+				v2Alloc.POST("/allocate", s.externalV2AllocateHandler)
+				v2Alloc.GET("/operations/:operation_id", s.externalV2GetOperationHandler)
+			}
+
+			v2Verify := v2.Group("")
+			v2Verify.Use(requireScope(store.ScopeVerify))
+			{
+				v2Verify.POST("/verification-requests", s.externalV2CreateVerificationRequestHandler)
+				v2Verify.GET("/verification-requests/:request_id", s.externalV2GetVerificationRequestHandler)
 			}
 		}
 	}

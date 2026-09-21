@@ -126,11 +126,11 @@ func TestPR07_P02_BatchInboxSyncReducesRedundantScans(t *testing.T) {
 	worker.RegisterAliasAccount("alias3@icloud.com", "acc_shared")
 
 	// 三个别名同时在等待事件
-	_, ch1 := eb.SubscribeWithBoundary("alias1@icloud.com", 1, 50)
+	_, ch1 := eb.SubscribeWithBoundary("alias1@icloud.com", "INBOX", 1, 50)
 	defer eb.Unsubscribe("alias1@icloud.com", 1)
-	_, ch2 := eb.SubscribeWithBoundary("alias2@icloud.com", 1, 50)
+	_, ch2 := eb.SubscribeWithBoundary("alias2@icloud.com", "INBOX", 1, 50)
 	defer eb.Unsubscribe("alias2@icloud.com", 2)
-	_, _ = eb.SubscribeWithBoundary("alias3@icloud.com", 1, 50)
+	_, _ = eb.SubscribeWithBoundary("alias3@icloud.com", "INBOX", 1, 50)
 	defer eb.Unsubscribe("alias3@icloud.com", 3)
 
 	// 手动触发单轮同步
@@ -205,8 +205,8 @@ func TestPR07_P03_SlowAccountIsolation(t *testing.T) {
 	worker.RegisterAliasAccount("slow@icloud.com", "acc_slow")
 	worker.RegisterAliasAccount("fast@icloud.com", "acc_fast")
 
-	_, _ = eb.SubscribeWithBoundary("slow@icloud.com", 1, 100)
-	_, fastCh := eb.SubscribeWithBoundary("fast@icloud.com", 1, 100)
+	_, _ = eb.SubscribeWithBoundary("slow@icloud.com", "INBOX", 1, 100)
+	_, fastCh := eb.SubscribeWithBoundary("fast@icloud.com", "INBOX", 1, 100)
 
 	start := time.Now()
 	// 执行单轮同步
@@ -268,7 +268,7 @@ func TestPR07_P04_VerificationQueueAndTokenLimits(t *testing.T) {
 
 	// 此时第 51 个请求应当被 429 TOO_MANY_REQUESTS 拒绝
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "limit_test@icloud.com", Active: true}, "replenish", true)
-	alloc, _, _ := st.ClaimInventoryAlias(context.Background(), "token", tok.ID, "allocate", "k_quota_1", "h", "tag", "")
+	alloc, _, _ := st.ClaimInventoryAlias(context.Background(), "token", tok.ID, "allocate", "k_quota_1", "h", "tag", nil)
 
 	body, _ := json.Marshal(map[string]string{"lease_id": alloc.AllocationID})
 	req, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/verification-requests", bytes.NewReader(body))
@@ -302,7 +302,7 @@ func TestPR07_P05_RequestCancellationReleasesResources(t *testing.T) {
 	_ = st.SaveToken(tok)
 
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "cancel_target@icloud.com", Active: true}, "replenish", true)
-	alloc, _, _ := st.ClaimInventoryAlias(context.Background(), "token", tok.ID, "allocate", "k_cancel", "h", "tag", "")
+	alloc, _, _ := st.ClaimInventoryAlias(context.Background(), "token", tok.ID, "allocate", "k_cancel", "h", "tag", nil)
 
 	fb := &fakeBackend{}
 	s, ts := newTestServerWithStore(fb, st)

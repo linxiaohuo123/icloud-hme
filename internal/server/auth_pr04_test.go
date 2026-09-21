@@ -38,7 +38,7 @@ func TestPR04_A01_CrossTokenVerificationIsolation(t *testing.T) {
 
 	// 录入可用别名并分配给 Token B
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "victim@icloud.com", Active: true}, "replenish", true)
-	allocB, _, err := st.ClaimInventoryAlias(context.Background(), "token", tokB.ID, "allocate", "k_b", "h", "tag", "")
+	allocB, _, err := st.ClaimInventoryAlias(context.Background(), "token", tokB.ID, "allocate", "k_b", "h", "tag", nil)
 	if err != nil || allocB.AliasEmail != "victim@icloud.com" {
 		t.Fatalf("failed to allocate to Token B: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestPR04_A04_TokenRenameAndRecreateNoDataLeak(t *testing.T) {
 	_ = st.SaveToken(tokOld)
 
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "cs_mail@icloud.com", Active: true}, "replenish", true)
-	_, _, _ = st.ClaimInventoryAlias(context.Background(), "token", tokOld.ID, "allocate", "k_cs", "h", "tag", "")
+	_, _, _ = st.ClaimInventoryAlias(context.Background(), "token", tokOld.ID, "allocate", "k_cs", "h", "tag", nil)
 
 	// 删除旧令牌
 	_, _ = st.DeleteToken(tokOld.ID)
@@ -167,7 +167,7 @@ func TestPR04_A05_TokenRevocationDuringLongPoll(t *testing.T) {
 	_ = st.SaveToken(tok)
 
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "ephemeral@icloud.com", Active: true}, "replenish", true)
-	_, _, _ = st.ClaimInventoryAlias(context.Background(), "token", tok.ID, "allocate", "k_eph", "h", "tag", "")
+	_, _, _ = st.ClaimInventoryAlias(context.Background(), "token", tok.ID, "allocate", "k_eph", "h", "tag", nil)
 
 	fb := &fakeBackend{}
 	s, ts := newTestServerWithStore(fb, st)

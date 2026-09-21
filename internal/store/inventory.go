@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 database/sql, context, time, fmt, errors, strings
- * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation, VerificationRequest 模型及 ClaimInventoryAlias, SyncAliasInventory, GetPrincipalAllocation, CreateVerificationRequest, GetVerificationRequest, UpdateVerificationRequestResult, CountActiveVerificationRequests 等原子持久化能力
- * [POS]: internal/store 的领域状态与库存隔离层 (PR-03/PR-05-1)，分离 remote_state 与 allocation_state，提供 SQLite 事务级唯一约束、幂等认领与持久化取码请求
+ * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation, VerificationRequest 模型及 ClaimInventoryAlias, CompleteVerificationRequest, ExpireVerificationRequest, InvalidateVerificationRequest, GetMinBaselineUIDByEmail, GetPrincipalAllocation, CreateVerificationRequest, GetVerificationRequest, UpdateVerificationRequestResult 等原子持久化与 CAS 能力
+ * [POS]: internal/store 的领域状态与库存隔离层 (PR-03/PR-05-1)，分离 remote_state 与 allocation_state，提供 SQLite 事务级唯一约束、幂等认领与终态原子 CAS 持久化取码请求
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -98,10 +98,11 @@ type VerificationRequest struct {
 	PrincipalID         string `json:"principal_id"`
 	LeaseID             string `json:"lease_id"`
 	AliasEmail          string `json:"alias_email"`
-	Status              string `json:"status"` // "pending", "succeeded", "expired", "failed"
+	Status              string `json:"status"` // "pending", "ready", "succeeded", "expired", "invalidated"
 	CreatedAt           string `json:"created_at"`
 	ExpiresAt           string `json:"expires_at"`
 	BaselineProvider    string `json:"baseline_provider,omitempty"`
+	BaselineMailbox     string `json:"baseline_mailbox,omitempty"`
 	BaselineUIDValidity uint32 `json:"baseline_uidvalidity,omitempty"`
 	BaselineUID         uint32 `json:"baseline_uid,omitempty"`
 	MatchedEventRef     string `json:"matched_event_ref,omitempty"`
@@ -163,6 +164,7 @@ func (s *Store) initInventorySchema() error {
 		created_at TEXT NOT NULL,
 		expires_at TEXT NOT NULL,
 		baseline_provider TEXT DEFAULT '',
+		baseline_mailbox TEXT DEFAULT 'INBOX',
 		baseline_uidvalidity INTEGER DEFAULT 0,
 		baseline_uid INTEGER DEFAULT 0,
 		matched_event_ref TEXT DEFAULT '',
@@ -172,8 +174,16 @@ func (s *Store) initInventorySchema() error {
 	CREATE INDEX IF NOT EXISTS idx_vreq_lease ON verification_requests (lease_id);
 	CREATE INDEX IF NOT EXISTS idx_vreq_email ON verification_requests (alias_email);
 	`
-	_, err := s.db.Exec(ddl)
-	return err
+	if _, err := s.db.Exec(ddl); err != nil {
+		return err
+	}
+	_, _ = s.db.Exec("ALTER TABLE verification_requests ADD COLUMN baseline_provider TEXT DEFAULT ''")
+	_, _ = s.db.Exec("ALTER TABLE verification_requests ADD COLUMN baseline_mailbox TEXT DEFAULT 'INBOX'")
+	_, _ = s.db.Exec("ALTER TABLE verification_requests ADD COLUMN baseline_uidvalidity INTEGER DEFAULT 0")
+	_, _ = s.db.Exec("ALTER TABLE verification_requests ADD COLUMN baseline_uid INTEGER DEFAULT 0")
+	_, _ = s.db.Exec("ALTER TABLE verification_requests ADD COLUMN matched_event_ref TEXT DEFAULT ''")
+	_, _ = s.db.Exec("ALTER TABLE verification_requests ADD COLUMN code TEXT DEFAULT ''")
+	return nil
 }
 
 func (s *Store) migrateInventory() error {
@@ -183,31 +193,7 @@ func (s *Store) migrateInventory() error {
 	}
 	defer tx.Rollback()
 
-	// 1. 映射 api_tokens 中唯一无歧义的 token name -> id (忽略大小写)
-	rows, err := tx.Query(`
-		SELECT LOWER(TRIM(name)), COUNT(1), MAX(id)
-		FROM api_tokens
-		WHERE TRIM(name) != ''
-		GROUP BY LOWER(TRIM(name))
-	`)
-	if err != nil {
-		return fmt.Errorf("query api_tokens for migration failed: %w", err)
-	}
-	defer rows.Close()
-
-	uniqueTokenMap := make(map[string]string) // lower(name) -> id
-	for rows.Next() {
-		var name, id string
-		var count int
-		if err := rows.Scan(&name, &count, &id); err == nil {
-			if count == 1 {
-				uniqueTokenMap[name] = id
-			}
-		}
-	}
-	_ = rows.Close()
-
-	// 2. 迁移已有流水：将已交付别名入库，标记为已分配 (allocated)
+	// 1. 迁移已有流水：将已交付别名入库，标记为已分配 (allocated)
 	qLeases := `
 	INSERT INTO alias_inventory (email, account_id, remote_state, allocation_state, source_type, snapshot_version)
 	SELECT LOWER(TRIM(email)), account_id, 'unknown', 'allocated', 'legacy_unknown', 1
@@ -220,8 +206,9 @@ func (s *Store) migrateInventory() error {
 		return fmt.Errorf("迁移 lease_records 到 alias_inventory 失败: %w", err)
 	}
 
-	// 3. 逐条精确迁移 lease_records 到 alias_allocations
-	leaseRows, err := tx.Query(`SELECT id, LOWER(TRIM(email)), account_id, TRIM(COALESCE(token_name, '')), tag, allocated_at FROM lease_records WHERE TRIM(email) != ''`)
+	// 2. 逐条迁移 lease_records 到 alias_allocations
+	// 历史无 immutable token_id 的记录一律归属于 legacy_unknown，严禁按 name 模糊匹配继承 (PR-06 §9.4, Issue 16)
+	leaseRows, err := tx.Query(`SELECT id, LOWER(TRIM(email)), account_id, tag, allocated_at FROM lease_records WHERE TRIM(email) != ''`)
 	if err != nil {
 		return fmt.Errorf("query lease_records for migration failed: %w", err)
 	}
@@ -229,7 +216,7 @@ func (s *Store) migrateInventory() error {
 
 	allocStmt, err := tx.Prepare(`
 		INSERT INTO alias_allocations (allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 'allocated')
+		VALUES (?, ?, ?, 'legacy_unknown', 'legacy_unknown', ?, ?, 'allocated')
 		ON CONFLICT(alias_email) DO NOTHING
 	`)
 	if err != nil {
@@ -238,20 +225,12 @@ func (s *Store) migrateInventory() error {
 	defer allocStmt.Close()
 
 	for leaseRows.Next() {
-		var id, email, accountID, tokenName, tag, allocatedAt string
-		if err := leaseRows.Scan(&id, &email, &accountID, &tokenName, &tag, &allocatedAt); err != nil {
+		var id, email, accountID, tag, allocatedAt string
+		if err := leaseRows.Scan(&id, &email, &accountID, &tag, &allocatedAt); err != nil {
 			return err
 		}
-		tokenNameLower := strings.ToLower(tokenName)
-		// 严禁因为名字相同让新 token 继承旧数据；scheduler/admin_console 或无法唯一映射的设为 legacy_unknown
-		if tokenID, ok := uniqueTokenMap[tokenNameLower]; ok && tokenNameLower != "scheduler" && tokenNameLower != "admin_console" && tokenNameLower != "" {
-			if _, err := allocStmt.Exec(id, email, accountID, "token", tokenID, tag, allocatedAt); err != nil {
-				return err
-			}
-		} else {
-			if _, err := allocStmt.Exec(id, email, accountID, "legacy_unknown", "legacy_unknown", tag, allocatedAt); err != nil {
-				return err
-			}
+		if _, err := allocStmt.Exec(id, email, accountID, tag, allocatedAt); err != nil {
+			return err
 		}
 	}
 	_ = leaseRows.Close()
@@ -359,11 +338,11 @@ func (s *Store) SyncAliasInventory(accountID string, aliases []hme.Alias) error 
 	return tx.Commit()
 }
 
-// ClaimInventoryAlias 在单事务内原子认领可用库存，保障 SQLite 级唯一性与操作幂等性
+// ClaimInventoryAlias 在单事务内原子认领可用库存，保障 SQLite 级唯一性与操作幂等性 (PR-06 §9.4, Issue 11)
 func (s *Store) ClaimInventoryAlias(
 	ctx context.Context,
 	principalKind, principalID, operationKind, idempKey, reqHash, tag string,
-	accountID string,
+	allowedAccountIDs []string,
 ) (*AliasAllocation, *Operation, error) {
 	principalKind = strings.TrimSpace(principalKind)
 	principalID = strings.TrimSpace(principalID)
@@ -463,17 +442,43 @@ func (s *Store) ClaimInventoryAlias(
 	}
 
 	// 3. 遴选可用别名 (必须满足 remote_state = active 且 allocation_state = available)
+	// 若 allowedAccountIDs 明确给出了集合但集合为空，直接返回库存为空，绝不跨账号越权发放 (Issue 11)
+	if allowedAccountIDs != nil && len(allowedAccountIDs) == 0 {
+		if idempKey != "" {
+			_, _ = tx.ExecContext(ctx, `UPDATE operations SET state = 'failed', error_code = 'NO_AVAILABLE_INVENTORY', updated_at = ? WHERE operation_id = ?`, now, opID)
+			_ = tx.Commit()
+			currentOp.State = "failed"
+			currentOp.ErrorCode = "NO_AVAILABLE_INVENTORY"
+		}
+		return nil, currentOp, ErrNoAvailableInventory
+	}
+
 	query := `
 		SELECT email, account_id
 		FROM alias_inventory
 		WHERE allocation_state = 'available' AND remote_state = 'active'
 	`
 	var args []any
-	if accountID != "" {
-		query += " AND account_id = ?"
-		args = append(args, accountID)
+	if len(allowedAccountIDs) == 1 && allowedAccountIDs[0] != "" {
+		query += " AND account_id = ? ORDER BY ROWID ASC LIMIT 1"
+		args = append(args, allowedAccountIDs[0])
+	} else if len(allowedAccountIDs) > 1 {
+		var caseExpr strings.Builder
+		caseExpr.WriteString("CASE account_id ")
+		placeholders := make([]string, len(allowedAccountIDs))
+		for i, a := range allowedAccountIDs {
+			placeholders[i] = "?"
+			args = append(args, a)
+			caseExpr.WriteString(fmt.Sprintf("WHEN ? THEN %d ", i))
+		}
+		caseExpr.WriteString("ELSE 9999 END")
+		for _, a := range allowedAccountIDs {
+			args = append(args, a)
+		}
+		query += fmt.Sprintf(" AND account_id IN (%s) ORDER BY %s, ROWID ASC LIMIT 1", strings.Join(placeholders, ","), caseExpr.String())
+	} else {
+		query += " ORDER BY ROWID ASC LIMIT 1"
 	}
-	query += " ORDER BY ROWID ASC LIMIT 1"
 
 	var candEmail, candAccountID string
 	err = tx.QueryRowContext(ctx, query, args...).Scan(&candEmail, &candAccountID)
@@ -756,16 +761,20 @@ func (s *Store) CreateVerificationRequestAtomic(
 		}
 	}
 
+	if req.BaselineMailbox == "" {
+		req.BaselineMailbox = "INBOX"
+	}
+
 	// 5. 原子插入
 	q := `
 	INSERT INTO verification_requests (
 		request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
-		baseline_provider, baseline_uidvalidity, baseline_uid, matched_event_ref, code
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		baseline_provider, baseline_mailbox, baseline_uidvalidity, baseline_uid, matched_event_ref, code
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 	_, err = tx.ExecContext(ctx, q,
 		req.RequestID, req.PrincipalKind, req.PrincipalID, req.LeaseID, req.AliasEmail, req.Status, req.CreatedAt, req.ExpiresAt,
-		req.BaselineProvider, req.BaselineUIDValidity, req.BaselineUID, req.MatchedEventRef, req.Code,
+		req.BaselineProvider, req.BaselineMailbox, req.BaselineUIDValidity, req.BaselineUID, req.MatchedEventRef, req.Code,
 	)
 	if err != nil {
 		return err
@@ -776,15 +785,18 @@ func (s *Store) CreateVerificationRequestAtomic(
 
 // CreateVerificationRequest 创建持久化取码请求 (Section VI)
 func (s *Store) CreateVerificationRequest(ctx context.Context, req *VerificationRequest) error {
+	if req.BaselineMailbox == "" {
+		req.BaselineMailbox = "INBOX"
+	}
 	q := `
 	INSERT INTO verification_requests (
 		request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
-		baseline_provider, baseline_uidvalidity, baseline_uid, matched_event_ref, code
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		baseline_provider, baseline_mailbox, baseline_uidvalidity, baseline_uid, matched_event_ref, code
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 	_, err := s.db.ExecContext(ctx, q,
 		req.RequestID, req.PrincipalKind, req.PrincipalID, req.LeaseID, req.AliasEmail, req.Status, req.CreatedAt, req.ExpiresAt,
-		req.BaselineProvider, req.BaselineUIDValidity, req.BaselineUID, req.MatchedEventRef, req.Code,
+		req.BaselineProvider, req.BaselineMailbox, req.BaselineUIDValidity, req.BaselineUID, req.MatchedEventRef, req.Code,
 	)
 	return err
 }
@@ -795,13 +807,13 @@ func (s *Store) GetVerificationRequest(ctx context.Context, requestID, principal
 	var req VerificationRequest
 	q := `
 	SELECT request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
-	       baseline_provider, baseline_uidvalidity, baseline_uid, matched_event_ref, code
+	       baseline_provider, COALESCE(baseline_mailbox, 'INBOX'), baseline_uidvalidity, baseline_uid, matched_event_ref, code
 	FROM verification_requests
 	WHERE request_id = ? AND principal_kind = ? AND principal_id = ?
 	`
 	err := s.db.QueryRowContext(ctx, q, requestID, principalKind, principalID).Scan(
 		&req.RequestID, &req.PrincipalKind, &req.PrincipalID, &req.LeaseID, &req.AliasEmail, &req.Status, &req.CreatedAt, &req.ExpiresAt,
-		&req.BaselineProvider, &req.BaselineUIDValidity, &req.BaselineUID, &req.MatchedEventRef, &req.Code,
+		&req.BaselineProvider, &req.BaselineMailbox, &req.BaselineUIDValidity, &req.BaselineUID, &req.MatchedEventRef, &req.Code,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -812,16 +824,120 @@ func (s *Store) GetVerificationRequest(ctx context.Context, requestID, principal
 	return &req, nil
 }
 
-// UpdateVerificationRequestResult 更新取码任务结果
-func (s *Store) UpdateVerificationRequestResult(ctx context.Context, requestID, status, code, matchedEventRef string) error {
+// getVerificationRequestByID 按 request_id 查询实体 (供 CAS 失败后获取最新终态)
+func (s *Store) getVerificationRequestByID(ctx context.Context, requestID string) (*VerificationRequest, error) {
+	requestID = strings.TrimSpace(requestID)
+	var req VerificationRequest
+	q := `
+	SELECT request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
+	       baseline_provider, COALESCE(baseline_mailbox, 'INBOX'), baseline_uidvalidity, baseline_uid, matched_event_ref, code
+	FROM verification_requests
+	WHERE request_id = ?
+	`
+	err := s.db.QueryRowContext(ctx, q, requestID).Scan(
+		&req.RequestID, &req.PrincipalKind, &req.PrincipalID, &req.LeaseID, &req.AliasEmail, &req.Status, &req.CreatedAt, &req.ExpiresAt,
+		&req.BaselineProvider, &req.BaselineMailbox, &req.BaselineUIDValidity, &req.BaselineUID, &req.MatchedEventRef, &req.Code,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrVerificationRequestNotFound
+		}
+		return nil, err
+	}
+	return &req, nil
+}
+
+// CompleteVerificationRequest 原子 CAS 将取码任务标记为成功 (Section VI, Issue 6 & 7)
+// 仅允许从 ready 或 pending 变迁为 succeeded；如果已经处于终态，返回当前终态与 won=false，绝不覆盖已有结果。
+func (s *Store) CompleteVerificationRequest(ctx context.Context, requestID, code, matchedEventRef string) (*VerificationRequest, bool, error) {
 	requestID = strings.TrimSpace(requestID)
 	q := `
 	UPDATE verification_requests
-	SET status = ?, code = ?, matched_event_ref = ?
-	WHERE request_id = ?
+	SET status = 'succeeded', code = ?, matched_event_ref = ?
+	WHERE request_id = ? AND status IN ('ready', 'pending')
 	`
-	_, err := s.db.ExecContext(ctx, q, status, code, matchedEventRef, requestID)
-	return err
+	res, err := s.db.ExecContext(ctx, q, code, matchedEventRef, requestID)
+	if err != nil {
+		return nil, false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return nil, false, err
+	}
+	req, err := s.getVerificationRequestByID(ctx, requestID)
+	if err != nil {
+		return nil, false, err
+	}
+	return req, rows > 0, nil
+}
+
+// ExpireVerificationRequest 原子 CAS 将取码任务标记为超时过期 (Issue 6)
+func (s *Store) ExpireVerificationRequest(ctx context.Context, requestID string) (*VerificationRequest, bool, error) {
+	requestID = strings.TrimSpace(requestID)
+	q := `
+	UPDATE verification_requests
+	SET status = 'expired'
+	WHERE request_id = ? AND status IN ('ready', 'pending')
+	`
+	res, err := s.db.ExecContext(ctx, q, requestID)
+	if err != nil {
+		return nil, false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return nil, false, err
+	}
+	req, err := s.getVerificationRequestByID(ctx, requestID)
+	if err != nil {
+		return nil, false, err
+	}
+	return req, rows > 0, nil
+}
+
+// InvalidateVerificationRequest 原子 CAS 将取码任务标记为因代际突变失效 (Issue 6)
+func (s *Store) InvalidateVerificationRequest(ctx context.Context, requestID string) (*VerificationRequest, bool, error) {
+	requestID = strings.TrimSpace(requestID)
+	q := `
+	UPDATE verification_requests
+	SET status = 'invalidated'
+	WHERE request_id = ? AND status IN ('ready', 'pending')
+	`
+	res, err := s.db.ExecContext(ctx, q, requestID)
+	if err != nil {
+		return nil, false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return nil, false, err
+	}
+	req, err := s.getVerificationRequestByID(ctx, requestID)
+	if err != nil {
+		return nil, false, err
+	}
+	return req, rows > 0, nil
+}
+
+// UpdateVerificationRequestResult 更新取码任务结果 (保证原子 CAS，拒绝终态覆盖)
+func (s *Store) UpdateVerificationRequestResult(ctx context.Context, requestID, status, code, matchedEventRef string) error {
+	switch status {
+	case "succeeded":
+		_, _, err := s.CompleteVerificationRequest(ctx, requestID, code, matchedEventRef)
+		return err
+	case "expired":
+		_, _, err := s.ExpireVerificationRequest(ctx, requestID)
+		return err
+	case "invalidated":
+		_, _, err := s.InvalidateVerificationRequest(ctx, requestID)
+		return err
+	default:
+		q := `
+		UPDATE verification_requests
+		SET status = ?, code = ?, matched_event_ref = ?
+		WHERE request_id = ? AND status IN ('ready', 'pending')
+		`
+		_, err := s.db.ExecContext(ctx, q, status, code, matchedEventRef, requestID)
+		return err
+	}
 }
 
 // GetActiveVerificationRequestByLease 查询指定 lease 是否已有进行中的取码任务 (status IN ('ready', 'pending') 且未过期) (PR-06 Section 9.2)
@@ -831,7 +947,7 @@ func (s *Store) GetActiveVerificationRequestByLease(ctx context.Context, leaseID
 	var req VerificationRequest
 	q := `
 	SELECT request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
-	       baseline_provider, baseline_uidvalidity, baseline_uid, matched_event_ref, code
+	       baseline_provider, COALESCE(baseline_mailbox, 'INBOX'), baseline_uidvalidity, baseline_uid, matched_event_ref, code
 	FROM verification_requests
 	WHERE lease_id = ? AND status IN ('ready', 'pending') AND expires_at > ?
 	ORDER BY created_at DESC
@@ -839,7 +955,7 @@ func (s *Store) GetActiveVerificationRequestByLease(ctx context.Context, leaseID
 	`
 	err := s.db.QueryRowContext(ctx, q, leaseID, now).Scan(
 		&req.RequestID, &req.PrincipalKind, &req.PrincipalID, &req.LeaseID, &req.AliasEmail, &req.Status, &req.CreatedAt, &req.ExpiresAt,
-		&req.BaselineProvider, &req.BaselineUIDValidity, &req.BaselineUID, &req.MatchedEventRef, &req.Code,
+		&req.BaselineProvider, &req.BaselineMailbox, &req.BaselineUIDValidity, &req.BaselineUID, &req.MatchedEventRef, &req.Code,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -874,4 +990,29 @@ func (s *Store) CountActiveVerificationRequestsByPrincipal(ctx context.Context, 
 	`
 	err := s.db.QueryRowContext(ctx, q, principalKind, principalID, now).Scan(&count)
 	return count, err
+}
+
+// GetMinBaselineUIDByEmail 查询指定别名邮箱当前所有活跃取码任务的最小 baseline_uid (Issue 14).
+// 若无活跃任务或有任何活跃任务缺少有效的 IMAP baseline UID，则返回 0 以退回全量拉取。
+func (s *Store) GetMinBaselineUIDByEmail(ctx context.Context, email string) (uint32, error) {
+	email = strings.TrimSpace(strings.ToLower(email))
+	now := time.Now().UTC().Format(time.RFC3339)
+	q := `
+	SELECT 
+		count(*),
+		count(CASE WHEN baseline_uid > 0 AND baseline_provider = 'imap' THEN 1 END),
+		COALESCE(min(CASE WHEN baseline_uid > 0 AND baseline_provider = 'imap' THEN baseline_uid END), 0)
+	FROM verification_requests
+	WHERE alias_email = ? AND status IN ('ready', 'pending') AND (expires_at IS NULL OR expires_at > ?)
+	`
+	var totalCount, validCount int
+	var minUID uint32
+	err := s.db.QueryRowContext(ctx, q, email, now).Scan(&totalCount, &validCount, &minUID)
+	if err != nil {
+		return 0, err
+	}
+	if totalCount == 0 || totalCount != validCount {
+		return 0, nil
+	}
+	return minUID, nil
 }

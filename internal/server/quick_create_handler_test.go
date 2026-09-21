@@ -233,6 +233,9 @@ func TestQuickCreatePoolFirstAndFallback(t *testing.T) {
 		APIKey:        "test-key",
 	}
 	s := newWithBackend(f, cfg)
+	for _, a := range f.aliases {
+		_ = s.store.AddInventoryAlias("acc_pool", a, "replenish", true)
+	}
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 
@@ -336,6 +339,12 @@ func TestQuickCreateRoundRobinInterleaving(t *testing.T) {
 		APIKey:        "test-key",
 	}
 	s := newWithBackend(f, cfg)
+	for _, a := range f.accountAliases["acc_alpha"] {
+		_ = s.store.AddInventoryAlias("acc_alpha", a, "replenish", true)
+	}
+	for _, a := range f.accountAliases["acc_beta"] {
+		_ = s.store.AddInventoryAlias("acc_beta", a, "replenish", true)
+	}
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 

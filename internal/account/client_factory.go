@@ -8,6 +8,7 @@
 package account
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -146,9 +147,11 @@ func (m *Manager) MailClient(id string) (*mail.Client, error) {
 	return mail.NewClientWithProxy(imapEmail, snap.AppPassword, snap.Proxy), nil
 }
 
-// WithMailClient 使用连接池中的长连接执行 fn(串行/账号级)。
-// fn 返回后连接保留在池中, 不会 Logout。
-func (m *Manager) WithMailClient(id string, fn func(*mail.Client) error) error {
+// WithMailClientContext 使用连接池中的长连接执行 fn，支持真实 Context 超时与取消 (Issue 13)。
+func (m *Manager) WithMailClientContext(ctx context.Context, id string, fn func(*mail.Client) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.mu.RLock()
 	acc, ok := m.accounts[id]
 	var mailbox *MailboxConfig
@@ -170,17 +173,38 @@ func (m *Manager) WithMailClient(id string, fn func(*mail.Client) error) error {
 			return err
 		}
 		defer mc.Disconnect()
-		// 外部转寄邮箱(QQ/163 等)没有命令级超时，必须显式设置绝对截止时间，
-		// 否则上游假死会让 HTTP 请求与 goroutine 永久挂起、fd 持续泄漏。
+
+		stopWatch := make(chan struct{})
+		defer close(stopWatch)
+		go func() {
+			select {
+			case <-ctx.Done():
+				mc.SetDeadline(time.Now())
+				mc.ForceClose()
+			case <-stopWatch:
+			}
+		}()
+
 		mc.SetDeadline(time.Now().Add(mail.IMAPCommandTimeout))
 		defer mc.SetDeadline(time.Time{})
-		return fn(mc)
+		err := fn(mc)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			mc.ForceClose()
+			return ctxErr
+		}
+		return err
 	}
 	imapEmail, appPassword, proxyURL, err := m.imapCreds(id)
 	if err != nil {
 		return err
 	}
-	return m.getIMAPPool().Do(imapEmail, appPassword, proxyURL, fn)
+	return m.getIMAPPool().DoContext(ctx, imapEmail, appPassword, proxyURL, fn)
+}
+
+// WithMailClient 使用连接池中的长连接执行 fn(串行/账号级)。
+// fn 返回后连接保留在池中, 不会 Logout。
+func (m *Manager) WithMailClient(id string, fn func(*mail.Client) error) error {
+	return m.WithMailClientContext(context.Background(), id, fn)
 }
 
 func (m *Manager) getIMAPPool() *mail.Pool {

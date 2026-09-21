@@ -357,7 +357,7 @@ accountLoop:
 }
 
 // fetchAndPublishBatch 按账号增量批量拉取邮件并分发给多个别名等待者 (PR-07 §10.2 & PR-08 Final Hardening §3)。
-// 单账号仅发起 1 次 ListInboxContext，真实支持上下文超时与取消。
+// 单账号仅发起 1 次 ListInboxContext，真实支持上下文超时与取消，且支持增量游标 (SinceUID, Issue 14)。
 func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID string, aliases []string) bool {
 	if len(aliases) == 0 {
 		return false
@@ -370,11 +370,35 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 			Limit:     5,
 			Days:      1,
 		}
+		if w.store != nil {
+			if uid, err := w.store.GetMinBaselineUIDByEmail(ctx, aliases[0]); err == nil && uid > 0 {
+				q.SinceUID = uid + 1
+				q.Limit = 50
+			}
+		}
 	} else {
 		q = InboxQuery{
 			AccountID: accountID,
 			Limit:     10,
 			Days:      1,
+		}
+		if w.store != nil {
+			var globalMinUID uint32
+			allHaveBaseline := true
+			for _, alias := range aliases {
+				uid, err := w.store.GetMinBaselineUIDByEmail(ctx, alias)
+				if err != nil || uid == 0 {
+					allHaveBaseline = false
+					break
+				}
+				if globalMinUID == 0 || uid < globalMinUID {
+					globalMinUID = uid
+				}
+			}
+			if allHaveBaseline && globalMinUID > 0 {
+				q.SinceUID = globalMinUID + 1
+				q.Limit = 50
+			}
 		}
 	}
 

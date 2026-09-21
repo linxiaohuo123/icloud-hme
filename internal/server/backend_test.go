@@ -72,7 +72,7 @@ type fakeBackend struct {
 	validateFunc func(id string) error
 
 	getMessageFunc      func(accountID string, id string) (*mail.FullMessage, error)
-	getMessagesFunc     func(accountID string, refs []MessageRef) ([]*mail.FullMessage, error)
+	getMessagesFunc     func(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error)
 	mailboxBoundaryFunc func(accountID, folder string) (string, uint32, uint32, error)
 }
 
@@ -287,13 +287,36 @@ func (f *fakeBackend) GetMessage(accountID string, id string) (*mail.FullMessage
 	return &mail.FullMessage{Message: mail.Message{ID: idPart}}, nil
 }
 
-func (f *fakeBackend) GetMessages(accountID string, refs []MessageRef) ([]*mail.FullMessage, error) {
+func (f *fakeBackend) GetMessages(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error) {
 	if f.getMessagesFunc != nil {
 		return f.getMessagesFunc(accountID, refs)
 	}
 	var out []*mail.FullMessage
 	for _, r := range refs {
-		out = append(out, &mail.FullMessage{Message: mail.Message{ID: fmt.Sprint(r.UID), Folder: r.Folder}})
+		mailbox := r.Mailbox
+		if mailbox == "" {
+			mailbox = "INBOX"
+		}
+		ref := mail.MessageRef{
+			Provider:    "imap",
+			AccountID:   accountID,
+			Mailbox:     mailbox,
+			UIDValidity: r.UIDValidity,
+			UID:         r.UID,
+		}
+		msg := &mail.FullMessage{
+			Message: mail.Message{
+				ID:          fmt.Sprint(r.UID),
+				Folder:      mailbox,
+				UIDValidity: r.UIDValidity,
+				UID:         r.UID,
+				Provider:    "imap",
+				MessageRef:  ref.Encode(),
+			},
+			Provider: "imap",
+			Method:   "imap",
+		}
+		out = append(out, msg)
 	}
 	return out, nil
 }

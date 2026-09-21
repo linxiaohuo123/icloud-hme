@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 sync, sync/atomic, time, mail.OTPResult
- * [OUTPUT]: 对外提供 EventBus, NewEventBus, CachedOTP
- * [POS]: internal/mail 的内存事件分发总线，解耦邮件接收与 HTTP 长轮询，提供基于 UID/UIDVALIDITY 边界的严格过滤与多事件并发隔离
+ * [OUTPUT]: 对外提供 EventBus, NewEventBus, CachedOTP, BaselineBoundary, BoundaryDecision, MatchBoundary
+ * [POS]: internal/mail 的内存事件分发总线，解耦邮件接收与 HTTP 长轮询，提供基于 UID/UIDVALIDITY/MAILBOX 边界的严格过滤与多事件并发隔离
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -30,11 +30,61 @@ type CachedOTP struct {
 	ExpiresAt   time.Time  `json:"expires_at"`
 }
 
+// BoundaryDecision 表示事件与基线边界的比对决策结果。
+type BoundaryDecision int
+
+const (
+	BoundaryIgnore BoundaryDecision = iota
+	BoundaryMatch
+	BoundaryInvalidated
+)
+
+// BaselineBoundary 定义用于验证码事件过滤的基线边界。
+type BaselineBoundary struct {
+	Mailbox     string
+	UIDValidity uint32
+	UID         uint32
+}
+
+// MatchBoundary 是纯函数，用于判定邮件事件是否满足基线边界约束 (PR-06 §9.5, Final Closure)。
+// MATCH: 同 mailbox + 同 UIDValidity + (ev.UID >= baselineUID)
+// IGNORE: 不同 mailbox 或 (同 mailbox + 同 UIDValidity + ev.UID < baselineUID)
+// BASELINE_INVALIDATED: 同 mailbox + UIDValidity != baselineUIDValidity (代际失效)
+func MatchBoundary(ev *CachedOTP, baseline BaselineBoundary) BoundaryDecision {
+	if ev == nil {
+		return BoundaryIgnore
+	}
+
+	evMailbox := ev.Folder
+	if evMailbox == "" {
+		evMailbox = "INBOX"
+	}
+	baseMailbox := baseline.Mailbox
+	if baseMailbox == "" {
+		baseMailbox = "INBOX"
+	}
+	// 非指定 mailbox 绝不参与当前基线比对
+	if !strings.EqualFold(evMailbox, baseMailbox) {
+		return BoundaryIgnore
+	}
+
+	// UIDVALIDITY 代际检查
+	if baseline.UIDValidity != 0 && ev.UIDValidity != 0 && ev.UIDValidity != baseline.UIDValidity {
+		return BoundaryInvalidated
+	}
+
+	// UID 游标检查
+	if baseline.UID != 0 && ev.UID != 0 && ev.UID < baseline.UID {
+		return BoundaryIgnore
+	}
+
+	return BoundaryMatch
+}
+
 type subscriberEntry struct {
-	ch                  chan *CachedOTP
-	baselineUIDValidity uint32
-	baselineUID         uint32
-	hasBoundary         bool
+	ch          chan *CachedOTP
+	boundary    BaselineBoundary
+	hasBoundary bool
 }
 
 // EventBus 是收信内存发布/订阅总线。
@@ -102,15 +152,21 @@ func (b *EventBus) SubscribeWithFresh(email string, fresh bool) (uint64, chan *C
 	return subID, ch
 }
 
-// SubscribeWithBoundary 订阅满足 UIDVALIDITY 和 UIDNEXT 边界的验证码到达事件 (PR-06 Section 9.2, 9.5)。
-// 只有在满足 UIDValidity == baselineUIDValidity 且 UID >= baselineUID 时才匹配交付。
-func (b *EventBus) SubscribeWithBoundary(email string, baselineUIDValidity, baselineUID uint32) (uint64, chan *CachedOTP) {
+// SubscribeWithBoundary 订阅满足 UIDVALIDITY 和 UIDNEXT 边界的验证码到达事件 (PR-06 Section 9.2, 9.5, Final Closure)。
+// 严格绑定 mailbox (缺省 INBOX)；未过期缓存完整保留，绝不因未命中或代际失效截断丢弃。
+func (b *EventBus) SubscribeWithBoundary(email, baselineMailbox string, baselineUIDValidity, baselineUID uint32) (uint64, chan *CachedOTP) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	subID := atomic.AddUint64(&b.subCounter, 1)
 	ch := make(chan *CachedOTP, 1)
+
+	baseline := BaselineBoundary{
+		Mailbox:     baselineMailbox,
+		UIDValidity: baselineUIDValidity,
+		UID:         baselineUID,
+	}
 
 	now := time.Now()
 	var unexpired []*CachedOTP
@@ -119,13 +175,8 @@ func (b *EventBus) SubscribeWithBoundary(email string, baselineUIDValidity, base
 		if now.Before(ev.ExpiresAt) {
 			unexpired = append(unexpired, ev)
 			if matched == nil {
-				if baselineUIDValidity != 0 && ev.UIDValidity != 0 && ev.UIDValidity != baselineUIDValidity {
-					matched = ev
-					break
-				}
-				validMatch := (baselineUIDValidity == 0 || ev.UIDValidity == 0 || ev.UIDValidity == baselineUIDValidity)
-				uidMatch := (baselineUID == 0 || ev.UID >= baselineUID)
-				if validMatch && uidMatch {
+				decision := MatchBoundary(ev, baseline)
+				if decision == BoundaryMatch || decision == BoundaryInvalidated {
 					matched = ev
 				}
 			}
@@ -143,10 +194,9 @@ func (b *EventBus) SubscribeWithBoundary(email string, baselineUIDValidity, base
 		b.subscribers[email] = subs
 	}
 	subs[subID] = &subscriberEntry{
-		ch:                  ch,
-		baselineUIDValidity: baselineUIDValidity,
-		baselineUID:         baselineUID,
-		hasBoundary:         true,
+		ch:          ch,
+		boundary:    baseline,
+		hasBoundary: true,
 	}
 	return subID, ch
 }
@@ -195,10 +245,8 @@ func (b *EventBus) PublishEvent(ev *CachedOTP) {
 	if subs, ok := b.subscribers[email]; ok {
 		for _, sub := range subs {
 			if sub.hasBoundary {
-				if sub.baselineUIDValidity != 0 && ev.UIDValidity != 0 && sub.baselineUIDValidity != ev.UIDValidity {
-					continue
-				}
-				if sub.baselineUID != 0 && ev.UID < sub.baselineUID {
+				decision := MatchBoundary(ev, sub.boundary)
+				if decision == BoundaryIgnore {
 					continue
 				}
 			}

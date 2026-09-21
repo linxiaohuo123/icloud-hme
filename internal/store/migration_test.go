@@ -38,7 +38,7 @@ func TestMIG01_EmptyDBInit(t *testing.T) {
 	}
 }
 
-// MIG02: 含 legacy lease_records 库迁移，无歧义 token 成功关联 token_id
+// MIG02: 含 legacy lease_records 库迁移，历史无不可变 token_id 的记录统一隔离至 legacy_unknown (Issue 16)
 func TestMIG02_LegacyLeasesUnambiguousToken(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "icloud_hme.db")
@@ -65,7 +65,7 @@ func TestMIG02_LegacyLeasesUnambiguousToken(t *testing.T) {
 	}
 	defer st.Close()
 
-	// 验证迁移结果
+	// 验证迁移结果：严禁因名称相同而自动关联，必须隔离为 legacy_unknown (铁律 C & Issue 16)
 	rawDB, _ = sql.Open("sqlite", dbPath)
 	defer rawDB.Close()
 
@@ -74,8 +74,8 @@ func TestMIG02_LegacyLeasesUnambiguousToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MIG02 失败: 查询 alias_allocations 失败: %v", err)
 	}
-	if ownerKind != "token" || ownerID != "tok_bot1" {
-		t.Fatalf("MIG02 失败: 期望关联 tok_bot1, 实际 ownerKind=%s ownerID=%s", ownerKind, ownerID)
+	if ownerKind != "legacy_unknown" || ownerID != "legacy_unknown" {
+		t.Fatalf("MIG02 失败: 历史资产无 immutable token_id 必须归属 legacy_unknown, 实际 ownerKind=%s ownerID=%s", ownerKind, ownerID)
 	}
 }
 

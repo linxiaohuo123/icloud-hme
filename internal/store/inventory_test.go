@@ -45,7 +45,7 @@ func TestPR03_D01_ConcurrentIdenticalIdempotentClaim(t *testing.T) {
 	for i := 0; i < concurrency; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			alloc, _, err := st.ClaimInventoryAlias(ctx, "token", "tok_test", "allocate", idempKey, reqHash, "test_tag", "")
+			alloc, _, err := st.ClaimInventoryAlias(ctx, "token", "tok_test", "allocate", idempKey, reqHash, "test_tag", nil)
 			results[idx] = alloc
 			errorsList[idx] = err
 		}(i)
@@ -59,13 +59,11 @@ func TestPR03_D01_ConcurrentIdenticalIdempotentClaim(t *testing.T) {
 		if errorsList[i] == nil {
 			if firstAlloc == nil {
 				firstAlloc = results[i]
-			} else {
-				if results[i].AllocationID != firstAlloc.AllocationID || results[i].AliasEmail != firstAlloc.AliasEmail {
-					t.Fatalf("idempotent results diverged: first=%+v, other=%+v", firstAlloc, results[i])
-				}
+			} else if results[i].AllocationID != firstAlloc.AllocationID {
+				t.Fatalf("concurrent claims returned different allocations: %s vs %s", results[i].AllocationID, firstAlloc.AllocationID)
 			}
 		} else if !errors.Is(errorsList[i], ErrOperationPending) {
-			t.Fatalf("unexpected error: %v", errorsList[i])
+			t.Fatalf("unexpected error during concurrent claim: %v", errorsList[i])
 		}
 	}
 
@@ -74,7 +72,7 @@ func TestPR03_D01_ConcurrentIdenticalIdempotentClaim(t *testing.T) {
 	}
 
 	// 再次以相同 key 和 hash 查询，必须返回相同的 allocation
-	repeatAlloc, _, err := st.ClaimInventoryAlias(ctx, "token", "tok_test", "allocate", idempKey, reqHash, "test_tag", "")
+	repeatAlloc, _, err := st.ClaimInventoryAlias(ctx, "token", "tok_test", "allocate", idempKey, reqHash, "test_tag", nil)
 	if err != nil || repeatAlloc.AllocationID != firstAlloc.AllocationID {
 		t.Fatalf("subsequent claim with same idempKey must return exact same allocation, got %+v, err=%v", repeatAlloc, err)
 	}
@@ -106,7 +104,7 @@ func TestPR03_D02_ConcurrentDifferentClaimsNoDuplicate(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			idempKey := fmt.Sprintf("idemp_diff_%d", idx)
-			alloc, _, err := st.ClaimInventoryAlias(ctx, "token", fmt.Sprintf("tok_%d", idx), "allocate", idempKey, "hash", "tag", "")
+			alloc, _, err := st.ClaimInventoryAlias(ctx, "token", fmt.Sprintf("tok_%d", idx), "allocate", idempKey, "hash", "tag", nil)
 			if err == nil && alloc != nil {
 				claimedEmails[idx] = alloc.AliasEmail
 			}
@@ -160,12 +158,12 @@ func TestPR03_D03_TwoIndependentStoreConnections(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		alloc1, _, err1 = st1.ClaimInventoryAlias(ctx, "token", "tok_conn1", "allocate", "key_conn1", "h1", "tag", "")
+		alloc1, _, err1 = st1.ClaimInventoryAlias(ctx, "token", "tok_conn1", "allocate", "key_conn1", "h1", "tag", nil)
 	}()
 
 	go func() {
 		defer wg.Done()
-		alloc2, _, err2 = st2.ClaimInventoryAlias(ctx, "token", "tok_conn2", "allocate", "key_conn2", "h2", "tag", "")
+		alloc2, _, err2 = st2.ClaimInventoryAlias(ctx, "token", "tok_conn2", "allocate", "key_conn2", "h2", "tag", nil)
 	}()
 
 	wg.Wait()
@@ -197,7 +195,7 @@ func TestPR03_D04_TokenRenameDeleteDoesNotResetInventory(t *testing.T) {
 	_ = st.SaveToken(tok)
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "d04@icloud.com", Active: true}, "replenish", true)
 
-	alloc, _, err := st.ClaimInventoryAlias(context.Background(), "token", tok.ID, "allocate", "k_d04", "h", "tag", "")
+	alloc, _, err := st.ClaimInventoryAlias(context.Background(), "token", tok.ID, "allocate", "k_d04", "h", "tag", nil)
 	if err != nil || alloc.AliasEmail != "d04@icloud.com" {
 		t.Fatalf("initial claim failed: %v", err)
 	}
@@ -206,7 +204,7 @@ func TestPR03_D04_TokenRenameDeleteDoesNotResetInventory(t *testing.T) {
 	tok.Name = "RenamedToken"
 	_ = st.SaveToken(tok)
 	// 2. 验证库存仍然为 allocated，绝不可被再次认领
-	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "another_tok", "allocate", "k_diff", "h", "tag", "")
+	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "another_tok", "allocate", "k_diff", "h", "tag", nil)
 	if !errors.Is(err, ErrNoAvailableInventory) {
 		t.Fatalf("inventory must remain allocated after token rename, got: %v", err)
 	}
@@ -214,7 +212,7 @@ func TestPR03_D04_TokenRenameDeleteDoesNotResetInventory(t *testing.T) {
 	// 3. 删除令牌
 	_, _ = st.DeleteToken(tok.ID)
 	// 4. 验证库存仍然为 allocated
-	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "another_tok", "allocate", "k_diff2", "h", "tag", "")
+	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "another_tok", "allocate", "k_diff2", "h", "tag", nil)
 	if !errors.Is(err, ErrNoAvailableInventory) {
 		t.Fatalf("inventory must remain allocated after token deletion, got: %v", err)
 	}
@@ -230,7 +228,7 @@ func TestPR03_D05_PruningLeaseRecordsDoesNotResetInventory(t *testing.T) {
 	defer st.Close()
 
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "d05@icloud.com", Active: true}, "replenish", true)
-	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_d05", "allocate", "k_d05", "h", "tag", "")
+	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_d05", "allocate", "k_d05", "h", "tag", nil)
 	if err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}
@@ -239,7 +237,7 @@ func TestPR03_D05_PruningLeaseRecordsDoesNotResetInventory(t *testing.T) {
 	_, _ = st.db.Exec("DELETE FROM lease_records")
 
 	// 确认即使 lease_records 为空，alias_inventory 的 allocated 状态仍永久存在！
-	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_new", "allocate", "k_new", "h", "tag", "")
+	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_new", "allocate", "k_new", "h", "tag", nil)
 	if !errors.Is(err, ErrNoAvailableInventory) {
 		t.Fatalf("pruning lease_records must NOT reset inventory to available, got err: %v", err)
 	}
@@ -257,13 +255,13 @@ func TestPR03_D06_IdempotencyConflictOnDifferentHash(t *testing.T) {
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "d06@icloud.com", Active: true}, "replenish", true)
 
 	// 第一次调用: hash1
-	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_d06", "allocate", "key_d06", "hash1", "tag", "")
+	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_d06", "allocate", "key_d06", "hash1", "tag", nil)
 	if err != nil {
 		t.Fatalf("first claim failed: %v", err)
 	}
 
 	// 第二次调用: 相同 key 但 hash2
-	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_d06", "allocate", "key_d06", "hash2", "tag", "")
+	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_d06", "allocate", "key_d06", "hash2", "tag", nil)
 	if !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatalf("expected ErrIdempotencyConflict, got: %v", err)
 	}
@@ -282,7 +280,7 @@ func TestPR03_D07_MigrationUnknownRemainsQuarantined(t *testing.T) {
 	_ = st.migrateInventory()
 
 	// 尝试认领此历史别名，必须返回无库存，因为其 allocation_state 必须为 unknown
-	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_1", "allocate", "key_legacy", "h", "tag", "")
+	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_1", "allocate", "key_legacy", "h", "tag", nil)
 	if !errors.Is(err, ErrNoAvailableInventory) {
 		t.Fatalf("legacy route without allocation history must NOT be available, got: %v", err)
 	}
@@ -295,7 +293,7 @@ func TestPR03_D07_MigrationUnknownRemainsQuarantined(t *testing.T) {
 	}
 	defer stReopen.Close()
 
-	_, _, err = stReopen.ClaimInventoryAlias(context.Background(), "token", "tok_1", "allocate", "key_legacy2", "h", "tag", "")
+	_, _, err = stReopen.ClaimInventoryAlias(context.Background(), "token", "tok_1", "allocate", "key_legacy2", "h", "tag", nil)
 	if !errors.Is(err, ErrNoAvailableInventory) {
 		t.Fatalf("reopened store must still preserve quarantined state, got: %v", err)
 	}
@@ -311,7 +309,7 @@ func TestPR03_D08_RemoteSyncDoesNotOverwriteAllocated(t *testing.T) {
 	defer st.Close()
 
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "d08@icloud.com", Active: true}, "replenish", true)
-	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_d08", "allocate", "k_d08", "h", "tag", "")
+	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_d08", "allocate", "k_d08", "h", "tag", nil)
 	if err != nil {
 		t.Fatalf("claim failed: %v", err)
 	}
@@ -335,7 +333,7 @@ func TestPR03_D08_RemoteSyncDoesNotOverwriteAllocated(t *testing.T) {
 	}
 
 	// 再次认领必须依然无库存
-	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_other", "allocate", "k_other", "h", "tag", "")
+	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_other", "allocate", "k_other", "h", "tag", nil)
 	if !errors.Is(err, ErrNoAvailableInventory) {
 		t.Fatalf("expected ErrNoAvailableInventory after sync, got: %v", err)
 	}

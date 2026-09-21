@@ -261,7 +261,7 @@ func TestPR06_V04_ConsumeDoesNotDeleteLaterEvents(t *testing.T) {
 	bus.ConsumeEvent(email, "evt_A")
 
 	// 订阅基线 101 的事件 (代表更晚的任务)，事件 B 必须依然存在
-	_, ch := bus.SubscribeWithBoundary(email, 1, 101)
+	_, ch := bus.SubscribeWithBoundary(email, "INBOX", 1, 101)
 	select {
 	case ev := <-ch:
 		if ev.EventID != "evt_B" || ev.OTP.Code != "222222" {

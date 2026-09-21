@@ -66,7 +66,7 @@ type Backend interface {
 	ListInboxContext(context.Context, InboxQuery) (InboxResult, error)
 	ListMailboxes(string) ([]mail.Folder, error)
 	GetMessage(string, string) (*mail.FullMessage, error)
-	GetMessages(string, []MessageRef) ([]*mail.FullMessage, error)
+	GetMessages(string, []mail.MessageRef) ([]*mail.FullMessage, error)
 	GetMailboxBoundary(string, string) (string, uint32, uint32, error)
 	DeleteMessage(string, uint32) error
 	ValidateAccount(string) error

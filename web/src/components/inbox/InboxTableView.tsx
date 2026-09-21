@@ -58,6 +58,12 @@ export default function InboxTableView({
   const [limit, setLimit] = useState(20)
   const [days, setDays] = useState(7)
 
+  const currentAccount = useMemo(() => accounts.find((a) => a.id === accountId), [accounts, accountId])
+  const isWebMailOnly = useMemo(() => {
+    if (!currentAccount) return false
+    return !currentAccount.has_app_password && !currentAccount.mailbox?.email
+  }, [currentAccount])
+
   // 客户端分页
   const [page, setPage] = useState(1)
   const pageSize = 20
@@ -215,9 +221,11 @@ export default function InboxTableView({
 
     const params = new URLSearchParams({ account_id: accountId })
     if (alias) params.set('alias', alias)
-    if (folder) params.set('folder', folder)
+    if (!isWebMailOnly) {
+      if (folder && folder !== 'all') params.set('folder', folder)
+      params.set('days', String(days))
+    }
     params.set('limit', String(limit))
-    params.set('days', String(days))
 
     request<InboxResult>(`/api/inbox?${params.toString()}`, {
       signal: controller.signal,
@@ -226,35 +234,35 @@ export default function InboxTableView({
         if (cancelled || currentGen !== accountGenRef.current) return
         setResult(data)
         setError('')
-        // 静默预取前 20 封邮件正文注入内存缓存 (基于完整 message_ref 与文件夹隔离键)
+        // 静默预取前 20 封邮件正文注入内存缓存 (基于规范 message_ref)
         if (data && Array.isArray(data.messages) && data.messages.length > 0) {
-          const targets = data.messages.slice(0, 20).map((m) => ({
-            folder: m.folder || 'INBOX',
-            uid: m.id,
-            id: m.id,
-            ref: m.message_ref,
-          }))
-          request<{ messages?: FullMessage[] }>('/api/messages', {
-            method: 'POST',
-            body: {
-              account_id: accountId,
-              messages: targets,
-            },
-            signal: controller.signal,
-          })
-            .then((batch) => {
-              if (cancelled || currentGen !== accountGenRef.current) return
-              const list = Array.isArray(batch?.messages) ? batch.messages : []
-              list.forEach((fm) => {
-                if (fm) {
-                  messageCacheRef.current.set(buildMailCacheKey(accountId, fm), fm)
-                  if (fm.id) {
-                    messageCacheRef.current.set(`${accountId}:${fm.folder || 'INBOX'}:${fm.id}`, fm)
-                  }
-                }
-              })
+          const targets = data.messages
+            .slice(0, 20)
+            .map((m) => ({
+              message_ref: m.message_ref,
+            }))
+            .filter((t) => Boolean(t.message_ref))
+
+          if (targets.length > 0) {
+            request<{ messages?: FullMessage[] }>('/api/messages', {
+              method: 'POST',
+              body: {
+                account_id: accountId,
+                messages: targets,
+              },
+              signal: controller.signal,
             })
-            .catch(() => {})
+              .then((batch) => {
+                if (cancelled || currentGen !== accountGenRef.current) return
+                const list = Array.isArray(batch?.messages) ? batch.messages : []
+                list.forEach((fm) => {
+                  if (fm && fm.message_ref) {
+                    messageCacheRef.current.set(buildMailCacheKey(accountId, fm), fm)
+                  }
+                })
+              })
+              .catch(() => {})
+          }
         }
       })
       .catch((err) => {
@@ -278,9 +286,11 @@ export default function InboxTableView({
     if (!fixedAccount) {
       const next: Record<string, string> = { account_id: accountId }
       if (alias) next.alias = alias
-      if (folder && folder !== 'all') next.folder = folder
+      if (!isWebMailOnly) {
+        if (folder && folder !== 'all') next.folder = folder
+        next.days = String(days)
+      }
       next.limit = String(limit)
-      next.days = String(days)
       setSearchParams(next, { replace: true })
     }
     setRetryKey((k) => k + 1)
@@ -299,8 +309,7 @@ export default function InboxTableView({
   async function openMessage(message: InboxMessage) {
     const currentGen = accountGenRef.current
     const primaryKey = buildMailCacheKey(accountId, message)
-    const fallbackKey = `${accountId}:${message.folder || 'INBOX'}:${message.id}`
-    const cached = messageCacheRef.current.get(primaryKey) || messageCacheRef.current.get(fallbackKey)
+    const cached = messageCacheRef.current.get(primaryKey)
     if (cached) {
       setDetail(cached)
       return
@@ -312,10 +321,10 @@ export default function InboxTableView({
       if (currentGen !== accountGenRef.current) return
       // 【PR-02 契约】消费规范响应中的 response.message
       const fullMsg = resp.message
-      messageCacheRef.current.set(primaryKey, fullMsg)
-      messageCacheRef.current.set(fallbackKey, fullMsg)
       if (fullMsg.message_ref) {
         messageCacheRef.current.set(buildMailCacheKey(accountId, fullMsg), fullMsg)
+      } else {
+        messageCacheRef.current.set(primaryKey, fullMsg)
       }
       setDetail(fullMsg)
     } catch (err) {
@@ -400,7 +409,6 @@ export default function InboxTableView({
     }
   }, [filteredMessages.length, onCountChange])
 
-  const currentAccount = accounts.find((a) => a.id === accountId)
   const currentAccountName = currentAccount?.name || currentAccount?.real_email || (accountId || '未选择')
   const totalCount = result?.count ?? filteredMessages.length
   const codesDetectedCount = useMemo(() => {
@@ -495,6 +503,12 @@ export default function InboxTableView({
                 </span>
               </span>
             )}
+
+            {isWebMailOnly && (
+              <span className="card-stat-pill" style={{ color: '#e6a23c', borderColor: 'rgba(230,162,60,0.3)' }} title="当前账号未配置 App 专用密码，运行于 WebMail 模式，仅支持默认收件箱拉取，文件夹与天数筛选已禁用">
+                <span>WebMail 模式 (仅支持基础收件箱)</span>
+              </span>
+            )}
           </div>
         </div>
 
@@ -538,15 +552,16 @@ export default function InboxTableView({
 
           <div className="inbox-filter-item">
             <label htmlFor="inbox-folder" className="inbox-filter-label">
-              文件夹
+              文件夹 {isWebMailOnly && <span style={{ opacity: 0.6, fontSize: '0.85em' }}>(WebMail固定)</span>}
             </label>
             <Select
               id="inbox-folder"
               aria-label="文件夹"
-              value={folder}
+              value={isWebMailOnly ? 'INBOX' : folder}
               onChange={(val) => setFolder(val)}
-              options={folderOptions}
-              style={{ minWidth: 200 }}
+              options={isWebMailOnly ? [{ value: 'INBOX', label: '收件箱 (WebMail模式)' }] : folderOptions}
+              disabled={isWebMailOnly}
+              style={{ minWidth: 200, opacity: isWebMailOnly ? 0.6 : 1 }}
             />
           </div>
 
@@ -570,7 +585,7 @@ export default function InboxTableView({
 
           <div className="inbox-filter-item">
             <label htmlFor="inbox-days" className="inbox-filter-label">
-              时间范围
+              时间范围 {isWebMailOnly && <span style={{ opacity: 0.6, fontSize: '0.85em' }}>(全量)</span>}
             </label>
             <Select
               id="inbox-days"
@@ -583,7 +598,8 @@ export default function InboxTableView({
                 { value: 30, label: '30 天' },
                 { value: 90, label: '90 天' },
               ]}
-              style={{ minWidth: 90 }}
+              disabled={isWebMailOnly}
+              style={{ minWidth: 90, opacity: isWebMailOnly ? 0.6 : 1 }}
             />
           </div>
 

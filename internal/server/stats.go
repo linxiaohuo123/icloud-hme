@@ -67,9 +67,11 @@ func (s *Server) systemStatsHandler(c *gin.Context) {
 	}
 
 	// 内存缓存水位(用于判断是否接近上限)
-	s.msgCacheMu.RLock()
-	stats["message_cache_entries"] = len(s.msgCache)
-	s.msgCacheMu.RUnlock()
+	if s.mailReadService != nil {
+		stats["message_cache_entries"] = s.mailReadService.CacheLen()
+	} else {
+		stats["message_cache_entries"] = 0
+	}
 
 	// 后台引擎状态
 	stats["engines"] = gin.H{

@@ -11,7 +11,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"icloud-hme/internal/auth"
@@ -23,8 +25,8 @@ var (
 	// ErrPoolEmpty 库存为空 / 池空
 	ErrPoolEmpty = errors.New("pool empty")
 	// ErrAllocationNotReady 存储层未就绪
-	ErrAllocationNotReady = errors.New("allocation not ready")
-	// ErrForbiddenAccountID 外部令牌禁止指定母号
+	ErrAllocationNotReady = errors.New("allocation store not ready")
+	// ErrForbiddenAccountID 外部令牌禁止指定出号母号
 	ErrForbiddenAccountID = errors.New("specifying account_id is forbidden for external tokens")
 	// ErrForbiddenRemoteCreation 外部令牌禁止现场按需创号
 	ErrForbiddenRemoteCreation = errors.New("remote on-demand creation is forbidden for external tokens")
@@ -57,6 +59,7 @@ type AliasAllocationService struct {
 	store      *store.Store
 	be         Backend
 	syncWorker *MailSyncWorker
+	rrIndex    uint64
 }
 
 // NewAliasAllocationService 创建统一出号服务实例
@@ -162,6 +165,21 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		req.RequestHash = fmt.Sprintf("tag=%s&account_id=%s&label=%s", req.Tag, strings.TrimSpace(req.AccountID), strings.TrimSpace(req.Label))
 	}
 
+	var poolAccountIDs []string
+	if req.AccountID != "" {
+		poolAccountIDs = []string{req.AccountID}
+	} else if s.be != nil {
+		poolAccountIDs = selectPoolAccounts(s.be.ListAccounts(), req.Tag)
+		if len(poolAccountIDs) > 1 {
+			idx := int(atomic.AddUint64(&s.rrIndex, 1) - 1) % len(poolAccountIDs)
+			rotated := make([]string, len(poolAccountIDs))
+			for i := 0; i < len(poolAccountIDs); i++ {
+				rotated[i] = poolAccountIDs[(idx+i)%len(poolAccountIDs)]
+			}
+			poolAccountIDs = rotated
+		}
+	}
+
 	// 3. 显式幂等分配分支 (如 external/v2 或携带 IdempotencyKey 的请求)
 	if req.IdempotencyKey != "" {
 		alloc, op, err := s.store.ClaimInventoryAlias(
@@ -172,7 +190,7 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 			req.IdempotencyKey,
 			req.RequestHash,
 			req.Tag,
-			req.AccountID,
+			poolAccountIDs,
 		)
 		if err != nil {
 			if errors.Is(err, store.ErrNoAvailableInventory) {
@@ -195,92 +213,27 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		}
 	}
 
-	// 4. 普通出号链路：收集并交错候选别名，保证跨母号负载均衡与预存池更新
-	var poolAccountIDs []string
-	if req.AccountID != "" {
-		poolAccountIDs = []string{req.AccountID}
-	} else if s.be != nil {
-		poolAccountIDs = selectPoolAccounts(s.be.ListAccounts(), req.Tag)
-	}
-
-	var accountAliases [][]store.PoolCandidate
-	maxCount := 0
-	if s.be != nil {
-		for _, accID := range poolAccountIDs {
-			aliases, _ := s.be.ListAliases(accID)
-			var list []store.PoolCandidate
-			for _, a := range aliases {
-				if a.Active {
-					list = append(list, store.PoolCandidate{
-						AccountID: accID,
-						Email:     a.Email,
-					})
-				}
-			}
-			if len(list) > 0 {
-				accountAliases = append(accountAliases, list)
-				if len(list) > maxCount {
-					maxCount = len(list)
-				}
-			}
+	// 4. 普通出号链路：严禁将 Apple 远端 active 别名自动当 available 发放 (Issue 9)
+	// 所有出号必须从 alias_inventory 原子认领，并下推账号池过滤到 SQL (Issue 11)
+	alloc, op, err := s.store.ClaimInventoryAlias(
+		ctx,
+		principalKind,
+		principalID,
+		"allocate",
+		req.IdempotencyKey,
+		req.RequestHash,
+		req.Tag,
+		poolAccountIDs,
+	)
+	if err == nil && alloc != nil {
+		if s.syncWorker != nil {
+			s.syncWorker.RegisterAliasAccount(alloc.AliasEmail, alloc.AccountID)
 		}
-	}
-
-	var candidates []store.PoolCandidate
-	for i := 0; i < maxCount; i++ {
-		for _, list := range accountAliases {
-			if i < len(list) {
-				candidates = append(candidates, list[i])
-			}
-		}
-	}
-
-	if len(candidates) > 0 {
-		rec, err := s.store.ClaimPoolAlias(candidates, req.Tag, principalKind, principalID, tokenDisplayName)
-		if err != nil {
-			return nil, err
-		}
-		if rec != nil {
-			if s.syncWorker != nil {
-				s.syncWorker.RegisterAliasAccount(rec.Email, rec.AccountID)
-			}
-			alloc := &store.AliasAllocation{
-				AllocationID: rec.ID,
-				AliasEmail:   rec.Email,
-				AccountID:    rec.AccountID,
-				OwnerKind:    principalKind,
-				OwnerID:      principalID,
-				BusinessTag:  rec.Tag,
-				AllocatedAt:  rec.AllocatedAt,
-				Status:       rec.Status,
-			}
-			return &AllocationResult{
-				Allocation: alloc,
-				Source:     "pool",
-			}, nil
-		}
-	} else {
-		// 无外挂账号别名列表时，直接从底层 alias_inventory 认领
-		alloc, op, err := s.store.ClaimInventoryAlias(
-			ctx,
-			principalKind,
-			principalID,
-			"allocate",
-			req.IdempotencyKey,
-			req.RequestHash,
-			req.Tag,
-			req.AccountID,
-		)
-		if err == nil && alloc != nil {
-			if s.syncWorker != nil {
-				s.syncWorker.RegisterAliasAccount(alloc.AliasEmail, alloc.AccountID)
-			}
-			return &AllocationResult{
-				Allocation: alloc,
-				Operation:  op,
-				Source:     "pool",
-			}, nil
-		}
+		return &AllocationResult{
+			Allocation: alloc,
+			Operation:  op,
+			Source:     "pool",
+		}, nil
 	}
 
 	// 5. 若库存池为空 (POOL_EMPTY)
@@ -323,7 +276,9 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		allocID := fmt.Sprintf("alloc_%d", time.Now().UnixNano())
 
 		// 同步记入 alias_inventory 与 alias_allocations
-		_ = s.store.AddInventoryAlias(accountID, hme.Alias{Email: res.Email, Active: true}, "created", false)
+		if invErr := s.store.AddInventoryAlias(accountID, hme.Alias{Email: res.Email, Label: res.Label, CreatedAt: res.CreatedAt, Active: true}, "created", false); invErr != nil {
+			log.Printf("[AllocationService] 登记别名库存失败: %v", invErr)
+		}
 		alloc := &store.AliasAllocation{
 			AllocationID: allocID,
 			AliasEmail:   res.Email,
@@ -334,8 +289,12 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 			AllocatedAt:  now,
 			Status:       "allocated",
 		}
-		_ = s.store.RecordAllocation(alloc, tokenDisplayName)
-		_ = s.store.UpsertAliasRoutes(accountID, []string{res.Email})
+		if recErr := s.store.RecordAllocation(alloc, tokenDisplayName); recErr != nil {
+			return nil, fmt.Errorf("持久化分配凭据失败: %w", recErr)
+		}
+		if routeErr := s.store.UpsertAliasRoutes(accountID, []string{res.Email}); routeErr != nil {
+			log.Printf("[AllocationService] 更新别名路由失败: %v", routeErr)
+		}
 		if s.syncWorker != nil {
 			s.syncWorker.RegisterAliasAccount(res.Email, accountID)
 		}

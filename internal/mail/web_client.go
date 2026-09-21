@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 bogdanfinn/tls-client, bogdanfinn/fhttp 进行 TLS 指纹伪造，依赖 Google UUID
- * [OUTPUT]: 对外提供 WebClient、NewWebClient、ListInbox、SearchMails、FindByAlias
- * [POS]: internal/mail 的 Web 邮件读取客户端，当账号未配置 App 专用密码时作为回退通道
+ * [INPUT]: 依赖 context, bogdanfinn/tls-client, bogdanfinn/fhttp 进行 TLS 指纹伪造，依赖 Google UUID
+ * [OUTPUT]: 对外提供 WebClient、NewWebClient、ListInboxContext、ListInbox、SearchMailsContext、SearchMails、FindByAliasContext、FindByAlias
+ * [POS]: internal/mail 的 Web 邮件读取客户端，当账号未配置 App 专用密码时作为回退通道 (支持真正的 Context 取消)
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -12,6 +12,7 @@
 package mail
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -186,13 +187,14 @@ func (c *WebClient) withParams(rawURL string) string {
 }
 
 // resolveMccGateway 从 validate 响应中获取 mccgateway URL。
-func (c *WebClient) resolveMccGateway() error {
+// resolveMccGatewayContext 从 validate 响应中获取 mccgateway URL (支持 context 取消)。
+func (c *WebClient) resolveMccGatewayContext(ctx context.Context) error {
 	if c.mccGatewayURL != "" {
 		return nil
 	}
 
 	setupURL := "https://setup." + c.host + "/setup/ws/1/validate"
-	req, err := http.NewRequest("POST", c.withParams(setupURL), nil)
+	req, err := http.NewRequestWithContext(ctx, "POST", c.withParams(setupURL), nil)
 	if err != nil {
 		return err
 	}
@@ -254,6 +256,11 @@ func (c *WebClient) resolveMccGateway() error {
 	return nil
 }
 
+// resolveMccGateway 从 validate 响应中获取 mccgateway URL。
+func (c *WebClient) resolveMccGateway() error {
+	return c.resolveMccGatewayContext(context.Background())
+}
+
 // threadSearchResp 是 thread/search 接口的响应结构。
 type threadSearchResp struct {
 	TotalThreadsReturned int `json:"totalThreadsReturned"`
@@ -269,14 +276,14 @@ type threadSearchResp struct {
 	} `json:"threadList"`
 }
 
-// search 执行 thread/search 请求,返回解析后的邮件列表。
-func (c *WebClient) search(payload string) ([]Message, error) {
-	if err := c.resolveMccGateway(); err != nil {
+// searchContext 执行 thread/search 请求,返回解析后的邮件列表 (支持 context 取消)。
+func (c *WebClient) searchContext(ctx context.Context, payload string) ([]Message, error) {
+	if err := c.resolveMccGatewayContext(ctx); err != nil {
 		return nil, err
 	}
 
 	searchURL := c.withParams(c.mccGatewayURL + "/mailws2/v1/thread/search")
-	req, err := http.NewRequest("POST", searchURL, strings.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", searchURL, strings.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -340,6 +347,11 @@ func (c *WebClient) search(payload string) ([]Message, error) {
 	return messages, nil
 }
 
+// search 执行 thread/search 请求,返回解析后的邮件列表。
+func (c *WebClient) search(payload string) ([]Message, error) {
+	return c.searchContext(context.Background(), payload)
+}
+
 func parseWebRecipients(toRaw, toRecipientsRaw, recipientsRaw json.RawMessage) string {
 	for _, raw := range []json.RawMessage{toRecipientsRaw, recipientsRaw, toRaw} {
 		if len(raw) == 0 {
@@ -374,25 +386,35 @@ func parseWebRecipients(toRaw, toRecipientsRaw, recipientsRaw json.RawMessage) s
 	return ""
 }
 
+// ListInboxContext 列出收件箱邮件 (支持 context 取消)。
+func (c *WebClient) ListInboxContext(ctx context.Context, limit int) ([]Message, error) {
+	payload := fmt.Sprintf(`{"responseType":"THREAD_DIGEST","includeFolderStatus":true,"maxResults":%d,"sessionHeaders":{"folder":"INBOX","modseq":null,"threadmodseq":null,"condstore":1,"qresync":1,"threadmode":1}}`, limit)
+	return c.searchContext(ctx, payload)
+}
+
 // ListInbox 列出收件箱邮件。
 func (c *WebClient) ListInbox(limit int) ([]Message, error) {
-	payload := fmt.Sprintf(`{"responseType":"THREAD_DIGEST","includeFolderStatus":true,"maxResults":%d,"sessionHeaders":{"folder":"INBOX","modseq":null,"threadmodseq":null,"condstore":1,"qresync":1,"threadmode":1}}`, limit)
-	return c.search(payload)
+	return c.ListInboxContext(context.Background(), limit)
+}
+
+// SearchMailsContext 搜索邮件 (支持 context 取消)。query 为空时等价于 ListInboxContext。
+func (c *WebClient) SearchMailsContext(ctx context.Context, query string, limit int) ([]Message, error) {
+	if query == "" {
+		return c.ListInboxContext(ctx, limit)
+	}
+	payload := fmt.Sprintf(`{"responseType":"THREAD_DIGEST","includeFolderStatus":false,"maxResults":%d,"query":%q,"sessionHeaders":{"folder":"INBOX","condstore":1,"qresync":1,"threadmode":1}}`, limit, query)
+	return c.searchContext(ctx, payload)
 }
 
 // SearchMails 搜索邮件。query 为空时等价于 ListInbox。
 func (c *WebClient) SearchMails(query string, limit int) ([]Message, error) {
-	if query == "" {
-		return c.ListInbox(limit)
-	}
-	payload := fmt.Sprintf(`{"responseType":"THREAD_DIGEST","includeFolderStatus":false,"maxResults":%d,"query":%q,"sessionHeaders":{"folder":"INBOX","condstore":1,"qresync":1,"threadmode":1}}`, limit, query)
-	return c.search(payload)
+	return c.SearchMailsContext(context.Background(), query, limit)
 }
 
-// FindByAlias 查找发给指定别名的邮件——优先使用服务端搜索,并回退本地过滤。
-func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
+// FindByAliasContext 查找发给指定别名的邮件 (支持 context 取消)——优先使用服务端搜索,并回退本地过滤。
+func (c *WebClient) FindByAliasContext(ctx context.Context, alias string, limit int) ([]Message, error) {
 	// 优先使用服务端检索
-	messages, err := c.SearchMails(alias, limit)
+	messages, err := c.SearchMailsContext(ctx, alias, limit)
 	if err == nil && len(messages) > 0 {
 		for i := range messages {
 			if messages[i].To == "" {
@@ -407,7 +429,7 @@ func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
 	if batchSize < 50 {
 		batchSize = 50
 	}
-	raw, err := c.ListInbox(batchSize)
+	raw, err := c.ListInboxContext(ctx, batchSize)
 	if err != nil {
 		return nil, err
 	}
@@ -429,6 +451,11 @@ func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
 		}
 	}
 	return filtered, nil
+}
+
+// FindByAlias 查找发给指定别名的邮件——优先使用服务端搜索,并回退本地过滤。
+func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
+	return c.FindByAliasContext(context.Background(), alias, limit)
 }
 
 func truncate(s string, n int) string {
