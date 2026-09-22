@@ -31,7 +31,8 @@ function formatShortDate(raw: string): string {
   if (Number.isNaN(d.getTime())) return raw
   const now = new Date()
   const isToday = d.toDateString() === now.toDateString()
-  const timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  const secStr = String(d.getSeconds()).padStart(2, '0')
+  const timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${secStr}`
   if (isToday) return `今天 ${timeStr}`
   const isThisYear = d.getFullYear() === now.getFullYear()
   const dateStr = `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
