@@ -1,13 +1,14 @@
 /**
- * [INPUT]: 依赖 api/types (InboxMessage), components/icons (IconCheck, IconCopy, IconKey, IconTrash, IconExternalLink), utils/sniffer (extractOTP, parseSenderInfo, buildSniffContext), utils/date (formatDate, formatFullDate)
- * [OUTPUT]: 对外提供 InboxTableRow 邮件单行数据渲染组件
+ * [INPUT]: 依赖 api/types (InboxMessage), components/icons, utils/sniffer (extractOTPMemoized, parseSenderInfo, buildSniffContext, stripHtml), utils/date (formatDate, formatFullDate), react (memo, useMemo)
+ * [OUTPUT]: 对外提供 InboxTableRow 邮件单行数据渲染原子组件 (带 React.memo 隔离与 O(1) 记忆化)
  * [POS]: web/src/components/inbox 的行级原子展示组件，承载验证码/激活链接高亮、发件人头像、收件别名复制与行级交互
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
+import { memo, useMemo } from 'react'
 import type { InboxMessage } from '../../api/types'
 import { formatFullDate } from '../../utils/date'
-import { buildSniffContext, extractOTP, parseSenderInfo, stripHtml } from '../../utils/sniffer'
+import { buildSniffContext, extractOTPMemoized, parseSenderInfo, stripHtml, type OTPResult, type SenderInfo } from '../../utils/sniffer'
 import {
   IconCheck,
   IconCopy,
@@ -17,7 +18,7 @@ import {
 } from '../icons'
 
 export interface InboxTableRowProps {
-  message: InboxMessage
+  message: InboxMessage & { otp?: OTPResult | null; sender?: SenderInfo }
   copiedCode: string | null
   copiedAlias: string | null
   onOpenMessage: (m: InboxMessage) => void
@@ -31,8 +32,7 @@ function formatShortDate(raw: string): string {
   if (Number.isNaN(d.getTime())) return raw
   const now = new Date()
   const isToday = d.toDateString() === now.toDateString()
-  const secStr = String(d.getSeconds()).padStart(2, '0')
-  const timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${secStr}`
+  const timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
   if (isToday) return `今天 ${timeStr}`
   const isThisYear = d.getFullYear() === now.getFullYear()
   const dateStr = `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
@@ -47,7 +47,7 @@ function cleanSnippet(preview?: string): string {
   return cleaned.length > 120 ? cleaned.slice(0, 120) + '…' : cleaned
 }
 
-export default function InboxTableRow({
+function InboxTableRowBase({
   message: m,
   copiedCode,
   copiedAlias,
@@ -55,10 +55,15 @@ export default function InboxTableRow({
   onCopyCode,
   onCopyAlias,
 }: InboxTableRowProps) {
-  const otpResult = extractOTP(buildSniffContext(m.subject, m.preview, m.body))
+  const otpResult = useMemo(() => {
+    return m.otp !== undefined ? m.otp : extractOTPMemoized(buildSniffContext(m.subject, m.preview, m.body))
+  }, [m.otp, m.subject, m.preview, m.body])
+
   const code = otpResult?.code
   const magicLink = otpResult?.magicLink
-  const sender = parseSenderInfo(m.from)
+  const sender = useMemo(() => {
+    return m.sender || parseSenderInfo(m.from)
+  }, [m.sender, m.from])
 
   return (
     <tr
@@ -210,3 +215,55 @@ export default function InboxTableRow({
     </tr>
   )
 }
+
+function arePropsEqual(prev: InboxTableRowProps, next: InboxTableRowProps): boolean {
+  if (
+    prev.onOpenMessage !== next.onOpenMessage ||
+    prev.onCopyCode !== next.onCopyCode ||
+    prev.onCopyAlias !== next.onCopyAlias ||
+    prev.onDelete !== next.onDelete
+  ) {
+    return false
+  }
+
+  if (prev.message !== next.message) {
+    if (
+      prev.message.id !== next.message.id ||
+      prev.message.subject !== next.message.subject ||
+      prev.message.preview !== next.message.preview ||
+      prev.message.body !== next.message.body ||
+      prev.message.unread !== next.message.unread ||
+      prev.message.date !== next.message.date ||
+      prev.message.folder !== next.message.folder ||
+      prev.message.to !== next.message.to ||
+      prev.message.from !== next.message.from
+    ) {
+      return false
+    }
+  }
+
+  // 提取 OTP 结果，同时校验验证码与激活链接变更，防丢激活链接徽章
+  const prevOtp = prev.message.otp ?? extractOTPMemoized(buildSniffContext(prev.message.subject, prev.message.preview, prev.message.body))
+  const nextOtp = next.message.otp ?? extractOTPMemoized(buildSniffContext(next.message.subject, next.message.preview, next.message.body))
+
+  if (prevOtp?.magicLink !== nextOtp?.magicLink) {
+    return false
+  }
+
+  // 复制状态精准比较：仅当当前行的验证码或别名命中复制状态变更时才重绘
+  const prevCode = prevOtp?.code
+  const nextCode = nextOtp?.code
+
+  const wasCodeCopied = Boolean(prevCode && prev.copiedCode === prevCode)
+  const isCodeCopied = Boolean(nextCode && next.copiedCode === nextCode)
+  if (wasCodeCopied !== isCodeCopied) return false
+
+  const wasAliasCopied = Boolean(prev.message.to && prev.copiedAlias === prev.message.to)
+  const isAliasCopied = Boolean(next.message.to && next.copiedAlias === next.message.to)
+  if (wasAliasCopied !== isAliasCopied) return false
+
+  return true
+}
+
+const InboxTableRow = memo(InboxTableRowBase, arePropsEqual)
+export default InboxTableRow

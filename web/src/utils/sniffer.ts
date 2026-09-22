@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖纯文本或 HTML 字符串输入
- * [OUTPUT]: 对外提供 extractVerifyCode, extractMagicLink, extractOTP, buildSniffContext, stripHtml, toHalfWidth 与 parseSenderInfo 函数及 SenderInfo, OTPResult 类型
- * [POS]: web/src/utils 的文本分析与验证码/链接嗅探工具；与 internal/mail/sniffer.go 深度对齐，支持全球多语言、HTML 盒式空格码、Steam Guard 混合码与防穿透
+ * [OUTPUT]: 对外提供 extractVerifyCode, extractMagicLink, extractOTP, extractOTPMemoized, buildSniffContext, stripHtml, toHalfWidth 与 parseSenderInfo 函数及 SenderInfo, OTPResult 类型
+ * [POS]: web/src/utils 的文本分析与验证码/链接嗅探工具；与 internal/mail/sniffer.go 深度对齐，支持全球多语言、HTML 盒式空格码、Steam Guard 混合码、顶层预编译正则与纯函数记忆化
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -145,6 +145,34 @@ function isAlphanumericOTP(s: string): boolean {
   return true
 }
 
+const FORWARD_PATTERNS = [
+  new RegExp(
+    `${multiLangKeywordPattern}[^\\r\\n]{0,64}?${copulaPattern}\\s*[:：\\s-]*\\b([0-9]{4,8})\\b`,
+    'i',
+  ),
+  new RegExp(`${multiLangKeywordPattern}\\s*[:：\\s-]+\\b([0-9]{4,8})\\b`, 'i'),
+  new RegExp(
+    `${multiLangKeywordPattern}[^\\r\\n]{0,64}?(?:${copulaPattern}|\\s)[:：\\s-]*\\b([0-9](?:\\s+[0-9]){3,7})\\b`,
+    'i',
+  ),
+  new RegExp(
+    `${multiLangKeywordPattern}[^\\r\\n]{0,64}?(?:${copulaPattern}|\\s)[:：\\s-]*\\b([0-9]{3,4}[-\\s][0-9]{3,4})\\b`,
+    'i',
+  ),
+]
+
+const REVERSE_PATTERN = new RegExp(
+  `\\b([0-9]{4,8})\\b[^\\r\\n\\d]{0,24}?(?:is(?:\\s+(?:your|the|a|an))?|为(?:您(?:的)?)?|是(?:你(?:的)?)?|为本次|作为|입니다|입력|est|es|ist|è|la|является|para)?[^\\r\\n\\d]{0,24}?${multiLangKeywordPattern}`,
+  'i',
+)
+
+const STEAM_GUARD_PATTERN = new RegExp(
+  `(?:steam\\s*guard|guard\\s*code)[^\\r\\n]{0,50}?(?:${copulaPattern}|\\n)\\s*([A-Z0-9]{5})\\b`,
+  'i',
+)
+
+const VERIFY_KEYWORD_REGEX = new RegExp(multiLangKeywordPattern, 'i')
+
 /**
  * 从文本中提取 4-8 位验证码
  * 覆盖正向系词、紧密前缀、盒式空格、倒装句式与 Steam Guard
@@ -160,23 +188,7 @@ export function extractVerifyCode(rawText: string): string | null {
   }
 
   // 2. 正向系词/冒号匹配 (防穿透，支持 "for order #839201 is 492019")
-  const forwardPatterns = [
-    new RegExp(
-      `${multiLangKeywordPattern}[^\\r\\n]{0,64}?${copulaPattern}\\s*[:：\\s-]*\\b([0-9]{4,8})\\b`,
-      'i',
-    ),
-    new RegExp(`${multiLangKeywordPattern}\\s*[:：\\s-]+\\b([0-9]{4,8})\\b`, 'i'),
-    new RegExp(
-      `${multiLangKeywordPattern}[^\\r\\n]{0,64}?(?:${copulaPattern}|\\s)[:：\\s-]*\\b([0-9](?:\\s+[0-9]){3,7})\\b`,
-      'i',
-    ),
-    new RegExp(
-      `${multiLangKeywordPattern}[^\\r\\n]{0,64}?(?:${copulaPattern}|\\s)[:：\\s-]*\\b([0-9]{3,4}[-\\s][0-9]{3,4})\\b`,
-      'i',
-    ),
-  ]
-
-  for (const pattern of forwardPatterns) {
+  for (const pattern of FORWARD_PATTERNS) {
     const match = text.match(pattern)
     if (match?.[1] && match.index !== undefined) {
       const code = match[1].replace(/[-\s]/g, '')
@@ -189,11 +201,7 @@ export function extractVerifyCode(rawText: string): string | null {
   }
 
   // 3. 反向倒装语序匹配 (例: "123456 is your code", "839201 为确认码")
-  const reversePattern = new RegExp(
-    `\\b([0-9]{4,8})\\b[^\\r\\n\\d]{0,24}?(?:is(?:\\s+(?:your|the|a|an))?|为(?:您(?:的)?)?|是(?:你(?:的)?)?|为本次|作为|입니다|입력|est|es|ist|è|la|является|para)?[^\\r\\n\\d]{0,24}?${multiLangKeywordPattern}`,
-    'i',
-  )
-  const revMatch = text.match(reversePattern)
+  const revMatch = text.match(REVERSE_PATTERN)
   if (revMatch?.[1] && revMatch.index !== undefined) {
     const code = revMatch[1]
     if (!isYear(code) && !isDummyCode(code)) {
@@ -206,11 +214,7 @@ export function extractVerifyCode(rawText: string): string | null {
   }
 
   // 4. Steam Guard 5 位大写字母数字混合码
-  const steamGuardPattern = new RegExp(
-    `(?:steam\\s*guard|guard\\s*code)[^\\r\\n]{0,50}?(?:${copulaPattern}|\\n)\\s*([A-Z0-9]{5})\\b`,
-    'i',
-  )
-  const sgMatch = text.match(steamGuardPattern)
+  const sgMatch = text.match(STEAM_GUARD_PATTERN)
   if (sgMatch?.[1]) {
     const code = sgMatch[1].toUpperCase().trim()
     if (isAlphanumericOTP(code) && !isYear(code) && !isDummyCode(code)) {
@@ -277,8 +281,32 @@ export function extractOTP(text: string): OTPResult | null {
   return { code: code ?? undefined, magicLink: magicLink ?? undefined }
 }
 
+const otpCache = new Map<string, OTPResult | null>()
+const MAX_OTP_CACHE_SIZE = 1000
+
+/**
+ * 纯函数记忆化：根据输入上下文缓存 OTP 提取结果，避免同一封邮件反复执行多道正则
+ */
+export function extractOTPMemoized(text: string): OTPResult | null {
+  if (!text) return null
+  if (text.length > 50000) {
+    return extractOTP(text)
+  }
+  const hit = otpCache.get(text)
+  if (hit !== undefined) return hit
+
+  if (otpCache.size >= MAX_OTP_CACHE_SIZE) {
+    const keys = Array.from(otpCache.keys()).slice(0, 200)
+    for (const k of keys) otpCache.delete(k)
+  }
+
+  const result = extractOTP(text)
+  otpCache.set(text, result)
+  return result
+}
+
 function hasVerifyKeyword(text: string): boolean {
-  return new RegExp(multiLangKeywordPattern, 'i').test(text)
+  return VERIFY_KEYWORD_REGEX.test(text)
 }
 
 /**

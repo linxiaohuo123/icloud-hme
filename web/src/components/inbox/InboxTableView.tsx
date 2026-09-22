@@ -1,13 +1,14 @@
 /**
- * [INPUT]: 依赖 api/client (request, ApiError, getMessageDetail), api/types, components (AsyncState, ConfirmDialog, Select, ToastProvider), utils (clipboard, date, mail, sniffer: buildSniffContext, extractVerifyCode, parseSenderInfo), ./InboxTableRow, ./MailDetailDialog
- * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；正文预取 POST /api/messages 使用 uid 并消费 data.messages；首屏 capability 保护与 CAPABILITY_UNSUPPORTED 优雅退避重试
+ * [INPUT]: 依赖 api/client (request, ApiError, getMessageDetail), api/types, components (AsyncState, ConfirmDialog, Select, ToastProvider), hooks/useAccounts (fetchAccountsDeduped), utils (clipboard, date, mail, sniffer: buildSniffContext, extractOTPMemoized, parseSenderInfo), ./InboxTableRow, ./MailDetailDialog
+ * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；支持 externalAliases 直传消灭冗余 I/O、fetchAccountsDeduped 全局缓存共享、数据层一次性嗅探与 O(1) 属性直读、模块级缓存防 Tab 切换重载与自动刷新轮询
  * [POS]: web/src/components/inbox 的核心视图容器，统一单账号工作台与全局收件箱大盘的数据流与交互
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { request, ApiError, getMessageDetail } from '../../api/client'
+import { fetchAccountsDeduped } from '../../hooks/useAccounts'
 import type { AccountSummary, Alias, FullMessage, InboxMessage, InboxResult, MailboxFolder } from '../../api/types'
 import AsyncState from '../AsyncState'
 import ConfirmDialog from '../ConfirmDialog'
@@ -16,7 +17,7 @@ import { useToast } from '../ToastProvider'
 import { copyText } from '../../utils/clipboard'
 import { dateTimestamp } from '../../utils/date'
 import { buildMailCacheKey } from '../../utils/mail'
-import { buildSniffContext, extractVerifyCode, parseSenderInfo } from '../../utils/sniffer'
+import { buildSniffContext, extractOTPMemoized, parseSenderInfo } from '../../utils/sniffer'
 import InboxTableRow from './InboxTableRow'
 import MailDetailDialog from './MailDetailDialog'
 import {
@@ -31,16 +32,32 @@ export interface InboxTableViewProps {
   accountId?: string
   fixedAccount?: boolean
   initialAlias?: string
+  externalAliases?: Alias[]
   onCopySuccess?: (msg: string) => void
   showPageHeader?: boolean
   onCountChange?: (count: number) => void
 }
 
+// 模块级单例缓存：生命周期超越组件挂载/卸载，保证工作台 Tab 切换 0ms 瞬间恢复
+const moduleMessageCache = new Map<string, FullMessage>()
+const MAX_MODULE_MSG_CACHE = 1000
+
+function setModuleMessageCache(key: string, msg: FullMessage) {
+  if (moduleMessageCache.size >= MAX_MODULE_MSG_CACHE) {
+    const it = moduleMessageCache.keys()
+    for (let i = 0; i < 200; i++) {
+      const k = it.next().value
+      if (k) moduleMessageCache.delete(k)
+    }
+  }
+  moduleMessageCache.set(key, msg)
+}
 
 export default function InboxTableView({
   accountId: propAccountId,
   fixedAccount = false,
   initialAlias = '',
+  externalAliases,
   onCopySuccess,
   showPageHeader = false,
   onCountChange,
@@ -51,13 +68,14 @@ export default function InboxTableView({
   const [accounts, setAccounts] = useState<AccountSummary[]>([])
   const [accountCapabilityReady, setAccountCapabilityReady] = useState(false)
   const [accountId, setAccountId] = useState(propAccountId || '')
-  const [aliases, setAliases] = useState<Alias[]>([])
+  const [aliases, setAliases] = useState<Alias[]>(externalAliases ?? [])
   const [folders, setFolders] = useState<MailboxFolder[]>([])
 
   const [alias, setAlias] = useState(initialAlias)
   const [folder, setFolder] = useState('all')
   const [limit, setLimit] = useState(20)
   const [days, setDays] = useState(7)
+  const [autoRefreshInterval, setAutoRefreshInterval] = useState<number>(0)
 
   // 记录通过 CAPABILITY_UNSUPPORTED 降级或静态推断为仅 WebMail 的账号集合
   const [effectiveWebMailAccounts, setEffectiveWebMailAccounts] = useState<Record<string, boolean>>({})
@@ -123,14 +141,27 @@ export default function InboxTableView({
     }
   }, [initialAlias])
 
-  // 1. 初始化账号列表（仅在非固定账号模式，或账号为空时拉取一次，防止 searchParams 诱发无限重拉）
+  const loadingRef = useRef(loading)
+  loadingRef.current = loading
+
+  // 自动刷新轮询定时器：在途请求未完成时跳过打断，杜绝高延迟 IMAP 网络下的死循环 abort 风暴
+  useEffect(() => {
+    if (autoRefreshInterval <= 0 || !accountId) return
+    const timer = setInterval(() => {
+      if (loadingRef.current) return
+      setRetryKey((k) => k + 1)
+    }, autoRefreshInterval * 1000)
+    return () => clearInterval(timer)
+  }, [autoRefreshInterval, accountId])
+
+  // 1. 初始化账号列表（优先消费全局 SWR 缓存与请求去重，防止 searchParams 诱发无限重拉）
   useEffect(() => {
     if (hasAccountsLoadedRef.current) {
       setAccountCapabilityReady(true)
       return
     }
     let cancelled = false
-    request<AccountSummary[]>('/api/accounts')
+    fetchAccountsDeduped(retryKey > 0)
       .then((data) => {
         if (cancelled) return
         hasAccountsLoadedRef.current = true
@@ -182,8 +213,12 @@ export default function InboxTableView({
     }
   }, [fixedAccount, retryKey, searchParams, setSearchParams])
 
-  // 2. 账号变化时拉取别名列表
+  // 2. 账号变化时拉取别名列表 (若父级已直传 externalAliases 则 0ms 消费，消灭重复网络请求)
   useEffect(() => {
+    if (externalAliases !== undefined) {
+      setAliases(externalAliases)
+      return
+    }
     if (!accountId) return
     let cancelled = false
     request<{ account_id: string; count: number; aliases: Alias[] }>(
@@ -200,7 +235,7 @@ export default function InboxTableView({
     return () => {
       cancelled = true
     }
-  }, [accountId])
+  }, [accountId, externalAliases])
 
   // 3. 账号变化时拉取文件夹列表 (供 INBOX/Junk 筛选)
   useEffect(() => {
@@ -248,13 +283,33 @@ export default function InboxTableView({
     })
       .then((data) => {
         if (cancelled || currentGen !== accountGenRef.current) return
-        setResult(data)
         setError('')
         unsupportedRetryRef.current[accountId] = 0
+
         // 静默预取前 50 封邮件正文注入内存缓存并响应式合入列表 (基于规范 message_ref / UID)
+        let initialMessages = data?.messages || []
         if (data && Array.isArray(data.messages) && data.messages.length > 0) {
-          const targets = data.messages
+          // 1. 先用本地/模块缓存中已有的正文快速回填，单次渲染避免视图闪烁
+          initialMessages = data.messages.map((m) => {
+            const key = buildMailCacheKey(accountId, m)
+            const cached = moduleMessageCache.get(key) || messageCacheRef.current.get(key)
+            if (cached && (cached.body || cached.preview)) {
+              return {
+                ...m,
+                preview: cached.preview || cached.body || m.preview,
+                body: cached.body || m.body,
+              }
+            }
+            return m
+          })
+        }
+        setResult(data ? { ...data, messages: initialMessages } : null)
+
+        if (data && Array.isArray(data.messages) && data.messages.length > 0) {
+          // 2. 仅针对无 preview/body 且未命中缓存的邮件发起预取差集
+          const targets = initialMessages
             .slice(0, 50)
+            .filter((m) => !m.preview && !m.body)
             .map((m) => ({
               message_ref: m.message_ref,
               folder: m.folder || folder || 'INBOX',
@@ -284,7 +339,9 @@ export default function InboxTableView({
                 list.forEach((fm) => {
                   if (!fm) return
                   if (fm.message_ref) {
-                    messageCacheRef.current.set(buildMailCacheKey(accountId, fm), fm)
+                    const cacheKey = buildMailCacheKey(accountId, fm)
+                    setModuleMessageCache(cacheKey, fm)
+                    messageCacheRef.current.set(cacheKey, fm)
                     byRef.set(fm.message_ref, fm)
                   }
                   if (fm.uid) {
@@ -385,10 +442,10 @@ export default function InboxTableView({
     setSearchParams({ account_id: newAccountId }, { replace: true })
   }
 
-  async function openMessage(message: InboxMessage) {
+  const openMessage = useCallback(async (message: InboxMessage) => {
     const currentGen = accountGenRef.current
     const primaryKey = buildMailCacheKey(accountId, message)
-    const cached = messageCacheRef.current.get(primaryKey)
+    const cached = moduleMessageCache.get(primaryKey) || messageCacheRef.current.get(primaryKey)
     if (cached) {
       setDetail(cached)
       return
@@ -401,8 +458,11 @@ export default function InboxTableView({
       // 【PR-02 契约】消费规范响应中的 response.message
       const fullMsg = resp.message
       if (fullMsg.message_ref) {
-        messageCacheRef.current.set(buildMailCacheKey(accountId, fullMsg), fullMsg)
+        const fullKey = buildMailCacheKey(accountId, fullMsg)
+        setModuleMessageCache(fullKey, fullMsg)
+        messageCacheRef.current.set(fullKey, fullMsg)
       } else {
+        setModuleMessageCache(primaryKey, fullMsg)
         messageCacheRef.current.set(primaryKey, fullMsg)
       }
       setDetail(fullMsg)
@@ -415,9 +475,9 @@ export default function InboxTableView({
         setDetailLoading(false)
       }
     }
-  }
+  }, [accountId, show])
 
-  async function deleteMessage() {
+  const deleteMessage = useCallback(async () => {
     if (!deleteFor) return
     setDeleting(true)
     try {
@@ -426,7 +486,9 @@ export default function InboxTableView({
         `/api/inbox/${encodeURIComponent(targetRefOrId)}?account_id=${encodeURIComponent(accountId)}`,
         { method: 'DELETE' },
       )
-      messageCacheRef.current.delete(buildMailCacheKey(accountId, deleteFor))
+      const key = buildMailCacheKey(accountId, deleteFor)
+      moduleMessageCache.delete(key)
+      messageCacheRef.current.delete(key)
       setDeleteFor(null)
       setDetail(null)
       show('邮件已删除')
@@ -436,9 +498,9 @@ export default function InboxTableView({
     } finally {
       setDeleting(false)
     }
-  }
+  }, [deleteFor, accountId, show])
 
-  async function handleCopyCode(code: string) {
+  const handleCopyCode = useCallback(async (code: string) => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current)
     const ok = await copyText(code)
     setCopiedCode(code)
@@ -448,9 +510,9 @@ export default function InboxTableView({
     const notifyMsg = ok ? `验证码 [${code}] 已复制` : `验证码：${code}`
     show(notifyMsg)
     if (onCopySuccess) onCopySuccess(notifyMsg)
-  }
+  }, [show, onCopySuccess])
 
-  async function handleCopyAlias(aliasText: string) {
+  const handleCopyAlias = useCallback(async (aliasText: string) => {
     if (copiedAliasTimerRef.current) clearTimeout(copiedAliasTimerRef.current)
     await copyText(aliasText)
     setCopiedAlias(aliasText)
@@ -458,7 +520,23 @@ export default function InboxTableView({
     const notifyMsg = `别名 [${aliasText}] 已复制`
     show(notifyMsg)
     if (onCopySuccess) onCopySuccess(notifyMsg)
-  }
+  }, [show, onCopySuccess])
+
+  const handleOpenMessage = useCallback((msg: InboxMessage) => {
+    void openMessage(msg)
+  }, [openMessage])
+
+  const handleCopyCodeAction = useCallback((c: string) => {
+    void handleCopyCode(c)
+  }, [handleCopyCode])
+
+  const handleCopyAliasAction = useCallback((a: string) => {
+    void handleCopyAlias(a)
+  }, [handleCopyAlias])
+
+  const handleDeleteAction = useCallback((msg: InboxMessage) => {
+    setDeleteFor(msg)
+  }, [])
 
   const folderOptions = useMemo(() => {
     const base = [
@@ -476,11 +554,28 @@ export default function InboxTableView({
 
   const rawMessages = useMemo(() => (Array.isArray(result?.messages) ? result.messages : []), [result])
 
-  // 服务端按多 Header (To, Delivered-To, X-Original-To, Envelope-To) 检索并返回权威结果；
-  // 客户端仅负责时间倒序排序，绝不按单一 m.to 再次过滤，消除转发邮件被误杀的幽灵丢信 Bug
+  // 服务端按多 Header 检索并返回权威结果；
+  // 数据层一次性计算并附加 OTP 嗅探与发件人解析结果，彻底消灭渲染视图层地毯式大正则计算
   const filteredMessages = useMemo(() => {
-    return rawMessages.slice().sort((a, b) => (dateTimestamp(b.date) ?? 0) - (dateTimestamp(a.date) ?? 0))
-  }, [rawMessages])
+    return rawMessages
+      .slice()
+      .sort((a, b) => (dateTimestamp(b.date) ?? 0) - (dateTimestamp(a.date) ?? 0))
+      .map((m) => {
+        const primaryKey = buildMailCacheKey(accountId, m)
+        const cached = moduleMessageCache.get(primaryKey) || messageCacheRef.current.get(primaryKey)
+        const body = m.body || cached?.body
+        const preview = m.preview || cached?.preview || body || ''
+        const otp = extractOTPMemoized(buildSniffContext(m.subject, preview, body))
+        const sender = parseSenderInfo(m.from)
+        return {
+          ...m,
+          preview,
+          body,
+          otp,
+          sender,
+        }
+      })
+  }, [rawMessages, accountId])
 
   useEffect(() => {
     if (onCountChange) {
@@ -491,7 +586,7 @@ export default function InboxTableView({
   const currentAccountName = currentAccount?.name || currentAccount?.real_email || (accountId || '未选择')
   const totalCount = result?.count ?? filteredMessages.length
   const codesDetectedCount = useMemo(() => {
-    return filteredMessages.filter((m) => Boolean(extractVerifyCode(buildSniffContext(m.subject, m.preview, m.body)))).length
+    return filteredMessages.filter((m) => Boolean(m.otp?.code)).length
   }, [filteredMessages])
 
   const totalPages = Math.max(1, Math.ceil(filteredMessages.length / pageSize))
@@ -682,6 +777,25 @@ export default function InboxTableView({
             />
           </div>
 
+          <div className="inbox-filter-item">
+            <label htmlFor="inbox-autorefresh" className="inbox-filter-label">
+              自动刷新
+            </label>
+            <Select
+              id="inbox-autorefresh"
+              aria-label="自动刷新"
+              value={autoRefreshInterval}
+              onChange={(val) => setAutoRefreshInterval(Number(val))}
+              options={[
+                { value: 0, label: '关闭' },
+                { value: 10, label: '10 秒' },
+                { value: 30, label: '30 秒' },
+                { value: 60, label: '60 秒' },
+              ]}
+              style={{ minWidth: 85 }}
+            />
+          </div>
+
           <button
             type="button"
             className="btn btn-primary"
@@ -719,10 +833,10 @@ export default function InboxTableView({
                     message={m}
                     copiedCode={copiedCode}
                     copiedAlias={copiedAlias}
-                    onOpenMessage={(msg) => void openMessage(msg)}
-                    onCopyCode={(c) => void handleCopyCode(c)}
-                    onCopyAlias={(a) => void handleCopyAlias(a)}
-                    onDelete={(msg) => setDeleteFor(msg)}
+                    onOpenMessage={handleOpenMessage}
+                    onCopyCode={handleCopyCodeAction}
+                    onCopyAlias={handleCopyAliasAction}
+                    onDelete={handleDeleteAction}
                   />
                 ))}
               </tbody>
