@@ -156,6 +156,48 @@ func TestExtractOTP(t *testing.T) {
 			body:         "Hi, here is your one-time verification link or code.",
 			expectedCode: "849201",
 		},
+		{
+			name:         "HTML盒式单个空格拆分数字 (5 7 6 9 3 2)",
+			subject:      "Uber 登录验证码",
+			body:         "<p>您的验证码如下：</p><div class='box'><span>5</span> <span>7</span> <span>6</span> <span>9</span> <span>3</span> <span>2</span></div>",
+			expectedCode: "576932",
+		},
+		{
+			name:         "防负向订单号穿透_命中真正验证码",
+			subject:      "Order confirmation",
+			body:         "Your verification code for order #839201 is 492019. Valid for 10 mins.",
+			expectedCode: "492019",
+		},
+		{
+			name:         "Steam Guard 5位字母数字混合码",
+			subject:      "Your Steam account: Access from new web or mobile device",
+			body:         "Here is the Steam Guard code you need that will allow you to sign in: H8R2K",
+			expectedCode: "H8R2K",
+		},
+		{
+			name:         "日文直角引号闭合强标注",
+			subject:      "『576932』認証コード",
+			body:         "認証コードを入力してください。",
+			expectedCode: "576932",
+		},
+		{
+			name:         "花括号强标注",
+			subject:      "Security Code",
+			body:         "Your account confirmation code is {839201}.",
+			expectedCode: "839201",
+		},
+		{
+			name:         "全角数字自动转半角",
+			subject:      "安全通知",
+			body:         "本次登录验证码为：５７６９３２",
+			expectedCode: "576932",
+		},
+		{
+			name:         "HTML内联样式CSS尺寸干扰防护",
+			subject:      "Verification code",
+			body:         "<style>.security-code { width: 480219px; color: #582910; }</style><p>Your code is: 123456</p>",
+			expectedCode: "123456",
+		},
 	}
 
 	for _, tt := range tests {

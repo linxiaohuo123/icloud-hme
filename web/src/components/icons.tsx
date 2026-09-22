@@ -412,3 +412,4 @@ export function IconDownload(props: IconProps) {
     </svg>
   )
 }
+

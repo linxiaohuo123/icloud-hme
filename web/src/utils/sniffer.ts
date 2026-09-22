@@ -1,23 +1,42 @@
 /**
  * [INPUT]: 依赖纯文本或 HTML 字符串输入
- * [OUTPUT]: 对外提供 extractVerifyCode, buildSniffContext, stripHtml 与 parseSenderInfo 函数及 SenderInfo 类型
- * [POS]: web/src/utils 的文本分析工具；支持全球主流语言多语种验证词元、标题括号直提与通用结构通杀提取，严格防守年份与业务负向词干扰
+ * [OUTPUT]: 对外提供 extractVerifyCode, extractMagicLink, extractOTP, buildSniffContext, stripHtml, toHalfWidth 与 parseSenderInfo 函数及 SenderInfo, OTPResult 类型
+ * [POS]: web/src/utils 的文本分析与验证码/链接嗅探工具；与 internal/mail/sniffer.go 深度对齐，支持全球多语言、HTML 盒式空格码、Steam Guard 混合码与防穿透
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
+
+export interface OTPResult {
+  code?: string
+  magicLink?: string
+}
+
+/**
+ * 全角数字转半角，剔除零宽字符与特殊空格
+ */
+export function toHalfWidth(s: string): string {
+  if (!s) return ''
+  return s
+    .replace(/[\uFF10-\uFF19]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+    .replace(/[\u200B\u200C\u200D\uFEFF]/g, '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/\u2011/g, '-')
+}
 
 /**
  * 辅助函数：合并邮件主题、正文摘要与正文内容构建完整嗅探上下文，消灭短路漏检
  */
 export function buildSniffContext(subject?: string, preview?: string, body?: string): string {
   const parts: string[] = []
-  if (subject) parts.push(subject)
+  if (subject) parts.push(toHalfWidth(subject))
   if (preview) {
-    parts.push(preview.includes('<') && preview.includes('>') ? stripHtml(preview) : preview)
+    const p = preview.includes('<') && preview.includes('>') ? stripHtml(preview) : preview
+    parts.push(toHalfWidth(p))
   }
   if (body && body !== preview) {
-    parts.push(body.includes('<') && body.includes('>') ? stripHtml(body) : body)
+    const b = body.includes('<') && body.includes('>') ? stripHtml(body) : body
+    parts.push(toHalfWidth(b))
   }
-  return parts.filter(Boolean).join(' ')
+  return parts.filter(Boolean).join('\n')
 }
 
 const multiLangKeywordPattern =
@@ -28,6 +47,7 @@ const multiLangKeywordPattern =
   // 英文
   'one-time\\s*password|temporary\\s*password|verification(?:\\s*code)?|security(?:\\s*code)?|verify(?:\\s*code)?|' +
   'auth\\s*code|confirmation(?:\\s*code)?|login\\s*code|access\\s*code|passcode|\\bcode\\b|\\botp\\b|\\bpin\\b|\\bpassword\\b|' +
+  'steam\\s*guard(?:\\s*code)?|2fa(?:\\s*code)?|\\bmfa\\b|two-factor(?:\\s*auth(?:entication)?)?(?:\\s*code)?|' +
   // 韩文
   '인증\\s*코드|인증\\s*번호|인증번호|임시\\s*코드|확인\\s*코드|보안\\s*코드|패스코드|비밀번호|인증|코드|확인|보안|임시|' +
   // 日文
@@ -51,63 +71,209 @@ const multiLangKeywordPattern =
   'رمز\\s*التحقق|رمز\\s*الأمان|رمز\\s*التأكيد|\\bرمز\\b' +
   ')'
 
-const negativeContextRegex =
-  /(?:order|tracking|invoice|receipt|bill|barcode|unicode|encode|ticket|account|phone|tel|fax|订单|发票|账单|快递|运单|编号)/i
+const copulaPattern = '(?:is|为|是|est|es|ist|lautet|è|la|является|para|[:：=])'
+
+const bracketCodeRegex = /(?:\[|\(|【|「|“|"|\{|<|«|『)\s*([0-9]{4,8})\s*(?:\]|\)|】|」|”|"|\}|>|»|』)/
+
+const negativePrefixRegex =
+  /(?:order|tracking|invoice|receipt|bill|barcode|ticket|account\s*(?:number|no|id)|phone|tel|fax|订单|发票|账单|快递|运单|账号|编号)[^\r\n\d]{0,10}#?\s*$/i
+
+const negativeSuffixRegex =
+  /^[^\r\n\d]{0,10}(?:order|tracking|invoice|receipt|bill|ticket|account\s*(?:number|no|id)|phone|tel|订单|发票|账单|快递|运单|账号|编号)/i
+
+const magicLinkRegex =
+  /https?:\/\/[^\s"'<>]+(?:verify|confirm|activate|validation|token=)[^\s"'<>]*/i
+
+function isNegativeContext(text: string, start: number, end: number): boolean {
+  let pStart = Math.max(0, start - 15)
+  const lineStart = text.lastIndexOf('\n', start)
+  if (lineStart !== -1 && lineStart >= pStart) {
+    pStart = lineStart + 1
+  }
+  if (negativePrefixRegex.test(text.slice(pStart, start))) {
+    return true
+  }
+
+  let sEnd = Math.min(text.length, end + 15)
+  const lineEnd = text.indexOf('\n', end)
+  if (lineEnd !== -1 && end + lineEnd < sEnd) {
+    sEnd = end + lineEnd
+  }
+  if (negativeSuffixRegex.test(text.slice(end, sEnd))) {
+    return true
+  }
+  return false
+}
+
+function isYear(s: string): boolean {
+  const num = Number(s)
+  return (
+    (s.length === 4 && num >= 2020 && num <= 2035) ||
+    (s.length === 6 && num >= 202000 && num <= 203599)
+  )
+}
+
+function isDummyCode(s: string): boolean {
+  if (!s) return true
+  for (let i = 1; i < s.length; i++) {
+    if (s[i] !== s[0]) return false
+  }
+  return true
+}
+
+function isAlphanumericOTP(s: string): boolean {
+  if (s.length !== 5) return false
+  let hasLetter = false
+  let hasDigit = false
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')) {
+      hasLetter = true
+    } else if (ch >= '0' && ch <= '9') {
+      hasDigit = true
+    } else {
+      return false
+    }
+  }
+  if (!hasLetter) return false
+  if (!hasDigit) {
+    const upper = s.toUpperCase()
+    for (let i = 0; i < upper.length; i++) {
+      if ('AEIOU'.includes(upper[i])) return false
+    }
+  }
+  return true
+}
 
 /**
  * 从文本中提取 4-8 位验证码
- * 优先匹配带有验证码上下文的关键词（支持正向句式与反向倒装句式）
+ * 覆盖正向系词、紧密前缀、盒式空格、倒装句式与 Steam Guard
  */
-export function extractVerifyCode(text: string): string | null {
-  if (!text) return null
+export function extractVerifyCode(rawText: string): string | null {
+  if (!rawText) return null
+  const text = toHalfWidth(rawText)
 
-  // 1. 上下文强特征正则 (正向关键词优先，支持连字号与倒装语序)
-  const contextualPatterns = [
-    // 括号/书名号/引号强标注 (例: "[576932]", "【839201】")
-    /(?:\[|\(|【|「|“|")\s*([0-9]{4,8})\s*(?:\]|\)|】|」|”|")/,
-    // 正向: 多语言关键词在前，数字在后
+  // 1. 闭合符号强标注 (例: "[849201]", "『576932』", "{492019}")
+  const bracketMatch = text.match(bracketCodeRegex)
+  if (bracketMatch?.[1] && !isYear(bracketMatch[1]) && !isDummyCode(bracketMatch[1])) {
+    return bracketMatch[1]
+  }
+
+  // 2. 正向系词/冒号匹配 (防穿透，支持 "for order #839201 is 492019")
+  const forwardPatterns = [
     new RegExp(
-      `${multiLangKeywordPattern}[^\\r\\n\\d]{0,32}?(?:is|为|是|est|es|ist|è|la|является|para|:|：|\\s)*[:：\\s-]*\\b([0-9]{4,8})\\b`,
+      `${multiLangKeywordPattern}[^\\r\\n]{0,64}?${copulaPattern}\\s*[:：\\s-]*\\b([0-9]{4,8})\\b`,
       'i',
     ),
-    // 连字号格式 (例: "code: 123-456", "인증 987-654")
+    new RegExp(`${multiLangKeywordPattern}\\s*[:：\\s-]+\\b([0-9]{4,8})\\b`, 'i'),
     new RegExp(
-      `${multiLangKeywordPattern}[^\\r\\n\\d]{0,32}?(?:is|为|是|est|es|ist|è|la|является|para|:|：|\\s)*[:：\\s-]*\\b([0-9]{3,4}[-\\s][0-9]{3,4})\\b`,
+      `${multiLangKeywordPattern}[^\\r\\n]{0,64}?(?:${copulaPattern}|\\s)[:：\\s-]*\\b([0-9](?:\\s+[0-9]){3,7})\\b`,
       'i',
     ),
-    // 反向: 数字在前，关键词在后
     new RegExp(
-      `\\b([0-9]{4,8})\\b[^\\r\\n\\d]{0,24}?(?:is(?:\\s+(?:your|the|a|an))?|为(?:您(?:的)?)?|是(?:你(?:的)?)?|为本次|作为|입니다|입력|est|es|ist|è|la|является|para)?[^\\r\\n\\d]{0,24}?${multiLangKeywordPattern}`,
+      `${multiLangKeywordPattern}[^\\r\\n]{0,64}?(?:${copulaPattern}|\\s)[:：\\s-]*\\b([0-9]{3,4}[-\\s][0-9]{3,4})\\b`,
       'i',
     ),
   ]
 
-  for (const pattern of contextualPatterns) {
+  for (const pattern of forwardPatterns) {
     const match = text.match(pattern)
-    if (match?.[1]) {
-      const candidate = match[1].replace(/[-\s]/g, '')
-      const num = Number(candidate)
-      if (num >= 2020 && num <= 2035) continue
-      return candidate
+    if (match?.[1] && match.index !== undefined) {
+      const code = match[1].replace(/[-\s]/g, '')
+      if (isYear(code) || isDummyCode(code)) continue
+      const codeStart = match.index + match[0].lastIndexOf(match[1])
+      const codeEnd = codeStart + match[1].length
+      if (isNegativeContext(text, codeStart, codeEnd)) continue
+      return code
     }
   }
 
-  // 2. 独立 6 位数字仅在验证类关键词下回退 (排除 2020-2035 年月伪码与负向业务词)
-  if (!hasVerifyKeyword(text)) return null
-  const sixDigitMatches = text.matchAll(/\b([0-9]{6})\b/g)
-  for (const m of sixDigitMatches) {
-    const val = m[1]
-    const num = Number(val)
-    if (num >= 202000 && num <= 203599) continue
-    const idx = m.index ?? 0
-    const windowStart = Math.max(0, idx - 30)
-    const windowEnd = Math.min(text.length, idx + val.length + 30)
-    const windowText = text.slice(windowStart, windowEnd)
-    if (negativeContextRegex.test(windowText)) continue
-    return val
+  // 3. 反向倒装语序匹配 (例: "123456 is your code", "839201 为确认码")
+  const reversePattern = new RegExp(
+    `\\b([0-9]{4,8})\\b[^\\r\\n\\d]{0,24}?(?:is(?:\\s+(?:your|the|a|an))?|为(?:您(?:的)?)?|是(?:你(?:的)?)?|为本次|作为|입니다|입력|est|es|ist|è|la|является|para)?[^\\r\\n\\d]{0,24}?${multiLangKeywordPattern}`,
+    'i',
+  )
+  const revMatch = text.match(reversePattern)
+  if (revMatch?.[1] && revMatch.index !== undefined) {
+    const code = revMatch[1]
+    if (!isYear(code) && !isDummyCode(code)) {
+      const start = revMatch.index
+      const end = start + code.length
+      if (!isNegativeContext(text, start, end)) {
+        return code
+      }
+    }
+  }
+
+  // 4. Steam Guard 5 位大写字母数字混合码
+  const steamGuardPattern = new RegExp(
+    `(?:steam\\s*guard|guard\\s*code)[^\\r\\n]{0,50}?(?:${copulaPattern}|\\n)\\s*([A-Z0-9]{5})\\b`,
+    'i',
+  )
+  const sgMatch = text.match(steamGuardPattern)
+  if (sgMatch?.[1]) {
+    const code = sgMatch[1].toUpperCase().trim()
+    if (isAlphanumericOTP(code) && !isYear(code) && !isDummyCode(code)) {
+      return code
+    }
+  }
+
+  // 5. 兜底策略：在确认为验证类邮件时，提取最佳独立数字
+  if (hasVerifyKeyword(text)) {
+    // 优先检查盒式空格码
+    const spacedMatch = text.match(/\b([0-9](?:\s+[0-9]){3,7})\b/)
+    if (spacedMatch?.[1] && spacedMatch.index !== undefined) {
+      const code = spacedMatch[1].replace(/\s+/g, '')
+      if (
+        code.length >= 4 &&
+        code.length <= 8 &&
+        !isYear(code) &&
+        !isDummyCode(code) &&
+        !isNegativeContext(text, spacedMatch.index, spacedMatch.index + spacedMatch[1].length)
+      ) {
+        return code
+      }
+    }
+
+    const sixDigitMatches = text.matchAll(/\b([0-9]{6})\b/g)
+    for (const m of sixDigitMatches) {
+      const val = m[1]
+      if (isYear(val) || isDummyCode(val)) continue
+      const idx = m.index ?? 0
+      if (isNegativeContext(text, idx, idx + val.length)) continue
+      return val
+    }
+
+    const fourDigitMatches = text.matchAll(/\b([0-9]{4})\b/g)
+    for (const m of fourDigitMatches) {
+      const val = m[1]
+      if (isYear(val) || isDummyCode(val)) continue
+      const idx = m.index ?? 0
+      if (isNegativeContext(text, idx, idx + val.length)) continue
+      return val
+    }
   }
 
   return null
+}
+
+/**
+ * 从文本中提取激活/验证链接
+ */
+export function extractMagicLink(text: string): string | null {
+  if (!text) return null
+  const m = text.match(magicLinkRegex)
+  return m ? m[0] : null
+}
+
+/**
+ * 综合提取验证码与激活链接
+ */
+export function extractOTP(text: string): OTPResult | null {
+  const code = extractVerifyCode(text)
+  const magicLink = extractMagicLink(text)
+  if (!code && !magicLink) return null
+  return { code: code ?? undefined, magicLink: magicLink ?? undefined }
 }
 
 function hasVerifyKeyword(text: string): boolean {
@@ -115,7 +281,7 @@ function hasVerifyKeyword(text: string): boolean {
 }
 
 /**
- * 剔除 HTML 标签并转换常见实体，获得纯文本
+ * 剔除 HTML 标签与样式并转换实体，获得纯净文本
  */
 export function stripHtml(html: string): string {
   if (!html) return ''

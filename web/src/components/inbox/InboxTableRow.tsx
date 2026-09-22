@@ -1,16 +1,17 @@
 /**
- * [INPUT]: 依赖 api/types (InboxMessage), components/icons, utils/sniffer (extractVerifyCode, parseSenderInfo, buildSniffContext), utils/date (formatDate, formatFullDate)
+ * [INPUT]: 依赖 api/types (InboxMessage), components/icons (IconCheck, IconCopy, IconKey, IconTrash, IconExternalLink), utils/sniffer (extractOTP, parseSenderInfo, buildSniffContext), utils/date (formatDate, formatFullDate)
  * [OUTPUT]: 对外提供 InboxTableRow 邮件单行数据渲染组件
- * [POS]: web/src/components/inbox 的行级原子展示组件，承载验证码高亮、发件人头像、收件别名复制与行级交互
+ * [POS]: web/src/components/inbox 的行级原子展示组件，承载验证码/激活链接高亮、发件人头像、收件别名复制与行级交互
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 import type { InboxMessage } from '../../api/types'
 import { formatFullDate } from '../../utils/date'
-import { buildSniffContext, extractVerifyCode, parseSenderInfo, stripHtml } from '../../utils/sniffer'
+import { buildSniffContext, extractOTP, parseSenderInfo, stripHtml } from '../../utils/sniffer'
 import {
   IconCheck,
   IconCopy,
+  IconExternalLink,
   IconKey,
   IconTrash,
 } from '../icons'
@@ -53,7 +54,9 @@ export default function InboxTableRow({
   onCopyCode,
   onCopyAlias,
 }: InboxTableRowProps) {
-  const code = extractVerifyCode(buildSniffContext(m.subject, m.preview, m.body))
+  const otpResult = extractOTP(buildSniffContext(m.subject, m.preview, m.body))
+  const code = otpResult?.code
+  const magicLink = otpResult?.magicLink
   const sender = parseSenderInfo(m.from)
 
   return (
@@ -85,6 +88,18 @@ export default function InboxTableRow({
             <span>{code}</span>
             <span className="copy-tag">{copiedCode === code ? '已复制' : '复制'}</span>
           </button>
+        ) : magicLink ? (
+          <a
+            href={magicLink}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="badge-code inbox-link-pill"
+            onClick={(e) => e.stopPropagation()}
+            title={`点击打开验证链接: ${magicLink}`}
+          >
+            <IconExternalLink size={13} />
+            <span>激活链接</span>
+          </a>
         ) : (
           <span className="inbox-no-code text-muted">—</span>
         )}
