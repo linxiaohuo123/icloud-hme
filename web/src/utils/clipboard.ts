@@ -1,4 +1,10 @@
 /**
+ * [INPUT]: 接收字符串 value
+ * [OUTPUT]: 导出 copyText: (value: string) => Promise<boolean>
+ * [POS]: web/src/utils 的剪贴板安全写入工具，优先 Clipboard API，自动回退 textarea
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+/**
  * 复制文本到剪贴板。
  * 某些浏览器扩展会拦截 Clipboard API，因此保留传统 API 作为降级路径。
  */

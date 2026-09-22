@@ -19,20 +19,8 @@ import { useToast } from '../components/ToastProvider'
 import { copyText } from '../utils/clipboard'
 import { dateTimestamp, formatDate } from '../utils/date'
 import {
-  IconAccounts,
-  IconAliases,
-  IconChevronDown,
-  IconChevronLeft,
-  IconChevronRight,
-  IconChevronUp,
-  IconCopy,
-  IconDownload,
-  IconEdit,
-  IconInbox,
-  IconPlus,
-  IconRefresh,
-  IconSearch,
-  IconTrash,
+  IconAccounts, IconAliases, IconChevronDown, IconChevronLeft, IconChevronRight,
+  IconChevronUp, IconCopy, IconDownload, IconEdit, IconInbox, IconPlus, IconRefresh, IconSearch, IconTrash,
 } from '../components/icons'
 
 type SortDirection = 'asc' | 'desc'
@@ -53,14 +41,7 @@ function tagHue(name: string): number {
 }
 
 const srOnly: CSSProperties = {
-  position: 'absolute',
-  width: 1,
-  height: 1,
-  padding: 0,
-  margin: -1,
-  overflow: 'hidden',
-  clip: 'rect(0, 0, 0, 0)',
-  border: 0,
+  position: 'absolute', width: 1, height: 1, padding: 0, margin: -1, overflow: 'hidden', clip: 'rect(0, 0, 0, 0)', border: 0,
 }
 
 export default function AliasesPage() {

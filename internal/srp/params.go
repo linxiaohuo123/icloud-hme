@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 crypto, fmt, math/big
+ * [OUTPUT]: 对外提供 SRPParams, GetParams, ComputeVerifier
+ * [POS]: internal/srp 的 RFC 5054 参数预设与大数运算辅助逻辑
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 package srp
 
 import (

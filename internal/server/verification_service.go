@@ -10,7 +10,6 @@ package server
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -34,13 +33,13 @@ var (
 
 // VerificationResult 取码状态结果
 type VerificationResult struct {
-	RequestID   string `json:"request_id"`
-	LeaseID     string `json:"lease_id"`
-	AliasEmail  string `json:"alias_email"`
-	Status      string `json:"status"` // ready / pending / succeeded / expired / invalidated
-	Code        string `json:"code,omitempty"`
-	MagicLink   string `json:"magic_link,omitempty"`
-	MessageRef  string `json:"message_ref,omitempty"`
+	RequestID  string `json:"request_id"`
+	LeaseID    string `json:"lease_id"`
+	AliasEmail string `json:"alias_email"`
+	Status     string `json:"status"` // ready / pending / succeeded / expired / invalidated
+	Code       string `json:"code,omitempty"`
+	MagicLink  string `json:"magic_link,omitempty"`
+	MessageRef string `json:"message_ref,omitempty"`
 }
 
 // VerificationService 统一管理验证码任务生命周期与事件唤醒
@@ -100,7 +99,7 @@ func (s *VerificationService) CreateVerificationRequest(ctx context.Context, p a
 
 	now := time.Now().UTC()
 	vreq := &store.VerificationRequest{
-		RequestID:           fmt.Sprintf("vreq_%d", now.UnixNano()),
+		RequestID:           store.NewOpaqueID("vreq_"),
 		PrincipalKind:       string(p.Kind),
 		PrincipalID:         p.ID,
 		LeaseID:             alloc.AllocationID,

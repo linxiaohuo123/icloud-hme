@@ -17,7 +17,7 @@ export function toHalfWidth(s: string): string {
   if (!s) return ''
   return s
     .replace(/[\uFF10-\uFF19]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
-    .replace(/[\u200B\u200C\u200D\uFEFF]/g, '')
+    .replace(/\u200D|[\u200B\u200C\uFEFF]/g, '')
     .replace(/\u00A0/g, ' ')
     .replace(/\u2011/g, '-')
 }

@@ -174,7 +174,7 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 			poolAccountIDs = []string{}
 		}
 		if len(poolAccountIDs) > 1 {
-			idx := int(atomic.AddUint64(&s.rrIndex, 1) - 1) % len(poolAccountIDs)
+			idx := int(atomic.AddUint64(&s.rrIndex, 1)-1) % len(poolAccountIDs)
 			rotated := make([]string, len(poolAccountIDs))
 			for i := 0; i < len(poolAccountIDs); i++ {
 				rotated[i] = poolAccountIDs[(idx+i)%len(poolAccountIDs)]
@@ -279,7 +279,7 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		}
 
 		now := time.Now().Format(time.RFC3339)
-		allocID := fmt.Sprintf("alloc_%d", time.Now().UnixNano())
+		allocID := store.NewOpaqueID("alloc_")
 
 		// 同步记入 alias_inventory 与 alias_allocations
 		if invErr := s.store.AddInventoryAlias(accountID, hme.Alias{Email: res.Email, Label: res.Label, CreatedAt: res.CreatedAt, Active: true}, "created", false); invErr != nil {

@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 api/client (request, ApiError, getMessageDetail), api/types, components (AsyncState, ConfirmDialog, Select, ToastProvider), hooks/useAccounts (fetchAccountsDeduped), utils (clipboard, date, mail, sniffer: buildSniffContext, extractOTPMemoized, parseSenderInfo), ./InboxTableRow, ./MailDetailDialog
+ * [INPUT]: 依赖 api/client (request, ApiError, getMessageDetail), api/types, components (AsyncState, ConfirmDialog, ToastProvider), hooks/useAccounts (fetchAccountsDeduped), utils (clipboard, date, mail, sniffer: buildSniffContext, extractOTPMemoized, parseSenderInfo), ./InboxFilterBar, ./InboxTableRow, ./MailDetailDialog
  * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；支持 externalAliases 直传消灭冗余 I/O、fetchAccountsDeduped 全局缓存共享、数据层一次性嗅探与 O(1) 属性直读、模块级缓存防 Tab 切换重载与自动刷新轮询
  * [POS]: web/src/components/inbox 的核心视图容器，统一单账号工作台与全局收件箱大盘的数据流与交互
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -12,7 +12,7 @@ import { fetchAccountsDeduped } from '../../hooks/useAccounts'
 import type { AccountSummary, Alias, FullMessage, InboxMessage, InboxResult, MailboxFolder } from '../../api/types'
 import AsyncState from '../AsyncState'
 import ConfirmDialog from '../ConfirmDialog'
-import Select from '../Select'
+import InboxFilterBar from './InboxFilterBar'
 import { useToast } from '../ToastProvider'
 import { copyText } from '../../utils/clipboard'
 import { dateTimestamp } from '../../utils/date'
@@ -20,13 +20,7 @@ import { buildMailCacheKey } from '../../utils/mail'
 import { buildSniffContext, extractOTPMemoized, parseSenderInfo } from '../../utils/sniffer'
 import InboxTableRow from './InboxTableRow'
 import MailDetailDialog from './MailDetailDialog'
-import {
-  IconAccounts,
-  IconKey,
-  IconMail,
-  IconRefresh,
-  IconSearch,
-} from '../icons'
+import { IconAccounts, IconKey, IconMail, IconRefresh, IconSearch } from '../icons'
 
 export interface InboxTableViewProps {
   accountId?: string
@@ -142,7 +136,9 @@ export default function InboxTableView({
   }, [initialAlias])
 
   const loadingRef = useRef(loading)
-  loadingRef.current = loading
+  useEffect(() => {
+    loadingRef.current = loading
+  }, [loading])
 
   // 自动刷新轮询定时器：在途请求未完成时跳过打断，杜绝高延迟 IMAP 网络下的死循环 abort 风暴
   useEffect(() => {
@@ -562,7 +558,7 @@ export default function InboxTableView({
       .sort((a, b) => (dateTimestamp(b.date) ?? 0) - (dateTimestamp(a.date) ?? 0))
       .map((m) => {
         const primaryKey = buildMailCacheKey(accountId, m)
-        const cached = moduleMessageCache.get(primaryKey) || messageCacheRef.current.get(primaryKey)
+        const cached = moduleMessageCache.get(primaryKey)
         const body = m.body || cached?.body
         const preview = m.preview || cached?.preview || body || ''
         const otp = extractOTPMemoized(buildSniffContext(m.subject, preview, body))
@@ -687,124 +683,27 @@ export default function InboxTableView({
         </div>
 
         {/* 统一工具栏 */}
-        <div className="inbox-filter-bar">
-          {!fixedAccount && (
-            <div className="inbox-filter-item">
-              <label htmlFor="inbox-account" className="inbox-filter-label">
-                账号
-              </label>
-              <Select
-                id="inbox-account"
-                aria-label="账号"
-                value={accountId}
-                onChange={handleAccountChange}
-                options={accounts.map((a) => ({ value: a.id, label: a.name || a.real_email }))}
-                style={{ minWidth: 160 }}
-              />
-            </div>
-          )}
-
-          <div className="inbox-filter-item">
-            <label htmlFor="inbox-alias" className="inbox-filter-label">
-              别名
-            </label>
-            <Select
-              id="inbox-alias"
-              aria-label="别名"
-              value={alias}
-              onChange={(val) => setAlias(val)}
-              options={[
-                { value: '', label: fixedAccount ? '全部别名邮件' : '全部' },
-                ...aliases.map((a) => ({
-                  value: a.email,
-                  label: a.email,
-                })),
-              ]}
-              style={{ minWidth: 190 }}
-            />
-          </div>
-
-          <div className="inbox-filter-item">
-            <label htmlFor="inbox-folder" className="inbox-filter-label">
-              文件夹 {isWebMailOnly && <span style={{ opacity: 0.6, fontSize: '0.85em' }}>(WebMail固定)</span>}
-            </label>
-            <Select
-              id="inbox-folder"
-              aria-label="文件夹"
-              value={isWebMailOnly ? 'INBOX' : folder}
-              onChange={(val) => setFolder(val)}
-              options={isWebMailOnly ? [{ value: 'INBOX', label: '收件箱 (WebMail模式)' }] : folderOptions}
-              disabled={isWebMailOnly}
-              style={{ minWidth: 200, opacity: isWebMailOnly ? 0.6 : 1 }}
-            />
-          </div>
-
-          <div className="inbox-filter-item">
-            <label htmlFor="inbox-limit" className="inbox-filter-label">
-              每页
-            </label>
-            <Select
-              id="inbox-limit"
-              aria-label="每页"
-              value={limit}
-              onChange={(val) => setLimit(Number(val))}
-              options={[
-                { value: 1, label: '1' },
-                { value: 20, label: '20' },
-                { value: 100, label: '100' },
-              ]}
-              style={{ minWidth: 72 }}
-            />
-          </div>
-
-          <div className="inbox-filter-item">
-            <label htmlFor="inbox-days" className="inbox-filter-label">
-              时间范围 {isWebMailOnly && <span style={{ opacity: 0.6, fontSize: '0.85em' }}>(全量)</span>}
-            </label>
-            <Select
-              id="inbox-days"
-              aria-label="时间范围"
-              value={days}
-              onChange={(val) => setDays(Number(val))}
-              options={[
-                { value: 1, label: '1 天' },
-                { value: 7, label: '7 天' },
-                { value: 30, label: '30 天' },
-                { value: 90, label: '90 天' },
-              ]}
-              disabled={isWebMailOnly}
-              style={{ minWidth: 90, opacity: isWebMailOnly ? 0.6 : 1 }}
-            />
-          </div>
-
-          <div className="inbox-filter-item">
-            <label htmlFor="inbox-autorefresh" className="inbox-filter-label">
-              自动刷新
-            </label>
-            <Select
-              id="inbox-autorefresh"
-              aria-label="自动刷新"
-              value={autoRefreshInterval}
-              onChange={(val) => setAutoRefreshInterval(Number(val))}
-              options={[
-                { value: 0, label: '关闭' },
-                { value: 10, label: '10 秒' },
-                { value: 30, label: '30 秒' },
-                { value: 60, label: '60 秒' },
-              ]}
-              style={{ minWidth: 85 }}
-            />
-          </div>
-
-          <button
-            type="button"
-            className="btn btn-primary"
-            onClick={handleSearch}
-            disabled={loading}
-          >
-            查询
-          </button>
-        </div>
+        <InboxFilterBar
+          fixedAccount={Boolean(fixedAccount)}
+          accountId={accountId}
+          accounts={accounts}
+          onAccountChange={handleAccountChange}
+          alias={alias}
+          aliases={aliases}
+          onAliasChange={(val) => setAlias(val)}
+          folder={folder}
+          folderOptions={folderOptions}
+          onFolderChange={(val) => setFolder(val)}
+          isWebMailOnly={isWebMailOnly}
+          limit={limit}
+          onLimitChange={(val) => setLimit(val)}
+          days={days}
+          onDaysChange={(val) => setDays(val)}
+          autoRefreshInterval={autoRefreshInterval}
+          onAutoRefreshIntervalChange={(val) => setAutoRefreshInterval(val)}
+          loading={loading}
+          onSearch={handleSearch}
+        />
 
         {/* 邮件列表数据体 */}
         <AsyncState

@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 react, api/client (request, registerUnauthorizedHandler, setCSRFToken), api/types (LoginResult)
+ * [OUTPUT]: 对外提供 AuthProvider, useAuth
+ * [POS]: web/src/auth 的全局认证状态提供者与鉴权上下文
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 import {
   createContext,
   useCallback,

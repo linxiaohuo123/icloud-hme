@@ -33,12 +33,32 @@ type Pool struct {
 }
 
 type pooledConn struct {
-	mu          sync.Mutex
+	sem         chan struct{} // 单账号并发信号量 (cap=1)，支持真正的无泄露 Context 超时
 	appleID     string
 	appPassword string
 	proxyURL    string
 	client      *Client
 	lastUsed    time.Time
+}
+
+func (pc *pooledConn) lock() {
+	pc.sem <- struct{}{}
+}
+
+func (pc *pooledConn) unlock() {
+	select {
+	case <-pc.sem:
+	default:
+	}
+}
+
+func (pc *pooledConn) tryLock() bool {
+	select {
+	case pc.sem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
 }
 
 // NewPool 创建连接池。
@@ -80,22 +100,12 @@ func (p *Pool) DoContext(ctx context.Context, appleID, appPassword, proxyURL str
 		return fmt.Errorf("连接池已关闭")
 	}
 
-	lockCh := make(chan struct{})
-	go func() {
-		pc.mu.Lock()
-		close(lockCh)
-	}()
-
 	select {
+	case pc.sem <- struct{}{}:
 	case <-ctx.Done():
-		go func() {
-			<-lockCh
-			pc.mu.Unlock()
-		}()
 		return ctx.Err()
-	case <-lockCh:
 	}
-	defer pc.mu.Unlock()
+	defer pc.unlock()
 
 	// 密码或代理变更则换新 (仅在单账号自身锁 pc.mu 内执行, 杜绝占死全局池锁 p.mu)
 	if pc.appPassword != appPassword || pc.proxyURL != proxyURL {
@@ -173,12 +183,12 @@ func (p *Pool) Close() {
 
 	for k, elem := range p.items {
 		pc := elem.Value.(*pooledConn)
-		pc.mu.Lock()
+		pc.lock()
 		if pc.client != nil {
 			pc.client.Disconnect()
 			pc.client = nil
 		}
-		pc.mu.Unlock()
+		pc.unlock()
 		delete(p.items, k)
 	}
 	p.lruList.Init()
@@ -200,7 +210,10 @@ func (p *Pool) getOrCreate(appleID string) *pooledConn {
 	// 超出容量上限时，驱逐最久未使用的空闲连接
 	p.evictOldestLocked()
 
-	pc := &pooledConn{appleID: appleID}
+	pc := &pooledConn{
+		appleID: appleID,
+		sem:     make(chan struct{}, 1),
+	}
 	elem := p.lruList.PushFront(pc)
 	p.items[key] = elem
 	return pc
@@ -213,12 +226,12 @@ func (p *Pool) evictOldestLocked() {
 		prev := elem.Prev()
 		pc := elem.Value.(*pooledConn)
 		// 仅淘汰当前空闲且非使用中的连接，杜绝将正在并发执行操作的活跃连接析构或漏泄
-		if pc.mu.TryLock() {
+		if pc.tryLock() {
 			if pc.client != nil {
 				pc.client.forceClose()
 				pc.client = nil
 			}
-			pc.mu.Unlock()
+			pc.unlock()
 			p.lruList.Remove(elem)
 			delete(p.items, strings.ToLower(strings.TrimSpace(pc.appleID)))
 		}
@@ -250,12 +263,12 @@ func (p *Pool) reapIdleConns() {
 	now := time.Now()
 	for _, elem := range p.items {
 		pc := elem.Value.(*pooledConn)
-		if pc.mu.TryLock() {
+		if pc.tryLock() {
 			if pc.client != nil && p.idleClose > 0 && !pc.lastUsed.IsZero() && now.Sub(pc.lastUsed) > p.idleClose {
 				pc.client.forceClose()
 				pc.client = nil
 			}
-			pc.mu.Unlock()
+			pc.unlock()
 		}
 	}
 	p.mu.Unlock()

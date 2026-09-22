@@ -1,3 +1,10 @@
+/**
+ * [INPUT]: 依赖 net/http, github.com/gin-gonic/gin
+ * [OUTPUT]: 对外提供 apiResp, ok, failCode, backendFail
+ * [POS]: internal/server 的统一 API 响应格式与稳定错误码映射管道
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
 // Package server - 统一响应格式与稳定错误码。
 package server
 
