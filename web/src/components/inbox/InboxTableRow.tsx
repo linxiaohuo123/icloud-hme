@@ -7,7 +7,7 @@
 
 import type { InboxMessage } from '../../api/types'
 import { formatFullDate } from '../../utils/date'
-import { buildSniffContext, extractVerifyCode, parseSenderInfo } from '../../utils/sniffer'
+import { buildSniffContext, extractVerifyCode, parseSenderInfo, stripHtml } from '../../utils/sniffer'
 import {
   IconCheck,
   IconCopy,
@@ -40,7 +40,8 @@ function formatShortDate(raw: string): string {
 
 function cleanSnippet(preview?: string): string {
   if (!preview) return ''
-  const cleaned = preview.replace(/\s+/g, ' ').trim()
+  const stripped = preview.includes('<') && preview.includes('>') ? stripHtml(preview) : preview
+  const cleaned = stripped.replace(/\s+/g, ' ').trim()
   return cleaned.length > 120 ? cleaned.slice(0, 120) + '…' : cleaned
 }
 
@@ -52,7 +53,7 @@ export default function InboxTableRow({
   onCopyCode,
   onCopyAlias,
 }: InboxTableRowProps) {
-  const code = extractVerifyCode(buildSniffContext(m.subject, m.preview))
+  const code = extractVerifyCode(buildSniffContext(m.subject, m.preview, m.body))
   const sender = parseSenderInfo(m.from)
 
   return (
@@ -117,9 +118,9 @@ export default function InboxTableRow({
               {m.subject || '（无主题）'}
             </button>
           </div>
-          {m.preview && (
-            <div className="inbox-snippet" title={m.preview}>
-              {cleanSnippet(m.preview)}
+          {(m.preview || m.body) && (
+            <div className="inbox-snippet" title={cleanSnippet(m.preview || m.body)}>
+              {cleanSnippet(m.preview || m.body)}
             </div>
           )}
         </div>

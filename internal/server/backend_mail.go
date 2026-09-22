@@ -115,10 +115,15 @@ func (b *managerBackend) ListInboxContext(ctx context.Context, q InboxQuery) (In
 		}
 		for i := range imapMessages {
 			imapMessages[i].Provider = "imap"
+			f := imapMessages[i].Folder
+			if f == "" || strings.EqualFold(f, "inbox") {
+				f = "INBOX"
+			}
+			imapMessages[i].Folder = f
 			ref := mail.MessageRef{
 				Provider:    "imap",
 				AccountID:   q.AccountID,
-				Mailbox:     imapMessages[i].Folder,
+				Mailbox:     f,
 				UIDValidity: imapMessages[i].UIDValidity,
 				UID:         imapMessages[i].UID,
 			}
@@ -318,7 +323,7 @@ func (b *managerBackend) GetMessages(accountID string, refs []mail.MessageRef) (
 			continue
 		}
 		f := strings.TrimSpace(r.Mailbox)
-		if f == "" || strings.EqualFold(f, "all") {
+		if f == "" || strings.EqualFold(f, "all") || strings.EqualFold(f, "inbox") {
 			f = "INBOX"
 		}
 		if r.UID > 0 {

@@ -50,7 +50,7 @@ func (r MessageRef) CacheKey() string {
 		return fmt.Sprintf("%s:webmail:%s", r.AccountID, r.ThreadID)
 	}
 	mailbox := strings.TrimSpace(r.Mailbox)
-	if mailbox == "" {
+	if mailbox == "" || strings.EqualFold(mailbox, "inbox") {
 		mailbox = "INBOX"
 	}
 	return fmt.Sprintf("%s:imap:%s:%d:%d", r.AccountID, mailbox, r.UIDValidity, r.UID)

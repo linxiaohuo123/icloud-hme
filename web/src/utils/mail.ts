@@ -13,7 +13,10 @@ export function buildMailCacheKey(
   if (msg.message_ref) {
     return `${accountId}:${msg.message_ref}`
   }
-  const folder = msg.folder || 'INBOX'
+  let folder = msg.folder || 'INBOX'
+  if (folder.toLowerCase() === 'inbox') {
+    folder = 'INBOX'
+  }
   const uid = msg.uid ?? msg.id
   const uv = msg.uid_validity ?? 0
   return `${accountId}:${folder}:${uv}:${uid}`

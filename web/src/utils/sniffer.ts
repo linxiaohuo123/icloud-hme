@@ -6,10 +6,18 @@
  */
 
 /**
- * 辅助函数：合并邮件主题与正文摘要构建完整嗅探上下文，消灭短路漏检
+ * 辅助函数：合并邮件主题、正文摘要与正文内容构建完整嗅探上下文，消灭短路漏检
  */
-export function buildSniffContext(subject?: string, preview?: string): string {
-  return [subject, preview].filter(Boolean).join(' ')
+export function buildSniffContext(subject?: string, preview?: string, body?: string): string {
+  const parts: string[] = []
+  if (subject) parts.push(subject)
+  if (preview) {
+    parts.push(preview.includes('<') && preview.includes('>') ? stripHtml(preview) : preview)
+  }
+  if (body && body !== preview) {
+    parts.push(body.includes('<') && body.includes('>') ? stripHtml(body) : body)
+  }
+  return parts.filter(Boolean).join(' ')
 }
 
 const multiLangKeywordPattern =

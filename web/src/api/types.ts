@@ -69,6 +69,7 @@ export interface InboxMessage {
   date: string
   preview: string
   unread?: boolean
+  body?: string
 }
 
 export interface FullMessage extends InboxMessage {

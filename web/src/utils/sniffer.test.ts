@@ -88,6 +88,14 @@ describe('extractVerifyCode', () => {
     expect(extractVerifyCode(context)).toBe('492019')
   })
 
+  it('正文包含 HTML 且仅在正文中含有验证码时，联合上下文剥除 HTML 并成功提取', () => {
+    const subject = 'OpenAI 验证邮件'
+    const preview = ''
+    const body = '<div><p>다음 임시 인증 코드를 입력해 계속하세요: <strong>576932</strong></p></div>'
+    const context = buildSniffContext(subject, preview, body)
+    expect(extractVerifyCode(context)).toBe('576932')
+  })
+
   it('兜底独立 6 位数字仅在验证类关键词下回退，并排除 2020-2035 年月伪码', () => {
     expect(extractVerifyCode('Notice 202501 has been dispatched')).toBeNull()
     expect(extractVerifyCode('Please enter 582910 to continue')).toBeNull()

@@ -251,14 +251,17 @@ export default function InboxTableView({
         setResult(data)
         setError('')
         unsupportedRetryRef.current[accountId] = 0
-        // 静默预取前 20 封邮件正文注入内存缓存 (基于规范 message_ref)
+        // 静默预取前 50 封邮件正文注入内存缓存并响应式合入列表 (基于规范 message_ref / UID)
         if (data && Array.isArray(data.messages) && data.messages.length > 0) {
           const targets = data.messages
-            .slice(0, 20)
+            .slice(0, 50)
             .map((m) => ({
               message_ref: m.message_ref,
+              folder: m.folder || folder || 'INBOX',
+              uid: m.uid ? String(m.uid) : undefined,
+              id: m.id,
             }))
-            .filter((t) => Boolean(t.message_ref))
+            .filter((t) => Boolean(t.message_ref || t.uid || t.id))
 
           if (targets.length > 0) {
             request<{ messages?: FullMessage[] }>('/api/messages', {
@@ -272,9 +275,58 @@ export default function InboxTableView({
               .then((batch) => {
                 if (cancelled || currentGen !== accountGenRef.current) return
                 const list = Array.isArray(batch?.messages) ? batch.messages : []
+                if (list.length === 0) return
+
+                const byRef = new Map<string, FullMessage>()
+                const byUid = new Map<string, FullMessage>()
+                const byId = new Map<string, FullMessage>()
+
                 list.forEach((fm) => {
-                  if (fm && fm.message_ref) {
+                  if (!fm) return
+                  if (fm.message_ref) {
                     messageCacheRef.current.set(buildMailCacheKey(accountId, fm), fm)
+                    byRef.set(fm.message_ref, fm)
+                  }
+                  if (fm.uid) {
+                    const f = (fm.folder || 'INBOX').toUpperCase()
+                    byUid.set(`${f}:${fm.uid}`, fm)
+                    byUid.set(String(fm.uid), fm)
+                  }
+                  if (fm.id) {
+                    byId.set(fm.id, fm)
+                  }
+                })
+
+                setResult((prev) => {
+                  if (!prev || !prev.messages) return prev
+                  let changed = false
+                  const updatedMessages = prev.messages.map((m) => {
+                    const folderKey = (m.folder || folder || 'INBOX').toUpperCase()
+                    const match =
+                      (m.message_ref && byRef.get(m.message_ref)) ||
+                      (m.uid && byUid.get(`${folderKey}:${m.uid}`)) ||
+                      (m.uid && byUid.get(String(m.uid))) ||
+                      (m.id && byId.get(m.id))
+                    if (!match) return m
+
+                    const nextPreview = match.preview || match.body || m.preview
+                    const nextBody = match.body || m.body
+                    if (nextPreview !== m.preview || nextBody !== m.body) {
+                      changed = true
+                      return {
+                        ...m,
+                        preview: nextPreview,
+                        body: nextBody,
+                        unread: m.unread ?? match.unread,
+                      }
+                    }
+                    return m
+                  })
+
+                  if (!changed) return prev
+                  return {
+                    ...prev,
+                    messages: updatedMessages,
                   }
                 })
               })
@@ -439,7 +491,7 @@ export default function InboxTableView({
   const currentAccountName = currentAccount?.name || currentAccount?.real_email || (accountId || '未选择')
   const totalCount = result?.count ?? filteredMessages.length
   const codesDetectedCount = useMemo(() => {
-    return filteredMessages.filter((m) => Boolean(extractVerifyCode(buildSniffContext(m.subject, m.preview)))).length
+    return filteredMessages.filter((m) => Boolean(extractVerifyCode(buildSniffContext(m.subject, m.preview, m.body)))).length
   }, [filteredMessages])
 
   const totalPages = Math.max(1, Math.ceil(filteredMessages.length / pageSize))

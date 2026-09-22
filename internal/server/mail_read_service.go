@@ -290,6 +290,9 @@ func (s *MailReadService) GetMessagesBatch(ctx context.Context, accountID string
 				if ref.Mailbox == "" {
 					ref.Mailbox = f.Folder
 				}
+				if strings.EqualFold(ref.Mailbox, "inbox") {
+					ref.Mailbox = "INBOX"
+				}
 				if ref.UIDValidity == 0 {
 					ref.UIDValidity = f.UIDValidity
 				}
@@ -299,6 +302,8 @@ func (s *MailReadService) GetMessagesBatch(ctx context.Context, accountID string
 				if ref.ThreadID == "" {
 					ref.ThreadID = f.ThreadID
 				}
+				f.MessageRef = ref.Encode()
+				f.AccountID = accountID
 				idMap[ref.CacheKey()] = f
 			}
 

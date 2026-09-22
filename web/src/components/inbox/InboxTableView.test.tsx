@@ -387,5 +387,78 @@ describe('InboxTableView WebMail 首屏 Capability 防竞争与退避重试 (PR-
     // 初始 1 次 + 最多重试 1 次 = 2 次，严禁无限循环
     expect(callCount).toBe(2)
   })
+
+  it('后台批量拉取正文完成后，响应式合并进邮件列表并提取展示验证码', async () => {
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: mockAccounts })),
+      http.get('/api/aliases', () => HttpResponse.json({ success: true, data: [] })),
+      http.get('/api/mailboxes', () => HttpResponse.json({ success: true, data: { folders: [] } })),
+      http.get('/api/inbox', () => {
+        return HttpResponse.json({
+          success: true,
+          data: {
+            account_id: 'acc_1',
+            count: 1,
+            method: 'imap',
+            messages: [
+              {
+                id: '99',
+                message_ref: 'ref_v1_test_99',
+                folder: 'INBOX',
+                uid: 99,
+                from: 'OpenAI <noreply@tm.openai.com>',
+                to: 'alias@icloud.com',
+                subject: 'ChatGPT 临时登录验证',
+                date: '2026-09-20T10:00:00Z',
+                preview: '',
+              },
+            ],
+          },
+        })
+      }),
+      http.post('/api/messages', () => {
+        return HttpResponse.json({
+          success: true,
+          data: {
+            account_id: 'acc_1',
+            count: 1,
+            messages: [
+              {
+                id: '99',
+                message_ref: 'ref_v1_test_99',
+                folder: 'INBOX',
+                uid: 99,
+                from: 'OpenAI <noreply@tm.openai.com>',
+                to: 'alias@icloud.com',
+                subject: 'ChatGPT 临时登录验证',
+                date: '2026-09-20T10:00:00Z',
+                preview: '다음 임시 인증 코드를 입력해 계속하세요: 576932',
+                body: '<p>다음 임시 인증 코드를 입력해 계속하세요: <strong>576932</strong></p>',
+              },
+            ],
+          },
+        })
+      }),
+    )
+
+    render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_1" fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    // 初始首屏先呈现信封
+    await waitFor(() => {
+      expect(screen.getByText('ChatGPT 临时登录验证')).toBeInTheDocument()
+    })
+
+    // /api/messages 返回后，响应式提取出 576932 并渲染到验证码列
+    await waitFor(() => {
+      expect(screen.getByText('576932')).toBeInTheDocument()
+      expect(screen.getByText(/探测到/)).toBeInTheDocument()
+    })
+  })
 })
 
