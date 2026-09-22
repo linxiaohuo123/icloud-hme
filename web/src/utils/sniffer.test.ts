@@ -174,9 +174,17 @@ describe('extractMagicLink & extractOTP', () => {
 })
 
 describe('stripHtml & parseSenderInfo', () => {
-  it('stripHtml 正确清洗 HTML 标签与样式', () => {
-    const raw = '<style>body { color: red; }</style><p>Hello &nbsp; <b>World</b>!</p>'
-    expect(stripHtml(raw)).toBe('Hello World !')
+  it('stripHtml 正确清洗 HTML 标签与样式并保留 a 标签链接', () => {
+    const raw = '<style>body { color: red; }</style><p>Hello &nbsp; <b>World</b>! <a href="https://example.com/confirm?token=xyz123&amp;ref=1">激活账户</a></p>'
+    expect(stripHtml(raw)).toBe('Hello World ! 激活账户 ( https://example.com/confirm?token=xyz123&ref=1 )')
+  })
+
+  it('从包含 a 标签的 HTML 正文中嗅探激活链接', () => {
+    const html = '<div><p>请点击下方按钮激活您的账号：</p><a href="https://slack.com/verify-email?token=sec_999888">点击激活</a></div>'
+    const context = buildSniffContext('Slack 登录验证', undefined, html)
+    const res = extractOTP(context)
+    expect(res).not.toBeNull()
+    expect(res?.magicLink).toBe('https://slack.com/verify-email?token=sec_999888')
   })
 
   it('parseSenderInfo 提取发件人名字、地址并反解 Apple Relay', () => {

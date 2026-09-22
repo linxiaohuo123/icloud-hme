@@ -39,6 +39,7 @@ type VerificationResult struct {
 	AliasEmail  string `json:"alias_email"`
 	Status      string `json:"status"` // ready / pending / succeeded / expired / invalidated
 	Code        string `json:"code,omitempty"`
+	MagicLink   string `json:"magic_link,omitempty"`
 	MessageRef  string `json:"message_ref,omitempty"`
 }
 
@@ -182,11 +183,16 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 
 	// 2. 幂等返回已有最终态
 	if vreq.Status == "succeeded" {
+		magicLink := ""
+		if strings.HasPrefix(vreq.Code, "http://") || strings.HasPrefix(vreq.Code, "https://") {
+			magicLink = vreq.Code
+		}
 		return &VerificationResult{
 			RequestID:  vreq.RequestID,
 			LeaseID:    vreq.LeaseID,
 			AliasEmail: vreq.AliasEmail,
 			Code:       vreq.Code,
+			MagicLink:  magicLink,
 			MessageRef: vreq.MatchedEventRef,
 			Status:     "succeeded",
 		}, nil
@@ -233,6 +239,10 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		}
 
 		code := item.OTP.Code
+		magicLink := item.OTP.MagicLink
+		if code == "" && magicLink != "" {
+			code = magicLink
+		}
 		// 终态原子 CAS (P0-3): 必须将当前时间传入数据库原子校验 expires_at，非 winner 绝不消费
 		nowUTC := time.Now().UTC()
 		curReq, won, err := s.store.CompleteVerificationRequest(ctx, vreq.RequestID, code, item.EventID, nowUTC)
@@ -247,6 +257,7 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 				LeaseID:    vreq.LeaseID,
 				AliasEmail: vreq.AliasEmail,
 				Code:       code,
+				MagicLink:  magicLink,
 				MessageRef: item.EventID,
 				Status:     "succeeded",
 			}, nil
@@ -265,11 +276,16 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 					Status:     "expired",
 				}, nil
 			}
+			curMagicLink := ""
+			if strings.HasPrefix(curReq.Code, "http://") || strings.HasPrefix(curReq.Code, "https://") {
+				curMagicLink = curReq.Code
+			}
 			return &VerificationResult{
 				RequestID:  curReq.RequestID,
 				LeaseID:    curReq.LeaseID,
 				AliasEmail: curReq.AliasEmail,
 				Code:       curReq.Code,
+				MagicLink:  curMagicLink,
 				MessageRef: curReq.MatchedEventRef,
 				Status:     curReq.Status,
 			}, nil

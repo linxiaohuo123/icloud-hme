@@ -1,6 +1,6 @@
 /**
- * [INPUT]: 依赖 api/types 的 FullMessage, components 下 Dialog 与 icons, utils 下 clipboard/sniffer/date
- * [OUTPUT]: 对外提供 MailDetailDialog 统一邮件详情弹窗组件 (发件人/别名/时间/多模式正文清洗；OTP 走 buildSniffContext，HTML 正文先 stripHtml)
+ * [INPUT]: 依赖 api/types 的 FullMessage, components 下 Dialog 与 icons (IconCheck, IconCopy, IconKey, IconExternalLink), utils 下 clipboard/sniffer (extractOTP, buildSniffContext, parseSenderInfo)/date
+ * [OUTPUT]: 对外提供 MailDetailDialog 统一邮件详情弹窗组件 (发件人/别名/时间/多模式正文清洗；OTP 与激活链接嗅探展示)
  * [POS]: web/src/components/inbox 的详情展示层，供工作台 Tab 与全局收件箱双入口消费
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -8,10 +8,10 @@
 import { useEffect, useState } from 'react'
 import type { FullMessage } from '../../api/types'
 import Dialog from '../Dialog'
-import { IconCheck, IconCopy, IconKey } from '../icons'
+import { IconCheck, IconCopy, IconExternalLink, IconKey } from '../icons'
 import { copyText } from '../../utils/clipboard'
 import { formatDate, formatFullDate, formatRelativeTime } from '../../utils/date'
-import { buildSniffContext, extractVerifyCode, parseSenderInfo, stripHtml } from '../../utils/sniffer'
+import { buildSniffContext, extractOTP, parseSenderInfo, stripHtml } from '../../utils/sniffer'
 
 export interface MailDetailDialogProps {
   detail: FullMessage | null
@@ -40,9 +40,11 @@ export default function MailDetailDialog({
 
   const isHtml = detail?.content_type?.toLowerCase().includes('html') ?? false
   const sender = detail ? parseSenderInfo(detail.from) : null
-  const code = detail
-    ? extractVerifyCode(buildSniffContext(detail.subject, isHtml ? stripHtml(detail.body) : detail.body))
+  const otpResult = detail
+    ? extractOTP(buildSniffContext(detail.subject, undefined, detail.body))
     : null
+  const code = otpResult?.code
+  const magicLink = otpResult?.magicLink
 
   async function handleCopyCode(otp: string) {
     const ok = await copyText(otp)
@@ -157,6 +159,25 @@ export default function MailDetailDialog({
                 {copiedCode ? <IconCheck size={14} /> : <IconCopy size={14} />}
                 <span>{copiedCode ? '已复制' : '复制验证码'}</span>
               </button>
+            </div>
+          )}
+
+          {!code && magicLink && (
+            <div className="email-code-banner" style={{ background: 'color-mix(in srgb, var(--color-primary) 10%, transparent)', borderColor: 'color-mix(in srgb, var(--color-primary) 30%, transparent)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <IconExternalLink size={18} style={{ color: 'var(--color-primary)' }} />
+                <span className="email-code-label">检测到激活验证链接</span>
+              </div>
+              <a
+                href={magicLink}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn btn-sm btn-primary"
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+              >
+                <span>打开激活链接</span>
+                <IconExternalLink size={13} />
+              </a>
             </div>
           )}
 

@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 api/client (request, ApiError, getMessageDetail), api/types, components (AsyncState, ConfirmDialog, Select, ToastProvider), utils (clipboard, date, mail, sniffer: extractVerifyCode, parseSenderInfo, buildSniffContext), ./InboxTableRow, ./MailDetailDialog
+ * [INPUT]: 依赖 api/client (request, ApiError, getMessageDetail), api/types, components (AsyncState, ConfirmDialog, Select, ToastProvider), utils (clipboard, date, mail, sniffer: buildSniffContext, extractVerifyCode, parseSenderInfo), ./InboxTableRow, ./MailDetailDialog
  * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；正文预取 POST /api/messages 使用 uid 并消费 data.messages；首屏 capability 保护与 CAPABILITY_UNSUPPORTED 优雅退避重试
  * [POS]: web/src/components/inbox 的核心视图容器，统一单账号工作台与全局收件箱大盘的数据流与交互
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md

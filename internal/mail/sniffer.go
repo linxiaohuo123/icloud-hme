@@ -332,10 +332,12 @@ func isAlphanumericOTP(s string) bool {
 // findBestDigitCode 提取最可能是验证码的纯数字串 (排除年份、虚拟占位符与负向业务词)
 func findBestDigitCode(text string) string {
 	// 优先检查盒式空格拆分码 (例: "5 7 6 9 3 2")
-	if m := spacedDigitsRegex.FindStringSubmatchIndex(text); len(m) >= 4 {
-		c := cleanCode(text[m[2]:m[3]])
-		if len(c) >= 4 && len(c) <= 8 && !isYear(c) && !isDummyCode(c) && !isNegativeContext(text, m[2], m[3]) {
-			return c
+	for _, m := range spacedDigitsRegex.FindAllStringSubmatchIndex(text, -1) {
+		if len(m) >= 4 {
+			c := cleanCode(text[m[2]:m[3]])
+			if len(c) >= 4 && len(c) <= 8 && !isYear(c) && !isDummyCode(c) && !isNegativeContext(text, m[2], m[3]) {
+				return c
+			}
 		}
 	}
 

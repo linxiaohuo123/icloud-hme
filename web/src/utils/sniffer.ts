@@ -181,7 +181,7 @@ export function extractVerifyCode(rawText: string): string | null {
     if (match?.[1] && match.index !== undefined) {
       const code = match[1].replace(/[-\s]/g, '')
       if (isYear(code) || isDummyCode(code)) continue
-      const codeStart = match.index + match[0].lastIndexOf(match[1])
+      const codeStart = match.index + (match[0].length - match[1].length)
       const codeEnd = codeStart + match[1].length
       if (isNegativeContext(text, codeStart, codeEnd)) continue
       return code
@@ -220,18 +220,19 @@ export function extractVerifyCode(rawText: string): string | null {
 
   // 5. 兜底策略：在确认为验证类邮件时，提取最佳独立数字
   if (hasVerifyKeyword(text)) {
-    // 优先检查盒式空格码
-    const spacedMatch = text.match(/\b([0-9](?:\s+[0-9]){3,7})\b/)
-    if (spacedMatch?.[1] && spacedMatch.index !== undefined) {
-      const code = spacedMatch[1].replace(/\s+/g, '')
-      if (
-        code.length >= 4 &&
-        code.length <= 8 &&
-        !isYear(code) &&
-        !isDummyCode(code) &&
-        !isNegativeContext(text, spacedMatch.index, spacedMatch.index + spacedMatch[1].length)
-      ) {
-        return code
+    // 优先检查盒式空格码 (全局遍历所有候选)
+    for (const spacedMatch of text.matchAll(/\b([0-9](?:\s+[0-9]){3,7})\b/g)) {
+      if (spacedMatch[1] && spacedMatch.index !== undefined) {
+        const code = spacedMatch[1].replace(/\s+/g, '')
+        if (
+          code.length >= 4 &&
+          code.length <= 8 &&
+          !isYear(code) &&
+          !isDummyCode(code) &&
+          !isNegativeContext(text, spacedMatch.index, spacedMatch.index + spacedMatch[1].length)
+        ) {
+          return code
+        }
       }
     }
 
@@ -281,13 +282,14 @@ function hasVerifyKeyword(text: string): boolean {
 }
 
 /**
- * 剔除 HTML 标签与样式并转换实体，获得纯净文本
+ * 剔除 HTML 标签与样式并转换实体，获得纯净文本 (保留 a 标签 href 供链接嗅探)
  */
 export function stripHtml(html: string): string {
   if (!html) return ''
   return html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
     .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<a\b[^>]*?\bhref=["']?([^"'\s>]+)["']?[^>]*>([\s\S]*?)<\/a>/gi, '$2 ( $1 )')
     .replace(/<[^>]+>/g, ' ')
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
