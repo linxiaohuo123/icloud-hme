@@ -116,14 +116,15 @@ func (s *Server) externalV2AllocateHandler(c *gin.Context) {
 	}
 
 	ok(c, gin.H{
-		"operation_id": opID,
-		"lease_id":     allocRes.Allocation.AllocationID,
-		"email":        allocRes.Allocation.AliasEmail,
-		"alias_email":  allocRes.Allocation.AliasEmail,
-		"account_id":   allocRes.Allocation.AccountID,
-		"source":       allocRes.Source,
-		"allocated_at": allocRes.Allocation.AllocatedAt,
-		"status":       allocRes.Allocation.Status,
+		"operation_id":  opID,
+		"lease_id":      allocRes.Allocation.AllocationID,
+		"allocation_id": allocRes.Allocation.AllocationID,
+		"email":         allocRes.Allocation.AliasEmail,
+		"alias_email":   allocRes.Allocation.AliasEmail,
+		"account_id":    allocRes.Allocation.AccountID,
+		"source":        allocRes.Source,
+		"allocated_at":  allocRes.Allocation.AllocatedAt,
+		"status":        allocRes.Allocation.Status,
 	})
 }
 

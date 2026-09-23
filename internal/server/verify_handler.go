@@ -22,7 +22,7 @@ import (
 //
 //	email (必须): 待接收验证码的别名邮箱
 //	timeout (可选): 最大等待秒数, 默认 30, 上限 120
-//	auto_delete (可选): 成功后是否自动在后台停用该别名以释放配额, 默认 false
+//	auto_delete: 已废弃并明确拒绝 (传入返回 400 UNSUPPORTED_PARAMETER)
 func (s *Server) verifyCodeHandler(c *gin.Context) {
 	email := strings.ToLower(strings.TrimSpace(c.Query("email")))
 	if email == "" {
