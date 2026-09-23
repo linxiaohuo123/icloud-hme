@@ -128,7 +128,7 @@ func (s *Server) listAliasesHandler(c *gin.Context) {
 
 		if refresh && s.store != nil {
 			if n, err := s.store.ReconcileAvailableInventory(); err == nil && n > 0 {
-				log.Printf("[Aliases] 刷新号池后对齐库存: 新激活 %d 个未分配别名", n)
+				log.Printf("[Aliases] 刷新后库存安全对齐: 已隔离/收敛 %d 个受保护或异常别名", n)
 			}
 		}
 

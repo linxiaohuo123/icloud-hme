@@ -178,7 +178,7 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 	if st != nil {
 		notifier.UpdateSettings(s.loadNotifySettings())
 		if n, err := st.ReconcileAvailableInventory(); err == nil && n > 0 {
-			log.Printf("[Server] 存量库存对齐完成: 已激活 %d 个未分配存量别名入号池", n)
+			log.Printf("[Server] 存量库存安全对齐完成: 已隔离/收敛 %d 个受保护或异常别名", n)
 		}
 	}
 	// 生产后端拉取到别名列表时自动登记「别名 → 母号」路由，

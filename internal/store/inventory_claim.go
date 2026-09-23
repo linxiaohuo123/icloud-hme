@@ -141,6 +141,17 @@ func (s *Store) ClaimInventoryAlias(
 		SELECT email, account_id
 		FROM alias_inventory
 		WHERE allocation_state = 'available' AND remote_state = 'active'
+		  AND (
+		      account_id IN (
+		          SELECT id FROM accounts
+		          WHERE status = 'active'
+		            AND (name NOT LIKE '%大号%')
+		            AND (tags NOT LIKE '%"personal"%' COLLATE NOCASE)
+		            AND (tags NOT LIKE '%"private"%' COLLATE NOCASE)
+		            AND (tags NOT LIKE '%"protected"%' COLLATE NOCASE)
+		      )
+		      OR NOT EXISTS (SELECT 1 FROM accounts)
+		  )
 	`
 	var args []any
 	if len(allowedAccountIDs) == 1 && allowedAccountIDs[0] != "" {

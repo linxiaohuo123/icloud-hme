@@ -268,41 +268,63 @@ func (s *Store) initInventorySchema() error {
 	return nil
 }
 
-// ReconcileAvailableInventory 将处于 unknown 状态且从未被分配给任何主体的活跃存量别名激活为 available 可用库存 (严格排除受保护私有账号)
+// ReconcileAvailableInventory 安全收敛库存状态：严禁无凭据激活 unknown 存量别名，隔离保护账号与孤儿资产
 func (s *Store) ReconcileAvailableInventory() (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(`
-		UPDATE alias_inventory
-		SET allocation_state = 'available',
-		    remote_state = 'active'
-		WHERE allocation_state = 'unknown'
-		  AND account_id NOT IN (
-		      SELECT id FROM accounts 
-		      WHERE tags LIKE '%"personal"%' 
-		         OR tags LIKE '%"private"%' 
-		         OR tags LIKE '%"protected"%'
-		         OR name LIKE '%大号%'
-		  )
-		  AND email NOT IN (SELECT alias_email FROM alias_allocations)
-	`)
-	if err != nil {
-		return 0, err
-	}
-	// 同时将受保护账号的非已分配别名归纳为 reserved 保护状态，杜绝误入可用库存
-	_, _ = s.db.Exec(`
+
+	var totalAffected int64
+
+	// 1. 将属于受保护账号的非已分配别名归纳为 reserved 保护状态，杜绝误入可用库存
+	resProt, err := s.db.Exec(`
 		UPDATE alias_inventory
 		SET allocation_state = 'reserved'
 		WHERE allocation_state IN ('unknown', 'available')
 		  AND account_id IN (
 		      SELECT id FROM accounts 
-		      WHERE tags LIKE '%"personal"%' 
-		         OR tags LIKE '%"private"%' 
-		         OR tags LIKE '%"protected"%'
+		      WHERE tags LIKE '%"personal"%' COLLATE NOCASE
+		         OR tags LIKE '%"private"%' COLLATE NOCASE
+		         OR tags LIKE '%"protected"%' COLLATE NOCASE
 		         OR name LIKE '%大号%'
 		  )
 	`)
-	return res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := resProt.RowsAffected(); n > 0 {
+		totalAffected += n
+	}
+
+	// 2. 账号缺失(孤儿资产)：account_id 在 accounts 表中不存在且系统已配置账号时，收敛隔离为 quarantined
+	resOrphan, err := s.db.Exec(`
+		UPDATE alias_inventory
+		SET allocation_state = 'quarantined'
+		WHERE allocation_state IN ('unknown', 'available')
+		  AND account_id NOT IN (SELECT id FROM accounts)
+		  AND EXISTS (SELECT 1 FROM accounts)
+	`)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := resOrphan.RowsAffected(); n > 0 {
+		totalAffected += n
+	}
+
+	// 3. 历史已分配别名收敛：确保已有 allocation 记录的资产必定处于 allocated
+	resAlloc, err := s.db.Exec(`
+		UPDATE alias_inventory
+		SET allocation_state = 'allocated'
+		WHERE allocation_state != 'allocated'
+		  AND email IN (SELECT alias_email FROM alias_allocations)
+	`)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := resAlloc.RowsAffected(); n > 0 {
+		totalAffected += n
+	}
+
+	return totalAffected, nil
 }
 
 func (s *Store) migrateInventory() error {
@@ -429,7 +451,7 @@ func (s *Store) SyncAliasInventory(accountID string, aliases []hme.Alias) error 
 	stmt, err := tx.Prepare(`
 		INSERT INTO alias_inventory (
 			email, account_id, provider_alias_id, remote_state, allocation_state, source_type, last_verified_at, snapshot_version
-		) VALUES (?, ?, ?, ?, 'available', 'synced', ?, 1)
+		) VALUES (?, ?, ?, ?, 'unknown', 'synced', ?, 1)
 		ON CONFLICT(email) DO UPDATE SET
 			remote_state = excluded.remote_state,
 			provider_alias_id = excluded.provider_alias_id,
