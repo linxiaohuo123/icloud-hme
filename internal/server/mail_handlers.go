@@ -43,6 +43,7 @@ func (s *Server) listInboxHandler(c *gin.Context) {
 	}
 	folderSpecified := c.Query("folder") != "" && c.Query("folder") != "all" && !strings.EqualFold(c.Query("folder"), "INBOX")
 	daysSpecified := c.Query("days") != ""
+	refresh := c.Query("refresh") == "1" || strings.EqualFold(c.Query("refresh"), "true")
 	withBody := c.Query("body") == "1" || strings.EqualFold(c.Query("body"), "true")
 
 	query := InboxQuery{
@@ -54,6 +55,7 @@ func (s *Server) listInboxHandler(c *gin.Context) {
 		WithBody:        withBody,
 		FolderSpecified: folderSpecified,
 		DaysSpecified:   daysSpecified,
+		Refresh:         refresh,
 	}
 
 	var result InboxResult
@@ -75,7 +77,13 @@ func (s *Server) listMailboxesHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数缺失: account_id")
 		return
 	}
-	folders, err := s.be.ListMailboxes(accountID)
+	var folders []mail.Folder
+	var err error
+	if s.mailReadService != nil {
+		folders, err = s.mailReadService.ListMailboxes(c.Request.Context(), accountID)
+	} else {
+		folders, err = s.be.ListMailboxesContext(c.Request.Context(), accountID)
+	}
 	if err != nil {
 		backendFail(c, err)
 		return

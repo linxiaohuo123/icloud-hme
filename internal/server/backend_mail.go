@@ -29,6 +29,7 @@ type InboxQuery struct {
 	FolderSpecified bool
 	DaysSpecified   bool
 	SinceUID        uint32
+	Refresh         bool
 }
 
 // InboxResult 是收件箱查询结果。
@@ -193,9 +194,9 @@ func (b *managerBackend) ListInbox(q InboxQuery) (InboxResult, error) {
 	return b.ListInboxContext(context.Background(), q)
 }
 
-func (b *managerBackend) ListMailboxes(accountID string) ([]mail.Folder, error) {
+func (b *managerBackend) ListMailboxesContext(ctx context.Context, accountID string) ([]mail.Folder, error) {
 	var folders []mail.Folder
-	err := b.mgr.WithMailClient(accountID, func(mc *mail.Client) error {
+	err := b.mgr.WithMailClientContext(ctx, accountID, func(mc *mail.Client) error {
 		var e error
 		folders, e = mc.ListMailboxes()
 		return e
@@ -204,12 +205,22 @@ func (b *managerBackend) ListMailboxes(accountID string) ([]mail.Folder, error) 
 		if strings.Contains(err.Error(), "不存在") || strings.Contains(err.Error(), "未设置") {
 			return nil, mapAccountErr(err)
 		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "获取文件夹列表失败"}
 	}
 	return folders, nil
 }
 
-func (b *managerBackend) GetMessage(accountID string, rawID string) (*mail.FullMessage, error) {
+func (b *managerBackend) ListMailboxes(accountID string) ([]mail.Folder, error) {
+	return b.ListMailboxesContext(context.Background(), accountID)
+}
+
+func (b *managerBackend) GetMessageContext(ctx context.Context, accountID string, rawID string) (*mail.FullMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	ref, err := mail.ParseMessageRef(rawID, accountID)
 	if err != nil {
 		return nil, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "邮件引用格式无效"}
@@ -224,7 +235,7 @@ func (b *managerBackend) GetMessage(accountID string, rawID string) (*mail.FullM
 		if werr != nil {
 			return nil, classifyInboxErr(werr)
 		}
-		msgs, errList := wmc.ListInbox(webMailLookupLimit)
+		msgs, errList := wmc.ListInboxContext(ctx, webMailLookupLimit)
 		if errList != nil {
 			return nil, classifyInboxErr(errList)
 		}
@@ -265,7 +276,7 @@ func (b *managerBackend) GetMessage(accountID string, rawID string) (*mail.FullM
 		lookupFolder = "INBOX"
 	}
 	var message *mail.FullMessage
-	imapErr := b.mgr.WithMailClient(accountID, func(mc *mail.Client) error {
+	imapErr := b.mgr.WithMailClientContext(ctx, accountID, func(mc *mail.Client) error {
 		var e error
 		if ref.UIDValidity > 0 {
 			message, e = mc.GetFullInFolderWithValidity(lookupFolder, ref.UIDValidity, ref.UID)
@@ -290,6 +301,10 @@ func (b *managerBackend) GetMessage(accountID string, rawID string) (*mail.FullM
 		return message, nil
 	}
 
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
 	if errors.Is(imapErr, mail.ErrUIDValidityMismatch) {
 		return nil, &BackendError{Status: http.StatusNotFound, Code: "UIDVALIDITY_MISMATCH", Message: "邮箱 UIDVALIDITY 已变更，原邮件引用失效"}
 	}
@@ -306,7 +321,14 @@ func (b *managerBackend) GetMessage(accountID string, rawID string) (*mail.FullM
 	return nil, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "读取邮件详情失败"}
 }
 
-func (b *managerBackend) GetMessages(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error) {
+func (b *managerBackend) GetMessage(accountID string, rawID string) (*mail.FullMessage, error) {
+	return b.GetMessageContext(context.Background(), accountID, rawID)
+}
+
+func (b *managerBackend) GetMessagesContext(ctx context.Context, accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(refs) == 0 {
 		return []*mail.FullMessage{}, nil
 	}
@@ -344,8 +366,11 @@ func (b *managerBackend) GetMessages(accountID string, refs []mail.MessageRef) (
 
 	var allMessages []*mail.FullMessage
 	if len(groups) > 0 {
-		err := b.mgr.WithMailClient(accountID, func(mc *mail.Client) error {
+		err := b.mgr.WithMailClientContext(ctx, accountID, func(mc *mail.Client) error {
 			for _, g := range groups {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
 				var msgs []*mail.FullMessage
 				var e error
 				if g.uidValidity > 0 {
@@ -379,6 +404,9 @@ func (b *managerBackend) GetMessages(accountID string, refs []mail.MessageRef) (
 			return nil
 		})
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			if strings.Contains(err.Error(), "不存在") || strings.Contains(err.Error(), "未设置") {
 				return nil, mapAccountErr(err)
 			}
@@ -388,13 +416,17 @@ func (b *managerBackend) GetMessages(accountID string, refs []mail.MessageRef) (
 
 	for _, wr := range webMailRefs {
 		if wr.ThreadID != "" {
-			if m, err := b.GetMessage(accountID, wr.ThreadID); err == nil && m != nil {
+			if m, err := b.GetMessageContext(ctx, accountID, wr.ThreadID); err == nil && m != nil {
 				allMessages = append(allMessages, m)
 			}
 		}
 	}
 
 	return allMessages, nil
+}
+
+func (b *managerBackend) GetMessages(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error) {
+	return b.GetMessagesContext(context.Background(), accountID, refs)
 }
 
 func (b *managerBackend) DeleteMessage(accountID string, uid uint32) error {

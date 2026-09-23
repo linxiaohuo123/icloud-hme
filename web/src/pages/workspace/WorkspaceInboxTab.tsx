@@ -6,10 +6,11 @@
  */
 
 import InboxTableView from '../../components/inbox/InboxTableView'
-import type { Alias } from '../../api/types'
+import type { AccountSummary, Alias } from '../../api/types'
 
 export interface WorkspaceInboxTabProps {
   accountId?: string
+  accountSummary?: AccountSummary | null
   aliases?: Alias[]
   selectedAlias?: string
   onSelectAlias?: (val: string) => void
@@ -19,6 +20,7 @@ export interface WorkspaceInboxTabProps {
 
 export default function WorkspaceInboxTab({
   accountId = '',
+  accountSummary,
   aliases,
   selectedAlias,
   onCopySuccess,
@@ -27,6 +29,7 @@ export default function WorkspaceInboxTab({
   return (
     <InboxTableView
       accountId={accountId}
+      accountSummary={accountSummary}
       fixedAccount={true}
       initialAlias={selectedAlias}
       externalAliases={aliases}

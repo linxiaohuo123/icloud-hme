@@ -277,6 +277,7 @@ export default function AccountWorkspace() {
       {activeTab === 'inbox' && (
         <WorkspaceInboxTab
           accountId={account?.id ?? accountId}
+          accountSummary={account}
           aliases={aliases}
           selectedAlias={selectedAliasForInbox}
           onSelectAlias={(val) => {

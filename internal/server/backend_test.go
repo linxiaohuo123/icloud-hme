@@ -310,6 +310,13 @@ func (f *fakeBackend) ListMailboxes(accountID string) ([]mail.Folder, error) {
 	}, nil
 }
 
+func (f *fakeBackend) ListMailboxesContext(ctx context.Context, accountID string) ([]mail.Folder, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return f.ListMailboxes(accountID)
+}
+
 func (f *fakeBackend) GetMessage(accountID string, id string) (*mail.FullMessage, error) {
 	if f.getMessageFunc != nil {
 		return f.getMessageFunc(accountID, id)
@@ -319,6 +326,13 @@ func (f *fakeBackend) GetMessage(accountID string, id string) (*mail.FullMessage
 		idPart = id
 	}
 	return &mail.FullMessage{Message: mail.Message{ID: idPart}}, nil
+}
+
+func (f *fakeBackend) GetMessageContext(ctx context.Context, accountID string, id string) (*mail.FullMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return f.GetMessage(accountID, id)
 }
 
 func (f *fakeBackend) GetMessages(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error) {
@@ -331,28 +345,28 @@ func (f *fakeBackend) GetMessages(accountID string, refs []mail.MessageRef) ([]*
 		if mailbox == "" {
 			mailbox = "INBOX"
 		}
-		ref := mail.MessageRef{
-			Provider:    "imap",
-			AccountID:   accountID,
-			Mailbox:     mailbox,
-			UIDValidity: r.UIDValidity,
-			UID:         r.UID,
-		}
-		msg := &mail.FullMessage{
+		out = append(out, &mail.FullMessage{
 			Message: mail.Message{
-				ID:          fmt.Sprint(r.UID),
+				ID:          r.Encode(),
+				MessageRef:  r.Encode(),
 				Folder:      mailbox,
 				UIDValidity: r.UIDValidity,
 				UID:         r.UID,
 				Provider:    "imap",
-				MessageRef:  ref.Encode(),
 			},
-			Provider: "imap",
-			Method:   "imap",
-		}
-		out = append(out, msg)
+			BodyComplete: true,
+			Provider:     "imap",
+			Method:       "imap",
+		})
 	}
 	return out, nil
+}
+
+func (f *fakeBackend) GetMessagesContext(ctx context.Context, accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return f.GetMessages(accountID, refs)
 }
 
 func (f *fakeBackend) GetMailboxBoundary(accountID, folder string) (string, uint32, uint32, error) {
