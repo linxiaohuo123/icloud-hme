@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"icloud-hme/internal/hme"
+	"icloud-hme/internal/store"
 )
 
 type createAliasReq struct {
@@ -313,6 +314,16 @@ func (s *Server) deactivateAliasHandler(c *gin.Context) {
 		backendFail(c, err)
 		return
 	}
+	if !success {
+		failCode(c, http.StatusBadGateway, "UPSTREAM_FAILED", "上游停用别名失败")
+		return
+	}
+	if s.store != nil {
+		if err := s.store.UpdateAliasRemoteState(accountID, anonymousID, store.RemoteInactive); err != nil {
+			failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", "本地库存状态更新失败: "+err.Error())
+			return
+		}
+	}
 	ok(c, gin.H{"anonymous_id": anonymousID, "success": success})
 }
 
@@ -326,6 +337,16 @@ func (s *Server) reactivateAliasHandler(c *gin.Context) {
 		backendFail(c, err)
 		return
 	}
+	if !success {
+		failCode(c, http.StatusBadGateway, "UPSTREAM_FAILED", "上游激活别名失败")
+		return
+	}
+	if s.store != nil {
+		if err := s.store.UpdateAliasRemoteState(accountID, anonymousID, store.RemoteActive); err != nil {
+			failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", "本地库存状态更新失败: "+err.Error())
+			return
+		}
+	}
 	ok(c, gin.H{"anonymous_id": anonymousID, "success": success})
 }
 
@@ -337,6 +358,12 @@ func (s *Server) deleteAliasHandler(c *gin.Context) {
 	if err := s.be.DeleteAlias(accountID, anonymousID); err != nil {
 		backendFail(c, err)
 		return
+	}
+	if s.store != nil {
+		if err := s.store.UpdateAliasRemoteState(accountID, anonymousID, store.RemoteDeleted); err != nil {
+			failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", "本地库存状态更新失败: "+err.Error())
+			return
+		}
 	}
 	ok(c, gin.H{"anonymous_id": anonymousID})
 }

@@ -71,6 +71,7 @@ type fakeBackend struct {
 	validateID   string
 	validateFunc func(id string) error
 
+	onSetAliasActive    func(accountID, anonymousID string, active bool) (bool, error)
 	getMessageFunc      func(accountID string, id string) (*mail.FullMessage, error)
 	getMessagesFunc     func(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error)
 	mailboxBoundaryFunc func(accountID, folder string) (string, uint32, uint32, error)
@@ -184,6 +185,9 @@ func (f *fakeBackend) RefreshAliases(accountID string) ([]hme.Alias, error) {
 
 func (f *fakeBackend) SetAliasActive(accountID, anonymousID string, active bool) (bool, error) {
 	f.aliasActID, f.aliasActActive = anonymousID, active
+	if f.onSetAliasActive != nil {
+		return f.onSetAliasActive(accountID, anonymousID, active)
+	}
 	return true, f.aliasActErr
 }
 

@@ -18,6 +18,7 @@ import (
 
 	"icloud-hme/internal/account"
 	"icloud-hme/internal/hme"
+	"icloud-hme/internal/store"
 )
 
 // BatchCreateResult 批量创建别名结果。
@@ -283,11 +284,30 @@ func (b *managerBackend) SetAliasActive(accountID, anonymousID string, active bo
 		}
 		return false, classifyUpstreamErr(msg, err)
 	}
+	if !success {
+		msg := "停用操作未成功"
+		if active {
+			msg = "激活操作未成功"
+		}
+		return false, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILED", Message: msg}
+	}
+
 	if active {
 		_ = b.mgr.AdjustAliasCounts(accountID, 0, 1)
 	} else {
 		_ = b.mgr.AdjustAliasCounts(accountID, 0, -1)
 	}
+
+	if b.store != nil {
+		rState := store.RemoteInactive
+		if active {
+			rState = store.RemoteActive
+		}
+		if stErr := b.store.UpdateAliasRemoteState(accountID, anonymousID, rState); stErr != nil {
+			return false, fmt.Errorf("local inventory state sync failed: %w", stErr)
+		}
+	}
+
 	b.invalidateAliasCache(accountID)
 	return success, nil
 }
@@ -438,6 +458,12 @@ func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
 		}
 		return classifyUpstreamErr("删除失败", err)
 	}
+	if b.store != nil {
+		if stErr := b.store.UpdateAliasRemoteState(accountID, anonymousID, store.RemoteDeleted); stErr != nil {
+			return fmt.Errorf("local inventory state sync failed: %w", stErr)
+		}
+	}
+
 	_ = b.mgr.AdjustAliasCounts(accountID, -1, deltaActive)
 	b.invalidateAliasCache(accountID)
 	return nil

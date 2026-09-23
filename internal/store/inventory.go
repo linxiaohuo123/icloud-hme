@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 database/sql, fmt, errors, strings, time, icloud-hme/internal/hme
- * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation 模型及 initInventorySchema, migrateInventory, AddInventoryAlias, GetInventoryAlias, SyncAliasInventory, CountAuthoritativeAvailableAliases
+ * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation 模型及 initInventorySchema, migrateInventory, AddInventoryAlias, GetInventoryAlias, SyncAliasInventory, CountAuthoritativeAvailableAliases, UpdateAliasRemoteState
  * [POS]: internal/store 的别名库存实体与迁移定义层，维护 alias_inventory, alias_allocations, operations 表结构与元数据
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -504,6 +504,44 @@ func (s *Store) QuarantineInventoryForAccount(accountID string) error {
 		    allocation_state = CASE WHEN allocation_state = 'available' THEN 'quarantined' ELSE allocation_state END
 		WHERE account_id = ?
 	`, accountID)
+	return err
+}
+
+// UpdateAliasRemoteState 更新指定别名的远端状态与对应的本地分配资格 (PR-08 工作包 C1)。
+// 停用：remote_state = 'inactive' (不可被认领分配)。
+// 删除：remote_state = 'deleted'，若原为 available 则置为 quarantined。
+// 激活：remote_state = 'active'；注意：绝不改变已有的 allocation_state (已分配/保留/隔离不可退回 available)。
+func (s *Store) UpdateAliasRemoteState(accountID, providerAliasID string, remoteState RemoteState) error {
+	accountID = strings.TrimSpace(accountID)
+	providerAliasID = strings.TrimSpace(providerAliasID)
+	now := time.Now().UTC().Format(time.RFC3339)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var err error
+	if providerAliasID != "" {
+		_, err = s.db.Exec(`
+			UPDATE alias_inventory
+			SET remote_state = ?,
+			    allocation_state = CASE 
+			        WHEN ? = 'deleted' AND allocation_state = 'available' THEN 'quarantined'
+			        ELSE allocation_state 
+			    END,
+			    last_verified_at = ?
+			WHERE account_id = ? AND (provider_alias_id = ? OR email = ?)
+		`, string(remoteState), string(remoteState), now, accountID, providerAliasID, providerAliasID)
+	} else {
+		_, err = s.db.Exec(`
+			UPDATE alias_inventory
+			SET remote_state = ?,
+			    allocation_state = CASE 
+			        WHEN ? = 'deleted' AND allocation_state = 'available' THEN 'quarantined'
+			        ELSE allocation_state 
+			    END,
+			    last_verified_at = ?
+			WHERE account_id = ?
+		`, string(remoteState), string(remoteState), now, accountID)
+	}
 	return err
 }
 

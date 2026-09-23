@@ -191,9 +191,16 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		if expTime, parseErr := time.Parse(time.RFC3339, vreq.ExpiresAt); parseErr == nil {
 			remaining := time.Until(expTime)
 			if remaining <= 0 {
-				if vreq.Status != "succeeded" && vreq.Status != "expired" {
-					_, _, _ = s.store.ExpireVerificationRequest(ctx, vreq.RequestID)
-					vreq.Status = "expired"
+				if vreq.Status != "succeeded" && vreq.Status != "expired" && vreq.Status != "invalidated" {
+					curReq, won, expErr := s.store.ExpireVerificationRequest(ctx, vreq.RequestID)
+					if expErr != nil {
+						return nil, &BackendError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "更新取码过期状态失败: " + expErr.Error()}
+					}
+					if curReq != nil {
+						vreq = curReq
+					} else if won {
+						vreq.Status = "expired"
+					}
 				}
 			} else if remaining < waitDuration {
 				waitDuration = remaining
@@ -253,7 +260,25 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		}
 		// UIDVALIDITY 突变检测 (Issue 5 & 6)
 		if item.UIDValidity != 0 && vreq.BaselineUIDValidity != 0 && item.UIDValidity != uint32(vreq.BaselineUIDValidity) {
-			_, _, _ = s.store.InvalidateVerificationRequest(ctx, vreq.RequestID)
+			curReq, _, invErr := s.store.InvalidateVerificationRequest(ctx, vreq.RequestID)
+			if invErr != nil {
+				return nil, &BackendError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "持久化代际失效失败: " + invErr.Error()}
+			}
+			if curReq != nil && curReq.Status == "succeeded" {
+				curMagicLink := ""
+				if strings.HasPrefix(curReq.Code, "http://") || strings.HasPrefix(curReq.Code, "https://") {
+					curMagicLink = curReq.Code
+				}
+				return &VerificationResult{
+					RequestID:  curReq.RequestID,
+					LeaseID:    curReq.LeaseID,
+					AliasEmail: curReq.AliasEmail,
+					Code:       curReq.Code,
+					MagicLink:  curMagicLink,
+					MessageRef: curReq.MatchedEventRef,
+					Status:     "succeeded",
+				}, nil
+			}
 			// 注意：代际突变不消费该事件，保留在 cache 中供新基线消费
 			return nil, ErrUIDValidityChanged
 		}
@@ -343,7 +368,36 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		if vreq.ExpiresAt != "" {
 			if expTime, parseErr := time.Parse(time.RFC3339, vreq.ExpiresAt); parseErr == nil {
 				if time.Now().UTC().After(expTime) {
-					_, _, _ = s.store.ExpireVerificationRequest(ctx, vreq.RequestID)
+					curReq, _, expErr := s.store.ExpireVerificationRequest(ctx, vreq.RequestID)
+					if expErr != nil {
+						return nil, &BackendError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "更新取码过期状态失败: " + expErr.Error()}
+					}
+					if curReq != nil {
+						if curReq.Status == "succeeded" {
+							curMagicLink := ""
+							if strings.HasPrefix(curReq.Code, "http://") || strings.HasPrefix(curReq.Code, "https://") {
+								curMagicLink = curReq.Code
+							}
+							return &VerificationResult{
+								RequestID:  curReq.RequestID,
+								LeaseID:    curReq.LeaseID,
+								AliasEmail: curReq.AliasEmail,
+								Code:       curReq.Code,
+								MagicLink:  curMagicLink,
+								MessageRef: curReq.MatchedEventRef,
+								Status:     "succeeded",
+							}, nil
+						}
+						if curReq.Status == "invalidated" {
+							return nil, ErrUIDValidityChanged
+						}
+						return &VerificationResult{
+							RequestID:  curReq.RequestID,
+							LeaseID:    curReq.LeaseID,
+							AliasEmail: curReq.AliasEmail,
+							Status:     curReq.Status,
+						}, nil
+					}
 					return &VerificationResult{
 						RequestID:  vreq.RequestID,
 						LeaseID:    vreq.LeaseID,
