@@ -520,13 +520,31 @@ func (s *Store) QuarantineInventoryForAccount(accountID string) error {
 	return err
 }
 
+// QuarantineInventoryAlias 将指定未成功分配的现场建号或暂存别名隔离为 quarantined，杜绝成为公共 available。
+func (s *Store) QuarantineInventoryAlias(email string) error {
+	email = strings.TrimSpace(strings.ToLower(email))
+	if email == "" {
+		return errors.New("empty email")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`
+		UPDATE alias_inventory
+		SET allocation_state = 'quarantined'
+		WHERE email = ? AND allocation_state IN ('unknown', 'available')
+	`, email)
+	return err
+}
+
 // UpdateAliasRemoteState 更新指定别名的远端状态与对应的本地分配资格 (PR-08 工作包 C1)。
 // 停用：remote_state = 'inactive' (不可被认领分配)。
 // 删除：remote_state = 'deleted'，若原为 available 则置为 quarantined。
 // 激活：remote_state = 'active'；注意：绝不改变已有的 allocation_state (已分配/保留/隔离不可退回 available)。
 // 约束：
-// 1. 禁止空标识退化为整账号批量覆写；
-// 2. 校验精确命中且仅命中目标一行 (RowsAffected == 1)，零行或多行均报错，杜绝假成功与身份歧义。
+// 1. account_id、email、providerAliasID 形成唯一一致绑定；
+// 2. 两个标识都非空时必须一致，不能 OR 命中任意不同对象；
+// 3. provider ID 缺失时仅凭可靠映射证据回填，已有非空 ID 与输入冲突时拒绝且不能覆盖；
+// 4. 本地更新在显式事务中执行，RowsAffected 不为 1 时显式回滚，零匹配/多匹配/账号不符全部明确失败。
 func (s *Store) UpdateAliasRemoteState(accountID, providerAliasID, email string, remoteState RemoteState) error {
 	accountID = strings.TrimSpace(accountID)
 	providerAliasID = strings.TrimSpace(providerAliasID)
@@ -543,7 +561,124 @@ func (s *Store) UpdateAliasRemoteState(accountID, providerAliasID, email string,
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	res, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var targetEmail string
+
+	if email != "" && providerAliasID != "" {
+		// 两个标识都非空时必须形成唯一一致绑定
+		var emailRow struct {
+			email     string
+			accountID string
+			provID    sql.NullString
+		}
+		errEmail := tx.QueryRow(`
+			SELECT email, account_id, provider_alias_id
+			FROM alias_inventory
+			WHERE email = ?
+		`, email).Scan(&emailRow.email, &emailRow.accountID, &emailRow.provID)
+
+		var idRow struct {
+			email     string
+			accountID string
+			provID    string
+		}
+		errID := tx.QueryRow(`
+			SELECT email, account_id, provider_alias_id
+			FROM alias_inventory
+			WHERE provider_alias_id = ?
+		`, providerAliasID).Scan(&idRow.email, &idRow.accountID, &idRow.provID)
+
+		if errEmail != nil && !errors.Is(errEmail, sql.ErrNoRows) {
+			return fmt.Errorf("query by email failed: %w", errEmail)
+		}
+		if errID != nil && !errors.Is(errID, sql.ErrNoRows) {
+			return fmt.Errorf("query by providerAliasID failed: %w", errID)
+		}
+
+		if errors.Is(errEmail, sql.ErrNoRows) && errors.Is(errID, sql.ErrNoRows) {
+			return fmt.Errorf("no inventory alias found matching id=%s or email=%s", providerAliasID, email)
+		}
+
+		// 检查两条记录是否指向不同的库存资产 (冲突)
+		if errEmail == nil && errID == nil {
+			if !strings.EqualFold(emailRow.email, idRow.email) {
+				return fmt.Errorf("identity conflict: providerAliasID %s belongs to %s, but input email is %s", providerAliasID, idRow.email, email)
+			}
+		}
+
+		if errEmail == nil {
+			if emailRow.accountID != accountID {
+				return fmt.Errorf("account mismatch for alias %s: expected %s, got %s", email, accountID, emailRow.accountID)
+			}
+			if emailRow.provID.Valid && emailRow.provID.String != "" && emailRow.provID.String != providerAliasID {
+				return fmt.Errorf("providerAliasID conflict for alias %s: existing %s != input %s", email, emailRow.provID.String, providerAliasID)
+			}
+			targetEmail = emailRow.email
+		} else if errID == nil {
+			if idRow.accountID != accountID {
+				return fmt.Errorf("account mismatch for providerAliasID %s: expected %s, got %s", providerAliasID, accountID, idRow.accountID)
+			}
+			if !strings.EqualFold(idRow.email, email) {
+				return fmt.Errorf("identity conflict: providerAliasID %s belongs to %s, but input email is %s", providerAliasID, idRow.email, email)
+			}
+			targetEmail = idRow.email
+		}
+	} else if email != "" {
+		// 仅提供 email
+		var dbAccID string
+		errQ := tx.QueryRow(`
+			SELECT account_id
+			FROM alias_inventory
+			WHERE email = ?
+		`, email).Scan(&dbAccID)
+		if errQ != nil {
+			if errors.Is(errQ, sql.ErrNoRows) {
+				return fmt.Errorf("no inventory alias found for email %s", email)
+			}
+			return fmt.Errorf("query by email failed: %w", errQ)
+		}
+		if dbAccID != accountID {
+			return fmt.Errorf("account mismatch for alias %s: expected %s, got %s", email, accountID, dbAccID)
+		}
+		targetEmail = email
+	} else {
+		// 仅提供 providerAliasID
+		rows, errQ := tx.Query(`
+			SELECT email, account_id
+			FROM alias_inventory
+			WHERE provider_alias_id = ?
+		`, providerAliasID)
+		if errQ != nil {
+			return fmt.Errorf("query by providerAliasID failed: %w", errQ)
+		}
+		defer rows.Close()
+
+		var matchedEmails []string
+		for rows.Next() {
+			var mEmail, mAccID string
+			if err := rows.Scan(&mEmail, &mAccID); err != nil {
+				return err
+			}
+			if mAccID != accountID {
+				return fmt.Errorf("account mismatch for providerAliasID %s: expected %s, got %s", providerAliasID, accountID, mAccID)
+			}
+			matchedEmails = append(matchedEmails, mEmail)
+		}
+		if len(matchedEmails) == 0 {
+			return fmt.Errorf("no inventory alias found for providerAliasID %s on account %s", providerAliasID, accountID)
+		}
+		if len(matchedEmails) > 1 {
+			return fmt.Errorf("ambiguous inventory update: %d rows matched providerAliasID %s", len(matchedEmails), providerAliasID)
+		}
+		targetEmail = matchedEmails[0]
+	}
+
+	res, err := tx.Exec(`
 		UPDATE alias_inventory
 		SET remote_state = ?,
 		    allocation_state = CASE 
@@ -555,11 +690,8 @@ func (s *Store) UpdateAliasRemoteState(accountID, providerAliasID, email string,
 		        ELSE provider_alias_id
 		    END,
 		    last_verified_at = ?
-		WHERE account_id = ? AND (
-		    (? != '' AND provider_alias_id = ?) OR
-		    (? != '' AND email = ?)
-		)
-	`, string(remoteState), string(remoteState), providerAliasID, providerAliasID, now, accountID, providerAliasID, providerAliasID, email, email)
+		WHERE account_id = ? AND email = ?
+	`, string(remoteState), string(remoteState), providerAliasID, providerAliasID, now, accountID, targetEmail)
 	if err != nil {
 		return err
 	}
@@ -568,12 +700,10 @@ func (s *Store) UpdateAliasRemoteState(accountID, providerAliasID, email string,
 	if err != nil {
 		return err
 	}
-	if rows == 0 {
-		return fmt.Errorf("no inventory alias found for account %s matching target (id=%s, email=%s)", accountID, providerAliasID, email)
+	if rows != 1 {
+		return fmt.Errorf("expected 1 row affected updating alias %s, got %d", targetEmail, rows)
 	}
-	if rows > 1 {
-		return fmt.Errorf("ambiguous inventory update: %d rows matched for account %s (id=%s, email=%s)", rows, accountID, providerAliasID, email)
-	}
-	return nil
+
+	return tx.Commit()
 }
 

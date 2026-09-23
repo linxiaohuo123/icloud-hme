@@ -215,6 +215,14 @@ func (b *EventBus) SubscribeWithBoundary(email, baselineMailbox string, baseline
 	return subID, ch
 }
 
+// SubscriberCount 返回指定邮箱当前的活跃订阅者数量（用于确定性同步屏障，杜绝固定 Sleep 碰运气）。
+func (b *EventBus) SubscriberCount(email string) int {
+	email = strings.ToLower(strings.TrimSpace(email))
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.subscribers[email])
+}
+
 // Publish 广播新到达的验证码。
 func (b *EventBus) Publish(email, accountID, subject, from, date string, otp *OTPResult) {
 	b.PublishEvent(&CachedOTP{

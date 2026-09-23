@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -731,5 +732,85 @@ func TestQuarantineInventoryForAccountOnDeletion(t *testing.T) {
 		t.Fatalf("期望 ErrNoAvailableInventory, 实际得到: %v", err)
 	}
 }
+
+// 针对 UpdateAliasRemoteState 的身份强校验与事务回滚确定性测试
+func TestUpdateAliasRemoteState_IdentityValidationAndRollback(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	insertTestAccount(t, st, "acc_1")
+	insertTestAccount(t, st, "acc_2")
+
+	// 1. 测试用例 1: id-a 与 email-b 指向两条库存 -> 返回冲突，而且两条原记录都不变
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "email_a@icloud.com", AnonymousID: "id_a", Active: true}, "replenish", true)
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "email_b@icloud.com", AnonymousID: "id_b", Active: true}, "replenish", true)
+
+	err1 := st.UpdateAliasRemoteState("acc_1", "id_a", "email_b@icloud.com", RemoteInactive)
+	if err1 == nil {
+		t.Fatal("期望 id-a 与 email-b 冲突报错，但返回了 nil")
+	}
+	if !strings.Contains(err1.Error(), "conflict") {
+		t.Fatalf("期望冲突错误包含 conflict, 实际: %v", err1)
+	}
+
+	invA, _ := st.GetInventoryAlias("email_a@icloud.com")
+	invB, _ := st.GetInventoryAlias("email_b@icloud.com")
+	if invA.RemoteState != RemoteActive || invA.ProviderAliasID != "id_a" {
+		t.Fatalf("email_a 原记录被意外篡改: %+v", invA)
+	}
+	if invB.RemoteState != RemoteActive || invB.ProviderAliasID != "id_b" {
+		t.Fatalf("email_b 原记录被意外篡改: %+v", invB)
+	}
+
+	// 2. 测试用例 2: email-a 存在，但输入 provider ID 与数据库不一致 -> 返回冲突，原记录不变
+	err2 := st.UpdateAliasRemoteState("acc_1", "id_diff", "email_a@icloud.com", RemoteInactive)
+	if err2 == nil {
+		t.Fatal("期望 provider ID 不一致报错，但返回了 nil")
+	}
+	if !strings.Contains(err2.Error(), "conflict") {
+		t.Fatalf("期望错误包含 conflict, 实际: %v", err2)
+	}
+	invA2, _ := st.GetInventoryAlias("email_a@icloud.com")
+	if invA2.RemoteState != RemoteActive || invA2.ProviderAliasID != "id_a" {
+		t.Fatalf("email_a 原记录在冲突后被篡改: %+v", invA2)
+	}
+
+	// 3. 测试用例 3: 同邮箱、不同 account -> 拒绝修改
+	err3 := st.UpdateAliasRemoteState("acc_2", "id_a", "email_a@icloud.com", RemoteInactive)
+	if err3 == nil {
+		t.Fatal("期望账号不匹配报错，但返回了 nil")
+	}
+	if !strings.Contains(err3.Error(), "account mismatch") {
+		t.Fatalf("期望错误包含 account mismatch, 实际: %v", err3)
+	}
+	invA3, _ := st.GetInventoryAlias("email_a@icloud.com")
+	if invA3.RemoteState != RemoteActive || invA3.AccountID != "acc_1" {
+		t.Fatalf("email_a 账号归属被意外篡改: %+v", invA3)
+	}
+
+	// 4. 测试用例 5: 历史 provider ID 为空、可靠映射成功 -> 只更新目标邮箱，其他资产不变
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "email_empty_id@icloud.com", AnonymousID: "", Active: true}, "replenish", true)
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "email_untouched@icloud.com", AnonymousID: "id_untouched", Active: true}, "replenish", true)
+
+	err5 := st.UpdateAliasRemoteState("acc_1", "id_newly_resolved", "email_empty_id@icloud.com", RemoteInactive)
+	if err5 != nil {
+		t.Fatalf("历史 provider ID 为空时回填更新失败: %v", err5)
+	}
+
+	invTarget, _ := st.GetInventoryAlias("email_empty_id@icloud.com")
+	if invTarget.RemoteState != RemoteInactive || invTarget.ProviderAliasID != "id_newly_resolved" {
+		t.Fatalf("email_empty_id 未正确回填或更新: %+v", invTarget)
+	}
+
+	invUntouched, _ := st.GetInventoryAlias("email_untouched@icloud.com")
+	if invUntouched.RemoteState != RemoteActive || invUntouched.ProviderAliasID != "id_untouched" {
+		t.Fatalf("对照资产 email_untouched 被意外修改: %+v", invUntouched)
+	}
+}
+
 
 

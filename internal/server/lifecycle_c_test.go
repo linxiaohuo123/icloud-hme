@@ -371,15 +371,23 @@ func TestC03_ConcurrentInterleaving_ExpiredAndSucceededDuringWait(t *testing.T) 
 	doneExp := make(chan *VerificationResult, 1)
 	errExp := make(chan error, 1)
 	go func() {
-		res, err := vService.GetVerificationResult(ctx, p, "vreq_wait_exp", 1)
+		res, err := vService.GetVerificationResult(ctx, p, "vreq_wait_exp", 2)
 		errExp <- err
 		doneExp <- res
 	}()
 
-	// 稍等以确认已进入订阅与定时器等待
-	time.Sleep(30 * time.Millisecond)
+	// 使用确定性同步屏障确认 GET 已读到 ready 并已在 EventBus 上建立订阅，杜绝盲目 Sleep
+	for i := 0; i < 100; i++ {
+		if eb.SubscriberCount("wait_exp@example.com") > 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if eb.SubscriberCount("wait_exp@example.com") == 0 {
+		t.Fatal("timed out waiting for subscription to be established for wait_exp@example.com")
+	}
 
-	// 并发协程将 DB 中该记录标记为 expired
+	// 另一执行者将 DB 中该记录标记为 expired
 	_, won, _ := st.ExpireVerificationRequest(ctx, "vreq_wait_exp")
 	if !won {
 		t.Fatal("expected ExpireVerificationRequest to win CAS")
@@ -418,14 +426,23 @@ func TestC03_ConcurrentInterleaving_ExpiredAndSucceededDuringWait(t *testing.T) 
 	doneSucc := make(chan *VerificationResult, 1)
 	errSucc := make(chan error, 1)
 	go func() {
-		res, err := vService.GetVerificationResult(ctx, p, "vreq_wait_succ", 1)
+		res, err := vService.GetVerificationResult(ctx, p, "vreq_wait_succ", 2)
 		errSucc <- err
 		doneSucc <- res
 	}()
 
-	time.Sleep(30 * time.Millisecond)
+	// 同步屏障确认订阅建立
+	for i := 0; i < 100; i++ {
+		if eb.SubscriberCount("wait_succ@example.com") > 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if eb.SubscriberCount("wait_succ@example.com") == 0 {
+		t.Fatal("timed out waiting for subscription to be established for wait_succ@example.com")
+	}
 
-	// 并发协程将 DB 中该记录标记为 succeeded
+	// 另一执行者将 DB 中该记录标记为 succeeded
 	_, won, _ = st.CompleteVerificationRequest(ctx, "vreq_wait_succ", "123456", "ev_succ_interleave")
 	if !won {
 		t.Fatal("expected CompleteVerificationRequest to win CAS")
@@ -445,7 +462,8 @@ func TestC03_ConcurrentInterleaving_ExpiredAndSucceededDuringWait(t *testing.T) 
 	}
 }
 
-// 测试 UIDVALIDITY 突变发生时，CAS 如果输给并发完成的 expired 或 succeeded，严格返回数据库真实胜出终态
+// 测试 UIDVALIDITY 突变发生时，必须让 GET 已读到 ready 并建立订阅，再由另一执行者提交 expired/succeeded，
+// 随后发布带完整 INBOX/UIDVALIDITY/UID 的失效事件，确实进入待验证分支并准确返回胜出终态。
 func TestC03_UIDValidityMutation_LosesToExpiredOrSucceeded(t *testing.T) {
 	st, err := store.NewStore(t.TempDir())
 	if err != nil {
@@ -467,7 +485,7 @@ func TestC03_UIDValidityMutation_LosesToExpiredOrSucceeded(t *testing.T) {
 
 	now := time.Now().UTC()
 
-	// 1. UIDVALIDITY 突变输给 expired：严格返回 expired
+	// 1. UIDVALIDITY 突变在等待中输给 expired：严格返回 expired
 	vreqExp := &store.VerificationRequest{
 		RequestID:           "vreq_uid_exp",
 		PrincipalKind:       "token",
@@ -484,31 +502,55 @@ func TestC03_UIDValidityMutation_LosesToExpiredOrSucceeded(t *testing.T) {
 	}
 	_ = st.CreateVerificationRequestAtomic(ctx, vreqExp, 100, 100)
 
-	// 先将其置为 expired
+	doneExp := make(chan *VerificationResult, 1)
+	errExp := make(chan error, 1)
+	go func() {
+		res, err := vService.GetVerificationResult(ctx, p, "vreq_uid_exp", 5)
+		errExp <- err
+		doneExp <- res
+	}()
+
+	// 同步屏障：确认 GET 已读到 ready 并建立订阅进入长轮询等待
+	for i := 0; i < 100; i++ {
+		if eb.SubscriberCount("uid_exp@example.com") > 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if eb.SubscriberCount("uid_exp@example.com") == 0 {
+		t.Fatal("timed out waiting for subscription on uid_exp@example.com")
+	}
+
+	// 另一执行者并发将 DB 状态置为 expired (CAS 胜出)
 	_, won, _ := st.ExpireVerificationRequest(ctx, "vreq_uid_exp")
 	if !won {
 		t.Fatal("ExpireVerificationRequest failed")
 	}
 
-	// 此时推送一个带有不同 UIDValidity (20 != 10) 的事件
+	// 随后发布带完整 INBOX/UIDVALIDITY/UID 的突变事件 (UIDValidity 20 != baseline 10)
 	eb.PublishEvent(&mail.CachedOTP{
 		EventID:     "ev_uid_1",
 		Email:       "uid_exp@example.com",
+		Folder:      "INBOX",
 		UIDValidity: 20,
-		UID:         101,
-		OTP:         &mail.OTPResult{Code: "000000"},
+		UID:         105,
+		OTP:         &mail.OTPResult{Code: "999999"},
 	})
 
-	// 获取结果：此时执行 InvalidateVerificationRequest 会输给 expired，必须准确返回 expired！
-	resExp, err := vService.GetVerificationResult(ctx, p, "vreq_uid_exp", 0)
-	if err != nil {
-		t.Fatalf("expected nil err for expired status, got: %v", err)
-	}
-	if resExp == nil || resExp.Status != "expired" {
-		t.Fatalf("expected status expired when losing CAS to expired, got: %v", resExp)
+	select {
+	case err := <-errExp:
+		if err != nil {
+			t.Fatalf("expected nil err for winning expired status, got: %v", err)
+		}
+		resExp := <-doneExp
+		if resExp == nil || resExp.Status != "expired" {
+			t.Fatalf("expected status expired when losing CAS to expired, got: %v", resExp)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for GetVerificationResult on expired branch")
 	}
 
-	// 2. UIDVALIDITY 突变输给 succeeded：严格返回 succeeded
+	// 2. UIDVALIDITY 突变在等待中输给 succeeded：严格返回 succeeded
 	vreqSucc := &store.VerificationRequest{
 		RequestID:           "vreq_uid_succ",
 		PrincipalKind:       "token",
@@ -525,28 +567,52 @@ func TestC03_UIDValidityMutation_LosesToExpiredOrSucceeded(t *testing.T) {
 	}
 	_ = st.CreateVerificationRequestAtomic(ctx, vreqSucc, 100, 100)
 
-	// 先将其置为 succeeded
+	doneSucc := make(chan *VerificationResult, 1)
+	errSucc := make(chan error, 1)
+	go func() {
+		res, err := vService.GetVerificationResult(ctx, p, "vreq_uid_succ", 5)
+		errSucc <- err
+		doneSucc <- res
+	}()
+
+	// 同步屏障：确认 GET 已读到 ready 并建立订阅进入长轮询等待
+	for i := 0; i < 100; i++ {
+		if eb.SubscriberCount("uid_succ@example.com") > 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if eb.SubscriberCount("uid_succ@example.com") == 0 {
+		t.Fatal("timed out waiting for subscription on uid_succ@example.com")
+	}
+
+	// 另一执行者并发将 DB 状态置为 succeeded (CAS 胜出)
 	_, won, _ = st.CompleteVerificationRequest(ctx, "vreq_uid_succ", "777888", "ev_prior_succ")
 	if !won {
 		t.Fatal("CompleteVerificationRequest failed")
 	}
 
-	// 推送带有不同 UIDValidity 的事件
+	// 随后发布带完整 INBOX/UIDVALIDITY/UID 的突变事件 (UIDValidity 30 != baseline 10)
 	eb.PublishEvent(&mail.CachedOTP{
 		EventID:     "ev_uid_2",
 		Email:       "uid_succ@example.com",
-		UIDValidity: 20,
-		UID:         102,
+		Folder:      "INBOX",
+		UIDValidity: 30,
+		UID:         108,
 		OTP:         &mail.OTPResult{Code: "000000"},
 	})
 
-	// 获取结果：此时执行 InvalidateVerificationRequest 会输给 succeeded，必须准确返回 succeeded！
-	resSucc, err := vService.GetVerificationResult(ctx, p, "vreq_uid_succ", 0)
-	if err != nil {
-		t.Fatalf("expected nil err for succeeded status, got: %v", err)
-	}
-	if resSucc == nil || resSucc.Status != "succeeded" || resSucc.Code != "777888" {
-		t.Fatalf("expected status succeeded with code 777888 when losing CAS to succeeded, got: %v", resSucc)
+	select {
+	case err := <-errSucc:
+		if err != nil {
+			t.Fatalf("expected nil err for winning succeeded status, got: %v", err)
+		}
+		resSucc := <-doneSucc
+		if resSucc == nil || resSucc.Status != "succeeded" || resSucc.Code != "777888" {
+			t.Fatalf("expected status succeeded with code 777888 when losing CAS to succeeded, got: %v", resSucc)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for GetVerificationResult on succeeded branch")
 	}
 }
 
@@ -822,4 +888,92 @@ func TestLifecycle_SchedulerReplenishedAlias_DeactivateAndDelete_ResolvesAnonymo
 		t.Fatalf("expected error when 0 rows affected, got nil")
 	}
 }
+
+// 针对生命周期身份校验与远端调用安全守卫的确定性测试：
+// 3. 同邮箱、不同 account：不允许拿另一账号的 provider ID 发起远端请求；
+// 4. 映射查询失败或无法完整解析：远端停用/删除调用次数必须为 0。
+func TestManagerBackend_IdentityResolutionAndUpstreamZeroCallGuard(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	mgr, err := account.NewManager(t.TempDir(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	accReal, err := mgr.AddAccount("real_user", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accAttacker, err := mgr.AddAccount("attacker_user", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES (?, 'Real Account', 'real@test.com', 'active', '["default"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`, accReal.ID)
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES (?, 'Attacker Account', 'attacker@test.com', 'active', '["default"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`, accAttacker.ID)
+
+	victimEmail := "victim@example.com"
+	victimAnonID := "victim_anon_id_999"
+	_ = st.AddInventoryAlias(accReal.ID, hme.Alias{
+		Email:       victimEmail,
+		AnonymousID: victimAnonID,
+		Active:      true,
+	}, "replenish", true)
+
+	mb := &managerBackend{
+		mgr:   mgr,
+		store: st,
+	}
+
+	// 用例 3: 同邮箱、不同 account：
+	// 试图拿 accAttacker 的身份去停用属于 accReal 的 victimEmail
+	_, err = mb.SetAliasActive(accAttacker.ID, victimEmail, false)
+	if err == nil {
+		t.Fatal("expected error when trying to deactivate alias belonging to another account, got nil")
+	}
+	if !strings.Contains(err.Error(), "belongs to account") && !strings.Contains(err.Error(), "ALIAS_NOT_FOUND") {
+		t.Fatalf("expected account mismatch or resolution failure error, got: %v", err)
+	}
+
+	// 试图拿 accAttacker 的身份去删除属于 accReal 的 victimEmail
+	err = mb.DeleteAlias(accAttacker.ID, victimEmail)
+	if err == nil {
+		t.Fatal("expected error when trying to delete alias belonging to another account, got nil")
+	}
+
+	// 试图拿 accAttacker 的身份使用属于 accReal 的 victimAnonID
+	_, err = mb.SetAliasActive(accAttacker.ID, victimAnonID, false)
+	if err == nil {
+		t.Fatal("expected error when trying to use another account's anonymousID, got nil")
+	}
+
+	// 用例 4: 映射查询失败或无法完整解析 -> 必须在发起上游远端调用前失败拦截
+	ghostID := "completely_unresolvable_anon_id"
+	_, err = mb.SetAliasActive(accReal.ID, ghostID, false)
+	if err == nil {
+		t.Fatal("expected error for unresolvable identifier, got nil")
+	}
+
+	err = mb.DeleteAlias(accReal.ID, ghostID)
+	if err == nil {
+		t.Fatal("expected error for unresolvable identifier, got nil")
+	}
+
+	// 验证数据库中 victim 记录丝毫未被影响
+	invVictim, err := st.GetInventoryAlias(victimEmail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if invVictim.RemoteState != store.RemoteActive || invVictim.AccountID != accReal.ID {
+		t.Fatalf("victim alias record was tampered with: %+v", invVictim)
+	}
+}
+
 

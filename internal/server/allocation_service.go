@@ -56,10 +56,11 @@ type AllocationResult struct {
 
 // AliasAllocationService 统管所有出号路径的领域/应用服务
 type AliasAllocationService struct {
-	store      *store.Store
-	be         Backend
-	syncWorker *MailSyncWorker
-	rrIndex    uint64
+	store                      *store.Store
+	be                         Backend
+	syncWorker                 *MailSyncWorker
+	rrIndex                    uint64
+	beforeRecordAllocationHook func(email string)
 }
 
 // NewAliasAllocationService 创建统一出号服务实例
@@ -287,14 +288,15 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		now := time.Now().Format(time.RFC3339)
 		allocID := store.NewOpaqueID("alloc_")
 
-		// 同步记入 alias_inventory 与 alias_allocations
+		// 现场创建别名先以不可分配暂存状态 (created + unknown) 记入 alias_inventory，
+		// 严禁提前暴露为公共 available 库存，防止被并发的普通 ClaimInventoryAlias 抢先认领
 		if invErr := s.store.AddInventoryAlias(accountID, hme.Alias{
 			Email:       res.Email,
 			AnonymousID: res.AnonymousID,
 			Label:       res.Label,
 			CreatedAt:   res.CreatedAt,
 			Active:      true,
-		}, "created", true); invErr != nil {
+		}, "created", false); invErr != nil {
 			return nil, fmt.Errorf("upstream created alias %s successfully but local inventory persistence failed (pending reconciliation): %w", res.Email, invErr)
 		}
 		alloc := &store.AliasAllocation{
@@ -307,8 +309,13 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 			AllocatedAt:  now,
 			Status:       "allocated",
 		}
+		if s.beforeRecordAllocationHook != nil {
+			s.beforeRecordAllocationHook(res.Email)
+		}
 		savedAlloc, recErr := s.store.RecordAllocation(alloc, tokenDisplayName)
 		if recErr != nil {
+			// 本地入账失败时，主动隔离暂存别名，确保不遗留可被其他消费者领取的中间状态
+			_ = s.store.QuarantineInventoryAlias(res.Email)
 			return nil, fmt.Errorf("持久化分配凭据失败: %w", recErr)
 		}
 		alloc = savedAlloc
