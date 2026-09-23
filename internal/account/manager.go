@@ -25,6 +25,9 @@ import (
 	"icloud-hme/internal/store"
 )
 
+// MaxAliasesPerAccount 是 Apple 官方单个 iCloud 账号的 Hide My Email 别名物理上限 (实测与官方实践为 750 个)。
+const MaxAliasesPerAccount = 750
+
 // Account 描述一个 iCloud 账号。
 type Account struct {
 	ID            string            `json:"id"`

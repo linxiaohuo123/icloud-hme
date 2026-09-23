@@ -47,14 +47,10 @@ func HasScope(scopes, want string) bool {
 	if scopes == "" || scopes == ScopeAdmin {
 		return true
 	}
-	if want == ScopeAdmin {
-		return false
-	}
+	want = strings.ToLower(strings.TrimSpace(want))
 	for _, s := range strings.Split(scopes, ",") {
-		switch strings.ToLower(strings.TrimSpace(s)) {
-		case want:
-			return true
-		case ScopeAdmin:
+		part := strings.ToLower(strings.TrimSpace(s))
+		if part == want || part == ScopeAdmin {
 			return true
 		}
 	}

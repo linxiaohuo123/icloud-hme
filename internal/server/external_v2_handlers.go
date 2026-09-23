@@ -152,13 +152,20 @@ func (s *Server) externalV2CreateVerificationRequestHandler(c *gin.Context) {
 		return
 	}
 
-	if leaseID == "" && s.store != nil {
-		alloc, err := s.store.GetPrincipalAllocation(c.Request.Context(), email, string(p.Kind), p.ID)
-		if err != nil || alloc == nil {
-			failCode(c, http.StatusNotFound, "RESOURCE_NOT_FOUND", "未找到指定别名或无权访问")
-			return
+	if leaseID == "" {
+		if s.store != nil {
+			alloc, err := s.store.GetPrincipalAllocation(c.Request.Context(), email, string(p.Kind), p.ID)
+			if err == nil && alloc != nil {
+				leaseID = alloc.AllocationID
+			} else if p.IsAdmin() {
+				leaseID = email
+			} else {
+				failCode(c, http.StatusNotFound, "RESOURCE_NOT_FOUND", "未找到指定别名或无权访问")
+				return
+			}
+		} else {
+			leaseID = email
 		}
-		leaseID = alloc.AllocationID
 	}
 
 	vreq, err := s.verifyService.CreateVerificationRequest(c.Request.Context(), p, leaseID)

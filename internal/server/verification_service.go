@@ -83,6 +83,27 @@ func (s *VerificationService) CreateVerificationRequest(ctx context.Context, p a
 			alloc, err = s.store.GetPrincipalAllocation(ctx, leaseID, string(p.Kind), p.ID)
 		}
 	}
+	if (err != nil || alloc == nil) && p.IsAdmin() && strings.Contains(leaseID, "@") {
+		normEmail := strings.ToLower(strings.TrimSpace(leaseID))
+		accID := ""
+		if s.syncWorker != nil {
+			accID = s.syncWorker.GetAliasAccount(normEmail)
+		}
+		if accID == "" && s.store != nil {
+			accID, _ = s.store.FindAliasRoute(normEmail)
+		}
+		if accID != "" {
+			alloc = &store.AliasAllocation{
+				AllocationID: "admin_" + normEmail,
+				AliasEmail:   normEmail,
+				AccountID:    accID,
+				OwnerKind:    string(p.Kind),
+				OwnerID:      p.ID,
+				Status:       "allocated",
+			}
+			err = nil
+		}
+	}
 	if err != nil || alloc == nil {
 		return nil, ErrVReqNotFound
 	}

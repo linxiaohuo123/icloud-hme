@@ -272,6 +272,8 @@ func (s *Server) removeAccountHandler(c *gin.Context) {
 		_ = s.store.DeleteScheduleConfig(id)
 		// 【BUG-14 修复】级联清理路由表,防止残留路由指向已删除账号
 		_ = s.store.DeleteAliasRoutesForAccount(id)
+		// 级联隔离预存库存,防止幽灵别名出号
+		_ = s.store.QuarantineInventoryForAccount(id)
 	}
 	ok(c, gin.H{"id": id})
 }

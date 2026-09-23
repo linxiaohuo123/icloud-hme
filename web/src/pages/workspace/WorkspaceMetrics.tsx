@@ -19,8 +19,9 @@ export default function WorkspaceMetrics({
   aliases,
   activeAliasCount,
 }: WorkspaceMetricsProps) {
+  const MAX_ALIASES = 750
   const totalCount = aliases.length || account?.alias_total || 0
-  const quotaPercent = Math.min(100, Math.round((totalCount / 500) * 100))
+  const quotaPercent = Math.min(100, Math.round((totalCount / MAX_ALIASES) * 100))
 
   return (
     <div className="stat-grid">
@@ -49,9 +50,9 @@ export default function WorkspaceMetrics({
           <span className="stat-badge stat-badge-purple">已用 {quotaPercent}%</span>
         </div>
         <div className="stat-value">
-          {totalCount} <span className="stat-value-unit">/ 500</span>
+          {totalCount} <span className="stat-value-unit">/ {MAX_ALIASES}</span>
         </div>
-        <div className="stat-subtext">官方配额上限 500 个</div>
+        <div className="stat-subtext">官方配额上限 {MAX_ALIASES} 个</div>
       </div>
 
       <div className="stat-card stat-card-green">

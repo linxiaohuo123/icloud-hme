@@ -268,6 +268,43 @@ func (s *Store) initInventorySchema() error {
 	return nil
 }
 
+// ReconcileAvailableInventory 将处于 unknown 状态且从未被分配给任何主体的活跃存量别名激活为 available 可用库存 (严格排除受保护私有账号)
+func (s *Store) ReconcileAvailableInventory() (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(`
+		UPDATE alias_inventory
+		SET allocation_state = 'available',
+		    remote_state = 'active'
+		WHERE allocation_state = 'unknown'
+		  AND account_id NOT IN (
+		      SELECT id FROM accounts 
+		      WHERE tags LIKE '%"personal"%' 
+		         OR tags LIKE '%"private"%' 
+		         OR tags LIKE '%"protected"%'
+		         OR name LIKE '%大号%'
+		  )
+		  AND email NOT IN (SELECT alias_email FROM alias_allocations)
+	`)
+	if err != nil {
+		return 0, err
+	}
+	// 同时将受保护账号的非已分配别名归纳为 reserved 保护状态，杜绝误入可用库存
+	_, _ = s.db.Exec(`
+		UPDATE alias_inventory
+		SET allocation_state = 'reserved'
+		WHERE allocation_state IN ('unknown', 'available')
+		  AND account_id IN (
+		      SELECT id FROM accounts 
+		      WHERE tags LIKE '%"personal"%' 
+		         OR tags LIKE '%"private"%' 
+		         OR tags LIKE '%"protected"%'
+		         OR name LIKE '%大号%'
+		  )
+	`)
+	return res.RowsAffected()
+}
+
 func (s *Store) migrateInventory() error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -392,7 +429,7 @@ func (s *Store) SyncAliasInventory(accountID string, aliases []hme.Alias) error 
 	stmt, err := tx.Prepare(`
 		INSERT INTO alias_inventory (
 			email, account_id, provider_alias_id, remote_state, allocation_state, source_type, last_verified_at, snapshot_version
-		) VALUES (?, ?, ?, ?, 'unknown', 'legacy_unknown', ?, 1)
+		) VALUES (?, ?, ?, ?, 'available', 'synced', ?, 1)
 		ON CONFLICT(email) DO UPDATE SET
 			remote_state = excluded.remote_state,
 			provider_alias_id = excluded.provider_alias_id,
@@ -432,3 +469,17 @@ func (s *Store) CountAuthoritativeAvailableAliases() int {
 	`).Scan(&count)
 	return count
 }
+
+// QuarantineInventoryForAccount 将指定账号名下的可用库存标记为隔离/删除状态 (母号注销时级联清理，防幽灵出号)。
+func (s *Store) QuarantineInventoryForAccount(accountID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`
+		UPDATE alias_inventory
+		SET remote_state = 'deleted',
+		    allocation_state = CASE WHEN allocation_state = 'available' THEN 'quarantined' ELSE allocation_state END
+		WHERE account_id = ?
+	`, accountID)
+	return err
+}
+

@@ -125,7 +125,7 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 	aliasBuf := NewAliasBuffer(be, 3, 20*time.Second)
 	mailPoll := cfg.MailPollInterval
 	if mailPoll <= 0 {
-		mailPoll = 2 * time.Second
+		mailPoll = 1 * time.Second
 	}
 	syncWorker := NewMailSyncWorker(be, st, eventBus, mailPoll)
 	reaper := NewAliasReaper(be, 1*time.Hour, 2*time.Hour)
@@ -177,6 +177,9 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 	}, be.ListAccounts)
 	if st != nil {
 		notifier.UpdateSettings(s.loadNotifySettings())
+		if n, err := st.ReconcileAvailableInventory(); err == nil && n > 0 {
+			log.Printf("[Server] 存量库存对齐完成: 已激活 %d 个未分配存量别名入号池", n)
+		}
 	}
 	// 生产后端拉取到别名列表时自动登记「别名 → 母号」路由，
 	// 使存量别名(未入出号流水表的)也能被定向拉信，而不必依赖有上限的盲扫。

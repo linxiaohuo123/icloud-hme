@@ -153,16 +153,19 @@ func requireSession(mgr *authManager, apiKey string, st *store.Store) gin.Handle
 				}
 			}
 			failCode(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
+			c.Abort()
 			return
 		}
 
 		sessionID := sessionIDFromCookie(c)
 		if sessionID == "" {
 			failCode(c, http.StatusUnauthorized, "AUTH_REQUIRED", "请先登录或提供有效的 API Key")
+			c.Abort()
 			return
 		}
 		if _, ok := mgr.Validate(sessionID); !ok {
 			failCode(c, http.StatusUnauthorized, "AUTH_REQUIRED", "会话已失效,请重新登录")
+			c.Abort()
 			return
 		}
 		p := auth.Principal{

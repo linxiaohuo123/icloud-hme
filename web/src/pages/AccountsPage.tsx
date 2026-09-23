@@ -360,7 +360,7 @@ export default function AccountsPage() {
               <span>
                 已分配 <strong>{totalAliases}</strong> 别名
                 {accounts.length > 0 && (
-                  <span className="card-stat-dim"> (上限 {accounts.length * 500})</span>
+                  <span className="card-stat-dim"> (上限 {accounts.length * 750})</span>
                 )}
               </span>
             </span>

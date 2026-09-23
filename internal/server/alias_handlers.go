@@ -10,6 +10,7 @@ package server
 import (
 	"encoding/csv"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -124,6 +125,12 @@ func (s *Server) listAliasesHandler(c *gin.Context) {
 			})
 		}
 		runBounded(10, "alias-scatter-gather", tasks)
+
+		if refresh && s.store != nil {
+			if n, err := s.store.ReconcileAvailableInventory(); err == nil && n > 0 {
+				log.Printf("[Aliases] 刷新号池后对齐库存: 新激活 %d 个未分配别名", n)
+			}
+		}
 
 		// 单线程装配: 到这一步才写归属字段，输入切片全程视为只读。
 		var allAliases []hme.Alias

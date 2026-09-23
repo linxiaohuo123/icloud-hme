@@ -34,7 +34,7 @@ const maxAliasRouteCache = 50000
 // PR-07 §10.2: 账号间有界并发与慢账号超时隔离常量
 const (
 	maxConcurrentAccountSync = 5
-	accountSyncTimeout       = 25 * time.Second
+	accountSyncTimeout       = 8 * time.Second
 )
 
 // MailSyncWorker 后台增量邮件同步器。
@@ -355,7 +355,10 @@ accountLoop:
 					if err := w.ctx.Err(); err != nil {
 						break probeAccLoop
 					}
-					if w.fetchAndPublish(w.ctx, acc.ID, alias) {
+					probeCtx, probeCancel := context.WithTimeout(w.ctx, accountSyncTimeout)
+					matched := w.fetchAndPublish(probeCtx, acc.ID, alias)
+					probeCancel()
+					if matched {
 						// 盲扫发现归属: 写穿路由表，此后不再需要盲扫
 						w.RegisterAliasAccounts(acc.ID, []string{alias})
 					}

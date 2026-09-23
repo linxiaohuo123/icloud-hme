@@ -238,6 +238,21 @@ func (s *Scheduler) run(manual, includeDisabled bool, countPerAccount int) (int,
 	var targetAccs []account.Summary
 	now := time.Now()
 	for _, a := range accs {
+		// 严禁调度私人/受保护账号：若打有 personal/private/protected 标签或名称含"大号"，一律豁免自动建号
+		isProtected := false
+		for _, t := range a.Tags {
+			if strings.EqualFold(t, "personal") || strings.EqualFold(t, "private") || strings.EqualFold(t, "protected") {
+				isProtected = true
+				break
+			}
+		}
+		if !isProtected && strings.Contains(a.Name, "大号") {
+			isProtected = true
+		}
+		if isProtected {
+			continue
+		}
+
 		cfg := s.store.GetScheduleConfig(a.ID)
 		if !cfg.Enabled && !includeDisabled {
 			continue
@@ -345,8 +360,8 @@ func (s *Scheduler) processAccount(a account.Summary, countPerAccount int, stopC
 		s.logs.Add(fmt.Sprintf("[%s] 账号状态异常（%s），已跳过", accName, a.Status))
 		return 0, 0
 	}
-	if a.AliasTotal >= 500 || a.AliasActive >= 500 {
-		s.logs.Add(fmt.Sprintf("[%s] 别名已达 500 上限，自动熔断跳过", accName))
+	if a.AliasTotal >= account.MaxAliasesPerAccount || a.AliasActive >= account.MaxAliasesPerAccount {
+		s.logs.Add(fmt.Sprintf("[%s] 别名已达 %d 上限，自动熔断跳过", accName, account.MaxAliasesPerAccount))
 		return 0, 0
 	}
 
@@ -400,8 +415,8 @@ func (s *Scheduler) processAccount(a account.Summary, countPerAccount int, stopC
 			a.AliasTotal++
 			s.recordPacedRun(a.ID, time.Now())
 			s.logs.Add(fmt.Sprintf("[%s] 创建成功: %s (备注: %s)", accName, res.Email, label))
-			if a.AliasTotal >= 500 || a.AliasActive >= 500 {
-				s.logs.Add(fmt.Sprintf("[%s] 别名已达 500 上限，已停止后续创建", accName))
+			if a.AliasTotal >= account.MaxAliasesPerAccount || a.AliasActive >= account.MaxAliasesPerAccount {
+				s.logs.Add(fmt.Sprintf("[%s] 别名已达 %d 上限，已停止后续创建", accName, account.MaxAliasesPerAccount))
 				break
 			}
 		}

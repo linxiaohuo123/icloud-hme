@@ -54,12 +54,12 @@ type aliasCacheItem struct {
 
 // CreateAlias 创建 HME 别名。
 func (b *managerBackend) CreateAlias(accountID, label string) (*hme.CreateResult, error) {
-	// 1. 检查 500 别名上限熔断 (总数或活跃数达到 500)
-	if acc, ok := b.mgr.GetAccount(accountID); ok && (acc.AliasTotal >= 500 || acc.AliasActive >= 500) {
+	// 1. 检查别名上限熔断 (总数或活跃数达到上限)
+	if acc, ok := b.mgr.GetAccount(accountID); ok && (acc.AliasTotal >= account.MaxAliasesPerAccount || acc.AliasActive >= account.MaxAliasesPerAccount) {
 		return nil, &BackendError{
 			Status:  http.StatusBadRequest,
 			Code:    "ALIAS_LIMIT_REACHED",
-			Message: fmt.Sprintf("账号 %s 别名数量已达 Apple 物理上限 (总数: %d, 活跃: %d/500)，本地熔断阻断", accountID, acc.AliasTotal, acc.AliasActive),
+			Message: fmt.Sprintf("账号 %s 别名数量已达 Apple 物理上限 (总数: %d, 活跃: %d/%d)，本地熔断阻断", accountID, acc.AliasTotal, acc.AliasActive, account.MaxAliasesPerAccount),
 		}
 	}
 
@@ -106,12 +106,12 @@ func (b *managerBackend) BatchCreateAlias(accountID string, count int, labelPref
 		return nil, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "count 必须在 1-5 之间"}
 	}
 
-	// 1. 检查 500 别名上限熔断 (总数或活跃数达到 500)
-	if acc, ok := b.mgr.GetAccount(accountID); ok && (acc.AliasTotal+count > 500 || acc.AliasActive+count > 500) {
+	// 1. 检查别名上限熔断 (总数或活跃数达到上限)
+	if acc, ok := b.mgr.GetAccount(accountID); ok && (acc.AliasTotal+count > account.MaxAliasesPerAccount || acc.AliasActive+count > account.MaxAliasesPerAccount) {
 		return nil, &BackendError{
 			Status:  http.StatusBadRequest,
 			Code:    "ALIAS_LIMIT_REACHED",
-			Message: fmt.Sprintf("账号 %s 别名数量已达或将超过 Apple 物理上限 (当前总数: %d, 活跃: %d/500)，本地熔断阻断", accountID, acc.AliasTotal, acc.AliasActive),
+			Message: fmt.Sprintf("账号 %s 别名数量已达或将超过 Apple 物理上限 (当前总数: %d, 活跃: %d/%d)，本地熔断阻断", accountID, acc.AliasTotal, acc.AliasActive, account.MaxAliasesPerAccount),
 		}
 	}
 

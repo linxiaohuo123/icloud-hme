@@ -86,7 +86,7 @@ func (b *AliasBuffer) syncCreate(label string) (*hme.CreateResult, string, error
 	accounts := b.be.ListAccounts()
 	var candidates []account.Summary
 	for _, acc := range accounts {
-		if acc.Status != "error" && acc.HasCookies && acc.AliasTotal < 500 && acc.AliasActive < 500 {
+		if acc.Status != "error" && acc.HasCookies && acc.AliasTotal < account.MaxAliasesPerAccount && acc.AliasActive < account.MaxAliasesPerAccount {
 			candidates = append(candidates, acc)
 		}
 	}
@@ -94,7 +94,7 @@ func (b *AliasBuffer) syncCreate(label string) (*hme.CreateResult, string, error
 		return nil, "", fmt.Errorf("没有可用的健康 iCloud 账号")
 	}
 
-	// 优雅自适应负载均衡与配额避障：优先选用当前活跃别名最少、离 500 配额上限最远的健康账号
+	// 优雅自适应负载均衡与配额避障：优先选用当前活跃别名最少、离配额上限最远的健康账号
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].AliasActive < candidates[j].AliasActive
 	})

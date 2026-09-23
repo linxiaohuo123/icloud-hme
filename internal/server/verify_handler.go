@@ -55,7 +55,7 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 		failCode(c, http.StatusForbidden, "SCOPE_DENIED", "当前主体无权读取验证码")
 		return
 	}
-	if p.Kind == auth.PrincipalToken && s.store != nil {
+	if p.Kind == auth.PrincipalToken && !p.IsAdmin() && s.store != nil {
 		if !s.store.IsEmailOwnedByToken(c.Request.Context(), email, p.ID) {
 			failCode(c, http.StatusNotFound, "RESOURCE_NOT_FOUND", "未找到该别名或无权访问")
 			return

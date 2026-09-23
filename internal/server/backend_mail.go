@@ -101,7 +101,9 @@ func (b *managerBackend) ListInboxContext(ctx context.Context, q InboxQuery) (In
 				imapMessages, e = mc.FindByRecipientInFolder(q.Alias, q.Folder, q.Limit, q.Days)
 			}
 		} else {
-			if q.WithBody {
+			if q.SinceUID > 0 {
+				imapMessages, e = mc.ListFolderSince(q.Folder, q.Limit, q.Days, q.SinceUID, q.WithBody)
+			} else if q.WithBody {
 				imapMessages, e = mc.ListFolderWithBodies(q.Folder, q.Limit, q.Days)
 			} else {
 				imapMessages, e = mc.ListFolder(q.Folder, q.Limit, q.Days)

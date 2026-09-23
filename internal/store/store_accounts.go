@@ -107,15 +107,17 @@ func (s *Store) UpdateAccountFields(id string, fields map[string]interface{}) er
 	return err
 }
 
-// DeleteAccount 物理删除一个账号，并级联清理其别名路由。
+// DeleteAccount 物理删除一个账号，并级联清理其别名路由与预存库存。
 //
 // 必须级联:残留路由会把取码请求指向一个已不存在的账号，导致
 // 定向拉取永远失败且不再回退到盲扫兜底。
+// 必须隔离库存:防止未领取的预存别名继续被出号逻辑选中 (幽灵号)。
 func (s *Store) DeleteAccount(id string) error {
 	if _, err := s.db.Exec(`DELETE FROM accounts WHERE id=?`, id); err != nil {
 		return err
 	}
 	_ = s.DeleteAliasRoutesForAccount(id)
+	_ = s.QuarantineInventoryForAccount(id)
 	return nil
 }
 

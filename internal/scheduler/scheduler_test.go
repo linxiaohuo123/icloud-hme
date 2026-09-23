@@ -236,8 +236,8 @@ func TestSchedulerAliasLimitCircuitBreak(t *testing.T) {
 
 	mockAccounts := func() []account.Summary {
 		return []account.Summary{
-			{ID: accID, Name: "活跃满额号", Status: "active", AliasActive: 500},
-			{ID: accID2, Name: "总数满额号", Status: "active", AliasTotal: 500, AliasActive: 100},
+			{ID: accID, Name: "活跃满额号", Status: "active", AliasActive: account.MaxAliasesPerAccount},
+			{ID: accID2, Name: "总数满额号", Status: "active", AliasTotal: account.MaxAliasesPerAccount, AliasActive: 100},
 		}
 	}
 
@@ -250,7 +250,7 @@ func TestSchedulerAliasLimitCircuitBreak(t *testing.T) {
 	sched := NewScheduler(st, mockCreator, mockAccounts)
 	created, errs := sched.RunOnce(false, 1)
 	if created != 0 || errs != 0 || creations != 0 {
-		t.Fatalf("account with 500 aliases should be skipped, created=%d creations=%d", created, creations)
+		t.Fatalf("account with max aliases should be skipped, created=%d creations=%d", created, creations)
 	}
 }
 
@@ -363,5 +363,51 @@ func TestSchedulerDoubleQuotaPrevention(t *testing.T) {
 	created2, _ := sched.RunOnce(false, 1)
 	if created2 != 0 {
 		t.Fatalf("配额耗尽后应被前置守卫拦截，实际 created=%d", created2)
+	}
+}
+
+func TestSchedulerExcludesProtectedAccounts(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := store.NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("NewStore failed: %v", err)
+	}
+	defer st.Close()
+
+	// 账号1：名称含"大号"
+	// 账号2：打上了"personal"标签
+	// 账号3：普通小号
+	_ = st.SaveScheduleConfig(store.ScheduleConfig{AccountID: "acc_main", Enabled: true, HourlyQuota: 5})
+	_ = st.SaveScheduleConfig(store.ScheduleConfig{AccountID: "acc_personal", Enabled: true, HourlyQuota: 5})
+	_ = st.SaveScheduleConfig(store.ScheduleConfig{AccountID: "acc_normal", Enabled: true, HourlyQuota: 5})
+
+	mockAccounts := func() []account.Summary {
+		return []account.Summary{
+			{ID: "acc_main", Name: "私人大号", Status: "active"},
+			{ID: "acc_personal", Name: "备用号", Status: "active", Tags: []string{"personal"}},
+			{ID: "acc_normal", Name: "公共小号", Status: "active"},
+		}
+	}
+
+	creations := make(map[string]int)
+	mockCreator := func(id, label string) (*hme.CreateResult, error) {
+		creations[id]++
+		return &hme.CreateResult{Email: fmt.Sprintf("%s_alias@icloud.com", id)}, nil
+	}
+
+	sched := NewScheduler(st, mockCreator, mockAccounts)
+	// 即使调用 RunAllNow 强推
+	created, errs := sched.RunAllNow(1)
+	if created != 1 || errs != 0 {
+		t.Fatalf("期望仅为公共小号创建 1 个别名，实际 created=%d errs=%d", created, errs)
+	}
+	if creations["acc_main"] > 0 {
+		t.Fatalf("大号被意外调度创建了别名: %d 次", creations["acc_main"])
+	}
+	if creations["acc_personal"] > 0 {
+		t.Fatalf("personal 标签账号被意外调度创建了别名: %d 次", creations["acc_personal"])
+	}
+	if creations["acc_normal"] != 1 {
+		t.Fatalf("期望公共小号创建 1 次，实际: %d", creations["acc_normal"])
 	}
 }

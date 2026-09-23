@@ -10,6 +10,7 @@ package account
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -166,7 +167,7 @@ func (m *Manager) WithMailClientContext(ctx context.Context, id string, fn func(
 	m.mu.RUnlock()
 	if mailbox != nil && mailbox.Email != "" && mailbox.Password != "" {
 		mc := mail.NewClientWithServer(mailbox.Email, mailbox.Password, mailbox.IMAPHost, mailbox.IMAPPort)
-		if proxyURL != "" {
+		if proxyURL != "" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "true" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "1" {
 			mc.SetProxy(proxyURL)
 		}
 		if err := mc.Connect(); err != nil {
@@ -244,7 +245,11 @@ func (m *Manager) imapCreds(id string) (imapEmail, appPassword, proxyURL string,
 	if snap.AppPassword == "" {
 		return "", "", "", fmt.Errorf("账号未设置 App 专用密码")
 	}
-	return imapEmail, snap.AppPassword, snap.Proxy, nil
+	proxy := snap.Proxy
+	if os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "true" || os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "1" {
+		proxy = ""
+	}
+	return imapEmail, snap.AppPassword, proxy, nil
 }
 
 // WebMailClient 为指定账号创建 Web 邮件客户端。

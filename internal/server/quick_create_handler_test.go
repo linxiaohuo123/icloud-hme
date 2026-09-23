@@ -25,7 +25,7 @@ func TestSelectAccountByTag(t *testing.T) {
 			ID:         "acc_tag_full",
 			Status:     "active",
 			HasCookies: true,
-			AliasTotal: 500,
+			AliasTotal: account.MaxAliasesPerAccount,
 			Tags:       []string{"biz_a"},
 		},
 		{
@@ -46,7 +46,7 @@ func TestSelectAccountByTag(t *testing.T) {
 			ID:         "acc_common_full",
 			Status:     "active",
 			HasCookies: true,
-			AliasTotal: 500,
+			AliasTotal: account.MaxAliasesPerAccount,
 			Tags:       nil,
 		},
 		{
@@ -72,32 +72,32 @@ func TestSelectAccountByTag(t *testing.T) {
 		},
 	}
 
-	// 1. 业务标签匹配：应跳过 500 上限的 acc_tag_full，并在 acc_tag_busy (120) 与 acc_tag_idle (10) 中按最低负载选中 acc_tag_idle
+	// 1. 业务标签匹配：应跳过满额上限的 acc_tag_full，并在 acc_tag_busy (120) 与 acc_tag_idle (10) 中按最低负载选中 acc_tag_idle
 	selectedA := selectAccountByTag(accounts, "biz_a")
 	if selectedA != "acc_tag_idle" {
 		t.Fatalf("期望选中负载最低的专属账号 acc_tag_idle, 实际得到: %s", selectedA)
 	}
 
-	// 2. 回退到通用池：标签未匹配时，跳过 500 上限的 acc_common_full，在 acc_common_busy(80) 与 acc_common_idle(5) 中选中 acc_common_idle
+	// 2. 回退到通用池：标签未匹配时，跳过满额上限的 acc_common_full，在 acc_common_busy(80) 与 acc_common_idle(5) 中选中 acc_common_idle
 	selectedFallback := selectAccountByTag(accounts, "biz_unmatched")
 	if selectedFallback != "acc_common_idle" {
 		t.Fatalf("期望回退选中负载最低的通用账号 acc_common_idle, 实际得到: %s", selectedFallback)
 	}
 
-	// 3. 所有账号皆满 500 时应熔断返回空
+	// 3. 所有账号皆满额时应熔断返回空
 	allFull := []account.Summary{
 		{
 			ID:         "full_1",
 			Status:     "active",
 			HasCookies: true,
-			AliasTotal: 500,
+			AliasTotal: account.MaxAliasesPerAccount,
 			Tags:       []string{"test"},
 		},
 		{
 			ID:         "full_2",
 			Status:     "active",
 			HasCookies: true,
-			AliasTotal: 501,
+			AliasTotal: account.MaxAliasesPerAccount + 1,
 			Tags:       nil,
 		},
 	}
@@ -161,34 +161,34 @@ func TestSelectAccountCandidatesQuotaPriority(t *testing.T) {
 	}
 }
 
-func TestSelectAccountCandidatesDual500Limit(t *testing.T) {
+func TestSelectAccountCandidatesDualQuotaLimit(t *testing.T) {
 	accounts := []account.Summary{
 		{
-			ID:          "acc_total_500",
+			ID:          "acc_total_max",
 			Status:      "active",
 			HasCookies:  true,
-			AliasTotal:  500,
+			AliasTotal:  account.MaxAliasesPerAccount,
 			AliasActive: 10,
 		},
 		{
-			ID:          "acc_active_500",
+			ID:          "acc_active_max",
 			Status:      "active",
 			HasCookies:  true,
 			AliasTotal:  450,
-			AliasActive: 500,
+			AliasActive: account.MaxAliasesPerAccount,
 		},
 		{
 			ID:          "acc_ok",
 			Status:      "active",
 			HasCookies:  true,
-			AliasTotal:  490,
-			AliasActive: 490,
+			AliasTotal:  740,
+			AliasActive: 740,
 		},
 	}
 
 	cands := selectAccountCandidates(accounts, "default", nil)
 	if len(cands) != 1 || cands[0] != "acc_ok" {
-		t.Fatalf("期望仅筛选出双维均未达 500 的 acc_ok, 实际得到: %v", cands)
+		t.Fatalf("期望仅筛选出双维均未达上限的 acc_ok, 实际得到: %v", cands)
 	}
 }
 

@@ -662,3 +662,47 @@ func TestVerificationCAS_ConcurrentExpiryVsSuccess(t *testing.T) {
 	}
 }
 
+func TestQuarantineInventoryForAccountOnDeletion(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	// 添加两个账号的可用库存
+	_ = st.AddInventoryAlias("acc_del", hme.Alias{Email: "del_1@icloud.com", Active: true}, "replenish", true)
+	_ = st.AddInventoryAlias("acc_del", hme.Alias{Email: "del_2@icloud.com", Active: true}, "replenish", true)
+	_ = st.AddInventoryAlias("acc_keep", hme.Alias{Email: "keep_1@icloud.com", Active: true}, "replenish", true)
+
+	if cnt := st.CountAuthoritativeAvailableAliases(); cnt != 3 {
+		t.Fatalf("初始可用库存期望为 3, 实际为 %d", cnt)
+	}
+
+	// 模拟删除 acc_del
+	if err := st.DeleteAccount("acc_del"); err != nil {
+		t.Fatalf("DeleteAccount 失败: %v", err)
+	}
+
+	// 确认可用库存已被级联隔离，仅剩 acc_keep 的 1 个
+	if cnt := st.CountAuthoritativeAvailableAliases(); cnt != 1 {
+		t.Fatalf("删除账号后可用库存期望为 1, 实际为 %d", cnt)
+	}
+
+	// 确认认领出号只会领到 keep_1，绝不会领到 del_1 或 del_2
+	alloc, _, err := st.ClaimInventoryAlias(context.Background(), "token", "tok_1", "claim", "", "", "", nil)
+	if err != nil {
+		t.Fatalf("ClaimInventoryAlias 失败: %v", err)
+	}
+	if alloc.AliasEmail != "keep_1@icloud.com" {
+		t.Fatalf("期望认领到 keep_1@icloud.com, 实际: %s", alloc.AliasEmail)
+	}
+
+	// 再次认领应当返回库存为空
+	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_2", "claim", "", "", "", nil)
+	if !errors.Is(err, ErrNoAvailableInventory) {
+		t.Fatalf("期望 ErrNoAvailableInventory, 实际得到: %v", err)
+	}
+}
+
+

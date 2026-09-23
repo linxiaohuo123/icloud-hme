@@ -122,46 +122,46 @@ func (p *Pool) DoContext(ctx context.Context, appleID, appPassword, proxyURL str
 		return err
 	}
 
+	cli := pc.client
+	if cli == nil {
+		return fmt.Errorf("IMAP 客户端未就绪")
+	}
+
 	// 监听 Context 取消：真正打断底层 TCP/TLS 连接网络 I/O
 	stopWatch := make(chan struct{})
 	defer close(stopWatch)
 
 	go func() {
+		defer func() {
+			_ = recover()
+		}()
 		select {
 		case <-ctx.Done():
-			if pc.client != nil {
-				pc.client.SetDeadline(time.Now())
-				pc.client.forceClose()
-			}
+			cli.SetDeadline(time.Now())
+			cli.forceClose()
 		case <-stopWatch:
 		}
 	}()
 
-	pc.client.SetDeadline(time.Now().Add(IMAPCommandTimeout))
+	cli.SetDeadline(time.Now().Add(IMAPCommandTimeout))
 	defer func() {
-		if pc.client != nil {
-			pc.client.SetDeadline(time.Time{})
-		}
+		cli.SetDeadline(time.Time{})
 	}()
 
-	err := fn(pc.client)
+	err := fn(cli)
 	pc.lastUsed = time.Now()
 
 	// 若在执行期间 context 已触发取消，连接已被打断，必须从连接池丢弃，严禁复用 (Issue 13)
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		if pc.client != nil {
-			pc.client.forceClose()
-			pc.client = nil
-		}
+		cli.forceClose()
+		pc.client = nil
 		return ctxErr
 	}
 
 	if err != nil && isLikelyConnErr(err) {
 		// 连接坏了, 丢掉, 下次重建
-		if pc.client != nil {
-			pc.client.forceClose()
-			pc.client = nil
-		}
+		cli.forceClose()
+		pc.client = nil
 	}
 	return err
 }
@@ -291,6 +291,15 @@ func (pc *pooledConn) ensure(idleClose time.Duration) error {
 	}
 	c := NewClientWithProxy(pc.appleID, pc.appPassword, pc.proxyURL)
 	if err := c.Connect(); err != nil {
+		if pc.proxyURL != "" {
+			// 慢代理超时/坏节点时，自动降级为直连尝试，保障 IMAP 取信不断供
+			direct := NewClient(pc.appleID, pc.appPassword)
+			if directErr := direct.Connect(); directErr == nil {
+				pc.client = direct
+				pc.lastUsed = time.Now()
+				return nil
+			}
+		}
 		return err
 	}
 	pc.client = c

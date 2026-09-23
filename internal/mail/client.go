@@ -221,16 +221,17 @@ func (c *Client) ForceClose() {
 	c.forceClose()
 }
 
-// forceClose 不发 LOGOUT, 直接掐断(坏连接/池丢弃时用)。
+// forceClose 不发 LOGOUT, 直接掐断底层网络连接(坏连接/池丢弃时用)。
+// 注意：严禁在此处将 c.cli 或 c.conn 置为 nil，因为异步超时中断协程会并发调用此方法；
+// 提前置空会导致正在进行中的 IMAP 方法发生 nil pointer dereference panic。
+// 掐断底层的 net.Conn 即可使所有阻塞读写安全报错返回。
 func (c *Client) forceClose() {
-	if c.cli != nil {
-		_ = c.cli.Terminate()
-		c.cli = nil
-	}
 	if c.conn != nil {
 		_ = c.conn.Close()
 	}
-	c.conn = nil
+	if c.cli != nil {
+		_ = c.cli.Terminate()
+	}
 }
 
 // InboxCount 返回收件箱邮件总数。
@@ -289,15 +290,20 @@ func (c *Client) ListInboxWithBodies(limit int, days int) ([]Message, error) {
 
 // ListFolder 拉取指定文件夹的最近邮件摘要 (支持 "all"、"inbox"、"junk" 或具体文件夹名，默认不拉正文)。
 func (c *Client) ListFolder(folder string, limit int, days int) ([]Message, error) {
-	return c.listFolder(folder, limit, days, false)
+	return c.listFolder(folder, limit, days, 0, false)
 }
 
 // ListFolderWithBodies 拉取指定文件夹的最近邮件并拉取正文。
 func (c *Client) ListFolderWithBodies(folder string, limit int, days int) ([]Message, error) {
-	return c.listFolder(folder, limit, days, true)
+	return c.listFolder(folder, limit, days, 0, true)
 }
 
-func (c *Client) listFolder(folder string, limit int, days int, includeBody bool) ([]Message, error) {
+// ListFolderSince 拉取指定文件夹中 UID >= sinceUID 的邮件 (支持带/不带正文)。
+func (c *Client) ListFolderSince(folder string, limit int, days int, sinceUID uint32, includeBody bool) ([]Message, error) {
+	return c.listFolder(folder, limit, days, sinceUID, includeBody)
+}
+
+func (c *Client) listFolder(folder string, limit int, days int, sinceUID uint32, includeBody bool) ([]Message, error) {
 	if c.cli == nil {
 		return nil, fmt.Errorf("未连接")
 	}
@@ -313,7 +319,7 @@ func (c *Client) listFolder(folder string, limit int, days int, includeBody bool
 	var all []Message
 	var folderErrors []error
 	for _, name := range folders {
-		messages, err := c.listMailbox(name, limit, days, includeBody)
+		messages, err := c.listMailbox(name, limit, days, sinceUID, includeBody)
 		if err != nil {
 			folderErrors = append(folderErrors, fmt.Errorf("%s: %w", name, err))
 			continue
@@ -327,7 +333,7 @@ func (c *Client) listFolder(folder string, limit int, days int, includeBody bool
 	return all, errors.Join(folderErrors...)
 }
 
-func (c *Client) listMailbox(folder string, limit int, days int, includeBody bool) ([]Message, error) {
+func (c *Client) listMailbox(folder string, limit int, days int, sinceUID uint32, includeBody bool) ([]Message, error) {
 	mbox, err := c.cli.Select(folder, true)
 	if err != nil {
 		return nil, err
@@ -337,13 +343,40 @@ func (c *Client) listMailbox(folder string, limit int, days int, includeBody boo
 		return []Message{}, nil
 	}
 
-	from := uint32(1)
-	if uint32(limit) < mbox.Messages {
-		from = mbox.Messages - uint32(limit) + 1
-	}
-
 	seqset := new(imap.SeqSet)
-	seqset.AddRange(from, mbox.Messages)
+	isUID := false
+	if sinceUID > 0 {
+		if mbox.UidNext > 0 && sinceUID >= mbox.UidNext {
+			return []Message{}, nil
+		}
+		criteria := imap.NewSearchCriteria()
+		criteria.Uid = new(imap.SeqSet)
+		criteria.Uid.AddRange(sinceUID, 0)
+		if days > 0 {
+			criteria.Since = time.Now().AddDate(0, 0, -days)
+		}
+		foundUIDs, searchErr := c.cli.UidSearch(criteria)
+		if searchErr != nil {
+			return nil, searchErr
+		}
+		if len(foundUIDs) == 0 {
+			return []Message{}, nil
+		}
+		sort.Slice(foundUIDs, func(i, j int) bool { return foundUIDs[i] < foundUIDs[j] })
+		if limit > 0 && len(foundUIDs) > limit {
+			foundUIDs = newestUIDs(foundUIDs, limit)
+		}
+		for _, u := range foundUIDs {
+			seqset.AddNum(u)
+		}
+		isUID = true
+	} else {
+		from := uint32(1)
+		if uint32(limit) < mbox.Messages {
+			from = mbox.Messages - uint32(limit) + 1
+		}
+		seqset.AddRange(from, mbox.Messages)
+	}
 
 	items := []imap.FetchItem{
 		imap.FetchUid,
@@ -361,12 +394,19 @@ func (c *Client) listMailbox(folder string, limit int, days int, includeBody boo
 	messages := make(chan *imap.Message, limit)
 	done := make(chan error, 1)
 	go func() {
-		done <- c.cli.Fetch(seqset, items, messages)
+		if isUID {
+			done <- c.cli.UidFetch(seqset, items, messages)
+		} else {
+			done <- c.cli.Fetch(seqset, items, messages)
+		}
 	}()
 
 	var out []Message
 	for msg := range messages {
 		m := parser(msg, folder)
+		if sinceUID > 0 && m.UID < sinceUID {
+			continue
+		}
 		m.UIDValidity = mbox.UidValidity
 		m.Provider = "imap"
 		ref := MessageRef{
@@ -477,8 +517,14 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 		return err
 	}
 
-	// 1) 服务端按多 Header 检索并 Union 去重: To, Delivered-To, X-Original-To, Envelope-To
-	headers := []string{"To", "Delivered-To", "X-Original-To", "Envelope-To"}
+	// 1) 服务端按 Header 检索并 Union 去重
+	// QQ 邮箱服务端不支持 Delivered-To 等非标 Header，强行搜索会导致全箱扫描并返回数千 UID 造成网络浪费与延迟。
+	// 因此对 QQ 邮箱仅搜索标准 To 标头，未命中时秒级穿透至本地快速比对。
+	headers := []string{"To"}
+	if !strings.Contains(strings.ToLower(c.server), "qq.com") {
+		headers = append(headers, "Delivered-To", "X-Original-To", "Envelope-To")
+	}
+
 	seen := make(map[uint32]struct{})
 	var allUIDs []uint32
 	for _, header := range headers {
@@ -493,6 +539,11 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 		}
 		found, err := c.cli.UidSearch(criteria)
 		if err == nil {
+			// 防御非标准 IMAP 服务器: 当请求不存在的标头时，若错误返回全箱邮件，果断丢弃并直接短路退出，
+			// 避免继续尝试其它非标标头带来多轮无谓网络往返与耗时。
+			if mbox.Messages > 5 && len(found) >= int(mbox.Messages) {
+				break
+			}
 			for _, u := range found {
 				if _, ok := seen[u]; !ok {
 					seen[u] = struct{}{}
@@ -500,7 +551,7 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 				}
 			}
 		}
-		// 性能关键优化：如果当前已搜出足够数量的 UID（>= limit），立即短路返回，无需再执行后续 3 次无谓网络往返
+		// 性能关键优化：如果当前已搜出足够数量的 UID（>= limit），立即短路返回
 		if len(allUIDs) >= limit {
 			break
 		}
@@ -545,14 +596,23 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 		if err := <-done; err != nil {
 			return err
 		}
-		// 按 UID 从大到小 (新到旧) 排序触发回调
+		// 按 UID 从大到小 (新到旧) 排序触发回调；严格核验收件人匹配
 		sort.SliceStable(fetched, func(i, j int) bool { return fetched[i].UID > fetched[j].UID })
+		matchedCount := 0
 		for _, m := range fetched {
+			if !m.matches(recipient) {
+				continue
+			}
+			matchedCount++
 			if !onMsg(m) {
 				return nil
 			}
 		}
-		return nil
+		// 只有当至少命中一封真正匹配目标别名的邮件时才提前结束；
+		// 若因非标 IMAP 返回了无关历史邮件导致 matchedCount == 0，必须穿透执行 fallback 深度比对
+		if matchedCount > 0 {
+			return nil
+		}
 	}
 
 	// 2) fallback: 扫最近 N 封信, 本地全文与 Header 深度比对 (解决 Apple 内部转寄重写 To 导致的漏信)

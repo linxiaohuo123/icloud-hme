@@ -28,7 +28,7 @@ type quickCreateReq struct {
 // selectAccountCandidates 根据业务标签与小时配额筛选候选母号列表 (用于现场新建别名场景)。
 // 调度原则：
 //  1. 业务隔离：优先专属标签匹配账号，其次回退至未打标的通用公共账号，绝不跨业务借用。
-//  2. 双维熔断：严格排除 AliasTotal >= 500 或 AliasActive >= 500 的账号。
+//  2. 双维熔断：严格排除 AliasTotal >= account.MaxAliasesPerAccount 或 AliasActive >= account.MaxAliasesPerAccount 的账号。
 //  3. 配额感知与负载均衡：
 //     若 st != nil，优先划分当前小时仍有剩余配额 (RemainingQuota > 0) 的账号。
 //     在同配额梯度内，按 AliasTotal 升序排序（最低水位优先分配）；
@@ -39,7 +39,7 @@ func selectAccountCandidates(accounts []account.Summary, tag string, st *store.S
 
 	if tag != "" {
 		for _, acc := range accounts {
-			if acc.Status == "active" && acc.HasCookies && acc.AliasTotal < 500 && acc.AliasActive < 500 {
+			if acc.Status == "active" && acc.HasCookies && acc.AliasTotal < account.MaxAliasesPerAccount && acc.AliasActive < account.MaxAliasesPerAccount {
 				for _, t := range acc.Tags {
 					if strings.EqualFold(t, tag) {
 						candidates = append(candidates, acc)
@@ -53,7 +53,7 @@ func selectAccountCandidates(accounts []account.Summary, tag string, st *store.S
 	// 回退到公共账号池 (未打任何业务标签的账号)
 	if len(candidates) == 0 {
 		for _, acc := range accounts {
-			if acc.Status == "active" && acc.HasCookies && len(acc.Tags) == 0 && acc.AliasTotal < 500 && acc.AliasActive < 500 {
+			if acc.Status == "active" && acc.HasCookies && len(acc.Tags) == 0 && acc.AliasTotal < account.MaxAliasesPerAccount && acc.AliasActive < account.MaxAliasesPerAccount {
 				candidates = append(candidates, acc)
 			}
 		}

@@ -1,8 +1,10 @@
 package mail
 
 import (
+	"context"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestPoolGetOrCreateAndClose(t *testing.T) {
@@ -79,5 +81,47 @@ func TestPoolLRUEviction(t *testing.T) {
 	}
 	if hasUser2 {
 		t.Fatalf("user2 应当被 LRU 驱逐")
+	}
+}
+
+func TestPoolDoContext_CancellationSafe(t *testing.T) {
+	p := NewPool()
+	defer p.Close()
+
+	pc := p.getOrCreate("cancel_test@icloud.com")
+	pc.appPassword = "dummy"
+	pc.client = &Client{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 预先取消
+
+	err := p.DoContext(ctx, "cancel_test@icloud.com", "dummy", "", func(c *Client) error {
+		return nil
+	})
+	if err == nil {
+		t.Fatalf("预先取消的 context 应当返回错误")
+	}
+}
+
+func TestPoolDoContext_CancellationDuringExecution(t *testing.T) {
+	p := NewPool()
+	defer p.Close()
+
+	pc := p.getOrCreate("cancel_run@icloud.com")
+	pc.appPassword = "dummy"
+	pc.client = &Client{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	err := p.DoContext(ctx, "cancel_run@icloud.com", "dummy", "", func(c *Client) error {
+		time.Sleep(50 * time.Millisecond)
+		return nil
+	})
+	if err == nil {
+		t.Fatalf("超时后应当返回错误")
+	}
+	if pc.client != nil {
+		t.Fatalf("超时后 client 应当被从连接池置空抛弃")
 	}
 }

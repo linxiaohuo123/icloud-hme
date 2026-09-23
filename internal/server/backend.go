@@ -97,7 +97,7 @@ type managerBackend struct {
 }
 
 // summaryCacheTTL 是 ListAccounts 快照的有效期。
-// 取值很短:它只用于负载均衡选号与列表展示，权威的 500 上限与配额校验另有专门路径。
+// 取值很短:它只用于负载均衡选号与列表展示，权威的 750 上限与配额校验另有专门路径。
 const summaryCacheTTL = time.Second
 
 // ListAccounts 返回账号安全摘要列表。
