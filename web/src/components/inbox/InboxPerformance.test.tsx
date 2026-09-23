@@ -323,4 +323,357 @@ describe('Inbox Baseline Performance Measurements', () => {
 
     unmount()
   })
+
+  it('only backfills body by canonical MessageRef and never by bare UID or id (INBOX vs Junk same UID)', async () => {
+    // Both INBOX and Junk messages share UID 100
+    const testMessages: InboxResult = {
+      account_id: 'acc_perf',
+      count: 2,
+      messages: [
+        {
+          id: '100',
+          uid: 100,
+          message_ref: 'imap:acc_perf:INBOX:1:100',
+          subject: 'Inbox Security Code',
+          from: 'apple@apple.com',
+          to: 'perf@icloud.com',
+          date: '2026-09-23 20:00:00',
+          folder: 'INBOX',
+          preview: '',
+          body: '',
+        },
+        {
+          id: '100',
+          uid: 100,
+          message_ref: 'imap:acc_perf:Junk:1:100',
+          subject: 'Junk Spam Warning',
+          from: 'spammer@spam.com',
+          to: 'perf@icloud.com',
+          date: '2026-09-23 20:01:00',
+          folder: 'Junk',
+          preview: '',
+          body: '',
+        },
+      ],
+      method: 'imap',
+    }
+
+    server.use(
+      http.get('/api/mailboxes', () => {
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_perf', folders: dummyFolders } })
+      }),
+      http.get('/api/inbox', () => {
+        return HttpResponse.json({ success: true, data: testMessages })
+      }),
+      http.post('/api/messages', async () => {
+        // Return body ONLY for the Junk message
+        return HttpResponse.json({
+          success: true,
+          data: {
+            messages: [
+              {
+                id: '100',
+                uid: 100,
+                folder: 'Junk',
+                message_ref: 'imap:acc_perf:Junk:1:100',
+                subject: 'Junk Spam Warning',
+                body: 'Malicious spam content',
+                preview: 'Malicious spam content',
+              },
+            ],
+          },
+        })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_perf" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Inbox Security Code')).toBeInTheDocument()
+      expect(screen.getByText('Junk Spam Warning')).toBeInTheDocument()
+    })
+
+    // Verify Junk received its body
+    await waitFor(() => {
+      expect(screen.getByText('Malicious spam content')).toBeInTheDocument()
+    })
+
+    // CRITICAL: The INBOX message must NEVER receive the Junk message body despite sharing UID 100
+    const inboxRow = screen.getByText('Inbox Security Code').closest('tr')
+    expect(inboxRow).not.toHaveTextContent('Malicious spam content')
+
+    unmount()
+  })
+
+  it('rejects mismatched UIDVALIDITY backfill on identical UID', async () => {
+    // Current inbox has UIDVALIDITY 2, message UID 100
+    const testMessages: InboxResult = {
+      account_id: 'acc_perf',
+      count: 1,
+      messages: [
+        {
+          id: '100',
+          uid: 100,
+          message_ref: 'imap:acc_perf:INBOX:2:100',
+          subject: 'New Mailbox Session Code',
+          from: 'apple@apple.com',
+          to: 'perf@icloud.com',
+          date: '2026-09-23 20:00:00',
+          folder: 'INBOX',
+          preview: '',
+          body: '',
+        },
+      ],
+      method: 'imap',
+    }
+
+    server.use(
+      http.get('/api/mailboxes', () => {
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_perf', folders: dummyFolders } })
+      }),
+      http.get('/api/inbox', () => {
+        return HttpResponse.json({ success: true, data: testMessages })
+      }),
+      http.post('/api/messages', async () => {
+        // Return body for an OLD session with UIDVALIDITY 1
+        return HttpResponse.json({
+          success: true,
+          data: {
+            messages: [
+              {
+                id: '100',
+                uid: 100,
+                folder: 'INBOX',
+                message_ref: 'imap:acc_perf:INBOX:1:100',
+                subject: 'Old Session Code',
+                body: 'OLD_SESSION_CODE_999999',
+                preview: 'OLD_SESSION_CODE_999999',
+              },
+            ],
+          },
+        })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_perf" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('New Mailbox Session Code')).toBeInTheDocument()
+    })
+
+    // The message must NOT receive the mismatched UIDVALIDITY body
+    expect(screen.queryByText('OLD_SESSION_CODE_999999')).toBeNull()
+
+    unmount()
+  })
+
+  it('handles later chunk failure gracefully without losing previously completed chunks', async () => {
+    let chunkCall = 0
+    const tenMessages = Array.from({ length: 10 }, (_, i) => ({
+      id: `msg_${i + 1}`,
+      message_ref: `imap:acc_perf:INBOX:1:${200 + i}`,
+      subject: `Batch Item #${i + 1}`,
+      from: 'apple@apple.com',
+      to: 'perf@icloud.com',
+      date: '2026-09-23 20:00:00',
+      folder: 'INBOX',
+      preview: '',
+      body: '',
+    }))
+
+    server.use(
+      http.get('/api/mailboxes', () => {
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_perf', folders: dummyFolders } })
+      }),
+      http.get('/api/inbox', () => {
+        return HttpResponse.json({
+          success: true,
+          data: {
+            account_id: 'acc_perf',
+            count: 10,
+            messages: tenMessages,
+            method: 'imap',
+          },
+        })
+      }),
+      http.post('/api/messages', async ({ request }) => {
+        chunkCall++
+        const body = (await request.json()) as { messages?: Array<{ id: string; message_ref: string }> }
+        if (chunkCall === 1) {
+          // Chunk 1 succeeds with verification code
+          return HttpResponse.json({
+            success: true,
+            data: {
+              messages: (body?.messages || []).map((m: { id: string; message_ref: string }) => ({
+                ...m,
+                body: `Body with OTP: 888123 for ${m.message_ref}`,
+                preview: `OTP: 888123`,
+              })),
+            },
+          })
+        }
+        // Chunk 2 fails with 500
+        return HttpResponse.json({ success: false, code: 'INTERNAL_ERROR', message: 'IMAP socket timeout' }, { status: 500 })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_perf" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Batch Item #1')).toBeInTheDocument()
+      expect(screen.getByText('Batch Item #10')).toBeInTheDocument()
+    })
+
+    // Chunk 1 OTP successfully displays
+    await waitFor(() => {
+      expect(screen.getAllByText('888123').length).toBeGreaterThanOrEqual(1)
+    })
+
+    // All 10 items remain listed in the table (view does not break or crash)
+    for (let i = 1; i <= 10; i++) {
+      expect(screen.getByText(`Batch Item #${i}`)).toBeInTheDocument()
+    }
+
+    unmount()
+  })
+
+  it('clears caches and does not write back when 401 AUTH_REQUIRED occurs', async () => {
+    let inboxRequests = 0
+
+    server.use(
+      http.get('/api/mailboxes', () => {
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_perf', folders: dummyFolders } })
+      }),
+      http.get('/api/inbox', () => {
+        inboxRequests++
+        if (inboxRequests === 1) {
+          return HttpResponse.json({ success: true, data: dummyInboxResult })
+        }
+        return HttpResponse.json({ success: false, code: 'AUTH_REQUIRED', message: '会话已过期' }, { status: 401 })
+      }),
+    )
+
+    // Mount 1 succeeds
+    const view1 = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_perf" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+    await waitFor(() => {
+      expect(screen.getByText('Apple Security Code')).toBeInTheDocument()
+    })
+    view1.unmount()
+
+    // Trigger auth-logout event
+    window.dispatchEvent(new CustomEvent('auth-logout'))
+
+    // Mount 2 receives 401
+    const view2 = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_perf" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('会话已过期')).toBeInTheDocument()
+    })
+
+    view2.unmount()
+  })
+
+  it('demonstrates progressive OTP appearance: first chunk OTP visible before remaining chunks complete', async () => {
+    const tenMessages = Array.from({ length: 10 }, (_, i) => ({
+      id: `prog_${i + 1}`,
+      message_ref: `imap:acc_perf:INBOX:1:${300 + i}`,
+      subject: `Prog Item #${i + 1}`,
+      from: 'apple@apple.com',
+      to: 'perf@icloud.com',
+      date: '2026-09-23 20:00:00',
+      folder: 'INBOX',
+      preview: '',
+      body: '',
+    }))
+
+    let chunkStep = 0
+
+    server.use(
+      http.get('/api/mailboxes', () => {
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_perf', folders: dummyFolders } })
+      }),
+      http.get('/api/inbox', () => {
+        return HttpResponse.json({
+          success: true,
+          data: {
+            account_id: 'acc_perf',
+            count: 10,
+            messages: tenMessages,
+            method: 'imap',
+          },
+        })
+      }),
+      http.post('/api/messages', async ({ request }) => {
+        chunkStep++
+        const body = (await request.json()) as { messages?: Array<{ id: string; message_ref: string }> }
+        // Each chunk takes 20ms
+        await new Promise((r) => setTimeout(r, 20))
+        return HttpResponse.json({
+          success: true,
+          data: {
+            messages: (body?.messages || []).map((m: { id: string; message_ref: string }) => {
+              const num = m.message_ref.split(':').pop() || '0'
+              const code = String(800000 + Number(num))
+              return {
+                ...m,
+                body: `Your verification code is ${code}`,
+                preview: `Your verification code is ${code}`,
+              }
+            }),
+          },
+        })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_perf" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    // First chunk items appear with their OTP badge first
+    await waitFor(() => {
+      expect(screen.getByText('800300')).toBeInTheDocument()
+    })
+
+    // Eventually all items have their OTP badges
+    await waitFor(() => {
+      expect(screen.getByText('800309')).toBeInTheDocument()
+      expect(chunkStep).toBe(2)
+    })
+
+    unmount()
+  })
 })

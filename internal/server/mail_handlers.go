@@ -77,10 +77,11 @@ func (s *Server) listMailboxesHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数缺失: account_id")
 		return
 	}
+	refresh := c.Query("refresh") == "true"
 	var folders []mail.Folder
 	var err error
 	if s.mailReadService != nil {
-		folders, err = s.mailReadService.ListMailboxes(c.Request.Context(), accountID)
+		folders, err = s.mailReadService.ListMailboxes(c.Request.Context(), accountID, refresh)
 	} else {
 		folders, err = s.be.ListMailboxesContext(c.Request.Context(), accountID)
 	}

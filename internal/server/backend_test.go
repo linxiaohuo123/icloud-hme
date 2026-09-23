@@ -67,6 +67,8 @@ type fakeBackend struct {
 	onListAliases      func(accountID string) ([]hme.Alias, error)
 	onListInbox        func(q InboxQuery) (InboxResult, error)
 	onListInboxContext func(ctx context.Context, q InboxQuery) (InboxResult, error)
+	onListMailboxes        func(accountID string) ([]mail.Folder, error)
+	onListMailboxesContext func(ctx context.Context, accountID string) ([]mail.Folder, error)
 
 	validateID   string
 	validateFunc func(id string) error
@@ -304,6 +306,9 @@ func (f *fakeBackend) ListInboxContext(ctx context.Context, q InboxQuery) (Inbox
 }
 
 func (f *fakeBackend) ListMailboxes(accountID string) ([]mail.Folder, error) {
+	if f.onListMailboxes != nil {
+		return f.onListMailboxes(accountID)
+	}
 	return []mail.Folder{
 		{Name: "INBOX", Role: "inbox"},
 		{Name: "Junk", Role: "junk"},
@@ -313,6 +318,9 @@ func (f *fakeBackend) ListMailboxes(accountID string) ([]mail.Folder, error) {
 func (f *fakeBackend) ListMailboxesContext(ctx context.Context, accountID string) ([]mail.Folder, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if f.onListMailboxesContext != nil {
+		return f.onListMailboxesContext(ctx, accountID)
 	}
 	return f.ListMailboxes(accountID)
 }

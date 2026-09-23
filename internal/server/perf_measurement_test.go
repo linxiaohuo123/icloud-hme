@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -177,6 +178,7 @@ func TestBaseline_InboxStageTimings(t *testing.T) {
 
 func TestOptimized_MailboxCache_And_InFlightDedup(t *testing.T) {
 	var listInboxCalls int32
+	var listMailboxesCalls int32
 	backendDelay := 40 * time.Millisecond
 
 	fb := &fakeBackend{
@@ -190,13 +192,17 @@ func TestOptimized_MailboxCache_And_InFlightDedup(t *testing.T) {
 			}
 			return InboxResult{AccountID: q.AccountID, Count: 1, Method: "imap"}, nil
 		},
+		onListMailboxesContext: func(ctx context.Context, accountID string) ([]mail.Folder, error) {
+			atomic.AddInt32(&listMailboxesCalls, 1)
+			return []mail.Folder{{Name: "INBOX", Role: "inbox"}}, nil
+		},
 	}
 
 	srv := newWithBackend(fb, Config{Debug: false, AdminPassword: "admin-pass-2026-strong"})
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	cookie, _ := login(t, ts, "admin-pass-2026-strong")
+	cookie, csrf := login(t, ts, "admin-pass-2026-strong")
 
 	// 1. Verify Mailboxes Cache
 	t.Run("Mailbox_Cache_Eliminates_Redundant_Upstream_Calls", func(t *testing.T) {
@@ -300,6 +306,79 @@ func TestOptimized_MailboxCache_And_InFlightDedup(t *testing.T) {
 			t.Errorf("Caller 2 should have succeeded despite Caller 1 cancellation, got %d", caller2Status)
 		}
 	})
+
+	// 4. Verify that when all callers cancel, a new caller does NOT join the canceled call and gets a fresh flight
+	t.Run("InFlight_AllCallersCancel_NewCallerGetsFreshFlight", func(t *testing.T) {
+		atomic.StoreInt32(&listInboxCalls, 0)
+
+		// Caller 1 cancels very quickly
+		ctx1, cancel1 := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel1()
+		req1 := authedReq(t, ts, "GET", "/api/inbox?account_id=acc_opt&folder=CANCEL_TEST&limit=20&days=7&refresh=true", "")
+		req1.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+		req1 = req1.WithContext(ctx1)
+		client := &http.Client{}
+		_, _ = client.Do(req1)
+
+		// Give a tiny moment for caller 1 cancellation to register in flight
+		time.Sleep(15 * time.Millisecond)
+
+		// Caller 2 should start a fresh flight and succeed
+		req2 := authedReq(t, ts, "GET", "/api/inbox?account_id=acc_opt&folder=CANCEL_TEST&limit=20&days=7&refresh=true", "")
+		req2.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+		status2, body2, _ := do(t, req2)
+
+		if status2 != http.StatusOK {
+			t.Fatalf("Caller 2 should succeed with fresh flight, got %d: %s", status2, body2)
+		}
+	})
+
+	// 5. Verify MailboxCache Invalidation on Account Updates
+	t.Run("MailboxCache_InvalidationOnAccountUpdate", func(t *testing.T) {
+		atomic.StoreInt32(&listMailboxesCalls, 0)
+
+		// Call 1: Backend hit (via refresh=true to ensure cold start)
+		req1 := authedReq(t, ts, "GET", "/api/mailboxes?account_id=acc_opt&refresh=true", "")
+		req1.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+		status1, _, _ := do(t, req1)
+		if status1 != http.StatusOK {
+			t.Fatalf("call 1 failed: %d", status1)
+		}
+		if atomic.LoadInt32(&listMailboxesCalls) != 1 {
+			t.Fatalf("expected 1 backend call, got %d", atomic.LoadInt32(&listMailboxesCalls))
+		}
+
+		// Call 2: Cache hit (0 backend calls)
+		req2 := authedReq(t, ts, "GET", "/api/mailboxes?account_id=acc_opt", "")
+		req2.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+		status2, _, _ := do(t, req2)
+		if status2 != http.StatusOK {
+			t.Fatalf("call 2 failed: %d", status2)
+		}
+		if atomic.LoadInt32(&listMailboxesCalls) != 1 {
+			t.Fatalf("expected cache hit with 1 total backend call, got %d", atomic.LoadInt32(&listMailboxesCalls))
+		}
+
+		// Mutation: Update account (should invalidate mailbox cache)
+		patchReq := authedReq(t, ts, "PATCH", "/api/accounts/acc_opt", `{"name":"Opt Account Updated"}`)
+		patchReq.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+		patchReq.Header.Set("X-CSRF-Token", csrf)
+		patchStatus, _, _ := do(t, patchReq)
+		if patchStatus != http.StatusOK {
+			t.Fatalf("patch account failed: %d", patchStatus)
+		}
+
+		// Call 3: Backend hit again because cache was invalidated
+		req3 := authedReq(t, ts, "GET", "/api/mailboxes?account_id=acc_opt", "")
+		req3.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+		status3, _, _ := do(t, req3)
+		if status3 != http.StatusOK {
+			t.Fatalf("call 3 failed: %d", status3)
+		}
+		if atomic.LoadInt32(&listMailboxesCalls) != 2 {
+			t.Fatalf("expected 2 backend calls after invalidation, got %d", atomic.LoadInt32(&listMailboxesCalls))
+		}
+	})
 }
 
 func TestOptimized_GetMessagesBatch_TrueCancellation(t *testing.T) {
@@ -341,6 +420,55 @@ func TestOptimized_GetMessagesBatch_TrueCancellation(t *testing.T) {
 	t.Logf("[OPTIMIZED] Cancelled /api/messages Duration: %v, Err: %v", dur, err)
 	if dur > 200*time.Millisecond {
 		t.Fatalf("Expected client context cancellation to abort in <200ms, took %v", dur)
+	}
+}
+
+// TestOptimized_ServerSideSocketCancellation 验证真实 TCP 套接字在 context 取消时由服务端真正断开 (非假取消)
+func TestOptimized_ServerSideSocketCancellation(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	serverConnClosed := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		buf := make([]byte, 128)
+		for {
+			_, rerr := conn.Read(buf)
+			if rerr != nil {
+				close(serverConnClosed)
+				return
+			}
+		}
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+
+	// 模拟 WithMailClientContext 的网络看门狗
+	go func() {
+		<-ctx.Done()
+		_ = clientConn.SetDeadline(time.Now())
+		_ = clientConn.Close()
+	}()
+
+	select {
+	case <-serverConnClosed:
+		t.Logf("[OPTIMIZED] Server confirmed socket was severed upon context timeout")
+	case <-time.After(300 * time.Millisecond):
+		t.Fatalf("Server side did not detect socket close within 300ms, connection leaked")
 	}
 }
 

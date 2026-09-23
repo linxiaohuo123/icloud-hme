@@ -66,11 +66,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     setCSRFToken(null)
     setStatus('anonymous')
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('auth-logout'))
+    }
   }, [])
 
   const handleUnauthorized = useCallback(() => {
     setCSRFToken(null)
     setStatus('anonymous')
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('auth-logout'))
+    }
   }, [])
 
   useEffect(() => {

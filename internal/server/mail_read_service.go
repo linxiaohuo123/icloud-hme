@@ -78,10 +78,6 @@ type MailReadService struct {
 	mailboxCache map[string]mailboxCacheEntry
 	mailboxTTL   time.Duration
 
-	listMu       sync.RWMutex
-	listCache    map[string]listCacheEntry
-	listTTL      time.Duration
-
 	flightMu     sync.Mutex
 	inFlightList map[string]*inFlightListCall
 }
@@ -95,8 +91,6 @@ func NewMailReadService(be Backend) *MailReadService {
 		cacheCap:     defaultMsgCacheMaxCap,
 		mailboxCache: make(map[string]mailboxCacheEntry),
 		mailboxTTL:   defaultMailboxTTL,
-		listCache:    make(map[string]listCacheEntry),
-		listTTL:      defaultListCacheTTL,
 		inFlightList: make(map[string]*inFlightListCall),
 	}
 }
@@ -137,43 +131,38 @@ func (s *MailReadService) InvalidateMailboxCache(accountID string) {
 	delete(s.mailboxCache, strings.TrimSpace(accountID))
 }
 
-// InvalidateListCache 清理指定账号的收件箱快照缓存
-func (s *MailReadService) InvalidateListCache(accountID string) {
-	s.listMu.Lock()
-	defer s.listMu.Unlock()
-	prefix := strings.TrimSpace(accountID) + ":"
-	for k := range s.listCache {
+// InvalidateAccount 清理指定账号关联的目录缓存与消息详情缓存
+func (s *MailReadService) InvalidateAccount(accountID string) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return
+	}
+	s.InvalidateMailboxCache(accountID)
+
+	s.cacheMu.Lock()
+	prefix := accountID + ":"
+	for k := range s.cache {
 		if strings.HasPrefix(k, prefix) {
-			delete(s.listCache, k)
+			delete(s.cache, k)
 		}
 	}
+	s.cacheMu.Unlock()
 }
 
-// ListInbox 读取收件箱列表 (支持列表快照复用与基于共享 context 的 in-flight 请求合并)
+// ListInbox 读取收件箱列表 (基于共享 context 的 in-flight 请求合并)
 func (s *MailReadService) ListInbox(ctx context.Context, q InboxQuery) (InboxResult, error) {
 	if err := ctx.Err(); err != nil {
 		return InboxResult{}, err
 	}
 
-	queryKey := normalizeInboxQueryKey(q)
-	now := time.Now()
-
-	// 1. 若非增量同步且未指定强制刷新，优先利用列表快照缓存
-	if q.SinceUID == 0 && !q.Refresh {
-		s.listMu.RLock()
-		entry, hit := s.listCache[queryKey]
-		s.listMu.RUnlock()
-		if hit && now.Before(entry.expiresAt) {
-			return cloneInboxResult(entry.result), nil
-		}
-	}
-
-	// 2. 增量 SinceUID 轮询直接穿透回源，严禁被普通列表合并
+	// 1. 增量 SinceUID 轮询直接穿透回源，严禁被普通列表合并
 	if q.SinceUID > 0 {
 		return s.be.ListInboxContext(ctx, q)
 	}
 
-	// 3. 同键在途请求合并 (In-flight Singleflight): 某个调用方取消不影响其他调用方，全部调用方离开才取消底层工作
+	queryKey := normalizeInboxQueryKey(q)
+
+	// 2. 同键在途请求合并 (In-flight Singleflight): 某个调用方取消不影响其他调用方，全部调用方离开才取消底层工作
 	s.flightMu.Lock()
 	if call, ok := s.inFlightList[queryKey]; ok {
 		call.refCount++
@@ -185,6 +174,9 @@ func (s *MailReadService) ListInbox(ctx context.Context, q InboxQuery) (InboxRes
 			call.refCount--
 			if call.refCount <= 0 {
 				call.cancel()
+				if s.inFlightList[queryKey] == call {
+					delete(s.inFlightList, queryKey)
+				}
 			}
 			s.flightMu.Unlock()
 			return InboxResult{}, ctx.Err()
@@ -213,19 +205,8 @@ func (s *MailReadService) ListInbox(ctx context.Context, q InboxQuery) (InboxRes
 		call.res = res
 		call.err = err
 		close(call.done)
-		delete(s.inFlightList, queryKey)
-
-		// 仅成功结果写入缓存，取消或报错绝不写入
-		if err == nil {
-			s.listMu.Lock()
-			if s.listCache == nil {
-				s.listCache = make(map[string]listCacheEntry)
-			}
-			s.listCache[queryKey] = listCacheEntry{
-				result:    res,
-				expiresAt: time.Now().Add(s.listTTL),
-			}
-			s.listMu.Unlock()
+		if s.inFlightList[queryKey] == call {
+			delete(s.inFlightList, queryKey)
 		}
 		s.flightMu.Unlock()
 	}()
@@ -236,6 +217,9 @@ func (s *MailReadService) ListInbox(ctx context.Context, q InboxQuery) (InboxRes
 		call.refCount--
 		if call.refCount <= 0 {
 			call.cancel()
+			if s.inFlightList[queryKey] == call {
+				delete(s.inFlightList, queryKey)
+			}
 		}
 		s.flightMu.Unlock()
 		return InboxResult{}, ctx.Err()
@@ -247,23 +231,25 @@ func (s *MailReadService) ListInbox(ctx context.Context, q InboxQuery) (InboxRes
 	}
 }
 
-// ListMailboxes 读取邮箱文件夹列表 (带 5 分钟 TTL 目录缓存与 context 贯穿)
-func (s *MailReadService) ListMailboxes(ctx context.Context, accountID string) ([]mail.Folder, error) {
+// ListMailboxes 读取邮箱文件夹列表 (带 5 分钟 TTL 目录缓存与 context 贯穿，支持 refresh 刷新)
+func (s *MailReadService) ListMailboxes(ctx context.Context, accountID string, refresh bool) ([]mail.Folder, error) {
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
 		return nil, &BackendError{Status: 400, Code: "VALIDATION_ERROR", Message: "参数缺失: account_id"}
 	}
 
-	// 1. 检查目录短缓存，避免与优先邮件列表竞争同账号唯一 IMAP 连接
-	s.mailboxMu.RLock()
-	entry, hit := s.mailboxCache[accountID]
-	s.mailboxMu.RUnlock()
-
 	now := time.Now()
-	if hit && now.Before(entry.expiresAt) {
-		out := make([]mail.Folder, len(entry.folders))
-		copy(out, entry.folders)
-		return out, nil
+	if !refresh {
+		// 1. 检查目录短缓存，避免与优先邮件列表竞争同账号唯一 IMAP 连接
+		s.mailboxMu.RLock()
+		entry, hit := s.mailboxCache[accountID]
+		s.mailboxMu.RUnlock()
+
+		if hit && now.Before(entry.expiresAt) {
+			out := make([]mail.Folder, len(entry.folders))
+			copy(out, entry.folders)
+			return out, nil
+		}
 	}
 
 	// 2. 回源查询 (贯穿 ctx)

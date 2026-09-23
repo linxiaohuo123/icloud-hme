@@ -133,6 +133,9 @@ func (s *Server) updateAccountHandler(c *gin.Context) {
 		backendFail(c, err)
 		return
 	}
+	if s.mailReadService != nil {
+		s.mailReadService.InvalidateAccount(id)
+	}
 	ok(c, sum)
 }
 
@@ -153,6 +156,9 @@ func (s *Server) updateProxyHandler(c *gin.Context) {
 	if err != nil {
 		backendFail(c, err)
 		return
+	}
+	if s.mailReadService != nil {
+		s.mailReadService.InvalidateAccount(id)
 	}
 	ok(c, sum)
 }
@@ -188,6 +194,9 @@ func (s *Server) updateCookiesHandler(c *gin.Context) {
 		backendFail(c, err)
 		return
 	}
+	if s.mailReadService != nil {
+		s.mailReadService.InvalidateAccount(id)
+	}
 	ok(c, sum)
 }
 
@@ -210,6 +219,9 @@ func (s *Server) setAppPasswordHandler(c *gin.Context) {
 		backendFail(c, err)
 		return
 	}
+	if s.mailReadService != nil {
+		s.mailReadService.InvalidateAccount(id)
+	}
 	ok(c, sum)
 }
 
@@ -227,12 +239,16 @@ func (s *Server) setMailboxHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: 收件邮箱、IMAP 服务器、端口和授权码必填")
 		return
 	}
-	sum, err := s.be.SetMailbox(c.Param("id"), account.MailboxConfig{
+	accountID := c.Param("id")
+	sum, err := s.be.SetMailbox(accountID, account.MailboxConfig{
 		Provider: req.Provider, Email: req.Email, IMAPHost: req.IMAPHost, IMAPPort: req.IMAPPort, Password: req.AuthorizationCode,
 	})
 	if err != nil {
 		backendFail(c, err)
 		return
+	}
+	if s.mailReadService != nil {
+		s.mailReadService.InvalidateAccount(accountID)
 	}
 	ok(c, sum)
 }
@@ -258,6 +274,9 @@ func (s *Server) loginAccountHandler(c *gin.Context) {
 		backendFail(c, err)
 		return
 	}
+	if s.mailReadService != nil {
+		s.mailReadService.InvalidateAccount(id)
+	}
 	ok(c, sum)
 }
 
@@ -267,6 +286,9 @@ func (s *Server) removeAccountHandler(c *gin.Context) {
 	if !s.be.RemoveAccount(id) {
 		failCode(c, http.StatusNotFound, "ACCOUNT_NOT_FOUND", "账号不存在")
 		return
+	}
+	if s.mailReadService != nil {
+		s.mailReadService.InvalidateAccount(id)
 	}
 	if s.store != nil {
 		_ = s.store.DeleteScheduleConfig(id)
