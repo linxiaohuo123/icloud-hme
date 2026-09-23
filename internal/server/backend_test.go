@@ -71,9 +71,12 @@ type fakeBackend struct {
 	validateID   string
 	validateFunc func(id string) error
 
+	onSetAliasActive    func(accountID, anonymousID string, active bool) (bool, error)
+	onDeleteAlias       func(accountID, anonymousID string) error
 	getMessageFunc      func(accountID string, id string) (*mail.FullMessage, error)
 	getMessagesFunc     func(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error)
 	mailboxBoundaryFunc func(accountID, folder string) (string, uint32, uint32, error)
+	store               *store.Store
 }
 
 func (f *fakeBackend) ListAccounts() []account.Summary {
@@ -184,7 +187,26 @@ func (f *fakeBackend) RefreshAliases(accountID string) ([]hme.Alias, error) {
 
 func (f *fakeBackend) SetAliasActive(accountID, anonymousID string, active bool) (bool, error) {
 	f.aliasActID, f.aliasActActive = anonymousID, active
-	return true, f.aliasActErr
+	var (
+		ok  = true
+		err = f.aliasActErr
+	)
+	if f.onSetAliasActive != nil {
+		ok, err = f.onSetAliasActive(accountID, anonymousID, active)
+	}
+	if err != nil || !ok {
+		return ok, err
+	}
+	if f.store != nil {
+		rState := store.RemoteInactive
+		if active {
+			rState = store.RemoteActive
+		}
+		if sErr := f.store.UpdateAliasRemoteState(accountID, anonymousID, "", rState); sErr != nil {
+			return false, fmt.Errorf("local store update failed: %w", sErr)
+		}
+	}
+	return true, nil
 }
 
 func (f *fakeBackend) UpdateAlias(accountID, anonymousID, label, note string) error {
@@ -211,7 +233,19 @@ func (f *fakeBackend) BatchUpdateAliases(accountID string, anonymousIDs []string
 
 func (f *fakeBackend) DeleteAlias(accountID, anonymousID string) error {
 	f.aliasDeleteID = anonymousID
-	return f.aliasDeleteErr
+	var err = f.aliasDeleteErr
+	if f.onDeleteAlias != nil {
+		err = f.onDeleteAlias(accountID, anonymousID)
+	}
+	if err != nil {
+		return err
+	}
+	if f.store != nil {
+		if sErr := f.store.UpdateAliasRemoteState(accountID, anonymousID, "", store.RemoteDeleted); sErr != nil {
+			return fmt.Errorf("local store delete update failed: %w", sErr)
+		}
+	}
+	return nil
 }
 
 func (f *fakeBackend) BatchCreateAlias(accountID string, count int, labelPrefix string) (*BatchCreateResult, error) {

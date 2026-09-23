@@ -51,11 +51,19 @@ func (s *Store) ClaimInventoryAlias(
 				qErr := s.db.QueryRowContext(ctx, `
 					SELECT allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status
 					FROM alias_allocations
-					WHERE allocation_id = ? OR alias_email = ?
-				`, op.ResultRef, op.CandidateEmail).Scan(&alloc.AllocationID, &alloc.AliasEmail, &alloc.AccountID, &alloc.OwnerKind, &alloc.OwnerID, &alloc.BusinessTag, &alloc.AllocatedAt, &alloc.Status)
-				if qErr == nil {
-					return &alloc, &op, nil
+					WHERE allocation_id = ?
+				`, op.ResultRef).Scan(&alloc.AllocationID, &alloc.AliasEmail, &alloc.AccountID, &alloc.OwnerKind, &alloc.OwnerID, &alloc.BusinessTag, &alloc.AllocatedAt, &alloc.Status)
+				if qErr != nil {
+					return nil, &op, fmt.Errorf("inconsistent operation state: allocation record not found for result_ref %s: %w", op.ResultRef, qErr)
 				}
+				// 严格核对主体与邮箱一致性
+				if alloc.OwnerKind != op.PrincipalKind || alloc.OwnerID != op.PrincipalID {
+					return nil, &op, fmt.Errorf("inconsistent operation state: principal mismatch (%s:%s vs %s:%s)", alloc.OwnerKind, alloc.OwnerID, op.PrincipalKind, op.PrincipalID)
+				}
+				if op.CandidateEmail != "" && !strings.EqualFold(alloc.AliasEmail, op.CandidateEmail) {
+					return nil, &op, fmt.Errorf("inconsistent operation state: email mismatch (%s vs %s)", alloc.AliasEmail, op.CandidateEmail)
+				}
+				return &alloc, &op, nil
 			}
 			if op.State == "pending" {
 				return nil, &op, ErrOperationPending
@@ -69,6 +77,8 @@ func (s *Store) ClaimInventoryAlias(
 				}
 				return nil, &op, errors.New("previous operation failed")
 			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return nil, nil, fmt.Errorf("idempotency pre-check query failed: %w", err)
 		}
 	}
 
@@ -89,16 +99,47 @@ func (s *Store) ClaimInventoryAlias(
 		`, opID, principalKind, principalID, operationKind, idempKey, reqHash, now, now)
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-				// 并发重入，查询既有操作
+				_ = tx.Rollback()
+				// 并发重入，释放事务后可靠查询既有操作
 				var existingOp Operation
-				_ = s.db.QueryRowContext(ctx, `
+				qErr := s.db.QueryRowContext(ctx, `
 					SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, candidate_email, result_ref, error_code, created_at, updated_at
 					FROM operations
 					WHERE principal_kind = ? AND principal_id = ? AND operation_kind = ? AND idempotency_key = ?
 				`, principalKind, principalID, operationKind, idempKey).Scan(
 					&existingOp.OperationID, &existingOp.PrincipalKind, &existingOp.PrincipalID, &existingOp.OperationKind, &existingOp.IdempotencyKey, &existingOp.RequestHash, &existingOp.State, &existingOp.CandidateEmail, &existingOp.ResultRef, &existingOp.ErrorCode, &existingOp.CreatedAt, &existingOp.UpdatedAt,
 				)
-				return nil, &existingOp, ErrOperationPending
+				if qErr != nil {
+					return nil, nil, fmt.Errorf("failed to read existing operation after unique conflict: %w", qErr)
+				}
+				if reqHash != "" && existingOp.RequestHash != "" && existingOp.RequestHash != reqHash {
+					return nil, &existingOp, ErrIdempotencyConflict
+				}
+				if existingOp.State == "succeeded" {
+					var alloc AliasAllocation
+					allocErr := s.db.QueryRowContext(ctx, `
+						SELECT allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status
+						FROM alias_allocations
+						WHERE allocation_id = ?
+					`, existingOp.ResultRef).Scan(&alloc.AllocationID, &alloc.AliasEmail, &alloc.AccountID, &alloc.OwnerKind, &alloc.OwnerID, &alloc.BusinessTag, &alloc.AllocatedAt, &alloc.Status)
+					if allocErr != nil {
+						return nil, &existingOp, fmt.Errorf("inconsistent operation state: allocation record not found for result_ref %s: %w", existingOp.ResultRef, allocErr)
+					}
+					return &alloc, &existingOp, nil
+				}
+				if existingOp.State == "pending" {
+					return nil, &existingOp, ErrOperationPending
+				}
+				if existingOp.State == "failed" {
+					if existingOp.ErrorCode == "NO_AVAILABLE_INVENTORY" {
+						return nil, &existingOp, ErrNoAvailableInventory
+					}
+					if existingOp.ErrorCode != "" {
+						return nil, &existingOp, fmt.Errorf("operation failed with code: %s", existingOp.ErrorCode)
+					}
+					return nil, &existingOp, errors.New("previous operation failed")
+				}
+				return nil, &existingOp, fmt.Errorf("unknown operation state: %s", existingOp.State)
 			}
 			return nil, nil, fmt.Errorf("记录操作失败: %w", err)
 		}
@@ -129,8 +170,12 @@ func (s *Store) ClaimInventoryAlias(
 	// 若 allowedAccountIDs 明确给出了集合但集合为空，直接返回库存为空，绝不跨账号越权发放 (Issue 11)
 	if allowedAccountIDs != nil && len(allowedAccountIDs) == 0 {
 		if idempKey != "" {
-			_, _ = tx.ExecContext(ctx, `UPDATE operations SET state = 'failed', error_code = 'NO_AVAILABLE_INVENTORY', updated_at = ? WHERE operation_id = ?`, now, opID)
-			_ = tx.Commit()
+			if _, execErr := tx.ExecContext(ctx, `UPDATE operations SET state = 'failed', error_code = 'NO_AVAILABLE_INVENTORY', updated_at = ? WHERE operation_id = ?`, now, opID); execErr != nil {
+				return nil, nil, fmt.Errorf("update failed operation failed: %w", execErr)
+			}
+			if cErr := tx.Commit(); cErr != nil {
+				return nil, nil, fmt.Errorf("commit failed operation failed: %w", cErr)
+			}
 			currentOp.State = "failed"
 			currentOp.ErrorCode = "NO_AVAILABLE_INVENTORY"
 		}
@@ -141,6 +186,27 @@ func (s *Store) ClaimInventoryAlias(
 		SELECT email, account_id
 		FROM alias_inventory
 		WHERE allocation_state = 'available' AND remote_state = 'active'
+		  AND account_id IN (
+		      SELECT id FROM accounts
+		      WHERE status = 'active'
+		        AND (name NOT LIKE '%大号%')
+		        AND (
+		            CASE 
+		                WHEN json_valid(tags) THEN NOT EXISTS (
+		                    SELECT 1 FROM json_each(tags) 
+		                    WHERE LOWER(TRIM(value)) IN ('personal', 'private', 'protected')
+		                )
+		                ELSE (
+		                    tags NOT LIKE '%"personal"%' COLLATE NOCASE AND
+		                    tags NOT LIKE '%"private"%' COLLATE NOCASE AND
+		                    tags NOT LIKE '%"protected"%' COLLATE NOCASE AND
+		                    tags NOT LIKE '%personal%' COLLATE NOCASE AND
+		                    tags NOT LIKE '%private%' COLLATE NOCASE AND
+		                    tags NOT LIKE '%protected%' COLLATE NOCASE
+		                )
+		            END
+		        )
+		  )
 	`
 	var args []any
 	if len(allowedAccountIDs) == 1 && allowedAccountIDs[0] != "" {
@@ -169,8 +235,12 @@ func (s *Store) ClaimInventoryAlias(
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			if idempKey != "" {
-				_, _ = tx.ExecContext(ctx, `UPDATE operations SET state = 'failed', error_code = 'NO_AVAILABLE_INVENTORY', updated_at = ? WHERE operation_id = ?`, now, opID)
-				_ = tx.Commit()
+				if _, execErr := tx.ExecContext(ctx, `UPDATE operations SET state = 'failed', error_code = 'NO_AVAILABLE_INVENTORY', updated_at = ? WHERE operation_id = ?`, now, opID); execErr != nil {
+					return nil, nil, fmt.Errorf("update failed operation failed: %w", execErr)
+				}
+				if cErr := tx.Commit(); cErr != nil {
+					return nil, nil, fmt.Errorf("commit failed operation failed: %w", cErr)
+				}
 				currentOp.State = "failed"
 				currentOp.ErrorCode = "NO_AVAILABLE_INVENTORY"
 			}
@@ -212,6 +282,9 @@ func (s *Store) ClaimInventoryAlias(
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, alloc.AllocationID, alloc.AliasEmail, alloc.AccountID, alloc.OwnerKind, alloc.OwnerID, alloc.BusinessTag, alloc.AllocatedAt, alloc.Status)
 	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return nil, currentOp, fmt.Errorf("%w: %v", ErrAllocationConflict, err)
+		}
 		return nil, currentOp, fmt.Errorf("写入分配关系失败: %w", err)
 	}
 
@@ -224,18 +297,27 @@ func (s *Store) ClaimInventoryAlias(
 			tokenName = name
 		}
 	}
-	_, _ = tx.ExecContext(ctx, `
+	if _, err = tx.ExecContext(ctx, `
 		INSERT INTO lease_records (id, email, account_id, tag, status, allocated_at, token_name)
 		VALUES (?, ?, ?, ?, 'leased', ?, ?)
-	`, allocID, candEmail, candAccountID, tag, now, tokenName)
+	`, allocID, candEmail, candAccountID, tag, now, tokenName); err != nil {
+		return nil, currentOp, fmt.Errorf("写入 lease_records 失败: %w", err)
+	}
 
 	// 7. 更新操作记录为 succeeded
 	if idempKey != "" {
-		_, _ = tx.ExecContext(ctx, `
+		res, err := tx.ExecContext(ctx, `
 			UPDATE operations
 			SET state = 'succeeded', result_ref = ?, candidate_email = ?, updated_at = ?
 			WHERE operation_id = ?
 		`, allocID, candEmail, now, opID)
+		if err != nil {
+			return nil, currentOp, fmt.Errorf("更新 operation 失败: %w", err)
+		}
+		rows, err := res.RowsAffected()
+		if err != nil || rows == 0 {
+			return nil, currentOp, fmt.Errorf("更新 operation 影响行数不符 (rows=%d): %w", rows, err)
+		}
 		currentOp.State = "succeeded"
 		currentOp.ResultRef = allocID
 		currentOp.CandidateEmail = candEmail
@@ -250,45 +332,133 @@ func (s *Store) ClaimInventoryAlias(
 }
 
 // RecordAllocation 原子持久化新建别名的分配凭据与审计流水
-func (s *Store) RecordAllocation(alloc *AliasAllocation, tokenName string) error {
+// 硬约束：严禁通过 ON CONFLICT 覆盖历史 allocation_id、owner、account、business_tag 或 allocated_at。
+// 行为约定：
+// - 全新 alias：可靠保存并返回持久化后的分配记录；
+// - 同主体同一业务操作的合法重试：幂等返回已有租约，不生成第二条审计流水；
+// - 跨主体冲突、来源不明(如 legacy_unknown)或不同业务标签：明确报错冲突，事务回滚。
+func (s *Store) RecordAllocation(alloc *AliasAllocation, tokenName string) (*AliasAllocation, error) {
+	if alloc == nil || alloc.AliasEmail == "" {
+		return nil, errors.New("invalid allocation: nil or empty email")
+	}
+	normEmail := strings.TrimSpace(strings.ToLower(alloc.AliasEmail))
+	alloc.AliasEmail = normEmail
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
 
-	// 1. 确保 inventory 为 allocated
-	_, _ = tx.Exec(`
+	// 1. 检查是否存在已有分配记录
+	var existing AliasAllocation
+	err = tx.QueryRow(`
+		SELECT allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status
+		FROM alias_allocations
+		WHERE alias_email = ?
+	`, normEmail).Scan(
+		&existing.AllocationID, &existing.AliasEmail, &existing.AccountID, &existing.OwnerKind, &existing.OwnerID, &existing.BusinessTag, &existing.AllocatedAt, &existing.Status,
+	)
+
+	if err == nil {
+		// 已存在分配记录
+		// 跨主体冲突或历史不明归属(legacy_unknown)或已被隔离(quarantined)：严禁接管与覆盖！
+		if existing.OwnerKind != alloc.OwnerKind || existing.OwnerID != alloc.OwnerID || existing.OwnerID == "legacy_unknown" || existing.Status == "quarantined" {
+			return nil, fmt.Errorf("alias %s is already allocated to owner (%s:%s): %w", normEmail, existing.OwnerKind, existing.OwnerID, ErrAllocationConflict)
+		}
+		// 同主体核验 account: 必须核验 account
+		if alloc.AccountID != "" && existing.AccountID != "" && existing.AccountID != alloc.AccountID {
+			return nil, fmt.Errorf("alias %s belongs to same owner but has different account (%s vs %s): %w", normEmail, existing.AccountID, alloc.AccountID, ErrAllocationConflict)
+		}
+		// 同主体核验：业务标签不一致时无法证明为同一操作重试，拒绝覆盖
+		if existing.BusinessTag != alloc.BusinessTag {
+			return nil, fmt.Errorf("alias %s belongs to same owner but has different business tag (%q vs %q): %w", normEmail, existing.BusinessTag, alloc.BusinessTag, ErrAllocationConflict)
+		}
+		// 同主体核验已有状态：必须处于合法的 allocated 状态
+		if existing.Status != "allocated" {
+			return nil, fmt.Errorf("alias %s existing allocation status is %s (expected allocated): %w", normEmail, existing.Status, ErrAllocationConflict)
+		}
+		// 同主体合法重试：原样返回持久化结果，不插入第二条 lease_records 审计
+		return &existing, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("query existing allocation failed: %w", err)
+	}
+
+	// 2. 显式校验库存存在、账号匹配、状态允许、来源可靠；禁止直接 UPDATE 未经证明的 legacy_unknown、reserved 或 quarantined
+	var inv AliasInventory
+	invErr := tx.QueryRow(`
+		SELECT email, account_id, provider_alias_id, remote_state, allocation_state, source_type
+		FROM alias_inventory
+		WHERE email = ?
+	`, normEmail).Scan(
+		&inv.Email, &inv.AccountID, &inv.ProviderAliasID, &inv.RemoteState, &inv.AllocationState, &inv.SourceType,
+	)
+	if invErr != nil {
+		if errors.Is(invErr, sql.ErrNoRows) {
+			return nil, fmt.Errorf("cannot allocate alias %s: inventory record does not exist: %w", normEmail, ErrNoAvailableInventory)
+		}
+		return nil, fmt.Errorf("query alias_inventory failed: %w", invErr)
+	}
+
+	// 账号匹配校验
+	if alloc.AccountID != "" && inv.AccountID != "" && inv.AccountID != alloc.AccountID {
+		return nil, fmt.Errorf("cannot allocate alias %s: account mismatch (%s vs %s): %w", normEmail, inv.AccountID, alloc.AccountID, ErrAllocationConflict)
+	}
+
+	// 来源与状态校验：禁止直接 UPDATE 未经证明的 legacy_unknown、reserved 或 quarantined
+	if inv.AllocationState == "reserved" || inv.AllocationState == "quarantined" {
+		return nil, fmt.Errorf("cannot allocate alias %s: inventory state %s is not allocatable: %w", normEmail, inv.AllocationState, ErrAllocationConflict)
+	}
+	if inv.SourceType == "legacy_unknown" {
+		return nil, fmt.Errorf("cannot allocate alias %s: unproven inventory source %s is not allocatable: %w", normEmail, inv.SourceType, ErrAllocationConflict)
+	}
+	if inv.AllocationState == "unknown" && inv.SourceType != "created" {
+		return nil, fmt.Errorf("cannot allocate alias %s: unknown inventory state without created provenance: %w", normEmail, ErrAllocationConflict)
+	}
+	if inv.RemoteState != RemoteActive {
+		return nil, fmt.Errorf("cannot allocate alias %s: remote state is %s (must be active): %w", normEmail, inv.RemoteState, ErrAllocationConflict)
+	}
+
+	// 3. 全新 alias：确保 inventory 为 allocated，校验 RowsAffected == 1
+	res, err := tx.Exec(`
 		UPDATE alias_inventory
 		SET allocation_state = 'allocated'
-		WHERE email = ?
-	`, alloc.AliasEmail)
+		WHERE email = ? AND (allocation_state = 'available' OR (allocation_state = 'unknown' AND source_type = 'created'))
+	`, normEmail)
+	if err != nil {
+		return nil, fmt.Errorf("update alias_inventory failed: %w", err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("check rows affected failed: %w", err)
+	}
+	if rowsAffected != 1 {
+		return nil, fmt.Errorf("expected 1 row affected updating alias_inventory for %s, got %d: %w", normEmail, rowsAffected, ErrAllocationConflict)
+	}
 
-	// 2. 写入 alias_allocations
-	_, err = tx.Exec(`
+	// 3. 写入 alias_allocations (全新插入，绝不使用覆盖更新)
+	if _, err = tx.Exec(`
 		INSERT INTO alias_allocations (allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(alias_email) DO UPDATE SET
-			owner_kind = excluded.owner_kind,
-			owner_id = excluded.owner_id,
-			status = excluded.status
-	`, alloc.AllocationID, alloc.AliasEmail, alloc.AccountID, alloc.OwnerKind, alloc.OwnerID, alloc.BusinessTag, alloc.AllocatedAt, alloc.Status)
-	if err != nil {
-		return err
+	`, alloc.AllocationID, alloc.AliasEmail, alloc.AccountID, alloc.OwnerKind, alloc.OwnerID, alloc.BusinessTag, alloc.AllocatedAt, alloc.Status); err != nil {
+		return nil, fmt.Errorf("insert alias_allocations failed: %w", err)
 	}
 
-	// 3. 写入 lease_records 审计流水
-	_, err = tx.Exec(`
+	// 4. 写入 lease_records 审计流水
+	if _, err = tx.Exec(`
 		INSERT INTO lease_records (id, email, account_id, tag, status, allocated_at, completed_at, token_name)
 		VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)
-	`, alloc.AllocationID, alloc.AliasEmail, alloc.AccountID, alloc.BusinessTag, alloc.AllocatedAt, alloc.AllocatedAt, tokenName)
-	if err != nil {
-		return err
+	`, alloc.AllocationID, alloc.AliasEmail, alloc.AccountID, alloc.BusinessTag, alloc.AllocatedAt, alloc.AllocatedAt, tokenName); err != nil {
+		return nil, fmt.Errorf("insert lease_records failed: %w", err)
 	}
 
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit allocation transaction failed: %w", err)
+	}
+
+	return alloc, nil
 }
 
 // GetPrincipalAllocation 根据邮箱与主体核验分配归属

@@ -128,7 +128,7 @@ func (s *Server) listAliasesHandler(c *gin.Context) {
 
 		if refresh && s.store != nil {
 			if n, err := s.store.ReconcileAvailableInventory(); err == nil && n > 0 {
-				log.Printf("[Aliases] 刷新号池后对齐库存: 新激活 %d 个未分配别名", n)
+				log.Printf("[Aliases] 刷新后库存安全对齐: 已隔离/收敛 %d 个受保护或异常别名", n)
 			}
 		}
 
@@ -313,6 +313,10 @@ func (s *Server) deactivateAliasHandler(c *gin.Context) {
 		backendFail(c, err)
 		return
 	}
+	if !success {
+		failCode(c, http.StatusBadGateway, "UPSTREAM_FAILED", "上游停用别名失败")
+		return
+	}
 	ok(c, gin.H{"anonymous_id": anonymousID, "success": success})
 }
 
@@ -324,6 +328,10 @@ func (s *Server) reactivateAliasHandler(c *gin.Context) {
 	success, err := s.be.SetAliasActive(accountID, anonymousID, true)
 	if err != nil {
 		backendFail(c, err)
+		return
+	}
+	if !success {
+		failCode(c, http.StatusBadGateway, "UPSTREAM_FAILED", "上游激活别名失败")
 		return
 	}
 	ok(c, gin.H{"anonymous_id": anonymousID, "success": success})

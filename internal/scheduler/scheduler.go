@@ -238,18 +238,8 @@ func (s *Scheduler) run(manual, includeDisabled bool, countPerAccount int) (int,
 	var targetAccs []account.Summary
 	now := time.Now()
 	for _, a := range accs {
-		// 严禁调度私人/受保护账号：若打有 personal/private/protected 标签或名称含"大号"，一律豁免自动建号
-		isProtected := false
-		for _, t := range a.Tags {
-			if strings.EqualFold(t, "personal") || strings.EqualFold(t, "private") || strings.EqualFold(t, "protected") {
-				isProtected = true
-				break
-			}
-		}
-		if !isProtected && strings.Contains(a.Name, "大号") {
-			isProtected = true
-		}
-		if isProtected {
+		// 严禁调度私人/受保护账号：统一使用 account.IsProtectedAccount 判定
+		if account.IsProtectedAccount(a.Name, a.Tags) {
 			continue
 		}
 

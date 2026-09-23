@@ -8,6 +8,7 @@
 package server
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -18,6 +19,7 @@ import (
 
 	"icloud-hme/internal/account"
 	"icloud-hme/internal/hme"
+	"icloud-hme/internal/store"
 )
 
 // BatchCreateResult 批量创建别名结果。
@@ -259,15 +261,134 @@ func (b *managerBackend) RefreshAliases(accountID string) ([]hme.Alias, error) {
 	return res, nil
 }
 
+func (b *managerBackend) resolveAliasIdentifiers(accountID, identifier string) (anonymousID string, email string, err error) {
+	accountID = strings.TrimSpace(accountID)
+	identifier = strings.TrimSpace(identifier)
+	if accountID == "" || identifier == "" {
+		return "", "", errors.New("empty accountID or identifier")
+	}
+
+	if strings.Contains(identifier, "@") {
+		email = strings.ToLower(identifier)
+		// 1. 优先从内存缓存查找
+		if cached, ok := b.getCachedAliases(accountID); ok {
+			for _, al := range cached {
+				if strings.EqualFold(al.Email, email) && al.AnonymousID != "" {
+					anonymousID = al.AnonymousID
+					break
+				}
+			}
+		}
+		// 2. 若内存未命中，从本地数据库查找
+		if anonymousID == "" && b.store != nil {
+			inv, errQ := b.store.GetInventoryAlias(email)
+			if errQ != nil && !errors.Is(errQ, sql.ErrNoRows) {
+				return "", "", fmt.Errorf("query inventory alias for email %s failed: %w", email, errQ)
+			}
+			if inv != nil {
+				// 关键校验：按邮箱从本地查询后，必须验证 inventory.AccountID
+				if inv.AccountID != "" && inv.AccountID != accountID {
+					return "", "", fmt.Errorf("alias %s belongs to account %s, not %s: %w", email, inv.AccountID, accountID, store.ErrAllocationConflict)
+				}
+				if inv.ProviderAliasID != "" {
+					anonymousID = inv.ProviderAliasID
+				}
+			}
+		}
+		// 3. 若仍未命中，从上游远端列表拉取并解析（同时刷新缓存）
+		if anonymousID == "" {
+			aliases, lerr := b.ListAliases(accountID)
+			if lerr != nil {
+				return "", "", fmt.Errorf("list aliases from upstream for account %s failed: %w", accountID, lerr)
+			}
+			for _, al := range aliases {
+				if strings.EqualFold(al.Email, email) && al.AnonymousID != "" {
+					anonymousID = al.AnonymousID
+					break
+				}
+			}
+		}
+		if anonymousID == "" {
+			return "", "", fmt.Errorf("unable to resolve providerAliasID for email %s on account %s", email, accountID)
+		}
+		return anonymousID, email, nil
+	}
+
+	// 标识符为 anonymousID
+	anonymousID = identifier
+	// 1. 优先从内存缓存查找
+	if cached, ok := b.getCachedAliases(accountID); ok {
+		for _, al := range cached {
+			if al.AnonymousID == anonymousID && al.Email != "" {
+				email = strings.ToLower(al.Email)
+				break
+			}
+		}
+	}
+	// 2. 若内存未命中，从本地数据库通过 provider_alias_id 查找
+	if email == "" && b.store != nil {
+		var dbEmail, dbAccID string
+		errQ := b.store.DB().QueryRow(`
+			SELECT email, account_id FROM alias_inventory
+			WHERE provider_alias_id = ?
+		`, anonymousID).Scan(&dbEmail, &dbAccID)
+		if errQ != nil && !errors.Is(errQ, sql.ErrNoRows) {
+			return "", "", fmt.Errorf("query inventory alias for provider_alias_id %s failed: %w", anonymousID, errQ)
+		}
+		if errQ == nil {
+			if dbAccID != accountID {
+				return "", "", fmt.Errorf("providerAliasID %s belongs to account %s, not %s: %w", anonymousID, dbAccID, accountID, store.ErrAllocationConflict)
+			}
+			if dbEmail != "" {
+				email = strings.ToLower(dbEmail)
+			}
+		}
+	}
+	// 3. 若仍未命中，从上游远端列表拉取并解析（必须在远端操作前完成解析）
+	if email == "" {
+		aliases, lerr := b.ListAliases(accountID)
+		if lerr != nil {
+			return "", "", fmt.Errorf("list aliases from upstream for account %s failed: %w", accountID, lerr)
+		}
+		for _, al := range aliases {
+			if al.AnonymousID == anonymousID && al.Email != "" {
+				email = strings.ToLower(al.Email)
+				break
+			}
+		}
+	}
+	if email == "" {
+		return "", "", fmt.Errorf("unable to resolve email for providerAliasID %s on account %s", anonymousID, accountID)
+	}
+
+	return anonymousID, email, nil
+}
+
 // SetAliasActive 停用或激活别名。
 func (b *managerBackend) SetAliasActive(accountID, anonymousID string, active bool) (bool, error) {
+	accountID = strings.TrimSpace(accountID)
+	anonymousID = strings.TrimSpace(anonymousID)
+	if accountID == "" || anonymousID == "" {
+		return false, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "accountID 和 anonymousID 不能为空"}
+	}
+
+	// 远端修改前可靠解析 account_id、anonymousID、email；不能用 "_" 忽略错误，无法确认目标时上游调用次数必须为 0
+	resolvedAnonID, resolvedEmail, err := b.resolveAliasIdentifiers(accountID, anonymousID)
+	if err != nil {
+		return false, &BackendError{Status: http.StatusBadRequest, Code: "ALIAS_NOT_FOUND", Message: fmt.Sprintf("解析别名标识失败: %v", err)}
+	}
+	if resolvedAnonID == "" || resolvedEmail == "" {
+		return false, &BackendError{Status: http.StatusBadRequest, Code: "ALIAS_NOT_FOUND", Message: fmt.Sprintf("无法完整解析别名标识 (account=%s, identifier=%s)", accountID, anonymousID)}
+	}
+	targetAnonID := resolvedAnonID
+
 	var success bool
-	err := b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
+	err = b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
 		var opErr error
 		if active {
-			success, opErr = client.ReactivateHME(anonymousID)
+			success, opErr = client.ReactivateHME(targetAnonID)
 		} else {
-			success, opErr = client.DeactivateHME(anonymousID)
+			success, opErr = client.DeactivateHME(targetAnonID)
 		}
 		return opErr
 	})
@@ -283,11 +404,38 @@ func (b *managerBackend) SetAliasActive(accountID, anonymousID string, active bo
 		}
 		return false, classifyUpstreamErr(msg, err)
 	}
+	if !success {
+		msg := "停用操作未成功"
+		if active {
+			msg = "激活操作未成功"
+		}
+		return false, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILED", Message: msg}
+	}
+
 	if active {
 		_ = b.mgr.AdjustAliasCounts(accountID, 0, 1)
 	} else {
 		_ = b.mgr.AdjustAliasCounts(accountID, 0, -1)
 	}
+
+	if b.store != nil {
+		rState := store.RemoteInactive
+		if active {
+			rState = store.RemoteActive
+		}
+		if stErr := b.store.UpdateAliasRemoteState(accountID, targetAnonID, resolvedEmail, rState); stErr != nil {
+			opName := "停用"
+			if active {
+				opName = "激活"
+			}
+			return false, &BackendError{
+				Status:  http.StatusInternalServerError,
+				Code:    "STORE_SYNC_PENDING_RECONCILIATION",
+				Message: fmt.Sprintf("上游%s成功但本地库存状态同步失败 (待核对): %v", opName, stErr),
+			}
+		}
+	}
+
 	b.invalidateAliasCache(accountID)
 	return success, nil
 }
@@ -418,10 +566,26 @@ func (b *managerBackend) updateCachedAliasLabels(accountID string, anonymousIDs 
 
 // DeleteAlias 删除别名。
 func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
+	accountID = strings.TrimSpace(accountID)
+	anonymousID = strings.TrimSpace(anonymousID)
+	if accountID == "" || anonymousID == "" {
+		return &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "accountID 和 anonymousID 不能为空"}
+	}
+
+	// 删除前必须完成解析，不能删除后再依赖远端查找；不能用 "_" 忽略错误，无法确认目标时上游调用次数必须为 0
+	resolvedAnonID, resolvedEmail, err := b.resolveAliasIdentifiers(accountID, anonymousID)
+	if err != nil {
+		return &BackendError{Status: http.StatusBadRequest, Code: "ALIAS_NOT_FOUND", Message: fmt.Sprintf("解析别名标识失败: %v", err)}
+	}
+	if resolvedAnonID == "" || resolvedEmail == "" {
+		return &BackendError{Status: http.StatusBadRequest, Code: "ALIAS_NOT_FOUND", Message: fmt.Sprintf("无法完整解析别名标识 (account=%s, identifier=%s)", accountID, anonymousID)}
+	}
+	targetAnonID := resolvedAnonID
+
 	deltaActive := -1
 	if cached, ok := b.getCachedAliases(accountID); ok {
 		for _, al := range cached {
-			if al.AnonymousID == anonymousID {
+			if al.AnonymousID == targetAnonID || (resolvedEmail != "" && strings.EqualFold(al.Email, resolvedEmail)) {
 				if !al.Active {
 					deltaActive = 0
 				}
@@ -429,8 +593,8 @@ func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
 			}
 		}
 	}
-	err := b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
-		return client.Delete(anonymousID)
+	err = b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
+		return client.Delete(targetAnonID)
 	})
 	if err != nil {
 		if errors.Is(err, account.ErrHMEClientUnavailable) {
@@ -438,6 +602,16 @@ func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
 		}
 		return classifyUpstreamErr("删除失败", err)
 	}
+	if b.store != nil {
+		if stErr := b.store.UpdateAliasRemoteState(accountID, targetAnonID, resolvedEmail, store.RemoteDeleted); stErr != nil {
+			return &BackendError{
+				Status:  http.StatusInternalServerError,
+				Code:    "STORE_SYNC_PENDING_RECONCILIATION",
+				Message: fmt.Sprintf("上游删除成功但本地库存状态同步失败 (待核对): %v", stErr),
+			}
+		}
+	}
+
 	_ = b.mgr.AdjustAliasCounts(accountID, -1, deltaActive)
 	b.invalidateAliasCache(accountID)
 	return nil

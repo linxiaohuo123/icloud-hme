@@ -65,7 +65,7 @@ func setupV2TestEnv(t *testing.T) (*Server, *store.Store, *fakeBackend, *httptes
 		Status:       "allocated",
 		AllocatedAt:  time.Now().Format(time.RFC3339),
 	}
-	if err := st.RecordAllocation(alloc, "v06_bot"); err != nil {
+	if _, err := st.RecordAllocation(alloc, "v06_bot"); err != nil {
 		t.Fatalf("RecordAllocation failed: %v", err)
 	}
 

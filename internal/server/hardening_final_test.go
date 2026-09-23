@@ -36,6 +36,9 @@ func TestPR08_FinalHardening_TokenIdentityIsolation(t *testing.T) {
 	}
 	defer st.Close()
 
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '["default"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+
 	fb := &fakeBackend{
 		accounts: []account.Summary{
 			{ID: "acc_1", Status: "active", HasCookies: true, Tags: []string{"default"}},
@@ -46,6 +49,7 @@ func TestPR08_FinalHardening_TokenIdentityIsolation(t *testing.T) {
 		AdminPassword: "admin-pass-2026-strong",
 	}
 	s := newWithBackendAndStore(fb, cfg, st)
+	defer s.Close()
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 
@@ -625,7 +629,11 @@ func TestP1A_StatsAvailableAliasesUsesAuthoritativeInventory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	_, err = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// 添加 2 个 active & available 别名
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "auth1@icloud.com", Active: true}, "replenish", true)
@@ -638,7 +646,8 @@ func TestP1A_StatsAvailableAliasesUsesAuthoritativeInventory(t *testing.T) {
 		},
 	}
 
-	_, ts := newTestServerWithStore(fb, st)
+	s, ts := newTestServerWithStore(fb, st)
+	defer s.Close()
 	defer ts.Close()
 
 	cookie, _ := login(t, ts, "admin-pass-2026-strong")

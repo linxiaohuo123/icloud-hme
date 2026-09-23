@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 database/sql, fmt, errors, strings, time, icloud-hme/internal/hme
- * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation 模型及 initInventorySchema, migrateInventory, AddInventoryAlias, GetInventoryAlias, SyncAliasInventory, CountAuthoritativeAvailableAliases
+ * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation 模型及 initInventorySchema, migrateInventory, AddInventoryAlias, GetInventoryAlias, SyncAliasInventory, CountAuthoritativeAvailableAliases, UpdateAliasRemoteState
  * [POS]: internal/store 的别名库存实体与迁移定义层，维护 alias_inventory, alias_allocations, operations 表结构与元数据
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -26,6 +26,8 @@ var (
 	ErrOperationPending = errors.New("operation is pending")
 	// ErrAllocationNotFound 未找到分配记录
 	ErrAllocationNotFound = errors.New("allocation not found")
+	// ErrAllocationConflict 别名已归属于其他主体或历史分配冲突
+	ErrAllocationConflict = errors.New("allocation conflict: email already allocated")
 	// ErrVerificationRequestNotFound 未找到取码任务记录
 	ErrVerificationRequestNotFound = errors.New("verification request not found")
 )
@@ -268,41 +270,76 @@ func (s *Store) initInventorySchema() error {
 	return nil
 }
 
-// ReconcileAvailableInventory 将处于 unknown 状态且从未被分配给任何主体的活跃存量别名激活为 available 可用库存 (严格排除受保护私有账号)
+// ReconcileAvailableInventory 安全收敛库存状态：严禁无凭据激活 unknown 存量别名，隔离保护账号与孤儿资产
 func (s *Store) ReconcileAvailableInventory() (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(`
-		UPDATE alias_inventory
-		SET allocation_state = 'available',
-		    remote_state = 'active'
-		WHERE allocation_state = 'unknown'
-		  AND account_id NOT IN (
-		      SELECT id FROM accounts 
-		      WHERE tags LIKE '%"personal"%' 
-		         OR tags LIKE '%"private"%' 
-		         OR tags LIKE '%"protected"%'
-		         OR name LIKE '%大号%'
-		  )
-		  AND email NOT IN (SELECT alias_email FROM alias_allocations)
-	`)
-	if err != nil {
-		return 0, err
-	}
-	// 同时将受保护账号的非已分配别名归纳为 reserved 保护状态，杜绝误入可用库存
-	_, _ = s.db.Exec(`
+
+	var totalAffected int64
+
+	// 1. 将属于受保护账号的非已分配别名归纳为 reserved 保护状态，杜绝误入可用库存
+	resProt, err := s.db.Exec(`
 		UPDATE alias_inventory
 		SET allocation_state = 'reserved'
 		WHERE allocation_state IN ('unknown', 'available')
 		  AND account_id IN (
 		      SELECT id FROM accounts 
-		      WHERE tags LIKE '%"personal"%' 
-		         OR tags LIKE '%"private"%' 
-		         OR tags LIKE '%"protected"%'
-		         OR name LIKE '%大号%'
+		      WHERE name LIKE '%大号%'
+		         OR (
+		             CASE 
+		                 WHEN json_valid(tags) THEN EXISTS (
+		                     SELECT 1 FROM json_each(tags) 
+		                     WHERE LOWER(TRIM(value)) IN ('personal', 'private', 'protected')
+		                 )
+		                 ELSE (
+		                     tags LIKE '%"personal"%' COLLATE NOCASE OR
+		                     tags LIKE '%"private"%' COLLATE NOCASE OR
+		                     tags LIKE '%"protected"%' COLLATE NOCASE OR
+		                     tags LIKE '%personal%' COLLATE NOCASE OR
+		                     tags LIKE '%private%' COLLATE NOCASE OR
+		                     tags LIKE '%protected%' COLLATE NOCASE
+		                 )
+		             END
+		         )
 		  )
 	`)
-	return res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := resProt.RowsAffected(); n > 0 {
+		totalAffected += n
+	}
+
+	// 2. 账号缺失(孤儿资产)：account_id 在 accounts 表中不存在时，收敛隔离为 quarantined
+	// 无论当前系统中是否存在其他账号，孤儿资产均必须隔离
+	resOrphan, err := s.db.Exec(`
+		UPDATE alias_inventory
+		SET allocation_state = 'quarantined'
+		WHERE allocation_state IN ('unknown', 'available')
+		  AND (account_id IS NULL OR account_id = '' OR account_id NOT IN (SELECT id FROM accounts))
+	`)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := resOrphan.RowsAffected(); n > 0 {
+		totalAffected += n
+	}
+
+	// 3. 历史已分配别名收敛：确保已有 allocation 记录的资产必定处于 allocated
+	resAlloc, err := s.db.Exec(`
+		UPDATE alias_inventory
+		SET allocation_state = 'allocated'
+		WHERE allocation_state != 'allocated'
+		  AND email IN (SELECT alias_email FROM alias_allocations)
+	`)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := resAlloc.RowsAffected(); n > 0 {
+		totalAffected += n
+	}
+
+	return totalAffected, nil
 }
 
 func (s *Store) migrateInventory() error {
@@ -429,7 +466,7 @@ func (s *Store) SyncAliasInventory(accountID string, aliases []hme.Alias) error 
 	stmt, err := tx.Prepare(`
 		INSERT INTO alias_inventory (
 			email, account_id, provider_alias_id, remote_state, allocation_state, source_type, last_verified_at, snapshot_version
-		) VALUES (?, ?, ?, ?, 'available', 'synced', ?, 1)
+		) VALUES (?, ?, ?, ?, 'unknown', 'synced', ?, 1)
 		ON CONFLICT(email) DO UPDATE SET
 			remote_state = excluded.remote_state,
 			provider_alias_id = excluded.provider_alias_id,
@@ -481,5 +518,192 @@ func (s *Store) QuarantineInventoryForAccount(accountID string) error {
 		WHERE account_id = ?
 	`, accountID)
 	return err
+}
+
+// QuarantineInventoryAlias 将指定未成功分配的现场建号或暂存别名隔离为 quarantined，杜绝成为公共 available。
+func (s *Store) QuarantineInventoryAlias(email string) error {
+	email = strings.TrimSpace(strings.ToLower(email))
+	if email == "" {
+		return errors.New("empty email")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`
+		UPDATE alias_inventory
+		SET allocation_state = 'quarantined'
+		WHERE email = ? AND allocation_state IN ('unknown', 'available')
+	`, email)
+	return err
+}
+
+// UpdateAliasRemoteState 更新指定别名的远端状态与对应的本地分配资格 (PR-08 工作包 C1)。
+// 停用：remote_state = 'inactive' (不可被认领分配)。
+// 删除：remote_state = 'deleted'，若原为 available 则置为 quarantined。
+// 激活：remote_state = 'active'；注意：绝不改变已有的 allocation_state (已分配/保留/隔离不可退回 available)。
+// 约束：
+// 1. account_id、email、providerAliasID 形成唯一一致绑定；
+// 2. 两个标识都非空时必须一致，不能 OR 命中任意不同对象；
+// 3. provider ID 缺失时仅凭可靠映射证据回填，已有非空 ID 与输入冲突时拒绝且不能覆盖；
+// 4. 本地更新在显式事务中执行，RowsAffected 不为 1 时显式回滚，零匹配/多匹配/账号不符全部明确失败。
+func (s *Store) UpdateAliasRemoteState(accountID, providerAliasID, email string, remoteState RemoteState) error {
+	accountID = strings.TrimSpace(accountID)
+	providerAliasID = strings.TrimSpace(providerAliasID)
+	email = strings.TrimSpace(strings.ToLower(email))
+
+	if accountID == "" {
+		return errors.New("accountID cannot be empty")
+	}
+	if providerAliasID == "" && email == "" {
+		return errors.New("cannot update alias remote state: neither providerAliasID nor email provided")
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var targetEmail string
+
+	if email != "" && providerAliasID != "" {
+		// 两个标识都非空时必须形成唯一一致绑定
+		var emailRow struct {
+			email     string
+			accountID string
+			provID    sql.NullString
+		}
+		errEmail := tx.QueryRow(`
+			SELECT email, account_id, provider_alias_id
+			FROM alias_inventory
+			WHERE email = ?
+		`, email).Scan(&emailRow.email, &emailRow.accountID, &emailRow.provID)
+
+		var idRow struct {
+			email     string
+			accountID string
+			provID    string
+		}
+		errID := tx.QueryRow(`
+			SELECT email, account_id, provider_alias_id
+			FROM alias_inventory
+			WHERE provider_alias_id = ?
+		`, providerAliasID).Scan(&idRow.email, &idRow.accountID, &idRow.provID)
+
+		if errEmail != nil && !errors.Is(errEmail, sql.ErrNoRows) {
+			return fmt.Errorf("query by email failed: %w", errEmail)
+		}
+		if errID != nil && !errors.Is(errID, sql.ErrNoRows) {
+			return fmt.Errorf("query by providerAliasID failed: %w", errID)
+		}
+
+		if errors.Is(errEmail, sql.ErrNoRows) && errors.Is(errID, sql.ErrNoRows) {
+			return fmt.Errorf("no inventory alias found matching id=%s or email=%s", providerAliasID, email)
+		}
+
+		// 检查两条记录是否指向不同的库存资产 (冲突)
+		if errEmail == nil && errID == nil {
+			if !strings.EqualFold(emailRow.email, idRow.email) {
+				return fmt.Errorf("identity conflict: providerAliasID %s belongs to %s, but input email is %s", providerAliasID, idRow.email, email)
+			}
+		}
+
+		if errEmail == nil {
+			if emailRow.accountID != accountID {
+				return fmt.Errorf("account mismatch for alias %s: expected %s, got %s", email, accountID, emailRow.accountID)
+			}
+			if emailRow.provID.Valid && emailRow.provID.String != "" && emailRow.provID.String != providerAliasID {
+				return fmt.Errorf("providerAliasID conflict for alias %s: existing %s != input %s", email, emailRow.provID.String, providerAliasID)
+			}
+			targetEmail = emailRow.email
+		} else if errID == nil {
+			if idRow.accountID != accountID {
+				return fmt.Errorf("account mismatch for providerAliasID %s: expected %s, got %s", providerAliasID, accountID, idRow.accountID)
+			}
+			if !strings.EqualFold(idRow.email, email) {
+				return fmt.Errorf("identity conflict: providerAliasID %s belongs to %s, but input email is %s", providerAliasID, idRow.email, email)
+			}
+			targetEmail = idRow.email
+		}
+	} else if email != "" {
+		// 仅提供 email
+		var dbAccID string
+		errQ := tx.QueryRow(`
+			SELECT account_id
+			FROM alias_inventory
+			WHERE email = ?
+		`, email).Scan(&dbAccID)
+		if errQ != nil {
+			if errors.Is(errQ, sql.ErrNoRows) {
+				return fmt.Errorf("no inventory alias found for email %s", email)
+			}
+			return fmt.Errorf("query by email failed: %w", errQ)
+		}
+		if dbAccID != accountID {
+			return fmt.Errorf("account mismatch for alias %s: expected %s, got %s", email, accountID, dbAccID)
+		}
+		targetEmail = email
+	} else {
+		// 仅提供 providerAliasID
+		rows, errQ := tx.Query(`
+			SELECT email, account_id
+			FROM alias_inventory
+			WHERE provider_alias_id = ?
+		`, providerAliasID)
+		if errQ != nil {
+			return fmt.Errorf("query by providerAliasID failed: %w", errQ)
+		}
+		defer rows.Close()
+
+		var matchedEmails []string
+		for rows.Next() {
+			var mEmail, mAccID string
+			if err := rows.Scan(&mEmail, &mAccID); err != nil {
+				return err
+			}
+			if mAccID != accountID {
+				return fmt.Errorf("account mismatch for providerAliasID %s: expected %s, got %s", providerAliasID, accountID, mAccID)
+			}
+			matchedEmails = append(matchedEmails, mEmail)
+		}
+		if len(matchedEmails) == 0 {
+			return fmt.Errorf("no inventory alias found for providerAliasID %s on account %s", providerAliasID, accountID)
+		}
+		if len(matchedEmails) > 1 {
+			return fmt.Errorf("ambiguous inventory update: %d rows matched providerAliasID %s", len(matchedEmails), providerAliasID)
+		}
+		targetEmail = matchedEmails[0]
+	}
+
+	res, err := tx.Exec(`
+		UPDATE alias_inventory
+		SET remote_state = ?,
+		    allocation_state = CASE 
+		        WHEN ? = 'deleted' AND allocation_state = 'available' THEN 'quarantined'
+		        ELSE allocation_state 
+		    END,
+		    provider_alias_id = CASE
+		        WHEN (provider_alias_id = '' OR provider_alias_id IS NULL) AND ? != '' THEN ?
+		        ELSE provider_alias_id
+		    END,
+		    last_verified_at = ?
+		WHERE account_id = ? AND email = ?
+	`, string(remoteState), string(remoteState), providerAliasID, providerAliasID, now, accountID, targetEmail)
+	if err != nil {
+		return err
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("expected 1 row affected updating alias %s, got %d", targetEmail, rows)
+	}
+
+	return tx.Commit()
 }
 

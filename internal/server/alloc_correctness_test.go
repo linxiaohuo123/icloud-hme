@@ -8,14 +8,18 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"icloud-hme/internal/account"
+	"icloud-hme/internal/auth"
 	"icloud-hme/internal/hme"
 	"icloud-hme/internal/store"
 )
@@ -25,6 +29,9 @@ func setupAllocTestServer(t *testing.T) (*store.Store, *fakeBackend, *httptest.S
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '["default"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
 
 	fb := &fakeBackend{
 		accounts: []account.Summary{
@@ -527,6 +534,11 @@ func TestAllocation_NoTaggedAccountsDoesNotFallBackGlobal(t *testing.T) {
 	}
 	defer st.Close()
 
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_finance', 'Finance Acc', 'fin@test.com', 'active', '["finance"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_default', 'Default Acc', 'def@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+
 	// 账号配置:
 	// acc_finance: 标签 ["finance"], 库存 10 个
 	// acc_default: 标签 [] (公共未标记), 库存 10 个
@@ -538,6 +550,7 @@ func TestAllocation_NoTaggedAccountsDoesNotFallBackGlobal(t *testing.T) {
 	}
 	cfg := Config{Debug: false, AdminPassword: "admin"}
 	s := newWithBackendAndStore(fb, cfg, st)
+	defer s.Close()
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 
@@ -614,12 +627,16 @@ func TestIdempotency_FailedPoolEmptyReplaysSameError(t *testing.T) {
 	}
 	defer st.Close()
 
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+
 	fb := &fakeBackend{
 		accounts: []account.Summary{
 			{ID: "acc_1", Status: "active", HasAppPassword: true, Tags: []string{}},
 		},
 	}
 	s := newWithBackendAndStore(fb, Config{AdminPassword: "admin"}, st)
+	defer s.Close()
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 
@@ -726,4 +743,140 @@ func TestIdempotency_FailedPoolEmptyReplaysSameError(t *testing.T) {
 		t.Fatalf("IDEMP-03 幂等重放未返回相同结果: 首次=%+v, 第二次=%+v", succ1Out.Data, succ2Out.Data)
 	}
 }
+
+// 确定性测试：现场创建结果不得提前暴露为公共 available 库存
+// 使用同步屏障：
+// 1. 让请求 A 暂停在新建结果登记之后、RecordAllocation 之前；
+// 2. 此时请求 B 领取，B 不能取得 A 正在绑定的邮箱；
+// 3. 再注入 A 入账失败，确认邮箱不会成为公共 available。
+func TestAllocate_NewlyCreatedAliasNotPrematurelyExposedToPool(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_demand', 'Demand Account', 'demand@test.com', 'active', '["default"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+
+	createdTarget := "newly_created_a@icloud.com"
+	fb := &fakeBackend{
+		accounts: []account.Summary{
+			{ID: "acc_demand", Status: "active", HasCookies: true, Tags: []string{"default"}},
+		},
+		created: &hme.CreateResult{
+			Email:       createdTarget,
+			AnonymousID: "anon_demand_a",
+			Label:       "for-request-a",
+		},
+	}
+
+	service := NewAliasAllocationService(st, fb, nil)
+
+	stepBarrier := make(chan struct{})
+	resumeChan := make(chan struct{})
+
+	// 注册同步屏障：在新建结果登记之后、RecordAllocation 之前暂停请求 A
+	service.beforeRecordAllocationHook = func(email string) {
+		close(stepBarrier) // 通知主协程：A 已经完成了新建结果登记入库，正停在 RecordAllocation 之前
+		<-resumeChan       // 阻塞等待主协程指令
+	}
+
+	ctx := context.Background()
+	adminPrincipal := auth.Principal{Kind: auth.PrincipalAdmin, ID: "admin_user"}
+	tokenPrincipal := auth.Principal{Kind: auth.PrincipalToken, ID: "tok_consumer", Scopes: []string{"allocate"}}
+	_ = st.SaveToken(store.APIToken{ID: "tok_consumer", Name: "tok_consumer", Token: "sec_consumer", Scopes: "allocate"})
+
+	// 1. 启动请求 A (现场创号)
+	errAChan := make(chan error, 1)
+	resAChan := make(chan *AllocationResult, 1)
+	go func() {
+		res, errA := service.Allocate(ctx, adminPrincipal, AllocationRequest{
+			Tag:   "default",
+			Mode:  "create",
+			Label: "label-a",
+		})
+		errAChan <- errA
+		resAChan <- res
+	}()
+
+	// 等待 A 达到同步屏障 (已完成 AddInventoryAlias, 未执行 RecordAllocation)
+	select {
+	case <-stepBarrier:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for request A to reach synchronization barrier")
+	}
+
+	// 验证：此时该邮箱在数据库中必须为 unknown 状态，绝不可为 available
+	invDuringA, err := st.GetInventoryAlias(createdTarget)
+	if err != nil {
+		t.Fatalf("failed to query inventory alias: %v", err)
+	}
+	if invDuringA.AllocationState != "unknown" || invDuringA.SourceType != "created" {
+		t.Fatalf("expected allocation_state unknown and source_type created during A's in-flight allocation, got state=%s, source=%s",
+			invDuringA.AllocationState, invDuringA.SourceType)
+	}
+
+	// 2. 此时并发请求 B 尝试认领库存
+	resB, errB := service.Allocate(ctx, tokenPrincipal, AllocationRequest{
+		Tag:  "default",
+		Mode: "pool",
+	})
+	// 断言：B 绝不能取得 A 正在绑定的邮箱
+	if resB != nil && strings.EqualFold(resB.Allocation.AliasEmail, createdTarget) {
+		t.Fatalf("CRITICAL SECURITY VIOLATION: Consumer B claimed in-flight alias %s being allocated by A!", createdTarget)
+	}
+	// 因为池中无可用库存，B 必须返回 ErrPoolEmpty
+	if !errors.Is(errB, ErrPoolEmpty) {
+		t.Fatalf("expected ErrPoolEmpty for consumer B, got: %v", errB)
+	}
+
+	// 3. 注入 A 入账失败：通过预先在 alias_allocations 中插入冲突归属，使 A 的 RecordAllocation 失败
+	_, err = st.DB().Exec(`
+		INSERT INTO alias_allocations (allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status)
+		VALUES ('alloc_conflict_mock', ?, 'acc_demand', 'other_owner', 'other_id', 'default', '2026-09-20T00:00:00Z', 'allocated')
+	`, createdTarget)
+	if err != nil {
+		t.Fatalf("failed to inject conflict: %v", err)
+	}
+
+	// 放行请求 A 执行 RecordAllocation
+	close(resumeChan)
+
+	// 等待 A 退出并捕获其失败
+	select {
+	case errA := <-errAChan:
+		if errA == nil {
+			t.Fatal("expected request A to fail on RecordAllocation conflict, but got nil")
+		}
+		_ = <-resAChan
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for request A to complete")
+	}
+
+	// 4. 确认入账失败后，邮箱被隔离，绝不会成为公共 available
+	invAfterFail, err := st.GetInventoryAlias(createdTarget)
+	if err != nil {
+		t.Fatalf("failed to query inventory alias after failure: %v", err)
+	}
+	if invAfterFail.AllocationState == "available" {
+		t.Fatalf("CRITICAL: alias %s became available after allocation failure!", createdTarget)
+	}
+	if invAfterFail.AllocationState != "quarantined" {
+		t.Fatalf("expected allocation_state to be quarantined after allocation failure, got: %s", invAfterFail.AllocationState)
+	}
+
+	// 再次让请求 B 尝试认领，确认依然无法认领该邮箱
+	resB2, errB2 := service.Allocate(ctx, tokenPrincipal, AllocationRequest{
+		Tag:  "default",
+		Mode: "pool",
+	})
+	if resB2 != nil {
+		t.Fatalf("expected no allocation for B, got: %+v", resB2)
+	}
+	if !errors.Is(errB2, ErrPoolEmpty) {
+		t.Fatalf("expected ErrPoolEmpty for consumer B, got: %v", errB2)
+	}
+}
+
 

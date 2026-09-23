@@ -162,10 +162,11 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 			// 严禁在补货时创建 consumer allocation / lease，确保普通出号能原子认领
 			if st != nil {
 				if addErr := st.AddInventoryAlias(accountID, hme.Alias{
-					Email:     res.Email,
-					Label:     res.Label,
-					CreatedAt: res.CreatedAt,
-					Active:    true,
+					Email:       res.Email,
+					AnonymousID: res.AnonymousID,
+					Label:       res.Label,
+					CreatedAt:   res.CreatedAt,
+					Active:      true,
 				}, "replenish", true); addErr != nil {
 					log.Printf("[Scheduler] 补货入库失败 email=%s: %v", res.Email, addErr)
 					return nil, fmt.Errorf("补货入库持久化失败 email=%s: %w", res.Email, addErr)
@@ -178,7 +179,7 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 	if st != nil {
 		notifier.UpdateSettings(s.loadNotifySettings())
 		if n, err := st.ReconcileAvailableInventory(); err == nil && n > 0 {
-			log.Printf("[Server] 存量库存对齐完成: 已激活 %d 个未分配存量别名入号池", n)
+			log.Printf("[Server] 存量库存安全对齐完成: 已隔离/收敛 %d 个受保护或异常别名", n)
 		}
 	}
 	// 生产后端拉取到别名列表时自动登记「别名 → 母号」路由，

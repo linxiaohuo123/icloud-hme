@@ -19,10 +19,11 @@ import (
 )
 
 type quickCreateReq struct {
-	AccountID string `json:"account_id"`
-	Label     string `json:"label"`
-	Tag       string `json:"tag"`
-	Mode      string `json:"mode"` // "pool" (默认池优先) | "pool_only" (仅池化) | "create" (强制现场新建)
+	AccountID      string `json:"account_id"`
+	Label          string `json:"label"`
+	Tag            string `json:"tag"`
+	Mode           string `json:"mode"` // "pool" (默认池优先) | "pool_only" (仅池化) | "create" (强制现场新建)
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 // selectAccountCandidates 根据业务标签与小时配额筛选候选母号列表 (用于现场新建别名场景)。
@@ -37,9 +38,9 @@ func selectAccountCandidates(accounts []account.Summary, tag string, st *store.S
 	tag = strings.TrimSpace(strings.ToLower(tag))
 	var candidates []account.Summary
 
-	if tag != "" {
+	if tag != "" && tag != "default" {
 		for _, acc := range accounts {
-			if acc.Status == "active" && acc.HasCookies && acc.AliasTotal < account.MaxAliasesPerAccount && acc.AliasActive < account.MaxAliasesPerAccount {
+			if acc.Status == "active" && acc.HasCookies && !account.IsProtectedAccount(acc.Name, acc.Tags) && acc.AliasTotal < account.MaxAliasesPerAccount && acc.AliasActive < account.MaxAliasesPerAccount {
 				for _, t := range acc.Tags {
 					if strings.EqualFold(t, tag) {
 						candidates = append(candidates, acc)
@@ -50,11 +51,20 @@ func selectAccountCandidates(accounts []account.Summary, tag string, st *store.S
 		}
 	}
 
-	// 回退到公共账号池 (未打任何业务标签的账号)
+	// 回退到通用公共账号池 (未打任何业务标签的账号或标为 default 的账号，且严格排除受保护账号，绝不跨业务借用其它业务标签账号)
 	if len(candidates) == 0 {
 		for _, acc := range accounts {
-			if acc.Status == "active" && acc.HasCookies && len(acc.Tags) == 0 && acc.AliasTotal < account.MaxAliasesPerAccount && acc.AliasActive < account.MaxAliasesPerAccount {
-				candidates = append(candidates, acc)
+			if acc.Status == "active" && acc.HasCookies && !account.IsProtectedAccount(acc.Name, acc.Tags) && acc.AliasTotal < account.MaxAliasesPerAccount && acc.AliasActive < account.MaxAliasesPerAccount {
+				if len(acc.Tags) == 0 {
+					candidates = append(candidates, acc)
+					continue
+				}
+				for _, t := range acc.Tags {
+					if strings.EqualFold(t, "default") {
+						candidates = append(candidates, acc)
+						break
+					}
+				}
 			}
 		}
 	}
@@ -106,14 +116,14 @@ func selectAccountCandidates(accounts []account.Summary, tag string, st *store.S
 	return res
 }
 
-// selectPoolAccounts 筛选适合从别名池领号的母号 (对齐业务标签隔离；具备凭据；不受 500 上限限制因为已有别名无需新建)。
+// selectPoolAccounts 筛选适合从别名池领号的母号 (对齐业务标签隔离；具备凭据；排除受保护账号；不受 500 上限限制因为已有别名无需新建)。
 func selectPoolAccounts(accounts []account.Summary, tag string) []string {
 	tag = strings.TrimSpace(strings.ToLower(tag))
 	matched := make([]string, 0)
 
 	if tag != "" && tag != "default" {
 		for _, acc := range accounts {
-			if acc.Status == "active" && (acc.HasCookies || acc.HasAppPassword) {
+			if acc.Status == "active" && (acc.HasCookies || acc.HasAppPassword) && !account.IsProtectedAccount(acc.Name, acc.Tags) {
 				for _, t := range acc.Tags {
 					if strings.EqualFold(t, tag) {
 						matched = append(matched, acc.ID)
@@ -126,9 +136,9 @@ func selectPoolAccounts(accounts []account.Summary, tag string) []string {
 		return matched
 	}
 
-	// tag == "" 或 tag == "default": 公共未打标账号或显式标为 default 的账号 (TAG-03)
+	// tag == "" 或 tag == "default": 公共未打标账号或显式标为 default 的账号 (TAG-03，严格排除受保护账号)
 	for _, acc := range accounts {
-		if acc.Status == "active" && (acc.HasCookies || acc.HasAppPassword) {
+		if acc.Status == "active" && (acc.HasCookies || acc.HasAppPassword) && !account.IsProtectedAccount(acc.Name, acc.Tags) {
 			if len(acc.Tags) == 0 {
 				matched = append(matched, acc.ID)
 				continue
@@ -187,14 +197,25 @@ func (s *Server) quickCreateHandler(c *gin.Context) {
 		return
 	}
 
+	if req.IdempotencyKey == "" {
+		req.IdempotencyKey = c.GetHeader("X-Idempotency-Key")
+	}
+	if req.IdempotencyKey == "" {
+		req.IdempotencyKey = c.GetHeader("Idempotency-Key")
+	}
+	if req.IdempotencyKey == "" {
+		req.IdempotencyKey = c.Query("idempotency_key")
+	}
+
 	p, _ := getPrincipal(c)
 
 	// 统一调用 AliasAllocationService 单一真相源出号
 	allocRes, err := s.allocService.Allocate(c.Request.Context(), p, AllocationRequest{
-		Tag:       req.Tag,
-		Label:     req.Label,
-		AccountID: req.AccountID,
-		Mode:      req.Mode,
+		Tag:            req.Tag,
+		Label:          req.Label,
+		AccountID:      req.AccountID,
+		Mode:           req.Mode,
+		IdempotencyKey: req.IdempotencyKey,
 	})
 
 	if err != nil {

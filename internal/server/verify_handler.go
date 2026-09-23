@@ -22,7 +22,7 @@ import (
 //
 //	email (必须): 待接收验证码的别名邮箱
 //	timeout (可选): 最大等待秒数, 默认 30, 上限 120
-//	auto_delete (可选): 成功后是否自动在后台停用该别名以释放配额, 默认 false
+//	auto_delete: 已废弃并明确拒绝 (传入返回 400 UNSUPPORTED_PARAMETER)
 func (s *Server) verifyCodeHandler(c *gin.Context) {
 	email := strings.ToLower(strings.TrimSpace(c.Query("email")))
 	if email == "" {
@@ -78,22 +78,18 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 
 	select {
 	case item := <-ch:
-		// 【PR-04】长轮询唤醒后、完成交付前复查令牌状态 (防止等待期间令牌被撤销)
+		// 【PR-04/C3】长轮询唤醒后、完成交付前基于认证的主体 p.ID 复查令牌状态 (无需重新解析请求头)
 		if p.Kind == auth.PrincipalToken && s.store != nil {
-			reqKey := c.GetHeader("X-API-Key")
-			if reqKey == "" {
-				authHeader := c.GetHeader("Authorization")
-				if strings.HasPrefix(authHeader, "Bearer ") {
-					reqKey = strings.TrimPrefix(authHeader, "Bearer ")
-				}
-			}
-			if _, _, _, ok := s.store.ValidateTokenPrincipal(reqKey); !ok {
+			tok, tokErr := s.store.GetToken(c.Request.Context(), p.ID)
+			if tokErr != nil || tok == nil {
 				failCode(c, http.StatusUnauthorized, "REVOKED_TOKEN", "令牌已被撤销")
 				return
 			}
 		}
-		// 成功返回后原子消费清除该别名缓存，杜绝后续重发验证码或二次登录误采陈旧历史 OTP
-		s.eventBus.ConsumeCache(email)
+		// 【C3】精准消费采用的事件 ID，绝不整桶清除更晚到达的其它新事件
+		if item != nil && item.EventID != "" {
+			s.eventBus.ConsumeEvent(email, item.EventID)
+		}
 		ok(c, gin.H{
 			"email":      email,
 			"code":       item.OTP.Code,
@@ -107,32 +103,5 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 		failCode(c, http.StatusRequestTimeout, "VERIFY_TIMEOUT", "等待验证码超时")
 	case <-c.Request.Context().Done():
 		return
-	}
-}
-
-// autoDeactivateAlias 后台查找别名并停用以释放配额。
-func (s *Server) autoDeactivateAlias(accountID, email string) {
-	if accountID == "" && s.syncWorker != nil {
-		accountID = s.syncWorker.GetAliasAccount(email)
-	}
-	if accountID == "" && s.store != nil {
-		if accID, ok := s.store.FindAliasRoute(email); ok {
-			accountID = accID
-		} else if accID, ok := s.store.FindLeaseAccount(email); ok {
-			accountID = accID
-		}
-	}
-	if accountID == "" {
-		return
-	}
-	aliases, err := s.be.ListAliases(accountID)
-	if err != nil {
-		return
-	}
-	for _, a := range aliases {
-		if strings.EqualFold(a.Email, email) && a.Active {
-			_, _ = s.be.SetAliasActive(accountID, a.AnonymousID, false)
-			return
-		}
 	}
 }

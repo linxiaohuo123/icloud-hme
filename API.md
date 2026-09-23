@@ -640,24 +640,25 @@ Authorization: Bearer <API_KEY>
 }
 ```
 
-### 22. 极速提取验证码与激活链接 (注册机专属长轮询)
+### 22. 验证码提取 (旧版兼容端点)
 
 ```http
-GET /api/verify-code?email=target@icloud.com&timeout=30&auto_delete=true
+GET /api/verify-code?email=target@icloud.com&timeout=30
 # 兼容外部分销路由：
-# GET /api/external/v1/verify-code?email=target@icloud.com&timeout=30&auto_delete=true
+# GET /api/external/v1/verify-code?email=target@icloud.com&timeout=30
 Authorization: Bearer <API_KEY> # 或 Bearer <EXTERNAL_TOKEN>
 ```
 
-**核心工作机制：**
-- **零延迟内存事件管道**：通过 `MailEventBus` 纯内存订阅，新邮件到达后**毫秒级推送到阻塞连接**直接返回，无须轮询数据库。
-- **智能提取能力**：自动正则提取 4–8 位纯数字验证码与 Magic Link 激活确认链接。
-- **`auto_delete=true` 自动闭环回收**：命中并返回验证码后，系统自动在后台异步停用该别名，即刻释放 Apple 750 别名配额，实现无需人工介入的无限循环注册！
-- **参数说明**：
-  - `email`（必填，亦兼容 `alias`）：待收件的别名地址。
-  - `timeout`（可选）：最大挂起秒数，默认 30 秒，上限 120 秒。超时返回 `408 VERIFY_TIMEOUT`。
-  - `auto_delete`（可选）：布尔值，默认 `false`。
-  - `fresh` 或 `nocache`（可选）：布尔值，默认 `false`。传 `true` 时跳过本地近期缓存，严格等待最新抵达的邮件，适用于平台二次重发验证码场景。
+**参数说明**：
+- `email`（必填，亦兼容 `alias`）：待收件的别名地址。
+- `timeout`（可选）：最大挂起秒数，默认 30 秒，上限 120 秒。超时返回 `408 VERIFY_TIMEOUT`。
+- `fresh` 或 `nocache`（可选）：布尔值，默认 `false`。传 `true` 时仅跳过本地近期内存缓存，**但不是严格的 IMAP 邮件基线保证**。需要严格基线保证的新客户端请使用 v2 端点。
+- `auto_delete`：**明确不支持并会被拒绝**。传入 `auto_delete=true` 或 `1` 会直接返回 `400 UNSUPPORTED_PARAMETER` 错误。依据 RFC 9110 规范，HTTP GET 必须具备安全/无副作用语义，严禁通过 GET 查询操作导致别名被隐式停用。
+
+> **关于别名停用与配额说明**：
+> - 停用别名必须由具备管理员权限的会话显式调用管理接口 `POST /api/aliases/:id/deactivate`；普通 `allocate,verify` 令牌不具备停用接口权限，且系统不提供外部令牌的租约停用能力。
+> - 在 Apple 侧停用别名仅代表停止该别名的邮件转发，**不保证**上游必定释放创建总额度，系统严禁声称可通过停用实现无限循环创建。
+> - 项目中的 `MaxAliasesPerAccount`（750）为本系统的内部安全防护与观测阈值，并非 Apple 官方的 SLA 承诺。
 
 **命中成功响应：**
 ```json
@@ -671,6 +672,94 @@ Authorization: Bearer <API_KEY> # 或 Bearer <EXTERNAL_TOKEN>
     "from": "no-reply@example.com",
     "date": "2026-09-20T14:38:00+08:00",
     "account_id": "acc_1"
+  }
+}
+```
+
+### 22.1 推荐方案：v2 规范化出号与权威取码链路 (新客户端首选)
+
+针对注册机、自动化客户端以及高可靠业务系统，推荐使用具备**显式幂等保障、主体资源隔离与严格 IMAP 邮件基线**的 v2 接口套件：
+
+#### 步骤 1：规范化出号认领 (POST /api/external/v2/allocate)
+必须携带 `Idempotency-Key` 请求头（防止网络抖动导致的重复出号）：
+```http
+POST /api/external/v2/allocate
+Authorization: Bearer <TOKEN>
+Idempotency-Key: task_unique_key_001
+Content-Type: application/json
+
+{
+  "tag": "default",
+  "label": "AutoTask"
+}
+```
+**响应：**
+```json
+{
+  "success": true,
+  "data": {
+    "lease_id": "alloc_6f8b2a1c...",
+    "allocation_id": "alloc_6f8b2a1c...",
+    "email": "fresh_alias@icloud.com",
+    "alias_email": "fresh_alias@icloud.com",
+    "account_id": "acc_1",
+    "operation_id": "op_9c72e1...",
+    "source": "pool",
+    "status": "allocated",
+    "allocated_at": "2026-09-23T10:00:00Z"
+  }
+}
+```
+> **字段说明**：
+> - `lease_id` / `allocation_id`：租约唯一标识（两者值相同，指向同一数据库分配记录，用于后续取码绑定）。
+> - `allocated_at`：别名真实租约分配时间戳（RFC3339 UTC 格式）。注：历史 v1 的 `tag` 与 `created_at` 字段在 v2 契约中不再提供。
+> - 若相同幂等键传参不一致返回 `409 IDEMPOTENCY_CONFLICT`；底层别名分配出现状态或唯一性冲突返回 `409 ALLOCATION_CONFLICT`。
+
+#### 步骤 2：创建取码意图并锁定邮件基线 (POST /api/external/v2/verification-requests)
+使用出号时返回的 `allocation_id`（即 `lease_id`）建立取码任务。系统将自动原子采集目标母号 IMAP 的最新 `UIDVALIDITY` 与 `UIDNEXT` 基线：
+```http
+POST /api/external/v2/verification-requests
+Authorization: Bearer <TOKEN>
+Content-Type: application/json
+
+{
+  "lease_id": "alloc_6f8b2a1c..."
+}
+```
+**响应：**
+```json
+{
+  "success": true,
+  "data": {
+    "request_id": "vreq_8a3d1e4f...",
+    "lease_id": "alloc_6f8b2a1c...",
+    "alias_email": "fresh_alias@icloud.com",
+    "status": "ready",
+    "expires_at": "2026-09-23T10:10:00Z"
+  }
+}
+```
+
+#### 步骤 3：在外部目标网站触发发送验证码邮件
+调用第三方注册/登录接口向 `fresh_alias@icloud.com` 发送验证码。
+
+#### 步骤 4：长轮询获取验证码 (GET /api/external/v2/verification-requests/:id)
+```http
+GET /api/external/v2/verification-requests/vreq_8a3d1e4f...?timeout=30
+Authorization: Bearer <TOKEN>
+```
+**响应：**
+```json
+{
+  "success": true,
+  "data": {
+    "request_id": "vreq_8a3d1e4f...",
+    "lease_id": "alloc_6f8b2a1c...",
+    "alias_email": "fresh_alias@icloud.com",
+    "status": "succeeded",
+    "code": "654321",
+    "magic_link": "",
+    "message_ref": "ev_msg_1002"
   }
 }
 ```
@@ -975,69 +1064,88 @@ Authorization: Bearer <API_KEY>
 
 ## 客户端极速接入示例
 
-### 场景一：注册机极速闭环脚本 (号池秒级出号 + 长期资产留存，推荐标准方案)
+### 场景一：注册机极速闭环脚本 (v2 规范化链路，推荐标准方案)
 
 ```bash
 #!/usr/bin/env bash
 BASE="http://127.0.0.1:8081"
-API_KEY="your_admin_api_key_or_token"
+TOKEN="your_external_token_here"
+IDEMP_KEY="task_$(date +%s)_$RANDOM"
 
-# 1. 秒级认领邮箱 (优先从后台定时囤积的号池中认领，~1ms 零延迟，不触发 Apple 限速)
-ALLOC=$(curl -s -X POST "$BASE/api/allocate" \
-  -H "Authorization: Bearer $API_KEY" \
+# 1. 规范化出号认领 (显式幂等键，秒级从号池获取就绪资产)
+ALLOC=$(curl -s -X POST "$BASE/api/external/v2/allocate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: $IDEMP_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"tag":"reg_pool_a","label":"AutoRegBot","mode":"pool"}')
+  -d '{"tag":"default","label":"AutoRegBot"}')
 
 EMAIL=$(echo "$ALLOC" | jq -r '.data.email')
-SOURCE=$(echo "$ALLOC" | jq -r '.data.source')
-echo "获取到别名: $EMAIL (出号来源: $SOURCE)"
+LEASE_ID=$(echo "$ALLOC" | jq -r '.data.allocation_id')
+echo "获取到别名: $EMAIL (租约 ID: $LEASE_ID)"
 
-# 2. 调用目标网站发起注册...
+# 2. 建立持久化取码意图 (锁定 IMAP 邮件基线)
+VREQ=$(curl -s -X POST "$BASE/api/external/v2/verification-requests" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"lease_id\":\"$LEASE_ID\"}")
+
+VREQ_ID=$(echo "$VREQ" | jq -r '.data.request_id')
+echo "已建立取码任务: $VREQ_ID (基线就绪)"
+
+# 3. 调用目标网站发起注册 / 请求发送验证码...
 # curl -X POST "https://example.com/register" -d "email=$EMAIL"
 
-# 3. 毫秒级长轮询验证码 (不传 auto_delete，别名作为永久资产留存，后续可随时收邮件/找回密码)
+# 4. 毫秒级长轮询验证码 (基于基线严格等待新邮件，无历史旧邮件串扰)
 echo "等待验证码到达..."
-CODE_RESP=$(curl -s "$BASE/api/external/v1/verify-code?email=$EMAIL&timeout=60" \
-  -H "Authorization: Bearer $API_KEY")
+RESULT=$(curl -s "$BASE/api/external/v2/verification-requests/$VREQ_ID?timeout=60" \
+  -H "Authorization: Bearer $TOKEN")
 
-CODE=$(echo "$CODE_RESP" | jq -r '.data.code')
-MAGIC=$(echo "$CODE_RESP" | jq -r '.data.magic_link')
-
+CODE=$(echo "$RESULT" | jq -r '.data.code')
+MAGIC=$(echo "$RESULT" | jq -r '.data.magic_link')
 echo "捕获验证码: $CODE, 激活链接: $MAGIC"
 ```
 
-> **注意：资产留存 vs 用完即抛**
-> - **长期留存（默认/推荐）**：不要在取码请求中传 `auto_delete=true`。别名将永久保留在 iCloud 母号中，日后目标网站重置密码或发通知时随时可在系统内查收邮件。
-> - **用完即抛（可选）**：仅当明确不需要该账号且欲释放母号 750 个上限时，才在 `verify-code` 中传入 `auto_delete=true`。
-
-### 场景二：Python 极速自动化封装
+### 场景二：Python 极速自动化封装 (v2 规范化标准)
 
 ```python
+import uuid
 import requests
 
 BASE = "http://127.0.0.1:8081"
-HEADERS = {"Authorization": "Bearer your_api_key"}
+HEADERS = {"Authorization": "Bearer your_token_here"}
 
-# 1. 优先从号池提取就绪别名 (~1ms，并发无冲突)
-resp = requests.post(
-    f"{BASE}/api/allocate",
-    json={"tag": "reg_pool_a", "label": "PyTask", "mode": "pool"},
-    headers=HEADERS
+# 1. 幂等出号
+alloc_resp = requests.post(
+    f"{BASE}/api/external/v2/allocate",
+    headers={**HEADERS, "Idempotency-Key": str(uuid.uuid4())},
+    json={"tag": "default", "label": "PyTask"},
 ).json()
 
-email = resp["data"]["email"]
-source = resp["data"]["source"]
-print(f"Allocated: {email} (source: {source})")
+email = alloc_resp["data"]["email"]
+lease_id = alloc_resp["data"]["allocation_id"]
+print(f"Allocated: {email} (lease: {lease_id})")
 
-# 2. 获取验证码 (长期保留别名资产，不传 auto_delete)
-verify = requests.get(
-    f"{BASE}/api/verify-code",
-    params={"email": email, "timeout": 30},
-    headers=HEADERS
+# 2. 创建取码意图并锁定 IMAP 基线
+vreq_resp = requests.post(
+    f"{BASE}/api/external/v2/verification-requests",
+    headers=HEADERS,
+    json={"lease_id": lease_id},
 ).json()
 
-if verify["success"]:
-    print(f"Code: {verify['data']['code']}")
+vreq_id = vreq_resp["data"]["request_id"]
+print(f"Verification request ready: {vreq_id}")
+
+# 3. 目标网站触发发信...
+
+# 4. 获取验证码
+result = requests.get(
+    f"{BASE}/api/external/v2/verification-requests/{vreq_id}",
+    headers=HEADERS,
+    params={"timeout": 30},
+).json()
+
+if result.get("success"):
+    print(f"Code: {result['data']['code']}")
 ```
 
 ---
@@ -1049,7 +1157,7 @@ if verify["success"]:
 2. **拟人化步长调度 (Human-like Pacing)**：
    自动计划任务通过动态计算当小时剩余时间与剩余额度，将创建请求随机平摊在 8–12 分钟间隔，彻底杜绝整点突发请求的机器特征。
 3. **750 别名硬顶熔断保护**：
-   单个 Apple ID 活跃别名官方上限为 750 个。网关层在出号与调度时实时核验，触顶时自动故障转移（Failover）至下一个健康账号，并在达到时返回 `400 ALIAS_LIMIT_REACHED`，严禁触碰 Apple 上游错误风控。
+   项目内置常量 `MaxAliasesPerAccount`（750）为本系统依据逆向观测与平台行为设定的安全防护阈值（非 Apple 官方 SLA 承诺）。网关层在出号与调度时实时核验，触顶时自动故障转移（Failover）至下一个健康账号，并在达到时返回 `400 ALIAS_LIMIT_REACHED`，严禁触碰 Apple 上游错误风控。
 4. **SQLite WAL 原子配额仲裁锁**：
    单账号创建入口（单建、批量、一键出号、定时补货）由底层数据库执行强一致原子配额计数，超限直接返回 `429 RATE_LIMITED` 并附加 `Retry-After: 3600` 秒头。
 5. **双向出口 IP 隧道对齐**：

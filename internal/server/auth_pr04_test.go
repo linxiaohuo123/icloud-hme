@@ -36,6 +36,9 @@ func TestPR04_A01_CrossTokenVerificationIsolation(t *testing.T) {
 	_ = st.SaveToken(tokA)
 	_ = st.SaveToken(tokB)
 
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '["default"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+
 	// 录入可用别名并分配给 Token B
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "victim@icloud.com", Active: true}, "replenish", true)
 	allocB, _, err := st.ClaimInventoryAlias(context.Background(), "token", tokB.ID, "allocate", "k_b", "h", "tag", nil)
@@ -130,6 +133,8 @@ func TestPR04_A04_TokenRenameAndRecreateNoDataLeak(t *testing.T) {
 	tokOld := store.APIToken{ID: "tok_immutable_old_id", Name: "CustomerService", Token: "key_old_token", Scopes: store.DefaultExternalScopes}
 	_ = st.SaveToken(tokOld)
 
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '["default"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "cs_mail@icloud.com", Active: true}, "replenish", true)
 	_, _, _ = st.ClaimInventoryAlias(context.Background(), "token", tokOld.ID, "allocate", "k_cs", "h", "tag", nil)
 
@@ -166,6 +171,8 @@ func TestPR04_A05_TokenRevocationDuringLongPoll(t *testing.T) {
 	tok := store.APIToken{ID: store.NewAPITokenID(), Name: "EphemeralToken", Token: "key_ephemeral", Scopes: store.DefaultExternalScopes}
 	_ = st.SaveToken(tok)
 
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '["default"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "ephemeral@icloud.com", Active: true}, "replenish", true)
 	_, _, _ = st.ClaimInventoryAlias(context.Background(), "token", tok.ID, "allocate", "k_eph", "h", "tag", nil)
 
@@ -216,6 +223,8 @@ func TestPR04_A07_V2LifecycleContract(t *testing.T) {
 	tok := store.APIToken{ID: store.NewAPITokenID(), Name: "V2Client", Token: "key_v2_client", Scopes: store.DefaultExternalScopes}
 	_ = st.SaveToken(tok)
 
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '["sales"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "v2_flow@icloud.com", Active: true}, "replenish", true)
 
 	fb := &fakeBackend{
