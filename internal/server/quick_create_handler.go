@@ -19,10 +19,11 @@ import (
 )
 
 type quickCreateReq struct {
-	AccountID string `json:"account_id"`
-	Label     string `json:"label"`
-	Tag       string `json:"tag"`
-	Mode      string `json:"mode"` // "pool" (默认池优先) | "pool_only" (仅池化) | "create" (强制现场新建)
+	AccountID      string `json:"account_id"`
+	Label          string `json:"label"`
+	Tag            string `json:"tag"`
+	Mode           string `json:"mode"` // "pool" (默认池优先) | "pool_only" (仅池化) | "create" (强制现场新建)
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 // selectAccountCandidates 根据业务标签与小时配额筛选候选母号列表 (用于现场新建别名场景)。
@@ -196,14 +197,25 @@ func (s *Server) quickCreateHandler(c *gin.Context) {
 		return
 	}
 
+	if req.IdempotencyKey == "" {
+		req.IdempotencyKey = c.GetHeader("X-Idempotency-Key")
+	}
+	if req.IdempotencyKey == "" {
+		req.IdempotencyKey = c.GetHeader("Idempotency-Key")
+	}
+	if req.IdempotencyKey == "" {
+		req.IdempotencyKey = c.Query("idempotency_key")
+	}
+
 	p, _ := getPrincipal(c)
 
 	// 统一调用 AliasAllocationService 单一真相源出号
 	allocRes, err := s.allocService.Allocate(c.Request.Context(), p, AllocationRequest{
-		Tag:       req.Tag,
-		Label:     req.Label,
-		AccountID: req.AccountID,
-		Mode:      req.Mode,
+		Tag:            req.Tag,
+		Label:          req.Label,
+		AccountID:      req.AccountID,
+		Mode:           req.Mode,
+		IdempotencyKey: req.IdempotencyKey,
 	})
 
 	if err != nil {

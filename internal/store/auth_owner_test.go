@@ -37,7 +37,7 @@ func TestAUTH01_OwnershipRequiresMatchingTokenID(t *testing.T) {
 		AllocatedAt:  "2026-01-01T00:00:00Z",
 		Status:       "allocated",
 	}
-	if err := st.RecordAllocation(alloc, "botA"); err != nil {
+	if _, err := st.RecordAllocation(alloc, "botA"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -74,7 +74,7 @@ func TestAUTH02_RecreatedSameNameTokenDoesNotInherit(t *testing.T) {
 		AllocatedAt:  "2026-01-01T00:00:00Z",
 		Status:       "allocated",
 	}
-	_ = st.RecordAllocation(alloc, "faka_bot")
+	_, _ = st.RecordAllocation(alloc, "faka_bot")
 
 	// 删除原 token，新建同名但不同 ID 的 token
 	_, _ = st.DeleteToken("tok_old")
@@ -110,7 +110,7 @@ func TestAUTH03_LegacyRecordCannotBeClaimedByExternalToken(t *testing.T) {
 		AllocatedAt:  "2026-01-01T00:00:00Z",
 		Status:       "allocated",
 	}
-	_ = st.RecordAllocation(alloc, "scheduler")
+	_, _ = st.RecordAllocation(alloc, "scheduler")
 
 	// 外部 token 绝不可认领该 legacy 别名
 	if st.IsEmailOwnedByToken(ctx, "legacy@icloud.com", "tok_attacker") {
@@ -138,7 +138,7 @@ func TestAUTH04_AdminOwnershipBypass(t *testing.T) {
 		AllocatedAt:  "2026-01-01T00:00:00Z",
 		Status:       "allocated",
 	}
-	_ = st.RecordAllocation(alloc, "client_bot")
+	_, _ = st.RecordAllocation(alloc, "client_bot")
 
 	// 验证 GetPrincipalAllocation 在管理员主体下可以查询到记录
 	record, err := st.GetPrincipalAllocation(ctx, "admin_target@icloud.com", "token", "tok_client")

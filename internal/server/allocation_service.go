@@ -242,7 +242,13 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		}, nil
 	}
 
-	// 5. 若库存池为空 (POOL_EMPTY)
+	// 5. 核心仲裁 (B3)：只有真正确定为空池 (ErrNoAvailableInventory) 才允许后续降级处理；
+	// 任何数据库故障、DB locked、上下文取消或约束冲突，原样分类返回，严禁触发现场建号！
+	if !errors.Is(err, store.ErrNoAvailableInventory) {
+		return nil, err
+	}
+
+	// 若库存池为空 (POOL_EMPTY)
 	// 【PR-05-1 Section II 核心铁律】外部令牌在库存为空时严禁 fallback 远程创号，必须立即返回 503 POOL_EMPTY
 	if p.Kind == auth.PrincipalToken && !p.IsAdmin() {
 		return nil, ErrPoolEmpty
@@ -295,9 +301,11 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 			AllocatedAt:  now,
 			Status:       "allocated",
 		}
-		if recErr := s.store.RecordAllocation(alloc, tokenDisplayName); recErr != nil {
+		savedAlloc, recErr := s.store.RecordAllocation(alloc, tokenDisplayName)
+		if recErr != nil {
 			return nil, fmt.Errorf("持久化分配凭据失败: %w", recErr)
 		}
+		alloc = savedAlloc
 		if routeErr := s.store.UpsertAliasRoutes(accountID, []string{res.Email}); routeErr != nil {
 			log.Printf("[AllocationService] 更新别名路由失败: %v", routeErr)
 		}

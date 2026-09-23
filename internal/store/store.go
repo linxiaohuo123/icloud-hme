@@ -58,6 +58,11 @@ type Store struct {
 	closed      bool
 }
 
+// DB 返回底层数据库句柄 (仅用于测试/诊断注入)
+func (s *Store) DB() *sql.DB {
+	return s.db
+}
+
 // NewStore 创建并加载 Store
 func NewStore(dataDir string) (*Store, error) {
 	if dataDir == "" {

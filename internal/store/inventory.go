@@ -26,6 +26,8 @@ var (
 	ErrOperationPending = errors.New("operation is pending")
 	// ErrAllocationNotFound 未找到分配记录
 	ErrAllocationNotFound = errors.New("allocation not found")
+	// ErrAllocationConflict 别名已归属于其他主体或历史分配冲突
+	ErrAllocationConflict = errors.New("allocation conflict: email already allocated")
 	// ErrVerificationRequestNotFound 未找到取码任务记录
 	ErrVerificationRequestNotFound = errors.New("verification request not found")
 )
