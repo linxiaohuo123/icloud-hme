@@ -29,6 +29,7 @@ func TestC01_LifecycleEligibilityTransition(t *testing.T) {
 		accounts: []account.Summary{
 			{ID: "acc_c01", Status: "active", HasCookies: true, Tags: []string{"default"}},
 		},
+		store: st,
 	}
 	cfg := Config{
 		AdminPassword: "admin-pass-strong-2026",
@@ -81,7 +82,7 @@ func TestC01_LifecycleEligibilityTransition(t *testing.T) {
 	}
 
 	// 3. 激活已 allocated 邮箱：绝不会重新变成 available
-	_ = st.AddInventoryAlias("acc_c01", hme.Alias{Email: "alloc@example.com", AnonymousID: "ano_alloc", Active: false}, "replenish", true)
+	_ = st.AddInventoryAlias("acc_c01", hme.Alias{Email: "alloc@example.com", AnonymousID: "ano_alloc", Active: true}, "replenish", true)
 	allocRecord := &store.AliasAllocation{
 		AllocationID: "alloc_rec_c01",
 		AliasEmail:   "alloc@example.com",
@@ -96,6 +97,9 @@ func TestC01_LifecycleEligibilityTransition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecordAllocation failed: %v", err)
 	}
+
+	// 先将已分配别名在远端和本地停用为 inactive
+	_ = st.UpdateAliasRemoteState("acc_c01", "ano_alloc", "alloc@example.com", store.RemoteInactive)
 
 	// 调用激活接口 POST /api/aliases/:id/reactivate
 	reqReact, _ := http.NewRequest("POST", ts.URL+"/api/aliases/ano_alloc/reactivate", strings.NewReader(`{"account_id":"acc_c01"}`))
@@ -166,6 +170,7 @@ func TestC02_UpstreamFailureAndLocalStoreFailure(t *testing.T) {
 		accounts: []account.Summary{
 			{ID: "acc_c02", Status: "active", HasCookies: true, Tags: []string{"default"}},
 		},
+		store: st,
 	}
 	cfg := Config{AdminPassword: "admin-pass-strong-2026"}
 	s := newWithBackendAndStore(fb, cfg, st)
@@ -321,6 +326,227 @@ func TestC03_InterleavingWinnerAuthoritative(t *testing.T) {
 	checkReq, _ := st.GetVerificationRequest(ctx, "vreq_inv", "token", "tok_c03")
 	if checkReq.Status != "invalidated" {
 		t.Fatalf("C03 FAILED: database status was mutated to %s", checkReq.Status)
+	}
+}
+
+// 并发交错测试：一个请求在长轮询等待中，并发请求或后台任务写入 expired 或 succeeded，
+// 等待唤醒/超时后准确返回数据库真实终态，不得误报 pending 或覆盖。
+func TestC03_ConcurrentInterleaving_ExpiredAndSucceededDuringWait(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	fb := &fakeBackend{}
+	eb := mail.NewEventBus(10 * time.Minute)
+	vService := NewVerificationService(fb, st, eb, nil)
+
+	ctx := context.Background()
+	p := auth.Principal{
+		Kind:   auth.PrincipalToken,
+		ID:     "tok_interleave",
+		Scopes: []string{"verify"},
+	}
+	_ = st.SaveToken(store.APIToken{ID: "tok_interleave", Name: "tok_interleave", Token: "sec_interleave", Scopes: "verify"})
+
+	// 1. 测试等待期间并发写入 expired
+	now := time.Now().UTC()
+	vreqExp := &store.VerificationRequest{
+		RequestID:           "vreq_wait_exp",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok_interleave",
+		LeaseID:             "lease_exp",
+		AliasEmail:          "wait_exp@example.com",
+		Status:              "ready",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "icloud",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         100,
+	}
+	_ = st.CreateVerificationRequestAtomic(ctx, vreqExp, 100, 100)
+
+	doneExp := make(chan *VerificationResult, 1)
+	errExp := make(chan error, 1)
+	go func() {
+		res, err := vService.GetVerificationResult(ctx, p, "vreq_wait_exp", 1)
+		errExp <- err
+		doneExp <- res
+	}()
+
+	// 稍等以确认已进入订阅与定时器等待
+	time.Sleep(30 * time.Millisecond)
+
+	// 并发协程将 DB 中该记录标记为 expired
+	_, won, _ := st.ExpireVerificationRequest(ctx, "vreq_wait_exp")
+	if !won {
+		t.Fatal("expected ExpireVerificationRequest to win CAS")
+	}
+
+	select {
+	case err := <-errExp:
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		res := <-doneExp
+		if res == nil || res.Status != "expired" {
+			t.Fatalf("expected real DB final status expired, got: %v", res)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for GetVerificationResult")
+	}
+
+	// 2. 测试等待期间并发写入 succeeded
+	vreqSucc := &store.VerificationRequest{
+		RequestID:           "vreq_wait_succ",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok_interleave",
+		LeaseID:             "lease_succ",
+		AliasEmail:          "wait_succ@example.com",
+		Status:              "ready",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "icloud",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         100,
+	}
+	_ = st.CreateVerificationRequestAtomic(ctx, vreqSucc, 100, 100)
+
+	doneSucc := make(chan *VerificationResult, 1)
+	errSucc := make(chan error, 1)
+	go func() {
+		res, err := vService.GetVerificationResult(ctx, p, "vreq_wait_succ", 1)
+		errSucc <- err
+		doneSucc <- res
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+
+	// 并发协程将 DB 中该记录标记为 succeeded
+	_, won, _ = st.CompleteVerificationRequest(ctx, "vreq_wait_succ", "123456", "ev_succ_interleave")
+	if !won {
+		t.Fatal("expected CompleteVerificationRequest to win CAS")
+	}
+
+	select {
+	case err := <-errSucc:
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		res := <-doneSucc
+		if res == nil || res.Status != "succeeded" || res.Code != "123456" {
+			t.Fatalf("expected real DB final status succeeded with code 123456, got: %v", res)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for GetVerificationResult")
+	}
+}
+
+// 测试 UIDVALIDITY 突变发生时，CAS 如果输给并发完成的 expired 或 succeeded，严格返回数据库真实胜出终态
+func TestC03_UIDValidityMutation_LosesToExpiredOrSucceeded(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	fb := &fakeBackend{}
+	eb := mail.NewEventBus(10 * time.Minute)
+	vService := NewVerificationService(fb, st, eb, nil)
+
+	ctx := context.Background()
+	p := auth.Principal{
+		Kind:   auth.PrincipalToken,
+		ID:     "tok_cas_loser",
+		Scopes: []string{"verify"},
+	}
+	_ = st.SaveToken(store.APIToken{ID: "tok_cas_loser", Name: "tok_cas_loser", Token: "sec_cas", Scopes: "verify"})
+
+	now := time.Now().UTC()
+
+	// 1. UIDVALIDITY 突变输给 expired：严格返回 expired
+	vreqExp := &store.VerificationRequest{
+		RequestID:           "vreq_uid_exp",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok_cas_loser",
+		LeaseID:             "lease_cas_1",
+		AliasEmail:          "uid_exp@example.com",
+		Status:              "ready",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "icloud",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 10,
+		BaselineUID:         100,
+	}
+	_ = st.CreateVerificationRequestAtomic(ctx, vreqExp, 100, 100)
+
+	// 先将其置为 expired
+	_, won, _ := st.ExpireVerificationRequest(ctx, "vreq_uid_exp")
+	if !won {
+		t.Fatal("ExpireVerificationRequest failed")
+	}
+
+	// 此时推送一个带有不同 UIDValidity (20 != 10) 的事件
+	eb.PublishEvent(&mail.CachedOTP{
+		EventID:     "ev_uid_1",
+		Email:       "uid_exp@example.com",
+		UIDValidity: 20,
+		UID:         101,
+		OTP:         &mail.OTPResult{Code: "000000"},
+	})
+
+	// 获取结果：此时执行 InvalidateVerificationRequest 会输给 expired，必须准确返回 expired！
+	resExp, err := vService.GetVerificationResult(ctx, p, "vreq_uid_exp", 0)
+	if err != nil {
+		t.Fatalf("expected nil err for expired status, got: %v", err)
+	}
+	if resExp == nil || resExp.Status != "expired" {
+		t.Fatalf("expected status expired when losing CAS to expired, got: %v", resExp)
+	}
+
+	// 2. UIDVALIDITY 突变输给 succeeded：严格返回 succeeded
+	vreqSucc := &store.VerificationRequest{
+		RequestID:           "vreq_uid_succ",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok_cas_loser",
+		LeaseID:             "lease_cas_2",
+		AliasEmail:          "uid_succ@example.com",
+		Status:              "ready",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "icloud",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 10,
+		BaselineUID:         100,
+	}
+	_ = st.CreateVerificationRequestAtomic(ctx, vreqSucc, 100, 100)
+
+	// 先将其置为 succeeded
+	_, won, _ = st.CompleteVerificationRequest(ctx, "vreq_uid_succ", "777888", "ev_prior_succ")
+	if !won {
+		t.Fatal("CompleteVerificationRequest failed")
+	}
+
+	// 推送带有不同 UIDValidity 的事件
+	eb.PublishEvent(&mail.CachedOTP{
+		EventID:     "ev_uid_2",
+		Email:       "uid_succ@example.com",
+		UIDValidity: 20,
+		UID:         102,
+		OTP:         &mail.OTPResult{Code: "000000"},
+	})
+
+	// 获取结果：此时执行 InvalidateVerificationRequest 会输给 succeeded，必须准确返回 succeeded！
+	resSucc, err := vService.GetVerificationResult(ctx, p, "vreq_uid_succ", 0)
+	if err != nil {
+		t.Fatalf("expected nil err for succeeded status, got: %v", err)
+	}
+	if resSucc == nil || resSucc.Status != "succeeded" || resSucc.Code != "777888" {
+		t.Fatalf("expected status succeeded with code 777888 when losing CAS to succeeded, got: %v", resSucc)
 	}
 }
 
@@ -487,3 +713,113 @@ func TestC05_TokenIsolationAndRevocationDuringWait(t *testing.T) {
 		t.Fatal("C05 FAILED: timeout waiting for verify-code response")
 	}
 }
+
+// TestLifecycle_SchedulerReplenishedAlias_DeactivateAndDelete_ResolvesAnonymousID 验证
+// Scheduler 补货别名在无 provider_alias_id 时，通过 upstream 远端解析 anonymousID/email
+// 可靠停用并把本地库存置为 inactive/quarantined，不再处于 available 状态。
+func TestLifecycle_SchedulerReplenishedAlias_DeactivateAndDelete_ResolvesAnonymousID(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at)
+		VALUES ('acc_sched', 'Sched Account', 'sched@test.com', 'active', '[]', ?, ?)`, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. 模拟历史/补货入库：provider_alias_id 为空，仅有 email
+	_, err = st.DB().Exec(`INSERT INTO alias_inventory (email, account_id, provider_alias_id, allocation_state, remote_state, source_type)
+		VALUES ('sched_target@example.com', 'acc_sched', '', 'available', 'active', 'replenish')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 验证初始可用库存为 1
+	if cnt := st.CountAuthoritativeAvailableAliases(); cnt != 1 {
+		t.Fatalf("expected 1 available alias initially, got %d", cnt)
+	}
+
+	// 2. 模拟 managerBackend 的 resolveAliasIdentifiers 链路：
+	// 当外部仅传入 anonymousID = "anon_from_apple_456"
+	// 上游返回包含该 anonymousID 及对应 email
+	mb := &managerBackend{
+		store: st,
+	}
+	mb.setCachedAliases("acc_sched", []hme.Alias{
+		{
+			Email:       "sched_target@example.com",
+			AnonymousID: "anon_from_apple_456",
+			Active:      true,
+		},
+	})
+
+	anonID, email, err := mb.resolveAliasIdentifiers("acc_sched", "anon_from_apple_456")
+	if err != nil {
+		t.Fatalf("resolveAliasIdentifiers failed: %v", err)
+	}
+	if anonID != "anon_from_apple_456" || email != "sched_target@example.com" {
+		t.Fatalf("expected anonID=anon_from_apple_456 and email=sched_target@example.com, got anonID=%s, email=%s", anonID, email)
+	}
+
+	// 3. 执行 UpdateAliasRemoteState (模拟停用)
+	err = st.UpdateAliasRemoteState("acc_sched", anonID, email, store.RemoteInactive)
+	if err != nil {
+		t.Fatalf("UpdateAliasRemoteState to inactive failed: %v", err)
+	}
+
+	// 验证数据库状态及 provider_alias_id 回填
+	inv, err := st.GetInventoryAlias("sched_target@example.com")
+	if err != nil || inv == nil {
+		t.Fatalf("GetInventoryAlias failed: %v", err)
+	}
+	if inv.RemoteState != store.RemoteInactive {
+		t.Fatalf("expected remote_state inactive, got %s", inv.RemoteState)
+	}
+	if inv.ProviderAliasID != "anon_from_apple_456" {
+		t.Fatalf("expected provider_alias_id backfilled to anon_from_apple_456, got %s", inv.ProviderAliasID)
+	}
+
+	// 验证可用库存已变为 0，且认领必定失败
+	if cnt := st.CountAuthoritativeAvailableAliases(); cnt != 0 {
+		t.Fatalf("expected 0 available aliases after deactivation, got %d", cnt)
+	}
+	alloc, _, err := st.ClaimInventoryAlias(context.Background(), "admin", "admin", "allocate", "key_test", "h", "default", nil)
+	if !errors.Is(err, store.ErrNoAvailableInventory) || alloc != nil {
+		t.Fatalf("expected ErrNoAvailableInventory for deactivated alias, got alloc=%v, err=%v", alloc, err)
+	}
+
+	// 4. 执行删除操作
+	err = st.UpdateAliasRemoteState("acc_sched", anonID, email, store.RemoteDeleted)
+	if err != nil {
+		t.Fatalf("UpdateAliasRemoteState to deleted failed: %v", err)
+	}
+
+	// 验证 allocation_state 变为 quarantined
+	invDel, err := st.GetInventoryAlias("sched_target@example.com")
+	if err != nil || invDel == nil {
+		t.Fatalf("GetInventoryAlias failed: %v", err)
+	}
+	if invDel.RemoteState != store.RemoteDeleted {
+		t.Fatalf("expected remote_state deleted, got %s", invDel.RemoteState)
+	}
+	if invDel.AllocationState != store.AllocationQuarantined {
+		t.Fatalf("expected allocation_state quarantined, got %s", invDel.AllocationState)
+	}
+
+	// 5. 验证防护机制：空 providerAliasID 和空 email 严禁执行更新，必须报错
+	err = st.UpdateAliasRemoteState("acc_sched", "", "", store.RemoteInactive)
+	if err == nil {
+		t.Fatalf("expected error when both providerAliasID and email are empty, got nil")
+	}
+
+	// 6. 验证防护机制：零行匹配时必须显式返回错误，禁止假成功
+	err = st.UpdateAliasRemoteState("acc_sched", "non_existent_id", "non_existent@example.com", store.RemoteInactive)
+	if err == nil {
+		t.Fatalf("expected error when 0 rows affected, got nil")
+	}
+}
+

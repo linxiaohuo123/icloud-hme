@@ -233,6 +233,9 @@ func TestQuickCreatePoolFirstAndFallback(t *testing.T) {
 		APIKey:        "test-key",
 	}
 	s := newWithBackend(f, cfg)
+	defer s.Close()
+	_, _ = s.store.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_pool', 'Pool Acc', 'pool@test.com', 'active', '["default"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
 	for _, a := range f.aliases {
 		_ = s.store.AddInventoryAlias("acc_pool", a, "replenish", true)
 	}
@@ -339,6 +342,11 @@ func TestQuickCreateRoundRobinInterleaving(t *testing.T) {
 		APIKey:        "test-key",
 	}
 	s := newWithBackend(f, cfg)
+	defer s.Close()
+	_, _ = s.store.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_alpha', 'Alpha Acc', 'alpha@test.com', 'active', '["default"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+	_, _ = s.store.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_beta', 'Beta Acc', 'beta@test.com', 'active', '["default"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
 	for _, a := range f.accountAliases["acc_alpha"] {
 		_ = s.store.AddInventoryAlias("acc_alpha", a, "replenish", true)
 	}

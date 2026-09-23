@@ -260,15 +260,103 @@ func (b *managerBackend) RefreshAliases(accountID string) ([]hme.Alias, error) {
 	return res, nil
 }
 
+func (b *managerBackend) resolveAliasIdentifiers(accountID, identifier string) (anonymousID string, email string, err error) {
+	accountID = strings.TrimSpace(accountID)
+	identifier = strings.TrimSpace(identifier)
+	if accountID == "" || identifier == "" {
+		return "", "", errors.New("empty accountID or identifier")
+	}
+
+	if strings.Contains(identifier, "@") {
+		email = strings.ToLower(identifier)
+		// 1. 优先从内存缓存查找
+		if cached, ok := b.getCachedAliases(accountID); ok {
+			for _, al := range cached {
+				if strings.EqualFold(al.Email, email) && al.AnonymousID != "" {
+					anonymousID = al.AnonymousID
+					break
+				}
+			}
+		}
+		// 2. 若内存未命中，从本地数据库查找
+		if anonymousID == "" && b.store != nil {
+			if inv, _ := b.store.GetInventoryAlias(email); inv != nil && inv.ProviderAliasID != "" {
+				anonymousID = inv.ProviderAliasID
+			}
+		}
+		// 3. 若仍未命中，从上游远端列表拉取并解析（同时刷新缓存）
+		if anonymousID == "" {
+			if aliases, lerr := b.ListAliases(accountID); lerr == nil {
+				for _, al := range aliases {
+					if strings.EqualFold(al.Email, email) && al.AnonymousID != "" {
+						anonymousID = al.AnonymousID
+						break
+					}
+				}
+			}
+		}
+		return anonymousID, email, nil
+	}
+
+	// 标识符为 anonymousID
+	anonymousID = identifier
+	// 1. 优先从内存缓存查找
+	if cached, ok := b.getCachedAliases(accountID); ok {
+		for _, al := range cached {
+			if al.AnonymousID == anonymousID && al.Email != "" {
+				email = strings.ToLower(al.Email)
+				break
+			}
+		}
+	}
+	// 2. 若内存未命中，从本地数据库通过 provider_alias_id 查找
+	if email == "" && b.store != nil {
+		var dbEmail string
+		err := b.store.DB().QueryRow(`
+			SELECT email FROM alias_inventory
+			WHERE account_id = ? AND provider_alias_id = ?
+		`, accountID, anonymousID).Scan(&dbEmail)
+		if err == nil && dbEmail != "" {
+			email = strings.ToLower(dbEmail)
+		}
+	}
+	// 3. 若仍未命中，从上游远端列表拉取并解析（必须在远端操作前完成解析）
+	if email == "" {
+		if aliases, lerr := b.ListAliases(accountID); lerr == nil {
+			for _, al := range aliases {
+				if al.AnonymousID == anonymousID && al.Email != "" {
+					email = strings.ToLower(al.Email)
+					break
+				}
+			}
+		}
+	}
+
+	return anonymousID, email, nil
+}
+
 // SetAliasActive 停用或激活别名。
 func (b *managerBackend) SetAliasActive(accountID, anonymousID string, active bool) (bool, error) {
+	accountID = strings.TrimSpace(accountID)
+	anonymousID = strings.TrimSpace(anonymousID)
+	if accountID == "" || anonymousID == "" {
+		return false, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "accountID 和 anonymousID 不能为空"}
+	}
+
+	// 远端修改前可靠解析 account_id、anonymousID、email
+	resolvedAnonID, resolvedEmail, _ := b.resolveAliasIdentifiers(accountID, anonymousID)
+	targetAnonID := anonymousID
+	if resolvedAnonID != "" {
+		targetAnonID = resolvedAnonID
+	}
+
 	var success bool
 	err := b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
 		var opErr error
 		if active {
-			success, opErr = client.ReactivateHME(anonymousID)
+			success, opErr = client.ReactivateHME(targetAnonID)
 		} else {
-			success, opErr = client.DeactivateHME(anonymousID)
+			success, opErr = client.DeactivateHME(targetAnonID)
 		}
 		return opErr
 	})
@@ -303,8 +391,16 @@ func (b *managerBackend) SetAliasActive(accountID, anonymousID string, active bo
 		if active {
 			rState = store.RemoteActive
 		}
-		if stErr := b.store.UpdateAliasRemoteState(accountID, anonymousID, rState); stErr != nil {
-			return false, fmt.Errorf("local inventory state sync failed: %w", stErr)
+		if stErr := b.store.UpdateAliasRemoteState(accountID, targetAnonID, resolvedEmail, rState); stErr != nil {
+			opName := "停用"
+			if active {
+				opName = "激活"
+			}
+			return false, &BackendError{
+				Status:  http.StatusInternalServerError,
+				Code:    "STORE_SYNC_PENDING_RECONCILIATION",
+				Message: fmt.Sprintf("上游%s成功但本地库存状态同步失败 (待核对): %v", opName, stErr),
+			}
 		}
 	}
 
@@ -438,10 +534,23 @@ func (b *managerBackend) updateCachedAliasLabels(accountID string, anonymousIDs 
 
 // DeleteAlias 删除别名。
 func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
+	accountID = strings.TrimSpace(accountID)
+	anonymousID = strings.TrimSpace(anonymousID)
+	if accountID == "" || anonymousID == "" {
+		return &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "accountID 和 anonymousID 不能为空"}
+	}
+
+	// 删除前必须完成解析，不能删除后再依赖远端查找
+	resolvedAnonID, resolvedEmail, _ := b.resolveAliasIdentifiers(accountID, anonymousID)
+	targetAnonID := anonymousID
+	if resolvedAnonID != "" {
+		targetAnonID = resolvedAnonID
+	}
+
 	deltaActive := -1
 	if cached, ok := b.getCachedAliases(accountID); ok {
 		for _, al := range cached {
-			if al.AnonymousID == anonymousID {
+			if al.AnonymousID == targetAnonID || (resolvedEmail != "" && strings.EqualFold(al.Email, resolvedEmail)) {
 				if !al.Active {
 					deltaActive = 0
 				}
@@ -450,7 +559,7 @@ func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
 		}
 	}
 	err := b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
-		return client.Delete(anonymousID)
+		return client.Delete(targetAnonID)
 	})
 	if err != nil {
 		if errors.Is(err, account.ErrHMEClientUnavailable) {
@@ -459,8 +568,12 @@ func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
 		return classifyUpstreamErr("删除失败", err)
 	}
 	if b.store != nil {
-		if stErr := b.store.UpdateAliasRemoteState(accountID, anonymousID, store.RemoteDeleted); stErr != nil {
-			return fmt.Errorf("local inventory state sync failed: %w", stErr)
+		if stErr := b.store.UpdateAliasRemoteState(accountID, targetAnonID, resolvedEmail, store.RemoteDeleted); stErr != nil {
+			return &BackendError{
+				Status:  http.StatusInternalServerError,
+				Code:    "STORE_SYNC_PENDING_RECONCILIATION",
+				Message: fmt.Sprintf("上游删除成功但本地库存状态同步失败 (待核对): %v", stErr),
+			}
 		}
 	}
 

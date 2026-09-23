@@ -19,6 +19,16 @@ import (
 	"icloud-hme/internal/hme"
 )
 
+func insertTestAccount(t *testing.T, st *Store, id string) {
+	t.Helper()
+	_, err := st.db.Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES (?, ?, ? || '@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`,
+		id, "Name_"+id, id)
+	if err != nil {
+		t.Fatalf("insertTestAccount failed: %v", err)
+	}
+}
+
 // D01: 100 个并发相同幂等请求仅产生一个 allocation，响应结果完全一致
 func TestPR03_D01_ConcurrentIdenticalIdempotentClaim(t *testing.T) {
 	tempDir := t.TempDir()
@@ -27,6 +37,8 @@ func TestPR03_D01_ConcurrentIdenticalIdempotentClaim(t *testing.T) {
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer st.Close()
+
+	insertTestAccount(t, st, "acc_1")
 
 	// 准备可用库存
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "pool1@icloud.com", Active: true}, "replenish", true)
@@ -87,6 +99,8 @@ func TestPR03_D02_ConcurrentDifferentClaimsNoDuplicate(t *testing.T) {
 	}
 	defer st.Close()
 
+	insertTestAccount(t, st, "acc_1")
+
 	const poolSize = 30
 	for i := 0; i < poolSize; i++ {
 		email := fmt.Sprintf("pool_%d@icloud.com", i)
@@ -138,6 +152,8 @@ func TestPR03_D03_TwoIndependentStoreConnections(t *testing.T) {
 		t.Fatalf("store 1 init failed: %v", err)
 	}
 	defer st1.Close()
+
+	insertTestAccount(t, st1, "acc_1")
 
 	// 存入仅有的一封可用别名
 	_ = st1.AddInventoryAlias("acc_1", hme.Alias{Email: "single_stock@icloud.com", Active: true}, "replenish", true)
@@ -191,6 +207,8 @@ func TestPR03_D04_TokenRenameDeleteDoesNotResetInventory(t *testing.T) {
 	}
 	defer st.Close()
 
+	insertTestAccount(t, st, "acc_1")
+
 	tok := APIToken{ID: NewAPITokenID(), Name: "OriginalName", Token: "tok_secret_123", Scopes: DefaultExternalScopes}
 	_ = st.SaveToken(tok)
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "d04@icloud.com", Active: true}, "replenish", true)
@@ -227,6 +245,8 @@ func TestPR03_D05_PruningLeaseRecordsDoesNotResetInventory(t *testing.T) {
 	}
 	defer st.Close()
 
+	insertTestAccount(t, st, "acc_1")
+
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "d05@icloud.com", Active: true}, "replenish", true)
 	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_d05", "allocate", "k_d05", "h", "tag", nil)
 	if err != nil {
@@ -251,6 +271,8 @@ func TestPR03_D06_IdempotencyConflictOnDifferentHash(t *testing.T) {
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer st.Close()
+
+	insertTestAccount(t, st, "acc_1")
 
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "d06@icloud.com", Active: true}, "replenish", true)
 
@@ -307,6 +329,8 @@ func TestPR03_D08_RemoteSyncDoesNotOverwriteAllocated(t *testing.T) {
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer st.Close()
+
+	insertTestAccount(t, st, "acc_1")
 
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "d08@icloud.com", Active: true}, "replenish", true)
 	_, _, err = st.ClaimInventoryAlias(context.Background(), "token", "tok_d08", "allocate", "k_d08", "h", "tag", nil)
@@ -669,6 +693,9 @@ func TestQuarantineInventoryForAccountOnDeletion(t *testing.T) {
 		t.Fatalf("failed to create store: %v", err)
 	}
 	defer st.Close()
+
+	insertTestAccount(t, st, "acc_del")
+	insertTestAccount(t, st, "acc_keep")
 
 	// 添加两个账号的可用库存
 	_ = st.AddInventoryAlias("acc_del", hme.Alias{Email: "del_1@icloud.com", Active: true}, "replenish", true)

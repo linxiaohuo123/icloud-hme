@@ -33,6 +33,9 @@ func TestPR07_P01_PoolOnlyZeroUpstreamCalls(t *testing.T) {
 	}
 	defer st.Close()
 
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_local_1', 'Local 1', 'l1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+
 	// 预置库存
 	_ = st.AddInventoryAlias("acc_local_1", hme.Alias{Email: "pool_perf@icloud.com", Active: true}, "replenish", true)
 
@@ -267,6 +270,8 @@ func TestPR07_P04_VerificationQueueAndTokenLimits(t *testing.T) {
 	}
 
 	// 此时第 51 个请求应当被 429 TOO_MANY_REQUESTS 拒绝
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "limit_test@icloud.com", Active: true}, "replenish", true)
 	alloc, _, _ := st.ClaimInventoryAlias(context.Background(), "token", tok.ID, "allocate", "k_quota_1", "h", "tag", nil)
 
@@ -301,6 +306,8 @@ func TestPR07_P05_RequestCancellationReleasesResources(t *testing.T) {
 	}
 	_ = st.SaveToken(tok)
 
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "cancel_target@icloud.com", Active: true}, "replenish", true)
 	alloc, _, _ := st.ClaimInventoryAlias(context.Background(), "token", tok.ID, "allocate", "k_cancel", "h", "tag", nil)
 

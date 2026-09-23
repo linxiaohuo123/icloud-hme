@@ -284,10 +284,23 @@ func (s *Store) ReconcileAvailableInventory() (int64, error) {
 		WHERE allocation_state IN ('unknown', 'available')
 		  AND account_id IN (
 		      SELECT id FROM accounts 
-		      WHERE tags LIKE '%"personal"%' COLLATE NOCASE
-		         OR tags LIKE '%"private"%' COLLATE NOCASE
-		         OR tags LIKE '%"protected"%' COLLATE NOCASE
-		         OR name LIKE '%大号%'
+		      WHERE name LIKE '%大号%'
+		         OR (
+		             CASE 
+		                 WHEN json_valid(tags) THEN EXISTS (
+		                     SELECT 1 FROM json_each(tags) 
+		                     WHERE LOWER(TRIM(value)) IN ('personal', 'private', 'protected')
+		                 )
+		                 ELSE (
+		                     tags LIKE '%"personal"%' COLLATE NOCASE OR
+		                     tags LIKE '%"private"%' COLLATE NOCASE OR
+		                     tags LIKE '%"protected"%' COLLATE NOCASE OR
+		                     tags LIKE '%personal%' COLLATE NOCASE OR
+		                     tags LIKE '%private%' COLLATE NOCASE OR
+		                     tags LIKE '%protected%' COLLATE NOCASE
+		                 )
+		             END
+		         )
 		  )
 	`)
 	if err != nil {
@@ -297,13 +310,13 @@ func (s *Store) ReconcileAvailableInventory() (int64, error) {
 		totalAffected += n
 	}
 
-	// 2. 账号缺失(孤儿资产)：account_id 在 accounts 表中不存在且系统已配置账号时，收敛隔离为 quarantined
+	// 2. 账号缺失(孤儿资产)：account_id 在 accounts 表中不存在时，收敛隔离为 quarantined
+	// 无论当前系统中是否存在其他账号，孤儿资产均必须隔离
 	resOrphan, err := s.db.Exec(`
 		UPDATE alias_inventory
 		SET allocation_state = 'quarantined'
 		WHERE allocation_state IN ('unknown', 'available')
-		  AND account_id NOT IN (SELECT id FROM accounts)
-		  AND EXISTS (SELECT 1 FROM accounts)
+		  AND (account_id IS NULL OR account_id = '' OR account_id NOT IN (SELECT id FROM accounts))
 	`)
 	if err != nil {
 		return 0, err
@@ -511,37 +524,56 @@ func (s *Store) QuarantineInventoryForAccount(accountID string) error {
 // 停用：remote_state = 'inactive' (不可被认领分配)。
 // 删除：remote_state = 'deleted'，若原为 available 则置为 quarantined。
 // 激活：remote_state = 'active'；注意：绝不改变已有的 allocation_state (已分配/保留/隔离不可退回 available)。
-func (s *Store) UpdateAliasRemoteState(accountID, providerAliasID string, remoteState RemoteState) error {
+// 约束：
+// 1. 禁止空标识退化为整账号批量覆写；
+// 2. 校验精确命中且仅命中目标一行 (RowsAffected == 1)，零行或多行均报错，杜绝假成功与身份歧义。
+func (s *Store) UpdateAliasRemoteState(accountID, providerAliasID, email string, remoteState RemoteState) error {
 	accountID = strings.TrimSpace(accountID)
 	providerAliasID = strings.TrimSpace(providerAliasID)
+	email = strings.TrimSpace(strings.ToLower(email))
+
+	if accountID == "" {
+		return errors.New("accountID cannot be empty")
+	}
+	if providerAliasID == "" && email == "" {
+		return errors.New("cannot update alias remote state: neither providerAliasID nor email provided")
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var err error
-	if providerAliasID != "" {
-		_, err = s.db.Exec(`
-			UPDATE alias_inventory
-			SET remote_state = ?,
-			    allocation_state = CASE 
-			        WHEN ? = 'deleted' AND allocation_state = 'available' THEN 'quarantined'
-			        ELSE allocation_state 
-			    END,
-			    last_verified_at = ?
-			WHERE account_id = ? AND (provider_alias_id = ? OR email = ?)
-		`, string(remoteState), string(remoteState), now, accountID, providerAliasID, providerAliasID)
-	} else {
-		_, err = s.db.Exec(`
-			UPDATE alias_inventory
-			SET remote_state = ?,
-			    allocation_state = CASE 
-			        WHEN ? = 'deleted' AND allocation_state = 'available' THEN 'quarantined'
-			        ELSE allocation_state 
-			    END,
-			    last_verified_at = ?
-			WHERE account_id = ?
-		`, string(remoteState), string(remoteState), now, accountID)
+	res, err := s.db.Exec(`
+		UPDATE alias_inventory
+		SET remote_state = ?,
+		    allocation_state = CASE 
+		        WHEN ? = 'deleted' AND allocation_state = 'available' THEN 'quarantined'
+		        ELSE allocation_state 
+		    END,
+		    provider_alias_id = CASE
+		        WHEN (provider_alias_id = '' OR provider_alias_id IS NULL) AND ? != '' THEN ?
+		        ELSE provider_alias_id
+		    END,
+		    last_verified_at = ?
+		WHERE account_id = ? AND (
+		    (? != '' AND provider_alias_id = ?) OR
+		    (? != '' AND email = ?)
+		)
+	`, string(remoteState), string(remoteState), providerAliasID, providerAliasID, now, accountID, providerAliasID, providerAliasID, email, email)
+	if err != nil {
+		return err
 	}
-	return err
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("no inventory alias found for account %s matching target (id=%s, email=%s)", accountID, providerAliasID, email)
+	}
+	if rows > 1 {
+		return fmt.Errorf("ambiguous inventory update: %d rows matched for account %s (id=%s, email=%s)", rows, accountID, providerAliasID, email)
+	}
+	return nil
 }
 

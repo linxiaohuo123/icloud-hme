@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"icloud-hme/internal/hme"
@@ -25,6 +26,11 @@ func TestB01_SamePrincipalIdempotentRetryReturnsSavedLeaseWithoutDuplicateAudit(
 		BusinessTag:  "tag_a",
 		AllocatedAt:  "2026-09-20T00:00:00Z",
 		Status:       "allocated",
+	}
+
+	_, _ = st.db.Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+	if err := st.AddInventoryAlias("acc_1", hme.Alias{Email: "idemp_test@example.com", Active: true}, "replenish", true); err != nil {
+		t.Fatalf("AddInventoryAlias failed: %v", err)
 	}
 
 	saved1, err := st.RecordAllocation(alloc1, "token_123")
@@ -76,6 +82,11 @@ func TestB02_CrossPrincipalConflictDoesNotOverwriteAndPreservesReferences(t *tes
 		t.Fatalf("NewStore failed: %v", err)
 	}
 	defer st.Close()
+
+	_, _ = st.db.Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+	if err := st.AddInventoryAlias("acc_1", hme.Alias{Email: "conflict_test@example.com", Active: true}, "replenish", true); err != nil {
+		t.Fatalf("AddInventoryAlias failed: %v", err)
+	}
 
 	// 1. 建立主体 A 的初始租约
 	allocA := &AliasAllocation{
@@ -147,6 +158,7 @@ func TestB03_FaultInjectionRollsBackTransaction(t *testing.T) {
 	}
 	defer st.Close()
 
+	_, _ = st.db.Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
 	// 准备可用库存
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "fault@example.com", Active: true}, "replenish", true)
 
@@ -199,6 +211,7 @@ func TestB05_IdempotentReplayIntegrity(t *testing.T) {
 	}
 	defer st.Close()
 
+	_, _ = st.db.Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "b05@example.com", Active: true}, "replenish", true)
 
 	// 1. 成功执行一次认领
@@ -226,5 +239,143 @@ func TestB05_IdempotentReplayIntegrity(t *testing.T) {
 	allocTampered, _, err := st.ClaimInventoryAlias(context.Background(), "token", "tok_b05", "allocate", "idemp_b05", "hash_valid", "tag", nil)
 	if err == nil {
 		t.Fatalf("B05 FAILED: tampered operation returned success: %v", allocTampered)
+	}
+}
+
+// B06: 认领成功与空池失败测试
+func TestB06_ClaimInventoryAlias_SuccessAndEmptyPool(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	_, _ = st.db.Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "b06@example.com", Active: true}, "replenish", true)
+
+	// 1. 成功认领
+	alloc, op, err := st.ClaimInventoryAlias(context.Background(), "token", "tok_b06", "allocate", "idemp_b06", "h1", "default", nil)
+	if err != nil || alloc == nil || op == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+	if alloc.AliasEmail != "b06@example.com" || op.State != "succeeded" {
+		t.Fatalf("unexpected allocation or op: alloc=%+v op=%+v", alloc, op)
+	}
+
+	// 2. 池空后认领失败，operation 标记为 failed
+	alloc2, op2, err := st.ClaimInventoryAlias(context.Background(), "token", "tok_b06", "allocate", "idemp_b06_2", "h2", "default", nil)
+	if err == nil || alloc2 != nil {
+		t.Fatalf("expected error on empty pool, got: %v", err)
+	}
+	if !errors.Is(err, ErrNoAvailableInventory) {
+		t.Fatalf("expected ErrNoAvailableInventory, got: %v", err)
+	}
+	if op2 == nil || op2.State != "failed" || op2.ErrorCode != "NO_AVAILABLE_INVENTORY" {
+		t.Fatalf("expected failed operation with code NO_AVAILABLE_INVENTORY, got: %+v", op2)
+	}
+}
+
+// B07: 上下文取消测试 (Cancellation)
+func TestB07_ClaimInventoryAlias_ContextCancellation(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	_, _ = st.db.Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "b07@example.com", Active: true}, "replenish", true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 预先取消
+
+	alloc, _, err := st.ClaimInventoryAlias(ctx, "token", "tok_b07", "allocate", "idemp_b07", "h1", "default", nil)
+	if err == nil || alloc != nil {
+		t.Fatalf("expected cancellation error, got: %v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+}
+
+// B08: 零行更新、缺失库存或非合法状态直接拒绝，事务回滚
+func TestB08_RecordAllocation_ZeroRowsOrStateRejection(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	_, _ = st.db.Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+
+	// 1. 无库存记录直接拒绝
+	allocMissing := &AliasAllocation{
+		AllocationID: "alloc_missing",
+		AliasEmail:   "missing@example.com",
+		AccountID:    "acc_1",
+		OwnerKind:    "token",
+		OwnerID:      "tok_1",
+		BusinessTag:  "tag",
+		AllocatedAt:  "2026-09-20T00:00:00Z",
+		Status:       "allocated",
+	}
+	_, err = st.RecordAllocation(allocMissing, "tok_1")
+	if err == nil || !errors.Is(err, ErrNoAvailableInventory) {
+		t.Fatalf("expected ErrNoAvailableInventory for missing inventory, got: %v", err)
+	}
+
+	// 2. 隔离或受保护状态 (reserved/quarantined/legacy_unknown) 拒绝直接 UPDATE 为 allocated
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "res@example.com", Active: true}, "replenish", false) // unknown
+	_, _ = st.db.Exec(`UPDATE alias_inventory SET allocation_state = 'reserved' WHERE email = 'res@example.com'`)
+
+	allocRes := &AliasAllocation{
+		AllocationID: "alloc_res",
+		AliasEmail:   "res@example.com",
+		AccountID:    "acc_1",
+		OwnerKind:    "token",
+		OwnerID:      "tok_1",
+		BusinessTag:  "tag",
+		AllocatedAt:  "2026-09-20T00:00:00Z",
+		Status:       "allocated",
+	}
+	_, err = st.RecordAllocation(allocRes, "tok_1")
+	if err == nil || !errors.Is(err, ErrAllocationConflict) {
+		t.Fatalf("expected ErrAllocationConflict for reserved inventory, got: %v", err)
+	}
+}
+
+// B09: 提交失败保证事务回滚 (零行孤立写入)
+func TestB09_ClaimInventoryAlias_TxFailureRollback(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := NewStore(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	_, _ = st.db.Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "b09@example.com", Active: true}, "replenish", true)
+
+	// 注入触发器阻断 lease_records 插入
+	_, _ = st.db.Exec(`CREATE TRIGGER fail_lease_insert BEFORE INSERT ON lease_records BEGIN SELECT RAISE(FAIL, 'injected lease insert fail'); END;`)
+
+	alloc, _, err := st.ClaimInventoryAlias(context.Background(), "token", "tok_b09", "allocate", "idemp_b09", "h1", "default", nil)
+	if err == nil || alloc != nil {
+		t.Fatalf("expected error on injected commit failure, got: %v", err)
+	}
+
+	// 确认事务回滚：inventory 保持 available，无 allocation
+	var state string
+	_ = st.db.QueryRow(`SELECT allocation_state FROM alias_inventory WHERE email = 'b09@example.com'`).Scan(&state)
+	if state != "available" {
+		t.Fatalf("expected state available, got %s", state)
+	}
+	var allocCnt int
+	_ = st.db.QueryRow(`SELECT COUNT(*) FROM alias_allocations WHERE alias_email = 'b09@example.com'`).Scan(&allocCnt)
+	if allocCnt != 0 {
+		t.Fatalf("expected 0 allocations, got %d", allocCnt)
 	}
 }

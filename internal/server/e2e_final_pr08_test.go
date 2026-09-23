@@ -31,6 +31,9 @@ func TestPR08_E2E_FullLifecycleIntegration(t *testing.T) {
 	}
 
 	// 1. 模拟管理员预置库存
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_master_1', 'Master 1', 'master1@test.com', 'active', '["order_service"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+
 	aliasEmail := "e2e_final_alias@icloud.com"
 	_ = st.AddInventoryAlias("acc_master_1", hme.Alias{
 		Email:       aliasEmail,

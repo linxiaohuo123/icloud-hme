@@ -87,6 +87,10 @@ func (s *Server) externalV2AllocateHandler(c *gin.Context) {
 			failCode(c, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "相同幂等键使用不同请求参数冲突")
 			return
 		}
+		if errors.Is(err, store.ErrAllocationConflict) {
+			failCode(c, http.StatusConflict, "ALLOCATION_CONFLICT", "别名分配发生冲突: "+err.Error())
+			return
+		}
 		if errors.Is(err, store.ErrOperationPending) {
 			opID := ""
 			if allocRes != nil && allocRes.Operation != nil {

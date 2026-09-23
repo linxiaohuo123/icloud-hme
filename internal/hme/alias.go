@@ -32,9 +32,10 @@ type Alias struct {
 
 // CreateResult 是 CreateAlias 的返回结果。
 type CreateResult struct {
-	Email     string `json:"email"`
-	Label     string `json:"label"`
-	CreatedAt string `json:"created_at"`
+	Email       string `json:"email"`
+	AnonymousID string `json:"anonymousId,omitempty"`
+	Label       string `json:"label"`
+	CreatedAt   string `json:"created_at"`
 }
 
 // ListAliasesWithContext 列出当前账号所有 Hide My Email 别名 (支持 Context 贯穿与严格模式)。
@@ -114,10 +115,10 @@ func (c *Client) Generate() (string, error) {
 	return c.GenerateWithContext(context.Background())
 }
 
-// ReserveWithContext 保留/确认候选别名,使其正式生效 (写操作 maxAttempts=1，包含网络中断后的写入状态核对)。
-func (c *Client) ReserveWithContext(ctx context.Context, hme, label string) (string, error) {
+// reserveInternalWithContext 保留候选别名并返回真实 email 和 anonymousId。
+func (c *Client) reserveInternalWithContext(ctx context.Context, hme, label string) (string, string, error) {
 	if err := c.resolveService(ctx); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if label == "" {
 		label = "Created " + time.Now().Format("2006-01-02 15:04")
@@ -132,7 +133,7 @@ func (c *Client) ReserveWithContext(ctx context.Context, hme, label string) (str
 	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/reserve", payload, 0, 1)
 	if err != nil {
 		if errors.Is(err, ErrAuthFailed) || ctx.Err() != nil {
-			return "", err
+			return "", "", err
 		}
 		// 上游写入状态不明: 发送请求后网络断开或超时，尝试核对上游别名列表确认候选是否已被创建成功 (U04)
 		c.log("Reserve 请求返回错误 (%v)，启动上游一致性核对...", err)
@@ -140,35 +141,43 @@ func (c *Client) ReserveWithContext(ctx context.Context, hme, label string) (str
 		if listErr == nil {
 			for _, a := range aliases {
 				if strings.EqualFold(a.Email, hme) {
-					c.log("核对恢复成功: 候选 %s 已存在于上游列表", hme)
-					return a.Email, nil
+					c.log("核对恢复成功: 候选 %s 已存在于上游列表 (id: %s)", hme, a.AnonymousID)
+					return a.Email, a.AnonymousID, nil
 				}
 			}
-			return "", fmt.Errorf("%w: reserve failed (%v) and candidate not found in upstream list", ErrOutcomeUnknown, err)
+			return "", "", fmt.Errorf("%w: reserve failed (%v) and candidate not found in upstream list", ErrOutcomeUnknown, err)
 		}
-		return "", fmt.Errorf("%w (reconciliation failed: %v): %v", ErrOutcomeUnknown, listErr, err)
+		return "", "", fmt.Errorf("%w (reconciliation failed: %v): %v", ErrOutcomeUnknown, listErr, err)
 	}
 
 	trimmed := strings.TrimSpace(body)
 	lower := strings.ToLower(trimmed)
 	if strings.HasPrefix(lower, "<!doctype") || strings.HasPrefix(lower, "<html") || !gjson.Valid(body) {
-		return "", fmt.Errorf("%w: invalid reserve response schema", ErrInvalidResponseSchema)
+		return "", "", fmt.Errorf("%w: invalid reserve response schema", ErrInvalidResponseSchema)
 	}
 
 	parsed := gjson.Parse(body)
 	if !parsed.Get("success").Bool() {
 		errMsg := parsed.Get("error.errorMessage").String()
-		return "", fmt.Errorf("保留失败: %s", nonEmpty(errMsg, "unknown"))
+		return "", "", fmt.Errorf("保留失败: %s", nonEmpty(errMsg, "unknown"))
 	}
 	alias := hme
+	var anonymousID string
 	resultHme := parsed.Get("result.hme")
 	if resultHme.IsObject() {
 		if v := resultHme.Get("hme").String(); v != "" {
 			alias = v
 		}
+		anonymousID = firstNonEmpty(resultHme.Get("anonymousId").String(), resultHme.Get("id").String())
 	}
-	c.log("已保留: %s", alias)
-	return alias, nil
+	c.log("已保留: %s (id: %s)", alias, anonymousID)
+	return alias, anonymousID, nil
+}
+
+// ReserveWithContext 保留/确认候选别名,使其正式生效 (写操作 maxAttempts=1，包含网络中断后的写入状态核对)。
+func (c *Client) ReserveWithContext(ctx context.Context, hme, label string) (string, error) {
+	email, _, err := c.reserveInternalWithContext(ctx, hme, label)
+	return email, err
 }
 
 // Reserve 保留/确认候选别名,使其正式生效。
@@ -209,7 +218,7 @@ func (c *Client) CreateAliasWithContext(ctx context.Context, label string, maxRe
 			}
 			break
 		}
-		email, err := c.ReserveWithContext(ctx, hme, label)
+		email, anonID, err := c.reserveInternalWithContext(ctx, hme, label)
 		if err != nil {
 			lastErr = fmt.Errorf("reserve 失败: %w", err)
 			c.log("%s", lastErr)
@@ -231,9 +240,10 @@ func (c *Client) CreateAliasWithContext(ctx context.Context, label string, maxRe
 			break
 		}
 		return &CreateResult{
-			Email:     email,
-			Label:     label,
-			CreatedAt: time.Now().Format(time.RFC3339),
+			Email:       email,
+			AnonymousID: anonID,
+			Label:       label,
+			CreatedAt:   time.Now().Format(time.RFC3339),
 		}, nil
 	}
 	if lastErr != nil {

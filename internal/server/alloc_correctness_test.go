@@ -26,6 +26,9 @@ func setupAllocTestServer(t *testing.T) (*store.Store, *fakeBackend, *httptest.S
 		t.Fatal(err)
 	}
 
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '["default"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+
 	fb := &fakeBackend{
 		accounts: []account.Summary{
 			{ID: "acc_1", Status: "active", HasCookies: true, Tags: []string{"default"}},
@@ -527,6 +530,11 @@ func TestAllocation_NoTaggedAccountsDoesNotFallBackGlobal(t *testing.T) {
 	}
 	defer st.Close()
 
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_finance', 'Finance Acc', 'fin@test.com', 'active', '["finance"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_default', 'Default Acc', 'def@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+
 	// 账号配置:
 	// acc_finance: 标签 ["finance"], 库存 10 个
 	// acc_default: 标签 [] (公共未标记), 库存 10 个
@@ -538,6 +546,7 @@ func TestAllocation_NoTaggedAccountsDoesNotFallBackGlobal(t *testing.T) {
 	}
 	cfg := Config{Debug: false, AdminPassword: "admin"}
 	s := newWithBackendAndStore(fb, cfg, st)
+	defer s.Close()
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 
@@ -614,12 +623,16 @@ func TestIdempotency_FailedPoolEmptyReplaysSameError(t *testing.T) {
 	}
 	defer st.Close()
 
+	_, _ = st.DB().Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) 
+		VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+
 	fb := &fakeBackend{
 		accounts: []account.Summary{
 			{ID: "acc_1", Status: "active", HasAppPassword: true, Tags: []string{}},
 		},
 	}
 	s := newWithBackendAndStore(fb, Config{AdminPassword: "admin"}, st)
+	defer s.Close()
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 

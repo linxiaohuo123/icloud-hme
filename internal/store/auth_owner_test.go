@@ -10,6 +10,8 @@ package store
 import (
 	"context"
 	"testing"
+
+	"icloud-hme/internal/hme"
 )
 
 // AUTH01: IsEmailOwnedByToken 仅查 alias_allocations，token_id 不匹配返回 false
@@ -27,6 +29,9 @@ func TestAUTH01_OwnershipRequiresMatchingTokenID(t *testing.T) {
 	_ = st.SaveToken(APIToken{ID: "tok_B", Name: "botB", Token: "secB"})
 
 	// 给 token A 分配别名
+	_, _ = st.db.Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "alpha@icloud.com", Active: true}, "replenish", true)
+
 	alloc := &AliasAllocation{
 		AllocationID: "alloc_1",
 		AliasEmail:   "alpha@icloud.com",
@@ -128,6 +133,9 @@ func TestAUTH04_AdminOwnershipBypass(t *testing.T) {
 	defer st.Close()
 
 	ctx := context.Background()
+	_, _ = st.db.Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) VALUES ('acc_1', 'Account 1', 'a1@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "admin_target@icloud.com", Active: true}, "replenish", true)
+
 	alloc := &AliasAllocation{
 		AllocationID: "alloc_admin",
 		AliasEmail:   "admin_target@icloud.com",
@@ -138,7 +146,9 @@ func TestAUTH04_AdminOwnershipBypass(t *testing.T) {
 		AllocatedAt:  "2026-01-01T00:00:00Z",
 		Status:       "allocated",
 	}
-	_, _ = st.RecordAllocation(alloc, "client_bot")
+	if _, err := st.RecordAllocation(alloc, "client_bot"); err != nil {
+		t.Fatalf("RecordAllocation failed: %v", err)
+	}
 
 	// 验证 GetPrincipalAllocation 在管理员主体下可以查询到记录
 	record, err := st.GetPrincipalAllocation(ctx, "admin_target@icloud.com", "token", "tok_client")

@@ -698,15 +698,22 @@ Content-Type: application/json
 {
   "success": true,
   "data": {
+    "lease_id": "alloc_6f8b2a1c...",
     "allocation_id": "alloc_6f8b2a1c...",
     "email": "fresh_alias@icloud.com",
+    "alias_email": "fresh_alias@icloud.com",
     "account_id": "acc_1",
-    "tag": "default",
+    "operation_id": "op_9c72e1...",
     "source": "pool",
-    "created_at": "2026-09-23T10:00:00Z"
+    "status": "allocated",
+    "allocated_at": "2026-09-23T10:00:00Z"
   }
 }
 ```
+> **字段说明**：
+> - `lease_id` / `allocation_id`：租约唯一标识（两者值相同，指向同一数据库分配记录，用于后续取码绑定）。
+> - `allocated_at`：别名真实租约分配时间戳（RFC3339 UTC 格式）。注：历史 v1 的 `tag` 与 `created_at` 字段在 v2 契约中不再提供。
+> - 若相同幂等键传参不一致返回 `409 IDEMPOTENCY_CONFLICT`；底层别名分配出现状态或唯一性冲突返回 `409 ALLOCATION_CONFLICT`。
 
 #### 步骤 2：创建取码意图并锁定邮件基线 (POST /api/external/v2/verification-requests)
 使用出号时返回的 `allocation_id`（即 `lease_id`）建立取码任务。系统将自动原子采集目标母号 IMAP 的最新 `UIDVALIDITY` 与 `UIDNEXT` 基线：

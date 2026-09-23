@@ -288,8 +288,14 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		allocID := store.NewOpaqueID("alloc_")
 
 		// 同步记入 alias_inventory 与 alias_allocations
-		if invErr := s.store.AddInventoryAlias(accountID, hme.Alias{Email: res.Email, Label: res.Label, CreatedAt: res.CreatedAt, Active: true}, "created", false); invErr != nil {
-			log.Printf("[AllocationService] 登记别名库存失败: %v", invErr)
+		if invErr := s.store.AddInventoryAlias(accountID, hme.Alias{
+			Email:       res.Email,
+			AnonymousID: res.AnonymousID,
+			Label:       res.Label,
+			CreatedAt:   res.CreatedAt,
+			Active:      true,
+		}, "created", true); invErr != nil {
+			return nil, fmt.Errorf("upstream created alias %s successfully but local inventory persistence failed (pending reconciliation): %w", res.Email, invErr)
 		}
 		alloc := &store.AliasAllocation{
 			AllocationID: allocID,

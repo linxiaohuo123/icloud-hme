@@ -209,33 +209,8 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 	}
 
 	// 2. 幂等返回已有最终态
-	if vreq.Status == "succeeded" {
-		magicLink := ""
-		if strings.HasPrefix(vreq.Code, "http://") || strings.HasPrefix(vreq.Code, "https://") {
-			magicLink = vreq.Code
-		}
-		return &VerificationResult{
-			RequestID:  vreq.RequestID,
-			LeaseID:    vreq.LeaseID,
-			AliasEmail: vreq.AliasEmail,
-			Code:       vreq.Code,
-			MagicLink:  magicLink,
-			MessageRef: vreq.MatchedEventRef,
-			Status:     "succeeded",
-		}, nil
-	}
-
-	if vreq.Status == "expired" {
-		return &VerificationResult{
-			RequestID:  vreq.RequestID,
-			LeaseID:    vreq.LeaseID,
-			AliasEmail: vreq.AliasEmail,
-			Status:     "expired",
-		}, nil
-	}
-
-	if vreq.Status == "invalidated" {
-		return nil, ErrUIDValidityChanged
+	if vreq.Status == "succeeded" || vreq.Status == "expired" || vreq.Status == "invalidated" {
+		return mapVerificationRecordToResult(vreq)
 	}
 
 	// 3. 基于 INBOX Mailbox、UIDVALIDITY 与 UIDNEXT 边界订阅事件 (PR-06 §9.2, 9.5, Issue 4 & 5)
@@ -260,26 +235,17 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		}
 		// UIDVALIDITY 突变检测 (Issue 5 & 6)
 		if item.UIDValidity != 0 && vreq.BaselineUIDValidity != 0 && item.UIDValidity != uint32(vreq.BaselineUIDValidity) {
-			curReq, _, invErr := s.store.InvalidateVerificationRequest(ctx, vreq.RequestID)
+			curReq, won, invErr := s.store.InvalidateVerificationRequest(ctx, vreq.RequestID)
 			if invErr != nil {
 				return nil, &BackendError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "持久化代际失效失败: " + invErr.Error()}
 			}
-			if curReq != nil && curReq.Status == "succeeded" {
-				curMagicLink := ""
-				if strings.HasPrefix(curReq.Code, "http://") || strings.HasPrefix(curReq.Code, "https://") {
-					curMagicLink = curReq.Code
-				}
-				return &VerificationResult{
-					RequestID:  curReq.RequestID,
-					LeaseID:    curReq.LeaseID,
-					AliasEmail: curReq.AliasEmail,
-					Code:       curReq.Code,
-					MagicLink:  curMagicLink,
-					MessageRef: curReq.MatchedEventRef,
-					Status:     "succeeded",
-				}, nil
+			if won {
+				return nil, ErrUIDValidityChanged
 			}
-			// 注意：代际突变不消费该事件，保留在 cache 中供新基线消费
+			// 代际失效 CAS 输给并发操作 (expired 或 succeeded)，严格返回胜出的真实终态，不得覆盖掩盖
+			if curReq != nil {
+				return mapVerificationRecordToResult(curReq)
+			}
 			return nil, ErrUIDValidityChanged
 		}
 
@@ -308,32 +274,9 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 			}, nil
 		}
 
-		// CAS 未中(已被并发完成或已过期/失效)
+		// CAS 未中 (已被并发完成或已过期/失效，返回数据库真实终态)
 		if curReq != nil {
-			if curReq.Status == "invalidated" {
-				return nil, ErrUIDValidityChanged
-			}
-			if curReq.Status == "expired" {
-				return &VerificationResult{
-					RequestID:  curReq.RequestID,
-					LeaseID:    curReq.LeaseID,
-					AliasEmail: curReq.AliasEmail,
-					Status:     "expired",
-				}, nil
-			}
-			curMagicLink := ""
-			if strings.HasPrefix(curReq.Code, "http://") || strings.HasPrefix(curReq.Code, "https://") {
-				curMagicLink = curReq.Code
-			}
-			return &VerificationResult{
-				RequestID:  curReq.RequestID,
-				LeaseID:    curReq.LeaseID,
-				AliasEmail: curReq.AliasEmail,
-				Code:       curReq.Code,
-				MagicLink:  curMagicLink,
-				MessageRef: curReq.MatchedEventRef,
-				Status:     curReq.Status,
-			}, nil
+			return mapVerificationRecordToResult(curReq)
 		}
 		return &VerificationResult{
 			RequestID:  vreq.RequestID,
@@ -348,6 +291,11 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		case item := <-ch:
 			return handleItem(item)
 		default:
+			if freshReq, ferr := s.store.GetVerificationRequest(ctx, requestID, string(p.Kind), p.ID); ferr == nil && freshReq != nil {
+				if freshReq.Status == "succeeded" || freshReq.Status == "expired" || freshReq.Status == "invalidated" {
+					return mapVerificationRecordToResult(freshReq)
+				}
+			}
 			return &VerificationResult{
 				RequestID:  vreq.RequestID,
 				LeaseID:    vreq.LeaseID,
@@ -373,30 +321,7 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 						return nil, &BackendError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "更新取码过期状态失败: " + expErr.Error()}
 					}
 					if curReq != nil {
-						if curReq.Status == "succeeded" {
-							curMagicLink := ""
-							if strings.HasPrefix(curReq.Code, "http://") || strings.HasPrefix(curReq.Code, "https://") {
-								curMagicLink = curReq.Code
-							}
-							return &VerificationResult{
-								RequestID:  curReq.RequestID,
-								LeaseID:    curReq.LeaseID,
-								AliasEmail: curReq.AliasEmail,
-								Code:       curReq.Code,
-								MagicLink:  curMagicLink,
-								MessageRef: curReq.MatchedEventRef,
-								Status:     "succeeded",
-							}, nil
-						}
-						if curReq.Status == "invalidated" {
-							return nil, ErrUIDValidityChanged
-						}
-						return &VerificationResult{
-							RequestID:  curReq.RequestID,
-							LeaseID:    curReq.LeaseID,
-							AliasEmail: curReq.AliasEmail,
-							Status:     curReq.Status,
-						}, nil
+						return mapVerificationRecordToResult(curReq)
 					}
 					return &VerificationResult{
 						RequestID:  vreq.RequestID,
@@ -407,6 +332,12 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 				}
 			}
 		}
+		// 即使未到 ExpiresAt，定时器触发后核查 DB 是否已产生并发落地的真实终态 (统一 handleItem 终态映射)
+		if freshReq, ferr := s.store.GetVerificationRequest(ctx, requestID, string(p.Kind), p.ID); ferr == nil && freshReq != nil {
+			if freshReq.Status == "succeeded" || freshReq.Status == "expired" || freshReq.Status == "invalidated" {
+				return mapVerificationRecordToResult(freshReq)
+			}
+		}
 		return &VerificationResult{
 			RequestID:  vreq.RequestID,
 			LeaseID:    vreq.LeaseID,
@@ -415,5 +346,44 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+}
+
+// mapVerificationRecordToResult 将数据库 VerificationRequest 映射为 VerificationResult 或失效错误
+func mapVerificationRecordToResult(rec *store.VerificationRequest) (*VerificationResult, error) {
+	if rec == nil {
+		return nil, ErrVReqNotFound
+	}
+	switch rec.Status {
+	case "succeeded":
+		magicLink := ""
+		if strings.HasPrefix(rec.Code, "http://") || strings.HasPrefix(rec.Code, "https://") {
+			magicLink = rec.Code
+		}
+		return &VerificationResult{
+			RequestID:  rec.RequestID,
+			LeaseID:    rec.LeaseID,
+			AliasEmail: rec.AliasEmail,
+			Code:       rec.Code,
+			MagicLink:  magicLink,
+			MessageRef: rec.MatchedEventRef,
+			Status:     "succeeded",
+		}, nil
+	case "expired":
+		return &VerificationResult{
+			RequestID:  rec.RequestID,
+			LeaseID:    rec.LeaseID,
+			AliasEmail: rec.AliasEmail,
+			Status:     "expired",
+		}, nil
+	case "invalidated":
+		return nil, ErrUIDValidityChanged
+	default:
+		return &VerificationResult{
+			RequestID:  rec.RequestID,
+			LeaseID:    rec.LeaseID,
+			AliasEmail: rec.AliasEmail,
+			Status:     rec.Status,
+		}, nil
 	}
 }

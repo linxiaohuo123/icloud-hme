@@ -162,10 +162,11 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 			// 严禁在补货时创建 consumer allocation / lease，确保普通出号能原子认领
 			if st != nil {
 				if addErr := st.AddInventoryAlias(accountID, hme.Alias{
-					Email:     res.Email,
-					Label:     res.Label,
-					CreatedAt: res.CreatedAt,
-					Active:    true,
+					Email:       res.Email,
+					AnonymousID: res.AnonymousID,
+					Label:       res.Label,
+					CreatedAt:   res.CreatedAt,
+					Active:      true,
 				}, "replenish", true); addErr != nil {
 					log.Printf("[Scheduler] 补货入库失败 email=%s: %v", res.Email, addErr)
 					return nil, fmt.Errorf("补货入库持久化失败 email=%s: %w", res.Email, addErr)
