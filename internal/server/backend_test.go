@@ -73,6 +73,10 @@ type fakeBackend struct {
 	validateID   string
 	validateFunc func(id string) error
 
+	onScanMailboxUIDPage        func(ctx context.Context, q ScanPageQuery) (ScanPageResult, error)
+	onGetMailboxBoundaryContext func(ctx context.Context, accountID, folder string) (string, uint32, uint32, error)
+	onGetMessagesContext        func(ctx context.Context, accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error)
+
 	onSetAliasActive    func(accountID, anonymousID string, active bool) (bool, error)
 	onDeleteAlias       func(accountID, anonymousID string) error
 	getMessageFunc      func(accountID string, id string) (*mail.FullMessage, error)
@@ -353,7 +357,7 @@ func (f *fakeBackend) GetMessages(accountID string, refs []mail.MessageRef) ([]*
 		if mailbox == "" {
 			mailbox = "INBOX"
 		}
-		out = append(out, &mail.FullMessage{
+		fm := &mail.FullMessage{
 			Message: mail.Message{
 				ID:          r.Encode(),
 				MessageRef:  r.Encode(),
@@ -365,7 +369,18 @@ func (f *fakeBackend) GetMessages(accountID string, refs []mail.MessageRef) ([]*
 			BodyComplete: true,
 			Provider:     "imap",
 			Method:       "imap",
-		})
+		}
+		for _, m := range f.inbox.Messages {
+			if m.UID == r.UID {
+				fm.Subject = m.Subject
+				fm.Preview = m.Preview
+				fm.From = m.From
+				fm.To = m.To
+				fm.Date = m.Date
+				break
+			}
+		}
+		out = append(out, fm)
 	}
 	return out, nil
 }
@@ -374,14 +389,65 @@ func (f *fakeBackend) GetMessagesContext(ctx context.Context, accountID string, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if f.onGetMessagesContext != nil {
+		return f.onGetMessagesContext(ctx, accountID, refs)
+	}
 	return f.GetMessages(accountID, refs)
 }
 
 func (f *fakeBackend) GetMailboxBoundary(accountID, folder string) (string, uint32, uint32, error) {
+	return f.GetMailboxBoundaryContext(context.Background(), accountID, folder)
+}
+
+func (f *fakeBackend) GetMailboxBoundaryContext(ctx context.Context, accountID, folder string) (string, uint32, uint32, error) {
+	if err := ctx.Err(); err != nil {
+		return "", 0, 0, err
+	}
+	if f.onGetMailboxBoundaryContext != nil {
+		return f.onGetMailboxBoundaryContext(ctx, accountID, folder)
+	}
 	if f.mailboxBoundaryFunc != nil {
 		return f.mailboxBoundaryFunc(accountID, folder)
 	}
-	return "imap", 1, 100, nil
+	return "imap", 1, 1000000, nil
+}
+
+func (f *fakeBackend) ScanMailboxUIDPage(ctx context.Context, q ScanPageQuery) (ScanPageResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ScanPageResult{}, err
+	}
+	if f.onScanMailboxUIDPage != nil {
+		return f.onScanMailboxUIDPage(ctx, q)
+	}
+	if f.onListInboxContext != nil {
+		inboxRes, err := f.onListInboxContext(ctx, InboxQuery{
+			AccountID: q.AccountID,
+			Folder:    q.Folder,
+			SinceUID:  q.FromUIDInclusive,
+			Limit:     q.PageSize,
+		})
+		if err != nil {
+			return ScanPageResult{}, err
+		}
+		f.mu.Lock()
+		f.inbox.Messages = append(f.inbox.Messages, inboxRes.Messages...)
+		f.mu.Unlock()
+		var nextUID uint32 = q.ToUIDInclusive + 1
+		if len(inboxRes.Messages) > 0 {
+			nextUID = inboxRes.Messages[len(inboxRes.Messages)-1].UID + 1
+		}
+		return ScanPageResult{
+			UIDValidity: q.UIDValidity,
+			Messages:    inboxRes.Messages,
+			NextUID:     nextUID,
+			HasMore:     false,
+		}, nil
+	}
+	return ScanPageResult{
+		UIDValidity: q.UIDValidity,
+		NextUID:     q.ToUIDInclusive + 1,
+		HasMore:     false,
+	}, nil
 }
 
 func (f *fakeBackend) DeleteMessage(accountID string, uid uint32) error { return nil }
