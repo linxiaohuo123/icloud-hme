@@ -91,3 +91,52 @@ jobs:
 
       - name: Build
         run: go build ./...
+
+  container-smoke:
+    name: Container Smoke (Non-root + Healthcheck)
+    runs-on: ubuntu-latest
+    needs: [web, go]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: webui-dist
+          path: internal/webui/dist/
+
+      - name: Build Docker Image
+        run: docker build -t icloud-hme:smoke .
+
+      - name: Run Smoke Container (Non-root UID 10001, Isolated Empty Data Dir)
+        run: |
+          mkdir -p /tmp/smoke-data
+          sudo chown -R 10001:10001 /tmp/smoke-data
+          docker run -d --name smoke-app \
+            -p 127.0.0.1:8081:8081 \
+            -v /tmp/smoke-data:/app/data \
+            -e ICLOUD_HME_ADMIN_PASSWORD=smoke_test_admin_password_2026 \
+            icloud-hme:smoke
+          sleep 3
+
+      - name: Verify Loopback Port Binding
+        run: |
+          PORT_BINDING=$(docker port smoke-app 8081)
+          echo "Port binding: $PORT_BINDING"
+          echo "$PORT_BINDING" | grep -q "127.0.0.1"
+
+      - name: Run Smoke Health Script
+        run: |
+          chmod +x scripts/smoke_health.sh
+          ./scripts/smoke_health.sh http://127.0.0.1:8081
+
+      - name: Verify Docker Container Healthcheck
+        run: |
+          sleep 12
+          STATUS=$(docker inspect --format='{{.State.Health.Status}}' smoke-app)
+          echo "Docker Health Status: $STATUS"
+          [ "$STATUS" = "healthy" ] || { echo "Container is not healthy: $STATUS"; exit 1; }
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f smoke-app || true
+

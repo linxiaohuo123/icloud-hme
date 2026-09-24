@@ -73,6 +73,30 @@ if [ "$SESSION_CODE" != "401" ]; then
     echo "[ERROR] /api/auth/session 未认证请求状态码异常: expected 401, got ${SESSION_CODE}"
     exit 1
 fi
-echo "[PASS] /api/auth/session 未认证请求严格返回 401 AUTH_REQUIRED"
+# 4. 负向测试: 验证实际判定函数对 200 HTML SPA 回退页面必须返回失败
+echo "[TEST] 正在执行负向测试: 验证 SPA HTML 回退必须被判定函数拦截拒绝..."
+LEGACY_SPA_URL="${BASE_URL}/unregistered_smoke_test_probe"
+TEMP_SPA=$(mktemp)
+SPA_CODE=$(wget -q -S -O "$TEMP_SPA" "$LEGACY_SPA_URL" 2>&1 | awk '/^  HTTP\// {print $2}' | tail -n1 || true)
+if [ -z "$SPA_CODE" ] && command -v curl >/dev/null 2>&1; then
+    SPA_CODE=$(curl -s -o "$TEMP_SPA" -w "%{http_code}" "$LEGACY_SPA_URL" || true)
+fi
+SPA_BODY=$(cat "$TEMP_SPA")
+rm -f "$TEMP_SPA"
+
+case "$SPA_BODY" in
+    *html*|*DOCTYPE*|*<!doctype*|*<html*)
+        if [ "$SPA_CODE" = "200" ]; then
+            echo "[PASS] 确认输入为真实 200 HTML SPA 回退页面"
+        fi
+        ;;
+esac
+
+if validate_probe "/unregistered_smoke_test_probe" >/dev/null 2>&1; then
+    echo "[ERROR] 负向测试失败: 判定逻辑错误将 200 HTML SPA 回退放行为健康!"
+    exit 1
+else
+    echo "[PASS] 负向测试通过: 判定逻辑确凿拒绝 200 HTML SPA 回退页面"
+fi
 
 echo "[SMOKE] 全部健康检查冒烟项验证通过!"
