@@ -112,6 +112,16 @@ func NewClientWithServer(username, password, server string, port int) *Client {
 	return &Client{username: username, password: password, server: server, port: port}
 }
 
+// NewClientForTesting 供测试构造已初始化的合法 Client，支持在本地测试中通过生产 Ping 检查
+func NewClientForTesting(appleID, appPassword string, conn net.Conn, cli *client.Client) *Client {
+	return &Client{
+		username: appleID,
+		password: appPassword,
+		conn:     conn,
+		cli:      cli,
+	}
+}
+
 // SetProxy 设置或更新代理配置。
 func (c *Client) SetProxy(proxyURL string) {
 	c.proxyURL = strings.TrimSpace(proxyURL)

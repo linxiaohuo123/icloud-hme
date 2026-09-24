@@ -61,6 +61,9 @@ export default function MailboxDialog({ accountId, current, open, onClose, onSav
         body: JSON.stringify({ provider, email, imap_host: host, imap_port: Number(port), authorization_code: code }),
       })
       onSaved()
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('account-updated', { detail: { accountId } }))
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : '收件邮箱接入失败')
     } finally {

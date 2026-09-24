@@ -67,6 +67,8 @@ type fakeBackend struct {
 	onListAliases      func(accountID string) ([]hme.Alias, error)
 	onListInbox        func(q InboxQuery) (InboxResult, error)
 	onListInboxContext func(ctx context.Context, q InboxQuery) (InboxResult, error)
+	onListMailboxes        func(accountID string) ([]mail.Folder, error)
+	onListMailboxesContext func(ctx context.Context, accountID string) ([]mail.Folder, error)
 
 	validateID   string
 	validateFunc func(id string) error
@@ -304,10 +306,23 @@ func (f *fakeBackend) ListInboxContext(ctx context.Context, q InboxQuery) (Inbox
 }
 
 func (f *fakeBackend) ListMailboxes(accountID string) ([]mail.Folder, error) {
+	if f.onListMailboxes != nil {
+		return f.onListMailboxes(accountID)
+	}
 	return []mail.Folder{
 		{Name: "INBOX", Role: "inbox"},
 		{Name: "Junk", Role: "junk"},
 	}, nil
+}
+
+func (f *fakeBackend) ListMailboxesContext(ctx context.Context, accountID string) ([]mail.Folder, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.onListMailboxesContext != nil {
+		return f.onListMailboxesContext(ctx, accountID)
+	}
+	return f.ListMailboxes(accountID)
 }
 
 func (f *fakeBackend) GetMessage(accountID string, id string) (*mail.FullMessage, error) {
@@ -321,6 +336,13 @@ func (f *fakeBackend) GetMessage(accountID string, id string) (*mail.FullMessage
 	return &mail.FullMessage{Message: mail.Message{ID: idPart}}, nil
 }
 
+func (f *fakeBackend) GetMessageContext(ctx context.Context, accountID string, id string) (*mail.FullMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return f.GetMessage(accountID, id)
+}
+
 func (f *fakeBackend) GetMessages(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error) {
 	if f.getMessagesFunc != nil {
 		return f.getMessagesFunc(accountID, refs)
@@ -331,28 +353,28 @@ func (f *fakeBackend) GetMessages(accountID string, refs []mail.MessageRef) ([]*
 		if mailbox == "" {
 			mailbox = "INBOX"
 		}
-		ref := mail.MessageRef{
-			Provider:    "imap",
-			AccountID:   accountID,
-			Mailbox:     mailbox,
-			UIDValidity: r.UIDValidity,
-			UID:         r.UID,
-		}
-		msg := &mail.FullMessage{
+		out = append(out, &mail.FullMessage{
 			Message: mail.Message{
-				ID:          fmt.Sprint(r.UID),
+				ID:          r.Encode(),
+				MessageRef:  r.Encode(),
 				Folder:      mailbox,
 				UIDValidity: r.UIDValidity,
 				UID:         r.UID,
 				Provider:    "imap",
-				MessageRef:  ref.Encode(),
 			},
-			Provider: "imap",
-			Method:   "imap",
-		}
-		out = append(out, msg)
+			BodyComplete: true,
+			Provider:     "imap",
+			Method:       "imap",
+		})
 	}
 	return out, nil
+}
+
+func (f *fakeBackend) GetMessagesContext(ctx context.Context, accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return f.GetMessages(accountID, refs)
 }
 
 func (f *fakeBackend) GetMailboxBoundary(accountID, folder string) (string, uint32, uint32, error) {

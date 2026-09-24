@@ -298,5 +298,8 @@ func (s *Server) handleLogout(c *gin.Context) {
 		s.auth.Logout(sessionID)
 	}
 	clearSessionCookie(c, s.cfg.SecureCookie)
+	if s.mailReadService != nil {
+		s.mailReadService.InvalidateAll()
+	}
 	ok(c, gin.H{"logged_out": true})
 }

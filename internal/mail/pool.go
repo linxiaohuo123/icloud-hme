@@ -324,3 +324,34 @@ func isLikelyConnErr(err error) bool {
 	}
 	return false
 }
+
+// SetClientForTesting 供测试在无需真实 Apple IMAP 认证时注入已初始化的 Client 验证生产连接池生命周期
+func (p *Pool) SetClientForTesting(appleID, appPassword string, cli *Client) {
+	pc := p.getOrCreate(appleID)
+	pc.appPassword = appPassword
+	pc.lastUsed = time.Now()
+	pc.client = cli
+}
+
+// ClientForTesting 供测试检查连接池中账号关联的 Client 是否已被置空丢弃
+func (p *Pool) ClientForTesting(appleID string) *Client {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	elem, ok := p.items[appleID]
+	if !ok || elem == nil {
+		return nil
+	}
+	return elem.Value.(*pooledConn).client
+}
+
+// TryLockForTesting 供测试检查单账号并发槽位信号量是否已释放
+func (p *Pool) TryLockForTesting(appleID string) bool {
+	pc := p.getOrCreate(appleID)
+	return pc.tryLock()
+}
+
+// UnlockForTesting 供测试释放单账号并发槽位信号量
+func (p *Pool) UnlockForTesting(appleID string) {
+	pc := p.getOrCreate(appleID)
+	pc.unlock()
+}
