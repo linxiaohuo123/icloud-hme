@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 context, database/sql, errors, strings, time, icloud-hme/internal/store (Store, ErrVerificationRequestNotFound)
- * [OUTPUT]: 对外提供 VerificationRequest, VerificationCompletion, ActiveVerificationWatch, VerificationEventInput 类型, ErrConflictActiveRequest, ErrServerBusy, ErrTooManyRequests 错误及 CreateVerificationRequestAtomic, CreateVerificationRequest, GetVerificationRequest, CompleteVerificationRequest, CompleteVerificationRequestResult, CompleteMatchingVerificationRequests, ExpireVerificationRequest, InvalidateVerificationRequest, UpdateVerificationRequestResult, GetActiveVerificationRequestByLease, CountActiveVerificationRequests, CountActiveVerificationRequestsByPrincipal, GetMinBaselineUIDByEmail, ListActiveVerificationWatches, HasActiveVerificationRequests
+ * [OUTPUT]: 对外提供 VerificationRequest, VerificationCompletion, ActiveVerificationWatch, VerificationEventInput 类型, ErrConflictActiveRequest, ErrServerBusy, ErrTooManyRequests 错误及 CreateVerificationRequestAtomic, CreateVerificationRequest, GetVerificationRequest, CompleteVerificationRequest, CompleteVerificationRequestResult, CompleteMatchingVerificationRequests, InvalidateVerificationRequestsForGenerationMismatch, ExpireVerificationRequest, InvalidateVerificationRequest, UpdateVerificationRequestResult, GetActiveVerificationRequestByLease, CountActiveVerificationRequests, CountActiveVerificationRequestsByPrincipal, GetMinBaselineUIDByEmail, ListActiveVerificationWatches, HasActiveVerificationRequests
  * [POS]: internal/store 的持久化取码请求与基线游标状态机领域 (PR-06/PR-08/PR-04B)，提供终态原子 CAS 与容量仲裁、权威持久化和持久化活跃观察查询
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -573,4 +573,37 @@ func (s *Store) CompleteMatchingVerificationRequests(ctx context.Context, ev Ver
 		return nil, err
 	}
 	return completed, nil
+}
+
+// InvalidateVerificationRequestsForGenerationMismatch 原子 CAS 将因代际 (UIDVALIDITY) 突变导致失效的活跃取码任务标记为 invalidated (PR-04B)
+// 仅影响 status IN ('ready', 'pending') 的未终态任务，已经处于终态的绝不覆盖。
+func (s *Store) InvalidateVerificationRequestsForGenerationMismatch(
+	ctx context.Context,
+	alias string,
+	mailbox string,
+	currentUIDValidity uint32,
+) (int64, error) {
+	if currentUIDValidity == 0 {
+		return 0, nil
+	}
+	if mailbox == "" {
+		mailbox = "INBOX"
+	}
+	normAlias := strings.ToLower(strings.TrimSpace(alias))
+
+	q := `
+	UPDATE verification_requests
+	SET status = 'invalidated'
+	WHERE status IN ('ready', 'pending')
+	  AND baseline_provider = 'imap'
+	  AND LOWER(TRIM(alias_email)) = ?
+	  AND (baseline_mailbox = ? OR (baseline_mailbox = '' AND ? = 'INBOX'))
+	  AND baseline_uidvalidity > 0
+	  AND baseline_uidvalidity != ?
+	`
+	res, err := s.db.ExecContext(ctx, q, normAlias, mailbox, mailbox, currentUIDValidity)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }

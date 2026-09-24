@@ -273,3 +273,89 @@ func TestStore_MagicLinkIndependentPersistence(t *testing.T) {
 		t.Fatalf("MagicLink 字段预期独立 URL, 实际: %s", got.MagicLink)
 	}
 }
+
+// 验证 InvalidateVerificationRequestsForGenerationMismatch 能够正确将 UIDVALIDITY 改变的未完成任务置为 invalidated，且不覆盖已完成任务
+func TestStore_InvalidateVerificationRequestsForGenerationMismatch(t *testing.T) {
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	alias := "gen_mismatch@icloud.com"
+
+	// 1. ready 状态，UIDValidity=1
+	_ = st.CreateVerificationRequest(ctx, &VerificationRequest{
+		RequestID:           "vreq_gen_ready",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok",
+		LeaseID:             "lease_1",
+		AliasEmail:          alias,
+		Status:              "ready",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "imap",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         100,
+	})
+
+	// 2. pending 状态，UIDValidity=1
+	_ = st.CreateVerificationRequest(ctx, &VerificationRequest{
+		RequestID:           "vreq_gen_pending",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok",
+		LeaseID:             "lease_2",
+		AliasEmail:          alias,
+		Status:              "pending",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "imap",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         100,
+	})
+
+	// 3. succeeded 状态，UIDValidity=1 (终态，绝不能被覆盖)
+	_ = st.CreateVerificationRequest(ctx, &VerificationRequest{
+		RequestID:           "vreq_gen_done",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok",
+		LeaseID:             "lease_3",
+		AliasEmail:          alias,
+		Status:              "succeeded",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		Code:                "888888",
+		BaselineProvider:    "imap",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         100,
+	})
+
+	// 当前 mailbox UIDValidity 变为 2
+	affected, err := st.InvalidateVerificationRequestsForGenerationMismatch(ctx, alias, "INBOX", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if affected != 2 {
+		t.Fatalf("预期更新 2 条任务为 invalidated, 实际: %d", affected)
+	}
+
+	r1, _ := st.GetVerificationRequest(ctx, "vreq_gen_ready", "token", "tok")
+	if r1.Status != "invalidated" {
+		t.Fatalf("vreq_gen_ready 应当变为 invalidated, 实际: %s", r1.Status)
+	}
+
+	r2, _ := st.GetVerificationRequest(ctx, "vreq_gen_pending", "token", "tok")
+	if r2.Status != "invalidated" {
+		t.Fatalf("vreq_gen_pending 应当变为 invalidated, 实际: %s", r2.Status)
+	}
+
+	r3, _ := st.GetVerificationRequest(ctx, "vreq_gen_done", "token", "tok")
+	if r3.Status != "succeeded" {
+		t.Fatalf("已 succeeded 的终态绝对不可被覆盖为 invalidated! 实际: %s", r3.Status)
+	}
+}

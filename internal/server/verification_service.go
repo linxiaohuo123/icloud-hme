@@ -225,6 +225,15 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		s.syncWorker.Trigger()
 	}
 
+	// Blocker 3 修复: Post-subscribe DB recheck (PR-04B)
+	// 订阅建立并触发 worker 后立即复查数据库。若任务已被后台 worker 或并发流程落库为终态
+	// (succeeded / expired / invalidated)，直接返回权威结果，不依赖 EventBus 内存唤醒，消除 subscribe race。
+	if freshReq, ferr := s.store.GetVerificationRequest(ctx, requestID, string(p.Kind), p.ID); ferr == nil && freshReq != nil {
+		if freshReq.Status == "succeeded" || freshReq.Status == "expired" || freshReq.Status == "invalidated" {
+			return mapVerificationRecordToResult(freshReq)
+		}
+	}
+
 	handleItem := func(item *mail.CachedOTP) (*VerificationResult, error) {
 		// 原子核查 Token 撤销状态
 		if p.Kind == auth.PrincipalToken {
