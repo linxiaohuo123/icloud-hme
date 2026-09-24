@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -287,7 +289,7 @@ func TestFault_05_RestartRecoveryDoesNotCreateSecondCandidate(t *testing.T) {
 	}
 
 	// 3. 模拟恶意或错误恢复程序试图将操作替换为候选 B：必须硬性拒绝！
-	_, tamperErr := st.ReconcileUnknownOperation(ctx, opID, true, candB, "acc_1", "default", "token", "tok_restart", "test")
+	_, tamperErr := st.ReconcileUnknownOperation(ctx, opID, store.ReconciliationFound, candB, "acc_1", "default", "token", "tok_restart", "test")
 	if tamperErr == nil {
 		t.Fatalf("TestFault_05 致命错误: 恢复程序成功将候选 A 篡改为候选 B，违反单候选铁律！")
 	}
@@ -296,7 +298,7 @@ func TestFault_05_RestartRecoveryDoesNotCreateSecondCandidate(t *testing.T) {
 	}
 
 	// 4. 正确针对原候选 A 进行一致性恢复：原子成功转为 succeeded
-	alloc, recoverErr := st.ReconcileUnknownOperation(ctx, opID, true, candA, "acc_1", "default", "token", "tok_restart", "test")
+	alloc, recoverErr := st.ReconcileUnknownOperation(ctx, opID, store.ReconciliationFound, candA, "acc_1", "default", "token", "tok_restart", "test")
 	if recoverErr != nil {
 		t.Fatalf("针对原候选 A 的恢复失败: %v", recoverErr)
 	}
@@ -439,3 +441,454 @@ func TestFault_07_ExplicitFailureAllowsRetry(t *testing.T) {
 		t.Fatalf("TestFault_07 期望重试后共计 2 次 generate, 实际: %d", calls)
 	}
 }
+
+// setupFaultTestEnvironment 为真实故障模拟建立隔离的临时测试环境
+func setupFaultTestEnvironment(t *testing.T, accountID string, handler http.Handler) (*httptest.Server, *managerBackend, *store.Store, string) {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	dir := t.TempDir()
+	accData := fmt.Sprintf(`{
+		"accounts": {
+			%q: {
+				"id": %q,
+				"name": "Fault Test Account",
+				"real_email": "fault@example.com",
+				"icloud_email": "fault@icloud.com",
+				"cookies": {"X-APPLE-WEBAUTH-USER": "cookie-val", "dsid": "dsid-val"},
+				"host": "icloud.com",
+				"status": "active",
+				"service_url": %q
+			}
+		}
+	}`, accountID, accountID, server.URL)
+	if err := os.WriteFile(filepath.Join(dir, "accounts.json"), []byte(accData), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := account.NewManager(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = mgr.WithHMEClient(accountID, func(c *hme.Client) error {
+		c.SetFixedServiceURL(server.URL)
+		return nil
+	})
+	st, err := store.NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mb := &managerBackend{mgr: mgr, store: st}
+	return server, mb, st, dir
+}
+
+// TestFault_PersistIntentBeforeReserve
+// 铁律验证：在调用上游 /v1/hme/reserve 发出写请求之前，SQLite 数据库中必须已经持久化了该候选 A 的 intent，
+// 且状态必须为 prepared 或 reserve_sent。
+func TestFault_PersistIntentBeforeReserve(t *testing.T) {
+	accID := "acc_test_persist"
+	candA := "cand_a_persist@icloud.com"
+	var reserveReceived int32
+	var intentVerifiedBeforeReserve int32
+
+	var server *httptest.Server
+	var st *store.Store
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/hme/generate":
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"success": true, "result": {"hme": "%s"}}`, candA)
+		case "/v1/hme/reserve":
+			atomic.AddInt32(&reserveReceived, 1)
+			// 核心断言：在写入网络响应之前，校验 SQLite 中 intent 已经落盘且为 reserve_sent 或 prepared
+			if st != nil {
+				intents, err := st.ListUnresolvedReserveIntents(context.Background(), accID)
+				if err != nil {
+					t.Errorf("查询 unresolved intents 失败: %v", err)
+				} else {
+					var foundIntent *store.HmeReserveIntent
+					for i := range intents {
+						if intents[i].CandidateEmail == candA {
+							foundIntent = &intents[i]
+							break
+						}
+					}
+					if foundIntent == nil {
+						t.Errorf("CRITICAL VIOLATION: upstream reserve 收到请求时，SQLite 未持久化候选 A 的 intent!")
+					} else {
+						if foundIntent.State != store.IntentStatePrepared && foundIntent.State != store.IntentStateReserveSent {
+							t.Errorf("upstream reserve 收到请求时，intent 状态不符合预期 (prepared/reserve_sent): %s", foundIntent.State)
+						} else {
+							atomic.StoreInt32(&intentVerifiedBeforeReserve, 1)
+						}
+					}
+				}
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"success": true, "result": {"hme": {"hme": "%s", "anonymousId": "anon_persist"}}}`, candA)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	srv, mb, storeInst, _ := setupFaultTestEnvironment(t, accID, handler)
+	server = srv
+	st = storeInst
+	defer server.Close()
+	defer st.Close()
+
+	res, err := mb.CreateAlias(accID, "test_label")
+	if err != nil {
+		t.Fatalf("CreateAlias 失败: %v", err)
+	}
+	if res.Email != candA {
+		t.Fatalf("返回别名不匹配: 期望 %s, 实际 %s", candA, res.Email)
+	}
+
+	if atomic.LoadInt32(&reserveReceived) != 1 {
+		t.Fatalf("reserve 调用次数不符合预期: %d", atomic.LoadInt32(&reserveReceived))
+	}
+	if atomic.LoadInt32(&intentVerifiedBeforeReserve) != 1 {
+		t.Fatalf("CRITICAL: 未通过写前持久化意图断言！")
+	}
+
+	// 最终状态必须为 succeeded
+	intent, err := st.FindLatestIntentForCandidate(context.Background(), candA)
+	if err != nil || intent == nil {
+		t.Fatalf("未能查询到完成后的 intent: %v", err)
+	}
+	if intent.State != store.IntentStateSucceeded {
+		t.Fatalf("最终 intent 状态期望 succeeded, 实际: %s", intent.State)
+	}
+}
+
+// TestFault_CrashAfterReserveSendBeforeResponse
+// 场景验证：候选 A intent 已持久化并且写请求已发往上游，但进程在收到 response 前“崩溃”退出；
+// 进程重启后新建 Store/Backend 实例，扫描未决意图，核对接口列表中存在候选 A，
+// 恢复为 succeeded 并录入 inventory；绝不调用 Generate，绝不产生候选 B！
+func TestFault_CrashAfterReserveSendBeforeResponse(t *testing.T) {
+	accID := "acc_test_crash"
+	candA := "cand_a_crash@icloud.com"
+	var generateCalls int32
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/hme/generate":
+			count := atomic.AddInt32(&generateCalls, 1)
+			t.Errorf("CRITICAL VIOLATION: 重启恢复核对期间严禁调用 Generate (调用次数=%d)！", count)
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"success": true, "result": {"hme": "cand_b_forbidden@icloud.com"}}`)
+		case "/v2/hme/list":
+			// 核对接口证实：在崩溃前发送的候选 A 已经成功落盘在上游
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{
+				"success": true,
+				"result": {
+					"hmeEmails": [
+						{"hme": "%s", "anonymousId": "anon_crash_a", "label": "test_crash", "isActive": true}
+					]
+				}
+			}`, candA)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	server, _, st1, dir := setupFaultTestEnvironment(t, accID, handler)
+	defer server.Close()
+
+	// 1. 模拟崩溃前留在磁盘的现场：候选 A 的 intent 已持久化且状态为 reserve_sent
+	ctx := context.Background()
+	intent, err := st1.CreateReserveIntent(ctx, accID, candA, "test_crash")
+	if err != nil {
+		t.Fatalf("CreateReserveIntent 失败: %v", err)
+	}
+	if err := st1.UpdateReserveIntentState(ctx, intent.IntentID, store.IntentStateReserveSent, "", "", ""); err != nil {
+		t.Fatalf("UpdateReserveIntentState 失败: %v", err)
+	}
+
+	// 2. 模拟进程崩溃：关闭当前 store
+	_ = st1.Close()
+
+	// 3. 模拟进程重启：使用相同数据目录启动新 Store 与新 Backend
+	st2, err := store.NewStore(dir)
+	if err != nil {
+		t.Fatalf("重启 NewStore 失败: %v", err)
+	}
+	defer st2.Close()
+
+	mgr2, err := account.NewManager(dir, nil)
+	if err != nil {
+		t.Fatalf("重启 NewManager 失败: %v", err)
+	}
+	_ = mgr2.WithHMEClient(accID, func(c *hme.Client) error {
+		c.SetFixedServiceURL(server.URL)
+		return nil
+	})
+	mb2 := &managerBackend{mgr: mgr2, store: st2}
+
+	// 4. 执行重启恢复扫描
+	recovered, err := mb2.ReconcileUnresolvedIntents(ctx)
+	if err != nil {
+		t.Fatalf("ReconcileUnresolvedIntents 失败: %v", err)
+	}
+	if len(recovered) != 1 {
+		t.Fatalf("期望恢复 1 个未决意图, 实际: %d", len(recovered))
+	}
+	if recovered[0].CandidateEmail != candA {
+		t.Fatalf("恢复的候选不匹配: 期望 %s, 实际 %s", candA, recovered[0].CandidateEmail)
+	}
+	if recovered[0].State != store.IntentStateSucceeded {
+		t.Fatalf("恢复状态期望 succeeded, 实际: %s", recovered[0].State)
+	}
+
+	// 5. 验证数据库中最终记录及 inventory 落盘
+	savedIntent, err := st2.GetReserveIntent(ctx, intent.IntentID)
+	if err != nil {
+		t.Fatalf("GetReserveIntent 失败: %v", err)
+	}
+	if savedIntent.State != store.IntentStateSucceeded {
+		t.Fatalf("数据库持久化状态期望 succeeded, 实际: %s", savedIntent.State)
+	}
+	if savedIntent.AnonymousID != "anon_crash_a" {
+		t.Fatalf("数据库持久化 anonymousID 期望 anon_crash_a, 实际: %s", savedIntent.AnonymousID)
+	}
+
+	// 检查 inventory 自动入库
+	var invCount int
+	_ = st2.DB().QueryRowContext(ctx, "SELECT COUNT(1) FROM alias_inventory WHERE email = ? AND account_id = ?", candA, accID).Scan(&invCount)
+	if invCount != 1 {
+		t.Fatalf("期望候选 A 录入 alias_inventory, 实际未查到")
+	}
+
+	// 6. 核心铁律断言：绝对没有调用 Generate 生成候选 B！
+	if calls := atomic.LoadInt32(&generateCalls); calls != 0 {
+		t.Fatalf("CRITICAL: 重启恢复期间产生候选 B: generateCalls=%d", calls)
+	}
+}
+
+// TestFault_RestartUnknownCandidateStillMissing
+// 核心安全铁律验证：
+// 候选 A 处于 outcome_unknown，进程重启后核对列表，如果 Apple upstream 尚未列出该候选 A (可能同步延迟)，
+// 坚决保持 outcome_unknown，严禁误标记为 failed / confirmed_failed，严禁生成候选 B！
+func TestFault_RestartUnknownCandidateStillMissing(t *testing.T) {
+	accID := "acc_test_missing"
+	candA := "cand_a_missing@icloud.com"
+	var generateCalls int32
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/hme/generate":
+			count := atomic.AddInt32(&generateCalls, 1)
+			t.Errorf("CRITICAL VIOLATION: 核对 inconclusive 期间严禁调用 Generate (调用次数=%d)！", count)
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"success": true, "result": {"hme": "cand_b_forbidden@icloud.com"}}`)
+		case "/v2/hme/list":
+			// 上游列表为空或仅有其他不相关别名，候选 A 尚未出现
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{
+				"success": true,
+				"result": {
+					"hmeEmails": []
+				}
+			}`)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	server, mb, st, _ := setupFaultTestEnvironment(t, accID, handler)
+	defer server.Close()
+	defer st.Close()
+
+	ctx := context.Background()
+	// 预置处于 outcome_unknown 的候选 A
+	intent, err := st.CreateReserveIntent(ctx, accID, candA, "test_missing")
+	if err != nil {
+		t.Fatalf("CreateReserveIntent 失败: %v", err)
+	}
+	if err := st.UpdateReserveIntentState(ctx, intent.IntentID, store.IntentStateOutcomeUnknown, "", "", "pre-existing unknown"); err != nil {
+		t.Fatalf("UpdateReserveIntentState 失败: %v", err)
+	}
+
+	// 执行核对
+	recovered, err := mb.ReconcileUnresolvedIntents(ctx)
+	if err != nil {
+		t.Fatalf("ReconcileUnresolvedIntents 返回错误: %v", err)
+	}
+	if len(recovered) != 1 {
+		t.Fatalf("期望包含 1 条 intent, 实际: %d", len(recovered))
+	}
+
+	// 核心断言 1：状态必须保持为 outcome_unknown，绝不能变为 failed 或 confirmed_failed
+	if recovered[0].State != store.IntentStateOutcomeUnknown {
+		t.Fatalf("CRITICAL: 未找到候选时禁止判定为失败！当前状态: %s", recovered[0].State)
+	}
+
+	savedIntent, err := st.GetReserveIntent(ctx, intent.IntentID)
+	if err != nil {
+		t.Fatalf("GetReserveIntent 失败: %v", err)
+	}
+	if savedIntent.State != store.IntentStateOutcomeUnknown {
+		t.Fatalf("CRITICAL: 数据库状态必须保持 outcome_unknown，实际: %s", savedIntent.State)
+	}
+
+	// 核心断言 2：绝对没有调用 Generate 生成候选 B！
+	if calls := atomic.LoadInt32(&generateCalls); calls != 0 {
+		t.Fatalf("CRITICAL: inconclusive 期间严禁产生候选 B: generateCalls=%d", calls)
+	}
+}
+
+// TestFault_RestartLaterFindsCandidate
+// 最终一致性验证：
+// 首次核对 missing 保持 outcome_unknown；后续第二次核对时上游出现候选 A，
+// 成功转为 succeeded 并录入 inventory；全程候选始终为 A，Generate 绝不被调用。
+func TestFault_RestartLaterFindsCandidate(t *testing.T) {
+	accID := "acc_test_later"
+	candA := "cand_a_later@icloud.com"
+	var generateCalls int32
+	var listCalls int32
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/hme/generate":
+			count := atomic.AddInt32(&generateCalls, 1)
+			t.Errorf("CRITICAL VIOLATION: Generate called %d times!", count)
+			w.WriteHeader(http.StatusOK)
+		case "/v2/hme/list":
+			count := atomic.AddInt32(&listCalls, 1)
+			w.WriteHeader(http.StatusOK)
+			if count == 1 {
+				// 第一次核对：列表尚未出现候选 A
+				_, _ = fmt.Fprintf(w, `{"success": true, "result": {"hmeEmails": []}}`)
+			} else {
+				// 第二次核对：上游最终一致性完成，候选 A 出现！
+				_, _ = fmt.Fprintf(w, `{
+					"success": true,
+					"result": {
+						"hmeEmails": [
+							{"hme": "%s", "anonymousId": "anon_later", "label": "test_later", "isActive": true}
+						]
+					}
+				}`, candA)
+			}
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	server, mb, st, _ := setupFaultTestEnvironment(t, accID, handler)
+	defer server.Close()
+	defer st.Close()
+
+	ctx := context.Background()
+	intent, err := st.CreateReserveIntent(ctx, accID, candA, "test_later")
+	if err != nil {
+		t.Fatalf("CreateReserveIntent 失败: %v", err)
+	}
+	_ = st.UpdateReserveIntentState(ctx, intent.IntentID, store.IntentStateOutcomeUnknown, "", "", "network drop")
+
+	// 第一次核对：missing -> 维持 outcome_unknown
+	res1, _ := mb.ReconcileUnresolvedIntents(ctx)
+	if len(res1) != 1 || res1[0].State != store.IntentStateOutcomeUnknown {
+		t.Fatalf("第一次核对未保持 outcome_unknown: %v", res1)
+	}
+
+	// 第二次核对：found -> 成功转为 succeeded
+	res2, _ := mb.ReconcileUnresolvedIntents(ctx)
+	if len(res2) != 1 || res2[0].State != store.IntentStateSucceeded {
+		t.Fatalf("第二次核对未能恢复 succeeded: %v", res2)
+	}
+
+	saved, err := st.GetReserveIntent(ctx, intent.IntentID)
+	if err != nil || saved.State != store.IntentStateSucceeded {
+		t.Fatalf("数据库状态未更新为 succeeded: %v, state=%s", err, saved.State)
+	}
+
+	if calls := atomic.LoadInt32(&generateCalls); calls != 0 {
+		t.Fatalf("CRITICAL: 全生命周期绝不允许生成第二候选: generateCalls=%d", calls)
+	}
+}
+
+// TestFault_ExplicitConfirmedFailureAllowsNewCandidate
+// 明确拒绝与安全重试验证：
+// 仅当上游明确返回业务拒绝 (如 errorCode -9999 / 别名被占用等，确知写入未落盘) 时，
+// 才将候选 A 记录为 confirmed_failed，并在重试机制下生成下一个候选 B 并最终成功。
+func TestFault_ExplicitConfirmedFailureAllowsNewCandidate(t *testing.T) {
+	accID := "acc_test_explicit_retry"
+	candA := "cand_a_explicit@icloud.com"
+	candB := "cand_b_explicit@icloud.com"
+	var generateCalls int32
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/hme/generate":
+			count := atomic.AddInt32(&generateCalls, 1)
+			w.WriteHeader(http.StatusOK)
+			if count == 1 {
+				_, _ = fmt.Fprintf(w, `{"success": true, "result": {"hme": "%s"}}`, candA)
+			} else {
+				_, _ = fmt.Fprintf(w, `{"success": true, "result": {"hme": "%s"}}`, candB)
+			}
+		case "/v1/hme/reserve":
+			w.WriteHeader(http.StatusOK)
+			if atomic.LoadInt32(&generateCalls) == 1 {
+				// 候选 A: 上游返回明确业务错误 (结构完整、确知未落盘)
+				_, _ = w.Write([]byte(`{
+					"success": false,
+					"error": {
+						"errorCode": "-9999",
+						"errorMessage": "Alias already taken"
+					}
+				}`))
+			} else {
+				// 候选 B: 成功创建
+				_, _ = fmt.Fprintf(w, `{
+					"success": true,
+					"result": {
+						"hme": {
+							"hme": "%s",
+							"anonymousId": "anon_b_success"
+						}
+					}
+				}`, candB)
+			}
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	server, mb, st, _ := setupFaultTestEnvironment(t, accID, handler)
+	defer server.Close()
+	defer st.Close()
+
+	res, err := mb.CreateAlias(accID, "test_retry")
+	if err != nil {
+		t.Fatalf("CreateAlias 期望成功交付候选 B, 实际失败: %v", err)
+	}
+	if res.Email != candB {
+		t.Fatalf("交付别名期望候选 B %s, 实际: %s", candB, res.Email)
+	}
+
+	if calls := atomic.LoadInt32(&generateCalls); calls != 2 {
+		t.Fatalf("期望共调用 2 次 Generate, 实际: %d", calls)
+	}
+
+	// 检查数据库中候选 A 的记录状态为 confirmed_failed
+	intentA, err := st.FindLatestIntentForCandidate(context.Background(), candA)
+	if err != nil || intentA == nil {
+		t.Fatalf("未能查到候选 A 的 intent: %v", err)
+	}
+	if intentA.State != store.IntentStateConfirmedFailed {
+		t.Fatalf("候选 A 状态期望 confirmed_failed, 实际: %s", intentA.State)
+	}
+
+	// 检查数据库中候选 B 的记录状态为 succeeded
+	intentB, err := st.FindLatestIntentForCandidate(context.Background(), candB)
+	if err != nil || intentB == nil {
+		t.Fatalf("未能查到候选 B 的 intent: %v", err)
+	}
+	if intentB.State != store.IntentStateSucceeded {
+		t.Fatalf("候选 B 状态期望 succeeded, 实际: %s", intentB.State)
+	}
+}
+

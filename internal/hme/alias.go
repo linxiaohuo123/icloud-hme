@@ -152,28 +152,54 @@ func (c *Client) reserveInternalWithContext(ctx context.Context, hme, label stri
 		return "", "", fmt.Errorf("%w (reconciliation failed: %v): %v", ErrOutcomeUnknown, listErr, triggerErr)
 	}
 
+	// 执行写操作前置持久化钩子 (保障 Reserve 发送前 candidate A 已落盘)
+	if c.PreReserveHook != nil {
+		if hookErr := c.PreReserveHook(ctx, hme); hookErr != nil {
+			return "", "", hookErr
+		}
+	}
+
 	// 写操作必须 maxAttempts=1，严禁通用盲目重试导致重复保留
 	body, err := c.RequestWithContext(ctx, "POST", c.ServiceURL()+"/v1/hme/reserve", payload, 0, 1)
 	if err != nil {
 		if errors.Is(err, ErrAuthFailed) {
+			if c.PostReserveHook != nil {
+				c.PostReserveHook(ctx, hme, "", err)
+			}
 			return "", "", err
 		}
-		return reconcile(err)
+		retEmail, retAnon, rErr := reconcile(err)
+		if c.PostReserveHook != nil {
+			c.PostReserveHook(ctx, hme, retAnon, rErr)
+		}
+		return retEmail, retAnon, rErr
 	}
 
 	trimmed := strings.TrimSpace(body)
 	lower := strings.ToLower(trimmed)
 	if strings.HasPrefix(lower, "<!doctype") || strings.HasPrefix(lower, "<html") || !gjson.Valid(body) {
-		return reconcile(fmt.Errorf("%w: invalid reserve response schema", ErrInvalidResponseSchema))
+		retEmail, retAnon, rErr := reconcile(fmt.Errorf("%w: invalid reserve response schema", ErrInvalidResponseSchema))
+		if c.PostReserveHook != nil {
+			c.PostReserveHook(ctx, hme, retAnon, rErr)
+		}
+		return retEmail, retAnon, rErr
 	}
 
 	parsed := gjson.Parse(body)
 	if !parsed.Get("success").Bool() {
 		if parsed.Get("error").Exists() {
 			errMsg := parsed.Get("error.errorMessage").String()
-			return "", "", fmt.Errorf("保留失败: %s", nonEmpty(errMsg, "unknown"))
+			rejErr := fmt.Errorf("保留失败: %s", nonEmpty(errMsg, "unknown"))
+			if c.PostReserveHook != nil {
+				c.PostReserveHook(ctx, hme, "", rejErr)
+			}
+			return "", "", rejErr
 		}
-		return reconcile(fmt.Errorf("%w: reserve response success=false without standard error", ErrInvalidResponseSchema))
+		retEmail, retAnon, rErr := reconcile(fmt.Errorf("%w: reserve response success=false without standard error", ErrInvalidResponseSchema))
+		if c.PostReserveHook != nil {
+			c.PostReserveHook(ctx, hme, retAnon, rErr)
+		}
+		return retEmail, retAnon, rErr
 	}
 	alias := hme
 	var anonymousID string
@@ -185,7 +211,15 @@ func (c *Client) reserveInternalWithContext(ctx context.Context, hme, label stri
 		anonymousID = firstNonEmpty(resultHme.Get("anonymousId").String(), resultHme.Get("id").String())
 	}
 	c.log("已保留: %s (id: %s)", alias, anonymousID)
+	if c.PostReserveHook != nil {
+		c.PostReserveHook(ctx, alias, anonymousID, nil)
+	}
 	return alias, anonymousID, nil
+}
+
+// ReserveDetailedWithContext 保留/确认候选别名并返回真实 email 和 anonymousId。
+func (c *Client) ReserveDetailedWithContext(ctx context.Context, hme, label string) (string, string, error) {
+	return c.reserveInternalWithContext(ctx, hme, label)
 }
 
 // ReserveWithContext 保留/确认候选别名,使其正式生效 (写操作 maxAttempts=1，包含网络中断后的写入状态核对)。

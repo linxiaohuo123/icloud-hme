@@ -77,13 +77,15 @@ type Client struct {
 	Username    string // iCloud 账号 (用于登录)
 	Password    string // iCloud 密码 (用于登录)
 	Verbose     bool
-	httpc         tls_client.HttpClient
-	setupURL      string
-	serviceURL    string
-	fixedEndpoint bool
-	dsid          string // 从 validate 响应提取
-	clientID      string // UUID,每次会话生成
-	accountInfo   *AccountInfo
+	httpc           tls_client.HttpClient
+	setupURL        string
+	serviceURL      string
+	fixedEndpoint   bool
+	dsid            string // 从 validate 响应提取
+	clientID        string // UUID,每次会话生成
+	accountInfo     *AccountInfo
+	PreReserveHook  func(ctx context.Context, candidate string) error
+	PostReserveHook func(ctx context.Context, candidate, anonymousID string, err error)
 }
 
 // NewClient 创建一个新的 HME 客户端,底层使用 Chrome TLS 指纹。

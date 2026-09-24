@@ -667,10 +667,26 @@ func (s *Store) MarkOperationOutcomeUnknown(ctx context.Context, opID, candidate
 	return err
 }
 
+// ReconciliationOutcome 表示核对结果类型 (F03)
+type ReconciliationOutcome string
+
+const (
+	ReconciliationFound                ReconciliationOutcome = "FOUND"
+	ReconciliationInconclusiveNotFound ReconciliationOutcome = "INCONCLUSIVE_NOT_FOUND"
+	ReconciliationConfirmedNotApplied  ReconciliationOutcome = "CONFIRMED_NOT_APPLIED"
+)
+
 // ReconcileUnknownOperation 在重启恢复或定时核对时处理未决操作:
-// 若 candidateEmail 已被上游证实落盘成功 (confirmed=true)，则推进为 succeeded；
-// 若无法证实落盘，但存在候选 candidateEmail，绝不允许分配或创建其他候选 B！
-func (s *Store) ReconcileUnknownOperation(ctx context.Context, opID string, confirmed bool, confirmedEmail, accountID, tag, ownerKind, ownerID, tokenName string) (*AliasAllocation, error) {
+// - FOUND: candidateEmail 已证实落盘成功，推进为 succeeded 并分配凭据；
+// - INCONCLUSIVE_NOT_FOUND: 列表未找到不能证明未落盘，坚决保持 outcome_unknown，仅刷新 updated_at，严禁产生第二候选；
+// - CONFIRMED_NOT_APPLIED: 仅当确知未生效时才标记为 failed；
+// - 原候选校验: 候选邮箱必须与原记录 candidate_email 严格一致，严禁分配其他候选 B！
+func (s *Store) ReconcileUnknownOperation(
+	ctx context.Context,
+	opID string,
+	outcome ReconciliationOutcome,
+	confirmedEmail, accountID, tag, ownerKind, ownerID, tokenName string,
+) (*AliasAllocation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -694,61 +710,81 @@ func (s *Store) ReconcileUnknownOperation(ctx context.Context, opID string, conf
 
 	now := time.Now().Format(time.RFC3339)
 
-	if !confirmed {
+	switch outcome {
+	case ReconciliationInconclusiveNotFound:
+		// 列表未找到不能证明未落盘: 坚决保持 outcome_unknown, 严禁标记 failed, 严禁生成候选 B
 		_, err = tx.ExecContext(ctx, `
 			UPDATE operations
-			SET state = 'failed', error_code = 'RECONCILIATION_NOT_FOUND', updated_at = ?
+			SET state = 'outcome_unknown', error_code = 'INCONCLUSIVE_NOT_FOUND', updated_at = ?
+			WHERE operation_id = ?
+		`, now, opID)
+		if err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return nil, ErrOperationOutcomeUnknown
+
+	case ReconciliationConfirmedNotApplied:
+		_, err = tx.ExecContext(ctx, `
+			UPDATE operations
+			SET state = 'failed', error_code = 'CONFIRMED_NOT_APPLIED', updated_at = ?
 			WHERE operation_id = ?
 		`, now, opID)
 		if err != nil {
 			return nil, err
 		}
 		return nil, tx.Commit()
-	}
 
-	confirmedEmail = strings.TrimSpace(strings.ToLower(confirmedEmail))
-	if op.CandidateEmail != "" && !strings.EqualFold(op.CandidateEmail, confirmedEmail) {
-		return nil, fmt.Errorf("reconciliation candidate mismatch: original candidate was %s but confirmed %s (second candidate strictly forbidden)", op.CandidateEmail, confirmedEmail)
-	}
+	case ReconciliationFound:
+		confirmedEmail = strings.TrimSpace(strings.ToLower(confirmedEmail))
+		if op.CandidateEmail != "" && !strings.EqualFold(op.CandidateEmail, confirmedEmail) {
+			return nil, fmt.Errorf("reconciliation candidate mismatch: original candidate was %s but confirmed %s (second candidate strictly forbidden)", op.CandidateEmail, confirmedEmail)
+		}
 
-	allocID := NewOpaqueID("alloc_")
-	alloc := &AliasAllocation{
-		AllocationID: allocID,
-		AliasEmail:   confirmedEmail,
-		AccountID:    accountID,
-		OwnerKind:    ownerKind,
-		OwnerID:      ownerID,
-		BusinessTag:  tag,
-		AllocatedAt:  now,
-		Status:       "allocated",
-	}
+		allocID := NewOpaqueID("alloc_")
+		alloc := &AliasAllocation{
+			AllocationID: allocID,
+			AliasEmail:   confirmedEmail,
+			AccountID:    accountID,
+			OwnerKind:    ownerKind,
+			OwnerID:      ownerID,
+			BusinessTag:  tag,
+			AllocatedAt:  now,
+			Status:       "allocated",
+		}
 
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO alias_allocations (
-			allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'allocated')
-	`, allocID, confirmedEmail, accountID, ownerKind, ownerID, tag, now)
-	if err != nil {
-		return nil, fmt.Errorf("reconciliation insert alias_allocations failed: %w", err)
-	}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO alias_allocations (
+				allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status
+			) VALUES (?, ?, ?, ?, ?, ?, ?, 'allocated')
+		`, allocID, confirmedEmail, accountID, ownerKind, ownerID, tag, now)
+		if err != nil {
+			return nil, fmt.Errorf("reconciliation insert alias_allocations failed: %w", err)
+		}
 
-	_, _ = tx.ExecContext(ctx, `
-		INSERT INTO lease_records (
-			lease_id, alias_email, account_id, business_tag, leased_at, token_name
-		) VALUES (?, ?, ?, ?, ?, ?)
-	`, allocID, confirmedEmail, accountID, tag, now, tokenName)
+		_, _ = tx.ExecContext(ctx, `
+			INSERT INTO lease_records (
+				lease_id, alias_email, account_id, business_tag, leased_at, token_name
+			) VALUES (?, ?, ?, ?, ?, ?)
+		`, allocID, confirmedEmail, accountID, tag, now, tokenName)
 
-	_, err = tx.ExecContext(ctx, `
-		UPDATE operations
-		SET state = 'succeeded', result_ref = ?, candidate_email = ?, error_code = '', updated_at = ?
-		WHERE operation_id = ?
-	`, allocID, confirmedEmail, now, opID)
-	if err != nil {
-		return nil, fmt.Errorf("reconciliation update operations failed: %w", err)
-	}
+		_, err = tx.ExecContext(ctx, `
+			UPDATE operations
+			SET state = 'succeeded', result_ref = ?, candidate_email = ?, error_code = '', updated_at = ?
+			WHERE operation_id = ?
+		`, allocID, confirmedEmail, now, opID)
+		if err != nil {
+			return nil, fmt.Errorf("reconciliation update operations failed: %w", err)
+		}
 
-	if err := tx.Commit(); err != nil {
-		return nil, err
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return alloc, nil
+
+	default:
+		return nil, fmt.Errorf("unknown reconciliation outcome: %s", outcome)
 	}
-	return alloc, nil
 }

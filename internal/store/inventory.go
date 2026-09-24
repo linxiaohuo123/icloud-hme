@@ -148,6 +148,19 @@ func (s *Store) initInventorySchema() error {
 		CONSTRAINT uq_op_idempotency UNIQUE (principal_kind, principal_id, operation_kind, idempotency_key)
 	);
 
+	CREATE TABLE IF NOT EXISTS hme_reserve_intents (
+		intent_id TEXT PRIMARY KEY,
+		account_id TEXT NOT NULL,
+		candidate_email TEXT NOT NULL,
+		label TEXT DEFAULT '',
+		state TEXT NOT NULL,
+		anonymous_id TEXT DEFAULT '',
+		result_ref TEXT DEFAULT '',
+		error_message TEXT DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	);
+
 	CREATE TABLE IF NOT EXISTS verification_requests (
 		request_id TEXT PRIMARY KEY,
 		principal_kind TEXT NOT NULL,
@@ -262,6 +275,7 @@ func (s *Store) initInventorySchema() error {
 		"CREATE INDEX IF NOT EXISTS idx_vreq_principal ON verification_requests (principal_kind, principal_id);",
 		"CREATE INDEX IF NOT EXISTS idx_vreq_lease ON verification_requests (lease_id);",
 		"CREATE INDEX IF NOT EXISTS idx_vreq_email ON verification_requests (alias_email);",
+		"CREATE INDEX IF NOT EXISTS idx_hme_intents_unresolved ON hme_reserve_intents (account_id, state);",
 	}
 	for _, idx := range indices {
 		if _, err := s.db.Exec(idx); err != nil {

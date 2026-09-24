@@ -182,6 +182,11 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 			log.Printf("[Server] 存量库存安全对齐完成: 已隔离/收敛 %d 个受保护或异常别名", n)
 		}
 	}
+	if reconciler, ok := be.(interface{ ReconcileUnresolvedIntents(context.Context) ([]store.HmeReserveIntent, error) }); ok {
+		if list, err := reconciler.ReconcileUnresolvedIntents(context.Background()); err == nil && len(list) > 0 {
+			log.Printf("[Server] 启动恢复: 扫描处理 %d 个未决 HME reserve 意图", len(list))
+		}
+	}
 	// 生产后端拉取到别名列表时自动登记「别名 → 母号」路由，
 	// 使存量别名(未入出号流水表的)也能被定向拉信，而不必依赖有上限的盲扫。
 	if mb, ok := be.(*managerBackend); ok {

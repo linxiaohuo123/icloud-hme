@@ -8,6 +8,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -79,7 +80,7 @@ func (b *managerBackend) CreateAlias(accountID, label string) (*hme.CreateResult
 
 	var result *hme.CreateResult
 	err := b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
-		res, cerr := client.CreateAlias(label, 5)
+		res, cerr := b.durableCreateAlias(context.Background(), client, accountID, label, 5)
 		if cerr != nil {
 			return cerr
 		}
@@ -98,6 +99,154 @@ func (b *managerBackend) CreateAlias(accountID, label string) (*hme.CreateResult
 	_ = b.mgr.AdjustAliasCounts(accountID, 1, 1)
 	b.invalidateAliasCache(accountID)
 	return result, nil
+}
+
+// durableCreateAlias 执行符合 F03 铁律的持久化创建状态机：
+// 1. Generate candidate A
+// 2. 持久化 intent(A, prepared) 并 Commit SQLite
+// 3. 标记状态为 reserve_sent 并 Commit SQLite
+// 4. 才向网络发送 Reserve(A)
+// 5. 成功 -> succeeded; 明确失败 -> confirmed_failed 并允许重试下一候选; 未知异常 -> outcome_unknown 并坚决阻断重试
+func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Client, accountID, label string, maxRetries int) (*hme.CreateResult, error) {
+	if maxRetries <= 0 {
+		maxRetries = 5
+	}
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		if attempt > 0 {
+			client.ResetServiceEndpoint()
+		}
+
+		// 1. Generate candidate A
+		cand, gErr := client.GenerateWithContext(ctx)
+		if gErr != nil {
+			lastErr = fmt.Errorf("generate 失败: %w", gErr)
+			if errors.Is(gErr, hme.ErrAuthFailed) {
+				return nil, gErr
+			}
+			if attempt < maxRetries-1 {
+				continue
+			}
+			break
+		}
+
+		// 2. 持久化 intent(A, prepared) 并 Commit SQLite (必须在 Reserve 发送之前完成)
+		var intentID string
+		if b.store != nil {
+			intent, iErr := b.store.CreateReserveIntent(ctx, accountID, cand, label)
+			if iErr != nil {
+				return nil, fmt.Errorf("持久化 reserve intent 失败: %w", iErr)
+			}
+			intentID = intent.IntentID
+		}
+
+		// 3. 标记状态为 reserve_sent (即将向网络发出写请求)
+		if b.store != nil && intentID != "" {
+			_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateReserveSent, "", "", "")
+		}
+
+		// 4. 发送写请求 Reserve(A)
+		email, anonID, rErr := client.ReserveDetailedWithContext(ctx, cand, label)
+		if rErr != nil {
+			lastErr = rErr
+			if errors.Is(rErr, hme.ErrAuthFailed) {
+				if b.store != nil && intentID != "" {
+					_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateConfirmedFailed, "", "", rErr.Error())
+				}
+				return nil, rErr
+			}
+
+			// 5. 结果未知: 标记 outcome_unknown，铁律阻断重试生成候选 B！
+			if errors.Is(rErr, hme.ErrOutcomeUnknown) {
+				if b.store != nil && intentID != "" {
+					_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateOutcomeUnknown, "", "", rErr.Error())
+				}
+				return nil, rErr
+			}
+
+			// 明确失败 (confirmed_failed, 如 Apple 显式业务拒绝)
+			if b.store != nil && intentID != "" {
+				_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateConfirmedFailed, "", "", rErr.Error())
+			}
+
+			// 只有确知明确拒绝才允许重试下一候选
+			if attempt < maxRetries-1 {
+				continue
+			}
+			break
+		}
+
+		// 6. 成功
+		if b.store != nil && intentID != "" {
+			_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateSucceeded, anonID, "", "")
+		}
+
+		return &hme.CreateResult{
+			Email:       email,
+			AnonymousID: anonID,
+			Label:       label,
+			CreatedAt:   time.Now().Format(time.RFC3339),
+		}, nil
+	}
+
+	if lastErr != nil {
+		return nil, fmt.Errorf("创建别名失败: %w", lastErr)
+	}
+	return nil, fmt.Errorf("创建别名失败,已重试 %d 次", maxRetries)
+}
+
+// ReconcileUnresolvedIntents 扫描所有未决 intent 并向 Apple 核对原候选 A (F03)
+func (b *managerBackend) ReconcileUnresolvedIntents(ctx context.Context) ([]store.HmeReserveIntent, error) {
+	if b.store == nil {
+		return nil, nil
+	}
+	intents, err := b.store.ListUnresolvedReserveIntents(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	if len(intents) == 0 {
+		return nil, nil
+	}
+
+	for i := range intents {
+		it := intents[i]
+		_ = b.mgr.WithHMEClient(it.AccountID, func(client *hme.Client) error {
+			aliases, listErr := client.ListAliasesWithContext(ctx)
+			if listErr != nil {
+				_ = b.store.UpdateReserveIntentState(ctx, it.IntentID, store.IntentStateOutcomeUnknown, "", "", fmt.Sprintf("reconciliation list failed: %v", listErr))
+				intents[i].State = store.IntentStateOutcomeUnknown
+				return listErr
+			}
+
+			var found *hme.Alias
+			for j := range aliases {
+				if strings.EqualFold(aliases[j].Email, it.CandidateEmail) {
+					found = &aliases[j]
+					break
+				}
+			}
+
+			if found != nil {
+				// FOUND: 证实已在上游成功落盘
+				_ = b.store.UpdateReserveIntentState(ctx, it.IntentID, store.IntentStateSucceeded, found.AnonymousID, "", "")
+				_ = b.store.AddInventoryAlias(it.AccountID, *found, "created", true)
+				_ = b.store.UpsertAliasRoutes(it.AccountID, []string{found.Email})
+				intents[i].State = store.IntentStateSucceeded
+				intents[i].AnonymousID = found.AnonymousID
+			} else {
+				// INCONCLUSIVE_NOT_FOUND: 坚决保持 outcome_unknown，严禁标记失败，严禁产生第二候选！
+				_ = b.store.UpdateReserveIntentState(ctx, it.IntentID, store.IntentStateOutcomeUnknown, "", "", "reconciliation inconclusive: candidate not found in upstream list")
+				intents[i].State = store.IntentStateOutcomeUnknown
+			}
+			return nil
+		})
+	}
+	return intents, nil
 }
 
 // BatchCreateAlias 批量创建 HME 别名 (1-5个)。
@@ -142,7 +291,7 @@ func (b *managerBackend) BatchCreateAlias(accountID string, count int, labelPref
 			if lbl != "" && count > 1 {
 				lbl = fmt.Sprintf("%s %d", labelPrefix, i+1)
 			}
-			res, createErr := client.CreateAlias(lbl, 3)
+			res, createErr := b.durableCreateAlias(context.Background(), client, accountID, lbl, 3)
 			if createErr != nil {
 				return createErr
 			}
