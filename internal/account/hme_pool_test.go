@@ -8,6 +8,7 @@
 package account
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -321,5 +322,78 @@ func BenchmarkHMEClientBorrowPooled(b *testing.B) {
 		if err := mgr.WithHMEClient(id, noop); err != nil {
 			b.Fatalf("WithHMEClient: %v", err)
 		}
+	}
+}
+
+// TestWithHMEClientContext_CancelWhileWaitingForBusyAccount 验证同账号借锁竞争时响应 Context 取消 (PR-05 F10)。
+// 步骤：
+// 1. goroutine A 调用 WithHMEClient 成功拿到 account entry lock 并通过 channel 阻塞；
+// 2. 确认 A 已进入后，goroutine B 调用 WithHMEClientContext(ctx, sameAccount) 尝试借出；
+// 3. cancel ctx；
+// 4. B 必须立即返回 context.Canceled，且 B 的回调函数绝不执行；
+// 5. 释放 A，确保无泄漏。
+func TestWithHMEClientContext_CancelWhileWaitingForBusyAccount(t *testing.T) {
+	mgr := newPoolTestManager(t, 1)
+	id := firstAccountIDs(mgr, 1)[0]
+
+	inA := make(chan struct{})
+	unblockA := make(chan struct{})
+	doneA := make(chan struct{})
+
+	// 1. goroutine A 占住该账号锁
+	go func() {
+		defer close(doneA)
+		_ = mgr.WithHMEClient(id, func(c *hme.Client) error {
+			close(inA)
+			<-unblockA
+			return nil
+		})
+	}()
+
+	// 2. 等待 A 确定性进入锁保护区
+	select {
+	case <-inA:
+	case <-time.After(2 * time.Second):
+		t.Fatal("goroutine A failed to enter WithHMEClient in time")
+	}
+
+	// 3. goroutine B 尝试借同账号 client，等待期间取消 ctx
+	ctx, cancel := context.WithCancel(context.Background())
+	bRan := false
+	errChB := make(chan error, 1)
+
+	go func() {
+		err := mgr.WithHMEClientContext(ctx, id, func(c *hme.Client) error {
+			bRan = true
+			return nil
+		})
+		errChB <- err
+	}()
+
+	// 稍微休眠让 B 进入 TryLock 失败并 select 等待
+	time.Sleep(20 * time.Millisecond)
+	cancel() // 触发取消
+
+	// 4. B 必须立即返回 context.Canceled
+	select {
+	case err := <-errChB:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("goroutine B expected context.Canceled, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("goroutine B did not cancel promptly while waiting for busy account")
+	}
+
+	// 5. B 的回调绝未执行
+	if bRan {
+		t.Fatal("goroutine B fn must never execute after context cancellation")
+	}
+
+	// 6. 释放 A 并等待其退出
+	close(unblockA)
+	select {
+	case <-doneA:
+	case <-time.After(2 * time.Second):
+		t.Fatal("goroutine A failed to finish cleanly")
 	}
 }

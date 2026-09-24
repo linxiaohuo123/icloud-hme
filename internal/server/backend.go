@@ -55,10 +55,15 @@ type Backend interface {
 	LoginAccount(string, string, string) (account.Summary, error)
 	RemoveAccount(string) bool
 	CreateAlias(string, string) (*hme.CreateResult, error)
+	CreateAliasContext(context.Context, string, string) (*hme.CreateResult, error)
 	BatchCreateAlias(string, int, string) (*BatchCreateResult, error)
+	BatchCreateAliasContext(context.Context, string, int, string) (*BatchCreateResult, error)
 	ListAliases(string) ([]hme.Alias, error)
+	ListAliasesContext(context.Context, string) ([]hme.Alias, error)
 	RefreshAliases(string) ([]hme.Alias, error)
+	RefreshAliasesContext(context.Context, string) ([]hme.Alias, error)
 	SetAliasActive(string, string, bool) (bool, error)
+	SetAliasActiveContext(context.Context, string, string, bool) (bool, error)
 	UpdateAlias(string, string, string, string) error
 	BatchUpdateAliases(string, []string, string, string) (BatchUpdateResult, error)
 	DeleteAlias(string, string) error
@@ -75,6 +80,7 @@ type Backend interface {
 	ScanMailboxUIDPage(context.Context, ScanPageQuery) (ScanPageResult, error)
 	DeleteMessage(string, uint32) error
 	ValidateAccount(string) error
+	ValidateAccountContext(context.Context, string) error
 	CheckProxy(string) (bool, int64, string, error)
 	Reload() error
 }
@@ -330,7 +336,12 @@ func (b *managerBackend) Reload() error {
 // ValidateAccount 校验账号 Cookie 会话并刷新状态(CookieMonitor 周期调用)。
 // 错误保留 account.ErrCookieExpired 哨兵包装，供监控器区分凭据失效与瞬时故障。
 func (b *managerBackend) ValidateAccount(id string) error {
-	return b.mgr.ValidateAccount(id)
+	return b.ValidateAccountContext(context.Background(), id)
+}
+
+// ValidateAccountContext 支持 context 贯穿的会话校验 (PR-05 F10)。
+func (b *managerBackend) ValidateAccountContext(ctx context.Context, id string) error {
+	return b.mgr.ValidateAccountWithContext(ctx, id)
 }
 
 // mapAccountErr 把账号管理器错误映射为稳定错误。
@@ -352,6 +363,12 @@ func classifyUpstreamErr(fixedMsg string, err error) *BackendError {
 	}
 	if errors.Is(err, hme.ErrOutcomeUnknown) {
 		return &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_OUTCOME_UNKNOWN", Message: "上游写操作结果未知，需核对后处理"}
+	}
+	if errors.Is(err, context.Canceled) {
+		return &BackendError{Status: 499, Code: "REQUEST_CANCELED", Message: "请求已取消"}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &BackendError{Status: http.StatusGatewayTimeout, Code: "REQUEST_TIMEOUT", Message: "请求超时"}
 	}
 	if isSessionError(err.Error()) {
 		return &BackendError{Status: http.StatusUnauthorized, Code: "UPSTREAM_UNAUTHORIZED", Message: "iCloud 会话失效,请更新 Cookie"}

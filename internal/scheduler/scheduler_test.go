@@ -8,6 +8,7 @@
 package scheduler
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -41,7 +42,7 @@ func TestSchedulerRunOnce(t *testing.T) {
 	}
 
 	createdCount := 0
-	mockCreator := func(id, label string) (*hme.CreateResult, error) {
+	mockCreator := func(ctx context.Context, id, label string) (*hme.CreateResult, error) {
 		createdCount++
 		return &hme.CreateResult{Email: "created@icloud.com"}, nil
 	}
@@ -77,7 +78,7 @@ func TestSchedulerSilentIdleRound(t *testing.T) {
 		}
 	}
 	creations := 0
-	mockCreator := func(id, label string) (*hme.CreateResult, error) {
+	mockCreator := func(ctx context.Context, id, label string) (*hme.CreateResult, error) {
 		creations++
 		return &hme.CreateResult{Email: "x@icloud.com"}, nil
 	}
@@ -118,7 +119,7 @@ func TestSchedulerStatus(t *testing.T) {
 	mockAccounts := func() []account.Summary {
 		return []account.Summary{{ID: accID, Name: "状态号", Status: "active"}}
 	}
-	mockCreator := func(id, label string) (*hme.CreateResult, error) {
+	mockCreator := func(ctx context.Context, id, label string) (*hme.CreateResult, error) {
 		return &hme.CreateResult{Email: "created@icloud.com"}, nil
 	}
 	sched := NewScheduler(st, mockCreator, mockAccounts)
@@ -166,7 +167,7 @@ func TestSchedulerCustomLabel(t *testing.T) {
 	}
 
 	var capturedLabel string
-	mockCreator := func(id, label string) (*hme.CreateResult, error) {
+	mockCreator := func(ctx context.Context, id, label string) (*hme.CreateResult, error) {
 		capturedLabel = label
 		return &hme.CreateResult{Email: "gpt@icloud.com"}, nil
 	}
@@ -242,7 +243,7 @@ func TestSchedulerAliasLimitCircuitBreak(t *testing.T) {
 	}
 
 	creations := 0
-	mockCreator := func(id, label string) (*hme.CreateResult, error) {
+	mockCreator := func(ctx context.Context, id, label string) (*hme.CreateResult, error) {
 		creations++
 		return &hme.CreateResult{Email: "full@icloud.com"}, nil
 	}
@@ -337,7 +338,7 @@ func TestSchedulerDoubleQuotaPrevention(t *testing.T) {
 
 	// 模拟 production server.go 中的 creator (它会调用 TryReserveQuota)
 	createdCount := 0
-	mockCreator := func(id, label string) (*hme.CreateResult, error) {
+	mockCreator := func(ctx context.Context, id, label string) (*hme.CreateResult, error) {
 		allowed, _ := st.TryReserveQuota(id, 1)
 		if !allowed {
 			return nil, fmt.Errorf("RATE_LIMITED: 配额已用完")
@@ -390,7 +391,7 @@ func TestSchedulerExcludesProtectedAccounts(t *testing.T) {
 	}
 
 	creations := make(map[string]int)
-	mockCreator := func(id, label string) (*hme.CreateResult, error) {
+	mockCreator := func(ctx context.Context, id, label string) (*hme.CreateResult, error) {
 		creations[id]++
 		return &hme.CreateResult{Email: fmt.Sprintf("%s_alias@icloud.com", id)}, nil
 	}

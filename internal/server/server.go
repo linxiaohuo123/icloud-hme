@@ -83,6 +83,7 @@ type Server struct {
 	mailReadService *MailReadService
 	scheduler       *scheduler.Scheduler
 	startedAt   time.Time
+	autoSyncWg  sync.WaitGroup     // 跟踪启动预热任务收敛 (PR-05 F10)
 	ctx         context.Context    // 【BUG-11】停机信号,由 Close() 触发 cancel
 	cancel      context.CancelFunc // 【BUG-11】停机信号取消函数
 	closeOnce   sync.Once          // 优雅停机幂等保证 (PR-07 §10.4)
@@ -153,9 +154,9 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 		ctx:             ctx,
 		cancel:          cancel,
 	}
-	// 调度器在 Server 组装完成后注入，语义闭环为可用库存补货 (PR-06 §9.4, Issue 10)
-	s.scheduler = scheduler.NewScheduler(st, func(accountID, label string) (*hme.CreateResult, error) {
-		res, err := be.CreateAlias(accountID, label)
+	// 调度器在 Server 组装完成后注入，语义闭环为可用库存补货 (PR-06 §9.4, Issue 10, PR-05 F10)
+	s.scheduler = scheduler.NewScheduler(st, func(ctx context.Context, accountID, label string) (*hme.CreateResult, error) {
+		res, err := be.CreateAliasContext(ctx, accountID, label)
 		if err == nil && res != nil {
 			syncWorker.RegisterAliasAccount(res.Email, accountID)
 			// 补货只做：AddInventoryAlias(source_type='replenish', allocation_state='available')
@@ -217,6 +218,9 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 	return s
 }
 
+// 优雅停机默认超时预算 (PR-05 F10)。统一约束 HTTP Shutdown 与后台各 Worker 收敛。
+const defaultShutdownTimeout = 10 * time.Second
+
 // Run 启动 HTTP 服务并开启后台引擎，支持响应中断信号优雅停机。
 func (s *Server) Run(addr string) error {
 	hasAuth := s.cfg.AdminPassword != "" || s.cfg.APIKey != ""
@@ -230,7 +234,7 @@ func (s *Server) Run(addr string) error {
 	s.leasePruner.Start()
 	s.scheduler.Start()
 	s.notifier.Start()
-	go s.autoSyncAccounts()
+	s.startAutoSyncAccounts()
 
 	httpServer := &http.Server{
 		Addr:    addr,
@@ -258,12 +262,15 @@ func (s *Server) Run(addr string) error {
 		log.Printf("[Server] 捕获退出信号 (%s)，开始优雅停机...", sig)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
 	defer cancel()
 
-	shutdownErr := httpServer.Shutdown(ctx)
-	s.Close()
-	return shutdownErr
+	shutdownErr := httpServer.Shutdown(shutdownCtx)
+	closeErr := s.CloseContext(shutdownCtx)
+	if shutdownErr != nil {
+		return shutdownErr
+	}
+	return closeErr
 }
 
 // 启动预热的分摊参数。
@@ -296,11 +303,19 @@ func (s *Server) startupSyncGap(n int) time.Duration {
 	return gap
 }
 
+// startAutoSyncAccounts 启动账号基数预热协程，严格保证 Add(+1) 发生在 launch 之前 (PR-05 F10)。
+func (s *Server) startAutoSyncAccounts() {
+	s.autoSyncWg.Add(1)
+	go s.autoSyncAccounts()
+}
+
 // autoSyncAccounts 服务启动后自动在后台对齐所有健康账号的别名基数。
 //
 // 账号间按 startupSyncGap 摊平提交并限制并发，避免两个极端:
 // 固定 2 秒会让 2000 账号预热耗时 66 分钟；不限速则会对 Apple 形成突发。
 func (s *Server) autoSyncAccounts() {
+	defer s.autoSyncWg.Done()
+
 	// 【BUG-11 修复】所有等待都响应 s.ctx，SIGTERM 到达时立即退出而非卡在 Sleep 中
 	select {
 	case <-s.ctx.Done():
@@ -340,32 +355,112 @@ func (s *Server) autoSyncAccounts() {
 		goSafe("auto-sync-accounts", func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			_, _ = s.be.ListAliases(id)
+			_, _ = s.be.ListAliasesContext(s.ctx, id)
 		})
 	}
 	wg.Wait()
 	log.Printf("[Server] 启动预热完成: %d 个账号", len(targets))
 }
 
-// Close 停止后台工作引擎，严格遵守优雅停机生命周期顺序 (PR-07 §10.4)：
-// 1. 发送上下文取消信号 (停止接纳新工作)
-// 2. 依次关闭各后台 worker 并平稳等待在途任务收敛
-// 3. 关闭底层客户端连接池 (IMAP / HME Pool)
-// 4. 关闭底层持久化数据库 (Store)
-func (s *Server) Close() {
+// CloseContext 停止后台工作引擎，严格遵守优雅停机生命周期顺序与单一预算约束 (PR-05 F10):
+// 1. 发送上下文取消信号 (停止接纳新工作与预热请求)
+// 2. 并发通知并等待各后台 worker 收敛 (受到传入 ctx 统一预算限制)
+// 3. 只有在 worker 全部平稳收敛后，才依次关闭底层客户端连接池与持久化数据库 (Store)
+//    若超时未完成，严禁提前关闭 Store，避免在途 goroutine 访问已关闭 DB 造成 panic 或数据破坏。
+func (s *Server) CloseContext(ctx context.Context) (err error) {
 	s.closeOnce.Do(func() {
 		// 1. 停止接收新工作，通知所有引用 s.ctx 的后台 goroutine 立即取消
 		if s.cancel != nil {
 			s.cancel()
 		}
-		// 2. 依次优雅停机各 worker
-		s.aliasBuffer.Stop()
-		s.syncWorker.Stop()
-		s.reaper.Stop()
-		s.cookieMon.Stop()
-		s.leasePruner.Stop()
-		s.scheduler.Stop()
-		s.notifier.Stop()
+
+		// 2. 并发停止各 worker 并等待它们退出
+		workersDone := make(chan struct{})
+		go func() {
+			var wg sync.WaitGroup
+
+			// Scheduler 调度器
+			if s.scheduler != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_ = s.scheduler.StopContext(ctx)
+				}()
+			}
+
+			// MailSyncWorker 同步器
+			if s.syncWorker != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					s.syncWorker.Stop()
+				}()
+			}
+
+			// CookieMonitor 监控器
+			if s.cookieMon != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					s.cookieMon.Stop()
+				}()
+			}
+
+			// AliasBuffer
+			if s.aliasBuffer != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					s.aliasBuffer.Stop()
+				}()
+			}
+
+			// Reaper
+			if s.reaper != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					s.reaper.Stop()
+				}()
+			}
+
+			// LeasePruner
+			if s.leasePruner != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					s.leasePruner.Stop()
+				}()
+			}
+
+			// Notifier
+			if s.notifier != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					s.notifier.Stop()
+				}()
+			}
+
+			// 启动预热任务
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s.autoSyncWg.Wait()
+			}()
+
+			wg.Wait()
+			close(workersDone)
+		}()
+
+		select {
+		case <-workersDone:
+			// worker 全部平稳收敛
+		case <-ctx.Done():
+			log.Printf("[Server] 优雅停机等待后台 worker 收敛超时: %v (保留 Store 连接以防损坏)", ctx.Err())
+			err = ctx.Err()
+			return
+		}
 
 		// 3. 关闭底层客户端连接池
 		if closer, ok := s.be.(interface{ Close() }); ok {
@@ -374,9 +469,19 @@ func (s *Server) Close() {
 
 		// 4. 最后关闭持久化存储
 		if s.store != nil {
-			_ = s.store.Close()
+			if cerr := s.store.Close(); cerr != nil {
+				err = cerr
+			}
 		}
 	})
+	return err
+}
+
+// Close 提供向后兼容的无上下文停机接口，默认使用 defaultShutdownTimeout (10s)。
+func (s *Server) Close() {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
+	defer cancel()
+	_ = s.CloseContext(ctx)
 }
 
 // Handler 返回底层 gin 引擎(便于测试)。

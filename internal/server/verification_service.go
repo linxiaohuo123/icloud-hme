@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 context, fmt, time, errors, icloud-hme/internal/auth, icloud-hme/internal/mail, icloud-hme/internal/store
+ * [INPUT]: 依赖 context, fmt, time, errors, sync, icloud-hme/internal/auth, icloud-hme/internal/mail, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 VerificationService, NewVerificationService, VerificationResult
- * [POS]: internal/server 的取码与基线状态机应用服务 (PR-06 & PR-08 §11.2)，封装边界准备、冲突仲裁、事件总线唤醒与单事件精准消费
+ * [POS]: internal/server 的取码与基线状态机应用服务 (PR-06 & PR-08 §11.2 & PR-05 F09/F10)，封装边界准备、准入预检、进程内槽位与单租约互斥门禁、冲突仲裁、事件总线唤醒与单事件精准消费
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -12,6 +12,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"icloud-hme/internal/auth"
@@ -42,25 +43,135 @@ type VerificationResult struct {
 	MessageRef string `json:"message_ref,omitempty"`
 }
 
+const defaultVerificationBaselineSlots = 8
+
+// keyedMutexEntry 为单个 key 的锁条目，附带引用计数
+type keyedMutexEntry struct {
+	sem chan struct{}
+	ref int
+}
+
+// keyedMutex 实现支持 context 取消且无死锁、自动回收的轻量 keyed mutex (PR-05 F09)
+type keyedMutex struct {
+	mu      sync.Mutex
+	entries map[string]*keyedMutexEntry
+}
+
+func newKeyedMutex() *keyedMutex {
+	return &keyedMutex{
+		entries: make(map[string]*keyedMutexEntry),
+	}
+}
+
+func (km *keyedMutex) Lock(ctx context.Context, key string) (func(), error) {
+	km.mu.Lock()
+	entry, ok := km.entries[key]
+	if !ok {
+		entry = &keyedMutexEntry{
+			sem: make(chan struct{}, 1),
+			ref: 0,
+		}
+		entry.sem <- struct{}{}
+		km.entries[key] = entry
+	}
+	entry.ref++
+	sem := entry.sem
+	km.mu.Unlock()
+
+	select {
+	case <-sem:
+		return func() {
+			sem <- struct{}{}
+			km.mu.Lock()
+			entry.ref--
+			if entry.ref <= 0 {
+				delete(km.entries, key)
+			}
+			km.mu.Unlock()
+		}, nil
+	case <-ctx.Done():
+		km.mu.Lock()
+		entry.ref--
+		if entry.ref <= 0 {
+			delete(km.entries, key)
+		}
+		km.mu.Unlock()
+		return nil, ctx.Err()
+	}
+}
+
 // VerificationService 统一管理验证码任务生命周期与事件唤醒
 type VerificationService struct {
-	be         Backend
-	store      *store.Store
-	eventBus   *mail.EventBus
-	syncWorker *MailSyncWorker
+	be              Backend
+	store           *store.Store
+	eventBus        *mail.EventBus
+	syncWorker      *MailSyncWorker
+	baselineSlots   chan struct{}
+	leaseLocks      *keyedMutex
+	maxGlobal       int
+	maxPerPrincipal int
 }
 
 func NewVerificationService(be Backend, st *store.Store, eb *mail.EventBus, sw *MailSyncWorker) *VerificationService {
 	return &VerificationService{
-		be:         be,
-		store:      st,
-		eventBus:   eb,
-		syncWorker: sw,
+		be:              be,
+		store:           st,
+		eventBus:        eb,
+		syncWorker:      sw,
+		baselineSlots:   make(chan struct{}, defaultVerificationBaselineSlots),
+		leaseLocks:      newKeyedMutex(),
+		maxGlobal:       maxGlobalActiveVerificationRequests,
+		maxPerPrincipal: maxPerTokenActiveVerificationRequests,
 	}
 }
 
-// CreateVerificationRequest 创建持久化取码任务并采集初始基线
+// SetBaselineSlotsForTest 允许测试动态注入受限的 baseline 并发槽位数
+func (s *VerificationService) SetBaselineSlotsForTest(slots int) {
+	s.baselineSlots = make(chan struct{}, slots)
+}
+
+// SetMaxLimitsForTest 允许测试动态注入全局与每主体活跃限制
+func (s *VerificationService) SetMaxLimitsForTest(maxGlobal, maxPerPrincipal int) {
+	s.maxGlobal = maxGlobal
+	s.maxPerPrincipal = maxPerPrincipal
+}
+
+func (s *VerificationService) limits() (int, int) {
+	mg := s.maxGlobal
+	if mg <= 0 {
+		mg = maxGlobalActiveVerificationRequests
+	}
+	mp := s.maxPerPrincipal
+	if mp <= 0 {
+		mp = maxPerTokenActiveVerificationRequests
+	}
+	return mg, mp
+}
+
+func (s *VerificationService) checkAdmission(ctx context.Context, principalKind, principalID, leaseID string) error {
+	if s.store == nil {
+		return &BackendError{Status: http.StatusServiceUnavailable, Code: "SERVICE_UNAVAILABLE", Message: "存储层未就绪"}
+	}
+	mg, mp := s.limits()
+	err := s.store.CheckVerificationRequestAdmission(ctx, principalKind, principalID, leaseID, mg, mp)
+	if err != nil {
+		if errors.Is(err, store.ErrConflictActiveRequest) {
+			return ErrConflictActiveRequest
+		}
+		if errors.Is(err, store.ErrServerBusy) {
+			return ErrServerBusy
+		}
+		if errors.Is(err, store.ErrTooManyRequests) {
+			return ErrTooManyRequests
+		}
+		return &BackendError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "准入预检失败: " + err.Error()}
+	}
+	return nil
+}
+
+// CreateVerificationRequest 创建持久化取码任务并采集初始基线 (PR-05 F09/F10 严格准入与边界取消)
 func (s *VerificationService) CreateVerificationRequest(ctx context.Context, p auth.Principal, leaseID string) (*store.VerificationRequest, error) {
+	// 1. CanVerify
 	if !p.CanVerify() {
 		return nil, ErrScopeDenied
 	}
@@ -72,7 +183,7 @@ func (s *VerificationService) CreateVerificationRequest(ctx context.Context, p a
 		return nil, &BackendError{Status: http.StatusServiceUnavailable, Code: "SERVICE_UNAVAILABLE", Message: "存储层未就绪"}
 	}
 
-	// 1. 核验租约归属 (优先按 AllocationID 查询，兼容直接传入 email)
+	// 2. lease ownership validation (优先按 AllocationID 查询，兼容直接传入 email)
 	var alloc *store.AliasAllocation
 	var err error
 	if strings.Contains(leaseID, "@") {
@@ -108,9 +219,42 @@ func (s *VerificationService) CreateVerificationRequest(ctx context.Context, p a
 		return nil, ErrVReqNotFound
 	}
 
-	// 2. 采集基线游标
-	provider, uidValidity, uidNext, bErr := s.be.GetMailboxBoundary(alloc.AccountID, "INBOX")
+	// 3. cheap DB admission preflight (碰任何网络前快速拒绝超限请求)
+	if err := s.checkAdmission(ctx, string(p.Kind), p.ID, alloc.AllocationID); err != nil {
+		return nil, err
+	}
+
+	// 4. acquire per-lease preparation serialization (同 lease 串行化，防止并发重复打 IMAP)
+	unlockLease, err := s.leaseLocks.Lock(ctx, alloc.AllocationID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockLease()
+
+	// 5. acquire bounded baseline slot (有界 baseline 并发槽位，防 IMAP stampede)
+	select {
+	case s.baselineSlots <- struct{}{}:
+		defer func() { <-s.baselineSlots }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	// 6. 再次 cheap DB admission preflight (获取锁和槽位后二次校验，避免 TOCTOU)
+	if err := s.checkAdmission(ctx, string(p.Kind), p.ID, alloc.AllocationID); err != nil {
+		return nil, err
+	}
+
+	// 7. ctx 检查
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// 8. 采集基线游标 (GetMailboxBoundaryContext: 严格响应 HTTP disconnect / cancel)
+	provider, uidValidity, uidNext, bErr := s.be.GetMailboxBoundaryContext(ctx, alloc.AccountID, "INBOX")
 	if bErr != nil {
+		if errors.Is(bErr, context.Canceled) || errors.Is(bErr, context.DeadlineExceeded) {
+			return nil, bErr
+		}
 		var be *BackendError
 		if errors.As(bErr, &be) {
 			return nil, be
@@ -118,6 +262,7 @@ func (s *VerificationService) CreateVerificationRequest(ctx context.Context, p a
 		return nil, &BackendError{Status: http.StatusServiceUnavailable, Code: "BASELINE_UNAVAILABLE", Message: "无法获取邮件基线游标: " + bErr.Error()}
 	}
 
+	// 9. 构造 ready request
 	now := time.Now().UTC()
 	vreq := &store.VerificationRequest{
 		RequestID:           store.NewOpaqueID("vreq_"),
@@ -134,8 +279,9 @@ func (s *VerificationService) CreateVerificationRequest(ctx context.Context, p a
 		BaselineUID:         uidNext,
 	}
 
-	// 3. 原子化检查同 lease 冲突、容量上限与任务插入 (PR-08 Final Hardening §4: 消除 TOCTOU 竞争)
-	if err := s.store.CreateVerificationRequestAtomic(ctx, vreq, maxGlobalActiveVerificationRequests, maxPerTokenActiveVerificationRequests); err != nil {
+	// 10. final authoritative atomic insert (PR-08 Final Hardening §4: 终态原子落盘与权威防重)
+	mg, mp := s.limits()
+	if err := s.store.CreateVerificationRequestAtomic(ctx, vreq, mg, mp); err != nil {
 		if errors.Is(err, store.ErrConflictActiveRequest) {
 			return nil, ErrConflictActiveRequest
 		}

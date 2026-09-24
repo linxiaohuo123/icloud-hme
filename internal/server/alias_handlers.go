@@ -35,7 +35,7 @@ func (s *Server) createAliasHandler(c *gin.Context) {
 		return
 	}
 
-	result, err := s.be.CreateAlias(req.AccountID, req.Label)
+	result, err := s.be.CreateAliasContext(c.Request.Context(), req.AccountID, req.Label)
 	if err != nil {
 		backendFail(c, err)
 		return
@@ -73,7 +73,7 @@ func (s *Server) createAliasBatchHandler(c *gin.Context) {
 		return
 	}
 
-	result, err := s.be.BatchCreateAlias(req.AccountID, req.Count, req.LabelPrefix)
+	result, err := s.be.BatchCreateAliasContext(c.Request.Context(), req.AccountID, req.Count, req.LabelPrefix)
 	if err != nil {
 		backendFail(c, err)
 		return

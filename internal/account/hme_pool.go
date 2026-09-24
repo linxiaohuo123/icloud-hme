@@ -8,6 +8,7 @@
 package account
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -240,12 +241,31 @@ func hmeFingerprint(acc *Account) string {
 // 另外，同一账号的调用在此串行执行：hme.Client 的 ListAliases 在失败时会
 // 「置空端点 → 重新校验」，若与并发操作交错，对方会读到空端点。
 //
-// 无论 fn 成败，都会把客户端刷新后的 Cookie 与服务端点回写账号（失败响应也可能带 Set-Cookie）。
-// 未能借出客户端时返回包装了 ErrHMEClientUnavailable 的错误。
-func (m *Manager) WithHMEClient(id string, fn func(*hme.Client) error) error {
+// WithHMEClientContext 借出账号级 HME 客户端执行 fn，借锁阶段响应 Context 取消 (PR-05 F10)。
+// 调用返回后客户端留在池中复用。
+func (m *Manager) WithHMEClientContext(ctx context.Context, id string, fn func(*hme.Client) error) error {
 	entry := m.hmePool.acquire(id)
-	entry.mu.Lock()
+
+	if !entry.mu.TryLock() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		locked := false
+		for !locked {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+				if entry.mu.TryLock() {
+					locked = true
+				}
+			}
+		}
+	}
 	defer entry.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	entry.lastUsed.Store(time.Now().UnixNano())
 
 	snap, err := m.accountSnapshot(id)
@@ -291,6 +311,11 @@ func (m *Manager) WithHMEClient(id string, fn func(*hme.Client) error) error {
 	entry.fingerprint = hmeFingerprint(snap)
 
 	return runErr
+}
+
+// WithHMEClient 借出账号级 HME 客户端执行 fn (兼容保留包装)。
+func (m *Manager) WithHMEClient(id string, fn func(*hme.Client) error) error {
+	return m.WithHMEClientContext(context.Background(), id, fn)
 }
 
 // accountSnapshot 返回账号的深拷贝（含 Cookies）。

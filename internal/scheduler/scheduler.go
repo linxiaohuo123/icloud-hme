@@ -8,6 +8,7 @@
 package scheduler
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
@@ -71,35 +72,40 @@ func (r *RingBuffer) Get() []LogEntry {
 	return res
 }
 
-// AliasCreator 抽象别名创建函数
-type AliasCreator func(accountID, label string) (*hme.CreateResult, error)
+// AliasCreator 抽象别名创建函数 (PR-05 F10: 支持 Context 贯穿与即时中断)
+type AliasCreator func(ctx context.Context, accountID, label string) (*hme.CreateResult, error)
 
 // AccountsProvider 抽象账号列表提供者
 type AccountsProvider func() []account.Summary
 
 // Scheduler 定时调度引擎
 type Scheduler struct {
-	store        *store.Store
-	creator      AliasCreator
-	accounts     AccountsProvider
-	logs         *RingBuffer
-	interval     time.Duration
-	stopCh       chan struct{}
-	running      bool
-	runMu        sync.Mutex
-	mu           sync.Mutex
-	roundRunning atomic.Bool  // 当前是否有一轮补货正在执行
-	lastRunAt    atomic.Int64 // 最近一轮完成时间(UnixNano, 0=从未执行)
-	paceMu       sync.Mutex
-	lastPacedRun map[string]time.Time // 记录每个账号最近一次发号时间(用于平滑平摊)
+	store         *store.Store
+	creator       AliasCreator
+	accounts      AccountsProvider
+	logs          *RingBuffer
+	interval      time.Duration
+	stopCh        chan struct{}
+	running       bool
+	runMu         sync.Mutex
+	mu            sync.Mutex
+	roundRunning  atomic.Bool  // 当前是否有一轮补货正在执行
+	lastRunAt     atomic.Int64 // 最近一轮完成时间(UnixNano, 0=从未执行)
+	paceMu        sync.Mutex
+	lastPacedRun  map[string]time.Time // 记录每个账号最近一次发号时间(用于平滑平摊)
 	// wg 跟踪在途的补货轮次，使 Stop 能等到本轮收敛后再放行停机。
-	wg sync.WaitGroup
+	wg            sync.WaitGroup
+	ctx           context.Context
+	cancel        context.CancelFunc
+	roundCancelMu sync.Mutex
+	roundCancel   context.CancelFunc
 }
 
 // schedulerStopGrace 是停机时等待在途补货轮次收敛的上限。
 const schedulerStopGrace = 10 * time.Second
 
 func NewScheduler(s *store.Store, creator AliasCreator, accounts AccountsProvider) *Scheduler {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Scheduler{
 		store:        s,
 		creator:      creator,
@@ -108,6 +114,8 @@ func NewScheduler(s *store.Store, creator AliasCreator, accounts AccountsProvide
 		interval:     5 * time.Minute,
 		stopCh:       make(chan struct{}),
 		lastPacedRun: make(map[string]time.Time),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 }
 
@@ -146,6 +154,7 @@ func (s *Scheduler) Start() {
 		return
 	}
 	s.running = true
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.stopCh = make(chan struct{})
 	stopCh := s.stopCh
 	s.mu.Unlock()
@@ -165,29 +174,49 @@ func (s *Scheduler) Start() {
 	}()
 }
 
-func (s *Scheduler) Stop() {
+// StopContext 支持 Context 限制的优雅停机，保证返回后无在途 goroutine 触碰 Store (PR-05 F10)
+func (s *Scheduler) StopContext(ctx context.Context) error {
 	s.mu.Lock()
 	if !s.running {
 		s.mu.Unlock()
-		return
+		return nil
 	}
 	s.running = false
-	close(s.stopCh)
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.roundCancelMu.Lock()
+	if s.roundCancel != nil {
+		s.roundCancel()
+	}
+	s.roundCancelMu.Unlock()
+
+	select {
+	case <-s.stopCh:
+	default:
+		close(s.stopCh)
+	}
 	s.mu.Unlock()
 
-	// 等待在途轮次收敛。若不等，Server.Close() 会紧接着关掉 SQLite，
-	// 而此时 Apple 侧可能已经建号成功 —— 配额计数与流水写入会静默失败，
-	// 造成「配额被消耗但本地无记录」的漂移。
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
 		close(done)
 	}()
+
 	select {
 	case <-done:
-	case <-time.After(schedulerStopGrace):
-		log.Printf("[Scheduler] 等待在途补货轮次收敛超时(%s)，继续停机", schedulerStopGrace)
+		return nil
+	case <-ctx.Done():
+		log.Printf("[Scheduler] 等待在途补货轮次收敛超时: %v", ctx.Err())
+		return ctx.Err()
 	}
+}
+
+func (s *Scheduler) Stop() {
+	ctx, cancel := context.WithTimeout(context.Background(), schedulerStopGrace)
+	defer cancel()
+	_ = s.StopContext(ctx)
 }
 
 // RunOnce 执行一次调度流程 (防重入)。
@@ -226,7 +255,29 @@ func (s *Scheduler) run(manual, includeDisabled bool, countPerAccount int) (int,
 		return 0, 0
 	}
 
-	stopCh := s.getStopCh()
+	s.mu.Lock()
+	baseCtx := s.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	stopCh := s.stopCh
+	s.mu.Unlock()
+
+	runCtx, cancelRound := context.WithCancel(baseCtx)
+	defer cancelRound()
+
+	s.roundCancelMu.Lock()
+	s.roundCancel = cancelRound
+	s.roundCancelMu.Unlock()
+	defer func() {
+		s.roundCancelMu.Lock()
+		s.roundCancel = nil
+		s.roundCancelMu.Unlock()
+	}()
+
+	if err := runCtx.Err(); err != nil {
+		return 0, 0
+	}
 
 	if countPerAccount <= 0 {
 		countPerAccount = 1
@@ -304,11 +355,13 @@ func (s *Scheduler) run(manual, includeDisabled bool, countPerAccount int) (int,
 			}()
 			for a := range taskCh {
 				select {
+				case <-runCtx.Done():
+					return
 				case <-stopCh:
 					return
 				default:
 				}
-				c, e := s.processAccount(a, countPerAccount, stopCh)
+				c, e := s.processAccount(runCtx, a, countPerAccount, stopCh)
 				createdTotal.Add(int64(c))
 				errorTotal.Add(int64(e))
 			}
@@ -336,7 +389,7 @@ func (s *Scheduler) run(manual, includeDisabled bool, countPerAccount int) (int,
 }
 
 // processAccount 负责单个账号的配额校验与别名生成。
-func (s *Scheduler) processAccount(a account.Summary, countPerAccount int, stopCh <-chan struct{}) (int, int) {
+func (s *Scheduler) processAccount(ctx context.Context, a account.Summary, countPerAccount int, stopCh <-chan struct{}) (int, int) {
 	cfg := s.store.GetScheduleConfig(a.ID)
 	accName := a.Name
 	if accName == "" {
@@ -360,6 +413,9 @@ func (s *Scheduler) processAccount(a account.Summary, countPerAccount int, stopC
 
 	for i := 0; i < countPerAccount; i++ {
 		select {
+		case <-ctx.Done():
+			s.logs.Add(fmt.Sprintf("[%s] 补货任务被中断", accName))
+			return created, errTotal
 		case <-stopCh:
 			s.logs.Add(fmt.Sprintf("[%s] 补货任务被中断", accName))
 			return created, errTotal
@@ -376,7 +432,7 @@ func (s *Scheduler) processAccount(a account.Summary, countPerAccount int, stopC
 		}
 
 		label := formatScheduleLabel(cfg.AliasLabel, accName, i+1)
-		res, err := s.creator(a.ID, label)
+		res, err := s.creator(ctx, a.ID, label)
 		if err != nil {
 			errTotal++
 			errStr := err.Error()
@@ -417,6 +473,9 @@ func (s *Scheduler) processAccount(a account.Summary, countPerAccount int, stopC
 
 		// 平滑节流：每个账号之间等待 2 秒，防 Apple IP 标记 (支持中断唤醒)
 		select {
+		case <-ctx.Done():
+			s.logs.Add(fmt.Sprintf("[%s] 补货任务被中断", accName))
+			return created, errTotal
 		case <-stopCh:
 			s.logs.Add(fmt.Sprintf("[%s] 补货任务被中断", accName))
 			return created, errTotal
