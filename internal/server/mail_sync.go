@@ -264,13 +264,39 @@ func (w *MailSyncWorker) syncOnce() {
 		}
 	}()
 
-	// 【安全与节流铁律】：仅在外部有活跃订阅等待验证码时才轮询，
-	// 杜绝 7x24 小时每两秒狂刷 Apple 接口导致大号 Session 或 IP 被风控封锁。
-	if !w.eventBus.HasSubscribers() {
+	// PR-04B: 扫描需求来源为 EventBus subscribers UNION 数据库中未过期的活跃 verification requests
+	hasSubscribers := w.eventBus.HasSubscribers()
+	var persistentAliases []string
+	if w.store != nil {
+		watches, err := w.store.ListActiveVerificationWatches(w.ctx)
+		if err == nil && len(watches) > 0 {
+			for _, watch := range watches {
+				persistentAliases = append(persistentAliases, watch.AliasEmail)
+			}
+		}
+	}
+
+	if !hasSubscribers && len(persistentAliases) == 0 {
 		return
 	}
 
-	subscribedEmails := w.eventBus.SubscribedEmails()
+	watchedSet := make(map[string]struct{})
+	for _, email := range w.eventBus.SubscribedEmails() {
+		norm := strings.ToLower(strings.TrimSpace(email))
+		if norm != "" {
+			watchedSet[norm] = struct{}{}
+		}
+	}
+	for _, email := range persistentAliases {
+		norm := strings.ToLower(strings.TrimSpace(email))
+		if norm != "" {
+			watchedSet[norm] = struct{}{}
+		}
+	}
+	if len(watchedSet) == 0 {
+		return
+	}
+
 	accounts := w.be.ListAccounts()
 	if len(accounts) == 0 {
 		return
@@ -281,12 +307,11 @@ func (w *MailSyncWorker) syncOnce() {
 	var unknownAliases []string
 
 	w.mu.RLock()
-	for _, email := range subscribedEmails {
-		norm := strings.ToLower(strings.TrimSpace(email))
-		if accID, ok := w.aliasToAccount[norm]; ok {
-			accountQueries[accID] = append(accountQueries[accID], norm)
+	for email := range watchedSet {
+		if accID, ok := w.aliasToAccount[email]; ok {
+			accountQueries[accID] = append(accountQueries[accID], email)
 		} else {
-			unknownAliases = append(unknownAliases, norm)
+			unknownAliases = append(unknownAliases, email)
 		}
 	}
 	w.mu.RUnlock()
@@ -464,6 +489,22 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 		for target := range aliasSet {
 			if !msgMatchesRecipient(msg, target) {
 				continue
+			}
+			if w.store != nil {
+				completedReqs, err := w.store.CompleteMatchingVerificationRequests(ctx, store.VerificationEventInput{
+					AliasEmail:  target,
+					Provider:    msg.Provider,
+					Mailbox:     msg.Folder,
+					UIDValidity: msg.UIDValidity,
+					UID:         msg.UID,
+					MessageRef:  msg.MessageRef,
+					Code:        otp.Code,
+					MagicLink:   otp.MagicLink,
+					Now:         time.Now().UTC(),
+				})
+				if err == nil && len(completedReqs) > 0 {
+					hasMatch = true
+				}
 			}
 			if !w.markPublished(accountID, msg.Folder, msg.UIDValidity, msg.UID, msg.ThreadID, msg.Provider, target) {
 				continue
@@ -648,6 +689,7 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 				break
 			}
 
+			pageDurableFailed := false
 			for _, fullMsg := range fullMsgs {
 				if fullMsg == nil {
 					continue
@@ -665,23 +707,59 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 					if !msgMatchesRecipient(fullMsg.Message, target) {
 						continue
 					}
-					if !w.markPublished(accountID, fullMsg.Folder, fullMsg.UIDValidity, fullMsg.UID, fullMsg.ThreadID, fullMsg.Provider, target) {
-						continue
+
+					// PR-04B 核心规则: 先写 verification_requests durable result，成功后再做 EventBus Publish。
+					// 数据库成功是 correctness，EventBus publish 只是 optimization。
+					if w.store != nil {
+						completedReqs, err := w.store.CompleteMatchingVerificationRequests(ctx, store.VerificationEventInput{
+							AliasEmail:  target,
+							Provider:    "imap",
+							Mailbox:     folder,
+							UIDValidity: fullMsg.UIDValidity,
+							UID:         fullMsg.UID,
+							MessageRef:  fullMsg.MessageRef,
+							Code:        otp.Code,
+							MagicLink:   otp.MagicLink,
+							Now:         time.Now().UTC(),
+						})
+						if err != nil {
+							// 数据库持久化失败:
+							// 当前 page 视为未完成，不推进 checkpoint，不 markPublished，留给下轮重试
+							log.Printf("[MailSync] 持久化验证码终态失败 (%s UID=%d): %v", target, fullMsg.UID, err)
+							pageDurableFailed = true
+							break
+						}
+						if len(completedReqs) > 0 {
+							hasMatch = true
+						}
 					}
-					w.eventBus.PublishEvent(&mail.CachedOTP{
-						EventID:     fullMsg.MessageRef,
-						AccountID:   accountID,
-						Email:       target,
-						Folder:      fullMsg.Folder,
-						UIDValidity: fullMsg.UIDValidity,
-						UID:         fullMsg.UID,
-						OTP:         otp,
-						Subject:     fullMsg.Subject,
-						From:        fullMsg.From,
-						Date:        fullMsg.Date,
-					})
-					hasMatch = true
+
+					// 数据库落库成功（或无 store 模式）后，执行内存去重并做 EventBus 广播优化。
+					// 即便 markPublished 返回 false (例如已广播过)，数据库完成状态仍然是权威状态。
+					if w.markPublished(accountID, fullMsg.Folder, fullMsg.UIDValidity, fullMsg.UID, fullMsg.ThreadID, fullMsg.Provider, target) {
+						w.eventBus.PublishEvent(&mail.CachedOTP{
+							EventID:     fullMsg.MessageRef,
+							AccountID:   accountID,
+							Email:       target,
+							Folder:      fullMsg.Folder,
+							UIDValidity: fullMsg.UIDValidity,
+							UID:         fullMsg.UID,
+							OTP:         otp,
+							Subject:     fullMsg.Subject,
+							From:        fullMsg.From,
+							Date:        fullMsg.Date,
+						})
+						hasMatch = true
+					}
 				}
+				if pageDurableFailed {
+					break
+				}
+			}
+
+			if pageDurableFailed {
+				// 本页有持久化失败，不可推进 checkpoint，直接中断本轮扫描等待下一轮
+				break
 			}
 		}
 
