@@ -1,0 +1,245 @@
+/**
+ * [INPUT]: 依赖 context, database/sql, fmt, io, os, path/filepath, strings, time, icloud-hme/internal/store
+ * [OUTPUT]: 对外提供 CreateBackup 方法与 package-level RestoreDatabase 离线恢复能力及 quickCheck 探针
+ * [POS]: internal/store 的一致性快照生成与离线恢复容灾层 (PR-06 Baseline)
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// quickCheck 执行 PRAGMA quick_check 检查数据库物理完整性
+func quickCheck(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA quick_check;")
+	if err != nil {
+		return fmt.Errorf("database integrity check failed: %w", err)
+	}
+	defer rows.Close()
+
+	var messages []string
+	for rows.Next() {
+		var msg string
+		if err := rows.Scan(&msg); err != nil {
+			return fmt.Errorf("database integrity check failed: %w", err)
+		}
+		if msg != "ok" {
+			messages = append(messages, msg)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("database integrity check failed: %w", err)
+	}
+	if len(messages) > 0 {
+		return fmt.Errorf("database integrity check failed: %s", strings.Join(messages, "; "))
+	}
+	return nil
+}
+
+// createOnlineBackup 使用 SQLite VACUUM INTO 创建一致性在线备份
+func createOnlineBackup(ctx context.Context, db *sql.DB, destination string) error {
+	destAbs, err := filepath.Abs(destination)
+	if err != nil {
+		return fmt.Errorf("resolve destination path failed: %w", err)
+	}
+
+	// 1. 不覆盖已存在的目标文件
+	if _, err := os.Stat(destAbs); err == nil {
+		return fmt.Errorf("backup destination already exists: %s", destAbs)
+	}
+
+	destDir := filepath.Dir(destAbs)
+	if err := os.MkdirAll(destDir, 0700); err != nil {
+		return fmt.Errorf("create backup directory failed: %w", err)
+	}
+	_ = os.Chmod(destDir, 0700)
+
+	// 2. 先写唯一临时文件
+	tempPath := fmt.Sprintf("%s.tmp.%s", destAbs, NewOpaqueID("bak"))
+	defer func() {
+		_ = os.Remove(tempPath)
+	}()
+
+	// 3. 执行 VACUUM INTO 生成快照
+	vacuumQuery := fmt.Sprintf("VACUUM INTO '%s'", strings.ReplaceAll(filepath.ToSlash(tempPath), "'", "''"))
+	if _, err := db.ExecContext(ctx, vacuumQuery); err != nil {
+		return fmt.Errorf("vacuum into failed: %w", err)
+	}
+
+	// 4. 对快照文件执行 PRAGMA quick_check 校验物理一致性
+	bakDB, err := sql.Open("sqlite", fmt.Sprintf("%s?mode=ro", filepath.ToSlash(tempPath)))
+	if err != nil {
+		return fmt.Errorf("open backup for verification failed: %w", err)
+	}
+	qcErr := quickCheck(bakDB)
+	_ = bakDB.Close()
+	if qcErr != nil {
+		return fmt.Errorf("backup integrity verification failed: %w", qcErr)
+	}
+
+	// 5. 权限收敛为 0600
+	_ = os.Chmod(tempPath, 0600)
+
+	// 6. 原子重命名到最终目标路径
+	if err := os.Rename(tempPath, destAbs); err != nil {
+		return fmt.Errorf("atomic rename backup failed: %w", err)
+	}
+	_ = os.Chmod(destAbs, 0600)
+
+	return nil
+}
+
+// CreateBackup 创建一致性数据库快照 (对外 API)
+func (s *Store) CreateBackup(ctx context.Context, destination string) error {
+	if s == nil || s.closed.Load() {
+		return errors.New("store is closed")
+	}
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+
+	return createOnlineBackup(ctx, s.db, destination)
+}
+
+// RestoreDatabase 实现离线数据库一致性恢复 (package-level API)
+func RestoreDatabase(ctx context.Context, dataDir string, backupPath string) error {
+	// 1. 校验 backup 文件存在且为普通文件
+	stat, err := os.Stat(backupPath)
+	if err != nil {
+		return fmt.Errorf("backup file not found: %w", err)
+	}
+	if stat.IsDir() {
+		return fmt.Errorf("backup path is a directory: %s", backupPath)
+	}
+
+	// 2. 以 SQLite 只读方式打开备份
+	bakDB, err := sql.Open("sqlite", fmt.Sprintf("%s?mode=ro", filepath.ToSlash(backupPath)))
+	if err != nil {
+		return fmt.Errorf("open backup failed: %w", err)
+	}
+
+	// 3. PRAGMA quick_check 必须为 ok
+	if err := quickCheck(bakDB); err != nil {
+		_ = bakDB.Close()
+		return fmt.Errorf("backup integrity check failed: %w", err)
+	}
+
+	// 4. 检查 user_version：backup version <= CurrentSchemaVersion, future version 拒绝恢复
+	var backupVersion int
+	if err := bakDB.QueryRowContext(ctx, "PRAGMA user_version;").Scan(&backupVersion); err != nil {
+		_ = bakDB.Close()
+		return fmt.Errorf("read backup user_version failed: %w", err)
+	}
+	_ = bakDB.Close()
+
+	if backupVersion > CurrentSchemaVersion {
+		return fmt.Errorf("backup schema version %d is newer than supported version %d", backupVersion, CurrentSchemaVersion)
+	}
+
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return fmt.Errorf("create dataDir failed: %w", err)
+	}
+	_ = os.Chmod(dataDir, 0700)
+
+	liveDBPath := filepath.Join(dataDir, "icloud_hme.db")
+
+	// 5. 如果当前 dataDir 已有数据库：先生成一致性的 pre-restore-<timestamp>.db 快照，绝不能简单复制主 db 文件
+	if liveStat, err := os.Stat(liveDBPath); err == nil && liveStat.Size() > 0 {
+		backupsDir := filepath.Join(dataDir, "backups")
+		_ = os.MkdirAll(backupsDir, 0700)
+		baseName := fmt.Sprintf("pre-restore-%s", time.Now().UTC().Format("20060102T150405Z"))
+		preRestorePath := filepath.Join(backupsDir, baseName+".db")
+		for seq := 1; ; seq++ {
+			if _, err := os.Stat(preRestorePath); os.IsNotExist(err) {
+				break
+			}
+			preRestorePath = filepath.Join(backupsDir, fmt.Sprintf("%s_%d.db", baseName, seq))
+		}
+
+		liveDB, openErr := sql.Open("sqlite", fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)", filepath.ToSlash(liveDBPath)))
+		if openErr == nil {
+			_ = createOnlineBackup(ctx, liveDB, preRestorePath)
+			_ = liveDB.Close()
+		}
+	}
+
+	// 6. 将 restore source 复制到 icloud_hme.db.restore.tmp，权限 0600
+	restoreTmp := filepath.Join(dataDir, "icloud_hme.db.restore.tmp")
+	defer func() {
+		_ = os.Remove(restoreTmp)
+	}()
+
+	srcFile, err := os.Open(backupPath)
+	if err != nil {
+		return fmt.Errorf("open backup file for reading failed: %w", err)
+	}
+	defer srcFile.Close()
+
+	tmpFile, err := os.OpenFile(restoreTmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("create restore tmp file failed: %w", err)
+	}
+
+	if _, err := io.Copy(tmpFile, srcFile); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("copy backup to tmp failed: %w", err)
+	}
+
+	// 7. fsync / close
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("fsync restore tmp file failed: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close restore tmp file failed: %w", err)
+	}
+
+	// 8. 原子替换原 liveDBPath (如果原文件存在，先重命名保留 rollback 现场)
+	liveBakPath := liveDBPath + ".live.bak"
+	_ = os.Remove(liveBakPath)
+	hasLiveDB := false
+	if _, err := os.Stat(liveDBPath); err == nil {
+		hasLiveDB = true
+		if err := os.Rename(liveDBPath, liveBakPath); err != nil {
+			return fmt.Errorf("backup existing database before swap failed: %w", err)
+		}
+	}
+
+	if err := os.Rename(restoreTmp, liveDBPath); err != nil {
+		if hasLiveDB {
+			_ = os.Rename(liveBakPath, liveDBPath)
+		}
+		return fmt.Errorf("atomic rename restored db failed: %w", err)
+	}
+	_ = os.Chmod(liveDBPath, 0600)
+
+	// 9. 删除属于旧数据库实例的 stale 边车文件
+	_ = os.Remove(filepath.Join(dataDir, "icloud_hme.db-wal"))
+	_ = os.Remove(filepath.Join(dataDir, "icloud_hme.db-shm"))
+
+	// 10. 再由正常 NewStore 打开恢复后的数据库 (自动校验 integrity、按需执行 migration 及 schema validation)
+	st, err := NewStore(dataDir)
+	if err != nil {
+		// 恢复失败：回滚现场
+		_ = os.Remove(liveDBPath)
+		if hasLiveDB {
+			_ = os.Rename(liveBakPath, liveDBPath)
+		}
+		return fmt.Errorf("failed to open restored database via NewStore: %w", err)
+	}
+	_ = st.Close()
+
+	// 恢复确认成功，清理临时 rollback 副本 (注意：pre-restore-*.db 必须永久保留，绝不删除)
+	_ = os.Remove(liveBakPath)
+
+	return nil
+}

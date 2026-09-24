@@ -1,6 +1,6 @@
 /**
- * [INPUT]: 依赖 flag, os, path/filepath, time, icloud-hme/internal/account, icloud-hme/internal/server
- * [OUTPUT]: icloud-hme 二进制可执行文件入口
+ * [INPUT]: 依赖 context, flag, os, path/filepath, time, icloud-hme/internal/account, icloud-hme/internal/server, icloud-hme/internal/store
+ * [OUTPUT]: icloud-hme 二进制可执行文件入口 (支持 -backup 与 -restore 一致性容灾 CLI)
  * [POS]: 项目全局 CLI 引导与环境初始化层
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -17,6 +17,8 @@
 //	./icloud-hme                    # 默认 :8081
 //	./icloud-hme -addr :9000        # 指定端口
 //	./icloud-hme -data ./data       # 指定数据目录
+//	./icloud-hme -data ./data -backup ./backup.db   # 离线/在线一致性备份 (不启动服务)
+//	./icloud-hme -data ./data -restore ./backup.db  # 离线一致性恢复并校验 (不启动服务)
 //	./icloud-hme -debug             # 调试模式
 //	./icloud-hme -log-level debug   # 日志级别 (debug/info/warn/error)
 //
@@ -29,6 +31,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -58,7 +61,57 @@ func main() {
 	passwordFlag := flag.String("password", "", "管理员密码 (至少 8 字符,也可通过 ICLOUD_HME_ADMIN_PASSWORD 设置)")
 	apiKeyFlag := flag.String("api-key", "", "自动化 API Key (也可通过 ICLOUD_HME_API_KEY 设置)")
 	apiTokenFlag := flag.String("api-token", "", "兼容参考项目的 API Token 参数 (也可通过 ICLOUD_PRIME_API_TOKEN 设置)")
+	backupFlag := flag.String("backup", "", "一致性备份目标文件路径")
+	restoreFlag := flag.String("restore", "", "一致性恢复源备份文件路径")
 	flag.Parse()
+
+	if *backupFlag != "" && *restoreFlag != "" {
+		log.Fatalf("错误: -backup 与 -restore 参数互斥，不能同时指定")
+	}
+
+	// 离线/一致性备份模式 (不要求管理员密码、不启动 HTTP/Worker/Apple 凭据)
+	if *backupFlag != "" {
+		absDataDir, err := filepath.Abs(*dataDir)
+		if err != nil {
+			log.Fatalf("数据目录路径错误: %v", err)
+		}
+		destPath, err := filepath.Abs(*backupFlag)
+		if err != nil {
+			log.Fatalf("备份目标路径错误: %v", err)
+		}
+		st, err := store.NewStore(absDataDir)
+		if err != nil {
+			log.Fatalf("打开数据库存储失败: %v", err)
+		}
+		defer st.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if err := st.CreateBackup(ctx, destPath); err != nil {
+			log.Fatalf("创建一致性备份失败: %v", err)
+		}
+		fmt.Printf("一致性备份创建成功: %s\n", destPath)
+		return
+	}
+
+	// 离线一致性恢复模式 (不要求管理员密码、不启动 HTTP/Worker/Apple 凭据)
+	if *restoreFlag != "" {
+		absDataDir, err := filepath.Abs(*dataDir)
+		if err != nil {
+			log.Fatalf("数据目录路径错误: %v", err)
+		}
+		srcPath, err := filepath.Abs(*restoreFlag)
+		if err != nil {
+			log.Fatalf("备份源路径错误: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if err := store.RestoreDatabase(ctx, absDataDir, srcPath); err != nil {
+			log.Fatalf("恢复数据库失败: %v", err)
+		}
+		fmt.Printf("数据库恢复成功: %s -> %s\n", srcPath, absDataDir)
+		return
+	}
 
 	// 自动从系统配置文件、当前目录或数据目录读取并装入 .env 中所有环境变量
 	loadEnvFiles("/etc/icloud-hme.env", ".env", filepath.Join(*dataDir, ".env"))

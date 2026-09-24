@@ -51,11 +51,12 @@ func newOpaqueID(prefix string) string {
 
 // Store 统管中台数据 (基于嵌入式 SQLite)
 type Store struct {
-	mu          sync.Mutex
-	dataDir     string
-	db          *sql.DB
-	activityCh  chan string
-	stopCh      chan struct{}
+	mu             sync.Mutex
+	backupMu       sync.Mutex
+	dataDir        string
+	db             *sql.DB
+	activityCh     chan string
+	stopCh         chan struct{}
 	flusherDone    chan struct{}
 	closed         atomic.Bool
 	hookMu         sync.RWMutex
@@ -79,6 +80,9 @@ func NewStore(dataDir string) (*Store, error) {
 	_ = os.Chmod(dataDir, 0700)
 
 	dbPath := filepath.Join(dataDir, "icloud_hme.db")
+	dbStat, statErr := os.Stat(dbPath)
+	dbExistedBefore := statErr == nil && dbStat.Size() > 0
+
 	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)", filepath.ToSlash(dbPath))
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -102,7 +106,7 @@ func NewStore(dataDir string) (*Store, error) {
 		flusherDone: make(chan struct{}),
 	}
 
-	if err := s.initSchema(); err != nil {
+	if err := s.initSchema(dbExistedBefore); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("初始化表结构失败: %w", err)
 	}
@@ -111,8 +115,11 @@ func NewStore(dataDir string) (*Store, error) {
 	restrictFileMode(dataDir, "icloud_hme.db-wal")
 	restrictFileMode(dataDir, "icloud_hme.db-shm")
 
-	// 自动无损迁移遗留的 JSON 数据
-	s.migrateLegacyJSON()
+	// 自动无损迁移遗留的 JSON 数据 (Fail-Closed: 失败直接拒绝启动)
+	if err := s.migrateLegacyJSON(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("迁移遗留 JSON 失败: %w", err)
+	}
 
 	// 用出号流水回填别名路由(覆盖本功能上线前已分配的别名)
 	s.backfillAliasRoutes()
@@ -185,29 +192,14 @@ func (s *Store) Ping(ctx context.Context) error {
 	return db.PingContext(ctx)
 }
 
-// tableHasColumn 使用 PRAGMA table_info 精准探测表字段，绝不盲目依赖忽略 ALTER 报错
-func tableHasColumn(db *sql.DB, tableName, colName string) (bool, error) {
-	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var cid int
-		var name, ctype string
-		var notnull, pk int
-		var dfltValue any
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err == nil {
-			if name == colName {
-				return true, nil
-			}
+func (s *Store) initSchema(dbExistedBefore bool) error {
+	// 1. Startup Integrity Gate: 启动阶段物理损坏硬拦截 (必须先于任何写入性 PRAGMA 执行)
+	if dbExistedBefore {
+		if err := quickCheck(s.db); err != nil {
+			return err
 		}
 	}
-	return false, rows.Err()
-}
 
-func (s *Store) initSchema() error {
 	pragmas := []string{
 		"PRAGMA journal_mode = WAL;",
 		"PRAGMA busy_timeout = 5000;",
@@ -216,145 +208,63 @@ func (s *Store) initSchema() error {
 	}
 	for _, p := range pragmas {
 		if _, err := s.db.Exec(p); err != nil {
-			return err
-		}
-	}
-
-	// 1. 创建基础表 (暂不包含依赖扩展字段的索引)
-	baseDDL := `
-	CREATE TABLE IF NOT EXISTS business_tags (
-		id TEXT PRIMARY KEY,
-		name TEXT NOT NULL,
-		tag TEXT NOT NULL UNIQUE,
-		description TEXT,
-		status TEXT DEFAULT 'active',
-		created_at TEXT NOT NULL,
-		last_assigned_at TEXT
-	);
-
-	CREATE TABLE IF NOT EXISTS api_tokens (
-		id TEXT PRIMARY KEY,
-		name TEXT NOT NULL,
-		token TEXT NOT NULL UNIQUE,
-		created_at TEXT NOT NULL,
-		last_used_at TEXT
-	);
-
-	CREATE TABLE IF NOT EXISTS lease_records (
-		id TEXT PRIMARY KEY,
-		email TEXT NOT NULL,
-		account_id TEXT NOT NULL,
-		tag TEXT NOT NULL,
-		status TEXT NOT NULL,
-		allocated_at TEXT NOT NULL,
-		completed_at TEXT
-	);
-
-	CREATE TABLE IF NOT EXISTS schedules (
-		account_id TEXT PRIMARY KEY,
-		enabled INTEGER NOT NULL DEFAULT 0,
-		hourly_quota INTEGER NOT NULL DEFAULT 5,
-		current_hour_count INTEGER NOT NULL DEFAULT 0,
-		last_hour_window INTEGER NOT NULL DEFAULT 0,
-		last_run_at TEXT
-	);
-
-	CREATE TABLE IF NOT EXISTS settings (
-		key TEXT PRIMARY KEY,
-		value TEXT NOT NULL,
-		updated_at TEXT NOT NULL
-	);
-
-	CREATE TABLE IF NOT EXISTS alias_routes (
-		email      TEXT PRIMARY KEY,
-		account_id TEXT NOT NULL,
-		updated_at TEXT NOT NULL
-	);
-
-	CREATE TABLE IF NOT EXISTS accounts (
-		id            TEXT PRIMARY KEY,
-		name          TEXT NOT NULL DEFAULT '',
-		real_email    TEXT DEFAULT '',
-		icloud_email  TEXT DEFAULT '',
-		cookies       TEXT DEFAULT '{}',
-		host          TEXT DEFAULT 'icloud.com',
-		service_url   TEXT DEFAULT '',
-		proxy         TEXT DEFAULT '',
-		app_password  TEXT DEFAULT '',
-		mailbox       TEXT DEFAULT '',
-		status        TEXT DEFAULT 'pending',
-		alias_total   INTEGER DEFAULT 0,
-		alias_active  INTEGER DEFAULT 0,
-		last_validated TEXT DEFAULT '',
-		last_error    TEXT DEFAULT '',
-		created_at    TEXT NOT NULL,
-		tags          TEXT DEFAULT '[]',
-		updated_at    TEXT NOT NULL
-	);
-	`
-	if _, err := s.db.Exec(baseDDL); err != nil {
-		return fmt.Errorf("创建基础表失败: %w", err)
-	}
-
-	// 2. 使用 PRAGMA table_info 探测并补充历史遗留库缺失的字段
-	hasTokenName, err := tableHasColumn(s.db, "lease_records", "token_name")
-	if err != nil {
-		return err
-	}
-	if !hasTokenName {
-		if _, err := s.db.Exec(`ALTER TABLE lease_records ADD COLUMN token_name TEXT DEFAULT ''`); err != nil {
-			return fmt.Errorf("alter lease_records add token_name failed: %w", err)
-		}
-	}
-
-	hasScopes, err := tableHasColumn(s.db, "api_tokens", "scopes")
-	if err != nil {
-		return err
-	}
-	if !hasScopes {
-		if _, err := s.db.Exec(`ALTER TABLE api_tokens ADD COLUMN scopes TEXT NOT NULL DEFAULT 'admin'`); err != nil {
-			return fmt.Errorf("alter api_tokens add scopes failed: %w", err)
-		}
-	}
-
-	scheduleCols := []struct {
-		col string
-		def string
-	}{
-		{"alias_label", "TEXT DEFAULT 'scheduled'"},
-		{"mode", "TEXT DEFAULT 'always'"},
-		{"start_time", "TEXT DEFAULT ''"},
-		{"end_time", "TEXT DEFAULT ''"},
-		{"duration_hours", "INTEGER DEFAULT 0"},
-		{"started_at", "TEXT DEFAULT ''"},
-	}
-	for _, sc := range scheduleCols {
-		hasCol, err := tableHasColumn(s.db, "schedules", sc.col)
-		if err != nil {
-			return err
-		}
-		if !hasCol {
-			if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE schedules ADD COLUMN %s %s`, sc.col, sc.def)); err != nil {
-				return fmt.Errorf("alter schedules add %s failed: %w", sc.col, err)
+			if dbExistedBefore {
+				return fmt.Errorf("database integrity check failed: %w", err)
 			}
+			return err
 		}
 	}
 
-	// 3. 字段补充完毕后，安全创建基础表索引 (包括依赖 token_name 的覆盖复合索引)
-	indexesDDL := `
-	CREATE INDEX IF NOT EXISTS idx_leases_allocated_at ON lease_records (allocated_at DESC);
-	CREATE INDEX IF NOT EXISTS idx_leases_email ON lease_records (email);
-	CREATE INDEX IF NOT EXISTS idx_leases_email_lower ON lease_records (LOWER(email));
-	CREATE INDEX IF NOT EXISTS idx_leases_email_lower_token ON lease_records (LOWER(email), token_name);
-	CREATE INDEX IF NOT EXISTS idx_leases_tag ON lease_records (tag);
-	CREATE INDEX IF NOT EXISTS idx_leases_status ON lease_records (status);
-	CREATE INDEX IF NOT EXISTS idx_alias_routes_account ON alias_routes (account_id);
-	CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
-	`
-	if _, err := s.db.Exec(indexesDDL); err != nil {
-		return fmt.Errorf("创建基础表索引失败: %w", err)
+	// 2. 检查 user_version
+	v, err := getUserVersion(s.db)
+	if err != nil {
+		return fmt.Errorf("read schema version failed: %w", err)
 	}
 
-	// 4. 初始化领域库存与操作表
-	return s.initInventorySchema()
+	// 3. 拒绝未来版本数据库
+	if v > CurrentSchemaVersion {
+		return fmt.Errorf("database schema version %d is newer than supported version %d", v, CurrentSchemaVersion)
+	}
+
+	// 4. 迁移前自动生成一致性快照 (仅在数据库文件已存在且 user_version < CurrentSchemaVersion 时)
+	if dbExistedBefore && v < CurrentSchemaVersion {
+		backupsDir := filepath.Join(s.dataDir, "backups")
+		if err := os.MkdirAll(backupsDir, 0700); err != nil {
+			return fmt.Errorf("create backups directory failed: %w", err)
+		}
+		_ = os.Chmod(backupsDir, 0700)
+		baseBackupName := fmt.Sprintf("pre-migrate-v%d-to-v%d-%s", v, CurrentSchemaVersion, time.Now().UTC().Format("20060102T150405Z"))
+		backupPath := filepath.Join(backupsDir, baseBackupName+".db")
+		for seq := 1; ; seq++ {
+			if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+				break
+			}
+			backupPath = filepath.Join(backupsDir, fmt.Sprintf("%s_%d.db", baseBackupName, seq))
+		}
+		if err := createOnlineBackup(context.Background(), s.db, backupPath); err != nil {
+			return fmt.Errorf("pre-migration backup failed: %w", err)
+		}
+	}
+
+	// 5. Version 0 -> Version 1 事务化迁移
+	if v < CurrentSchemaVersion {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin migration tx failed: %w", err)
+		}
+		if err := migrateV0ToV1(tx); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("migrate v0 to v1 failed: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration tx failed: %w", err)
+		}
+	}
+
+	// 6. Schema 完整性终态校验门禁
+	if err := validateSchema(s.db); err != nil {
+		return err
+	}
+
+	return nil
 }
