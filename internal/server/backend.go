@@ -97,6 +97,9 @@ type managerBackend struct {
 	summaryMu    sync.Mutex
 	summaryCache []account.Summary
 	summaryAt    time.Time
+
+	// accountMutations 存储每个账号的互斥锁 (*sync.Mutex)，用于串行化单账号的 HME 写操作生命周期与未决门禁
+	accountMutations sync.Map
 }
 
 // summaryCacheTTL 是 ListAccounts 快照的有效期。

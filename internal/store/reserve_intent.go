@@ -8,12 +8,14 @@ import (
 	"time"
 )
 
+type IntentState = string
+
 const (
-	IntentStatePrepared        = "prepared"
-	IntentStateReserveSent     = "reserve_sent"
-	IntentStateOutcomeUnknown  = "outcome_unknown"
-	IntentStateSucceeded       = "succeeded"
-	IntentStateConfirmedFailed = "confirmed_failed"
+	IntentStatePrepared        IntentState = "prepared"
+	IntentStateReserveSent     IntentState = "reserve_sent"
+	IntentStateOutcomeUnknown  IntentState = "outcome_unknown"
+	IntentStateSucceeded       IntentState = "succeeded"
+	IntentStateConfirmedFailed IntentState = "confirmed_failed"
 )
 
 // HmeReserveIntent 记录上游 HME Reserve 写操作的持久化意图状态机 (F03)

@@ -892,3 +892,209 @@ func TestFault_ExplicitConfirmedFailureAllowsNewCandidate(t *testing.T) {
 	}
 }
 
+// TestFault_UnresolvedIntentBlocksSubsequentCreate
+// 验证 account-level unresolved gate:
+// 当某账号存在 prepared / reserve_sent / outcome_unknown 的未决意图，
+// 且核对列表暂时未找到原候选 A 时，坚决保持 outcome_unknown；
+// 随后调用真正的 mb.CreateAlias(accountID, "new_request")：
+// 必须立即返回 ErrOutcomeUnknown / UPSTREAM_OUTCOME_UNKNOWN，
+// 严禁调用 Generate (调用次数=0)，严禁调用 Reserve (调用次数=0)，
+// 数据库中原候选 A 保持 outcome_unknown，严禁产生 candidate B！
+func TestFault_UnresolvedIntentBlocksSubsequentCreate(t *testing.T) {
+	states := []store.IntentState{
+		store.IntentStateOutcomeUnknown,
+		store.IntentStatePrepared,
+		store.IntentStateReserveSent,
+	}
+
+	for _, initialState := range states {
+		t.Run(string(initialState), func(t *testing.T) {
+			accID := "acc_block_" + string(initialState)
+			candA := "cand_a_" + string(initialState) + "@icloud.com"
+			var generateCalls int32
+			var reserveCalls int32
+
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/hme/generate":
+					count := atomic.AddInt32(&generateCalls, 1)
+					t.Errorf("CRITICAL VIOLATION: 未决账号新创建请求严禁调用 Generate (调用次数=%d)！", count)
+					w.WriteHeader(http.StatusOK)
+					_, _ = fmt.Fprintf(w, `{"success": true, "result": {"hme": "cand_b_forbidden@icloud.com"}}`)
+				case "/v1/hme/reserve":
+					count := atomic.AddInt32(&reserveCalls, 1)
+					t.Errorf("CRITICAL VIOLATION: 未决账号新创建请求严禁调用 Reserve (调用次数=%d)！", count)
+					w.WriteHeader(http.StatusOK)
+					_, _ = fmt.Fprintf(w, `{"success": true, "result": {"hme": {"hme": "cand_b_forbidden@icloud.com", "anonymousId": "anon_b"}}}`)
+				case "/v2/hme/list":
+					// 上游列表暂时未出现该候选 A
+					w.WriteHeader(http.StatusOK)
+					_, _ = fmt.Fprintf(w, `{"success": true, "result": {"hmeEmails": []}}`)
+				default:
+					w.WriteHeader(http.StatusOK)
+				}
+			})
+
+			server, mb, st, _ := setupFaultTestEnvironment(t, accID, handler)
+			defer server.Close()
+			defer st.Close()
+
+			ctx := context.Background()
+
+			// 1. 预置处于 initialState 的候选 A
+			intent, err := st.CreateReserveIntent(ctx, accID, candA, "initial_intent")
+			if err != nil {
+				t.Fatalf("CreateReserveIntent 失败: %v", err)
+			}
+			if err := st.UpdateReserveIntentState(ctx, intent.IntentID, initialState, "", "", "pre-existing"); err != nil {
+				t.Fatalf("UpdateReserveIntentState 失败: %v", err)
+			}
+
+			// 2. 模拟启动/后台核对，上游列表暂时无 A，核对结果 inconclusive
+			_, _ = mb.ReconcileUnresolvedIntents(ctx)
+
+			// 3. 随后调用真正的业务创建门面 mb.CreateAlias
+			res, createErr := mb.CreateAlias(accID, "new_request")
+
+			// 断言 1: 必须返回 ErrOutcomeUnknown / UPSTREAM_OUTCOME_UNKNOWN
+			if createErr == nil {
+				t.Fatalf("CRITICAL: 未决账号新创建必须报错阻断，实际成功交付: %v", res)
+			}
+			var be *BackendError
+			if errors.As(createErr, &be) {
+				if be.Code != "UPSTREAM_OUTCOME_UNKNOWN" {
+					t.Fatalf("期望错误码 UPSTREAM_OUTCOME_UNKNOWN, 实际: %s", be.Code)
+				}
+			} else if !errors.Is(createErr, hme.ErrOutcomeUnknown) {
+				t.Fatalf("期望包装 ErrOutcomeUnknown, 实际错误: %v", createErr)
+			}
+
+			// 断言 2: 严禁产生网络写操作
+			if calls := atomic.LoadInt32(&generateCalls); calls != 0 {
+				t.Fatalf("CRITICAL: Generate 调用次数必须为 0, 实际: %d", calls)
+			}
+			if calls := atomic.LoadInt32(&reserveCalls); calls != 0 {
+				t.Fatalf("CRITICAL: Reserve 调用次数必须为 0, 实际: %d", calls)
+			}
+
+			// 断言 3: A intent 仍是 outcome_unknown
+			saved, err := st.GetReserveIntent(ctx, intent.IntentID)
+			if err != nil {
+				t.Fatalf("GetReserveIntent 失败: %v", err)
+			}
+			if saved.State != store.IntentStateOutcomeUnknown {
+				t.Fatalf("原候选 A 状态期望 outcome_unknown, 实际: %s", saved.State)
+			}
+
+			// 断言 4: 数据库中不存在任何 candidate B intent
+			allIntents, err := st.ListUnresolvedReserveIntents(ctx, accID)
+			if err != nil {
+				t.Fatalf("ListUnresolvedReserveIntents 失败: %v", err)
+			}
+			if len(allIntents) != 1 || allIntents[0].CandidateEmail != candA {
+				t.Fatalf("发现异常的多余候选意图: %v", allIntents)
+			}
+		})
+	}
+}
+
+// TestFault_ResolvedIntentAllowsLaterIndependentCreate
+// 证明 gate 只冻结“仍未解决”的账号，不会永久锁死创建能力：
+// 1. A initially outcome_unknown；
+// 2. reconciliation 后找到 A -> succeeded；
+// 3. unresolved 列表变空；
+// 4. 此时再发一个明确独立的新 CreateAlias 请求；
+// 预期：新请求可以正常 Generate B，返回 B。
+func TestFault_ResolvedIntentAllowsLaterIndependentCreate(t *testing.T) {
+	accID := "acc_test_resolved_allows_create"
+	candA := "cand_a_resolved@icloud.com"
+	candB := "cand_b_new@icloud.com"
+	var generateCalls int32
+	var reserveCalls int32
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/hme/generate":
+			atomic.AddInt32(&generateCalls, 1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"success": true, "result": {"hme": "%s"}}`, candB)
+		case "/v1/hme/reserve":
+			atomic.AddInt32(&reserveCalls, 1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"success": true, "result": {"hme": {"hme": "%s", "anonymousId": "anon_b_new"}}}`, candB)
+		case "/v2/hme/list":
+			// 核对列表包含候选 A
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{
+				"success": true,
+				"result": {
+					"hmeEmails": [
+						{"hme": "%s", "anonymousId": "anon_a_resolved", "label": "old_a", "isActive": true}
+					]
+				}
+			}`, candA)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	server, mb, st, _ := setupFaultTestEnvironment(t, accID, handler)
+	defer server.Close()
+	defer st.Close()
+
+	ctx := context.Background()
+
+	// 1. A initially outcome_unknown
+	intentA, err := st.CreateReserveIntent(ctx, accID, candA, "old_intent")
+	if err != nil {
+		t.Fatalf("CreateReserveIntent 失败: %v", err)
+	}
+	_ = st.UpdateReserveIntentState(ctx, intentA.IntentID, store.IntentStateOutcomeUnknown, "", "", "network drop")
+
+	// 2. reconciliation 后找到 A -> succeeded
+	recovered, err := mb.ReconcileUnresolvedIntents(ctx)
+	if err != nil {
+		t.Fatalf("ReconcileUnresolvedIntents 失败: %v", err)
+	}
+	if len(recovered) != 1 || recovered[0].State != store.IntentStateSucceeded {
+		t.Fatalf("核对未能将 A 转为 succeeded: %v", recovered)
+	}
+
+	// 3. unresolved 列表变空
+	unresolved, err := st.ListUnresolvedReserveIntents(ctx, accID)
+	if err != nil {
+		t.Fatalf("ListUnresolvedReserveIntents 失败: %v", err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("期望 unresolved 列表变空, 实际仍有: %d 条", len(unresolved))
+	}
+
+	// 4. 此时再发一个明确独立的新 CreateAlias 请求
+	res, createErr := mb.CreateAlias(accID, "independent_new_request")
+	if createErr != nil {
+		t.Fatalf("独立新请求期望成功创建，实际失败: %v", createErr)
+	}
+	if res.Email != candB {
+		t.Fatalf("独立新请求期望交付新别名 %s, 实际: %s", candB, res.Email)
+	}
+
+	// 验证 Generate 和 Reserve 均只针对候选 B 调用了 1 次
+	if calls := atomic.LoadInt32(&generateCalls); calls != 1 {
+		t.Fatalf("期望 Generate 被调用 1 次 (针对候选 B), 实际: %d", calls)
+	}
+	if calls := atomic.LoadInt32(&reserveCalls); calls != 1 {
+		t.Fatalf("期望 Reserve 被调用 1 次 (针对候选 B), 实际: %d", calls)
+	}
+
+	// 验证库中 A 仍为 succeeded，B 也为 succeeded
+	savedA, _ := st.GetReserveIntent(ctx, intentA.IntentID)
+	if savedA.State != store.IntentStateSucceeded {
+		t.Fatalf("候选 A 状态期望 succeeded, 实际: %s", savedA.State)
+	}
+	intentB, err := st.FindLatestIntentForCandidate(ctx, candB)
+	if err != nil || intentB == nil || intentB.State != store.IntentStateSucceeded {
+		t.Fatalf("候选 B 未能持久化为 succeeded: %v", err)
+	}
+}
+
+
