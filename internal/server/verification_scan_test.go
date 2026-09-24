@@ -433,7 +433,10 @@ func TestVerificationScan_NoDuplicatePublishAcrossPagesAndRetries(t *testing.T) 
 	// 模拟 cursor rewind (例如新 subscriber 加入且带更早 baseline)
 	worker.mu.Lock()
 	cpKey := checkpointKey{accountID: "acc_1", mailbox: "INBOX", uidValidity: 1}
-	worker.checkpoints[cpKey] = 100 // rewind cursor back to 100
+	worker.checkpoints[cpKey] = &checkpointState{
+		NextUID:        100,
+		AliasBaselines: make(map[string]uint32),
+	} // rewind cursor back to 100
 	worker.mu.Unlock()
 
 	// 第二次扫描同一页面
@@ -526,8 +529,8 @@ func TestVerificationScan_CancelAfterPageThenResume(t *testing.T) {
 	cpVal := worker.checkpoints[cpKey]
 	worker.mu.RUnlock()
 
-	if cpVal != 200 {
-		t.Fatalf("中断后 checkpoint 应当停在 200, 实际: %d", cpVal)
+	if cpVal == nil || cpVal.NextUID != 200 {
+		t.Fatalf("中断后 checkpoint 应当停在 200, 实际: %+v", cpVal)
 	}
 
 	// 第二轮恢复执行: 传入新的 context，恢复原始未拦截的扫描
@@ -557,8 +560,8 @@ func TestVerificationScan_CancelAfterPageThenResume(t *testing.T) {
 	finalCp := worker.checkpoints[cpKey]
 	worker.mu.RUnlock()
 
-	if finalCp < 250 {
-		t.Fatalf("扫描完成后 checkpoint 应推进到 >=250, 实际: %d", finalCp)
+	if finalCp == nil || finalCp.NextUID < 250 {
+		t.Fatalf("扫描完成后 checkpoint 应推进到 >=250, 实际: %+v", finalCp)
 	}
 }
 
@@ -863,5 +866,505 @@ func TestNormalInboxLimitSemanticsUnchanged(t *testing.T) {
 	}
 	if res.Messages[0].UID != 51 || res.Messages[49].UID != 100 {
 		t.Fatalf("普通收件箱应当保留最新的 50 封 (51..100), 实际首尾: %d..%d", res.Messages[0].UID, res.Messages[49].UID)
+	}
+}
+
+// Test 9: TestVerificationScan_NewEarlierSubscriberRewindsCheckpoint
+// 验证新 subscriber 带来更早 baseline 时，必须自动触发 rewind 扫回其 baseline。
+// 旧实现由于直接使用 checkpoint (351 >= 100) 导致 cursor 停在 351，从而跳过 100..349，aliasB 永久漏收 UID 120。
+func TestVerificationScan_NewEarlierSubscriberRewindsCheckpoint(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	aliasA := "alias_a@icloud.com"
+	aliasB := "alias_b@icloud.com"
+	now := time.Now().UTC()
+
+	// 阶段一: 仅 aliasA，baseline = 200
+	err = st.CreateVerificationRequest(ctx, &store.VerificationRequest{
+		RequestID:           "vreq_a_1",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok_a",
+		LeaseID:             "lease_a",
+		AliasEmail:          aliasA,
+		Status:              "ready",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "imap",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         200,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 准备 100..350 的邮件
+	messages := make([]mail.Message, 0, 260)
+	for u := uint32(100); u <= 350; u++ {
+		msg := mail.Message{
+			ID:          fmt.Sprintf("%d", u),
+			AccountID:   "acc_1",
+			Folder:      "INBOX",
+			UIDValidity: 1,
+			UID:         u,
+			Provider:    "imap",
+			To:          "noise@icloud.com",
+			Subject:     "Noise",
+			Preview:     "Noise",
+		}
+		if u == 120 {
+			msg.To = aliasB
+			msg.Subject = "Code for B: 654321"
+			msg.Preview = "Your code is 654321"
+		}
+		messages = append(messages, msg)
+	}
+
+	fb := newScanTestBackend("acc_1", messages, 351)
+	eventBus := mail.NewEventBus(5 * time.Minute)
+	worker := NewMailSyncWorker(fb, st, eventBus, 1*time.Second)
+
+	// 阶段一扫描: 仅传 aliasA，将其 checkpoint 推进到 351
+	worker.fetchAndPublishBatch(ctx, "acc_1", []string{aliasA})
+
+	// 阶段二: 新增 aliasB, baseline = 100
+	err = st.CreateVerificationRequest(ctx, &store.VerificationRequest{
+		RequestID:           "vreq_b_1",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok_b",
+		LeaseID:             "lease_b",
+		AliasEmail:          aliasB,
+		Status:              "ready",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "imap",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	subB, chB := eventBus.SubscribeWithBoundary(aliasB, "INBOX", 1, 100)
+	defer eventBus.Unsubscribe(aliasB, subB)
+
+	// 真实调用 fetchAndPublishBatch，带 aliasA 和 aliasB (绝不手动改动 checkpoint)
+	matched := worker.fetchAndPublishBatch(ctx, "acc_1", []string{aliasA, aliasB})
+	if !matched {
+		t.Fatal("新 subscriber 加入后 fetchAndPublishBatch 应匹配成功")
+	}
+
+	select {
+	case evt := <-chB:
+		if evt.UID != 120 || evt.OTP == nil || evt.OTP.Code != "654321" {
+			t.Fatalf("aliasB 收到错误事件: %+v", evt)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("aliasB 超时未收到 UID 120 事件! 说明扫描未能自动 rewind 到 100，仍从 350 开始")
+	}
+}
+
+// Test 10: TestVerificationScan_NewAliasSameBaselineStillRewinds
+// 验证同 baseline 的新 alias subscriber 加入时，即使 baseline 与已有历史相同 (例如 200)，
+// 但由于该 checkpoint 尚未覆盖该新 alias，仍必须安全 rewind 到 200。
+func TestVerificationScan_NewAliasSameBaselineStillRewinds(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	aliasA := "alias_same_a@icloud.com"
+	aliasB := "alias_same_b@icloud.com"
+	now := time.Now().UTC()
+
+	// 阶段一: 仅 aliasA，baseline = 200
+	err = st.CreateVerificationRequest(ctx, &store.VerificationRequest{
+		RequestID:           "vreq_same_a",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok_a",
+		LeaseID:             "lease_a",
+		AliasEmail:          aliasA,
+		Status:              "ready",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "imap",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         200,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	messages := make([]mail.Message, 0, 160)
+	for u := uint32(200); u <= 350; u++ {
+		msg := mail.Message{
+			ID:          fmt.Sprintf("%d", u),
+			AccountID:   "acc_1",
+			Folder:      "INBOX",
+			UIDValidity: 1,
+			UID:         u,
+			Provider:    "imap",
+			To:          "noise@icloud.com",
+			Subject:     "Noise",
+			Preview:     "Noise",
+		}
+		if u == 220 {
+			msg.To = aliasB
+			msg.Subject = "Code for Same B: 765432"
+			msg.Preview = "Your code is 765432"
+		}
+		messages = append(messages, msg)
+	}
+
+	fb := newScanTestBackend("acc_1", messages, 351)
+	eventBus := mail.NewEventBus(5 * time.Minute)
+	worker := NewMailSyncWorker(fb, st, eventBus, 1*time.Second)
+
+	// 阶段一: aliasA 扫描，推进 checkpoint 到 351
+	worker.fetchAndPublishBatch(ctx, "acc_1", []string{aliasA})
+
+	// 阶段二: 新 subscriber aliasB 加入，baseline 同样为 200
+	err = st.CreateVerificationRequest(ctx, &store.VerificationRequest{
+		RequestID:           "vreq_same_b",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok_b",
+		LeaseID:             "lease_b",
+		AliasEmail:          aliasB,
+		Status:              "ready",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "imap",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         200,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	subB, chB := eventBus.SubscribeWithBoundary(aliasB, "INBOX", 1, 200)
+	defer eventBus.Unsubscribe(aliasB, subB)
+
+	matched := worker.fetchAndPublishBatch(ctx, "acc_1", []string{aliasA, aliasB})
+	if !matched {
+		t.Fatal("新 alias 加入后 fetchAndPublishBatch 应匹配成功")
+	}
+
+	select {
+	case evt := <-chB:
+		if evt.UID != 220 || evt.OTP == nil || evt.OTP.Code != "765432" {
+			t.Fatalf("aliasB 收到错误事件: %+v", evt)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("aliasB 超时未收到 UID 220 事件! 说明相同 baseline 的新 subscriber 未能触发 rewind")
+	}
+}
+
+// Test 11: TestVerificationScan_ExistingAliasNewBaselineRewindsWhenNeeded
+// 验证同一个 alias 重新发起验证请求导致其有效 baseline 变早时，必须触发 rewind。
+func TestVerificationScan_ExistingAliasNewBaselineRewindsWhenNeeded(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	aliasA := "alias_reissue@icloud.com"
+	now := time.Now().UTC()
+
+	// 阶段一: aliasA 初始 baseline = 200
+	err = st.CreateVerificationRequest(ctx, &store.VerificationRequest{
+		RequestID:           "vreq_reissue_1",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok_1",
+		LeaseID:             "lease_1",
+		AliasEmail:          aliasA,
+		Status:              "ready",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "imap",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         200,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	messages := make([]mail.Message, 0, 260)
+	for u := uint32(100); u <= 350; u++ {
+		msg := mail.Message{
+			ID:          fmt.Sprintf("%d", u),
+			AccountID:   "acc_1",
+			Folder:      "INBOX",
+			UIDValidity: 1,
+			UID:         u,
+			Provider:    "imap",
+			To:          "noise@icloud.com",
+			Subject:     "Noise",
+			Preview:     "Noise",
+		}
+		if u == 130 {
+			msg.To = aliasA
+			msg.Subject = "Code for Reissue: 889900"
+			msg.Preview = "Your code is 889900"
+		}
+		messages = append(messages, msg)
+	}
+
+	fb := newScanTestBackend("acc_1", messages, 351)
+	eventBus := mail.NewEventBus(5 * time.Minute)
+	worker := NewMailSyncWorker(fb, st, eventBus, 1*time.Second)
+
+	// 阶段一: 扫描推进到 351 (此时 UID 130 尚未在 baseline 200 范围内)
+	worker.fetchAndPublishBatch(ctx, "acc_1", []string{aliasA})
+
+	// 阶段二: 同一 aliasA 发起更早的 baseline (例如 120)
+	err = st.CreateVerificationRequest(ctx, &store.VerificationRequest{
+		RequestID:           "vreq_reissue_2",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok_2",
+		LeaseID:             "lease_2",
+		AliasEmail:          aliasA,
+		Status:              "ready",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "imap",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         120,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	subA, chA := eventBus.SubscribeWithBoundary(aliasA, "INBOX", 1, 120)
+	defer eventBus.Unsubscribe(aliasA, subA)
+
+	matched := worker.fetchAndPublishBatch(ctx, "acc_1", []string{aliasA})
+	if !matched {
+		t.Fatal("同一 alias 带来更早 baseline 后 fetchAndPublishBatch 应匹配成功")
+	}
+
+	select {
+	case evt := <-chA:
+		if evt.UID != 130 || evt.OTP == nil || evt.OTP.Code != "889900" {
+			t.Fatalf("aliasA 收到错误事件: %+v", evt)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("aliasA 超时未收到 UID 130 事件! 说明 baseline 变早未能触发 rewind")
+	}
+}
+
+// Test 12: TestVerificationScan_RewindInterruptedKeepsRewoundProgress
+// 验证 rewind 触发后若扫描中途被取消中断，checkpoint 必须保持在实际推进的位置，绝不能弹回旧的更大游标。
+func TestVerificationScan_RewindInterruptedKeepsRewoundProgress(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	aliasA := "alias_rewind_a@icloud.com"
+	aliasB := "alias_rewind_b@icloud.com"
+	now := time.Now().UTC()
+
+	// 阶段一: aliasA baseline = 200
+	err = st.CreateVerificationRequest(ctx, &store.VerificationRequest{
+		RequestID:           "vreq_int_a",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok_a",
+		LeaseID:             "lease_a",
+		AliasEmail:          aliasA,
+		Status:              "ready",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "imap",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         200,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 消息区间: 100..350 (251 封)
+	messages := make([]mail.Message, 0, 260)
+	for u := uint32(100); u <= 350; u++ {
+		messages = append(messages, mail.Message{
+			ID:          fmt.Sprintf("%d", u),
+			AccountID:   "acc_1",
+			Folder:      "INBOX",
+			UIDValidity: 1,
+			UID:         u,
+			Provider:    "imap",
+			To:          "noise@icloud.com",
+			Subject:     "Noise",
+			Preview:     "Noise",
+		})
+	}
+
+	fb := newScanTestBackend("acc_1", messages, 351)
+	eventBus := mail.NewEventBus(5 * time.Minute)
+	worker := NewMailSyncWorker(fb, st, eventBus, 1*time.Second)
+
+	// 第一阶段: 仅 aliasA，推进 checkpoint 到 351
+	worker.fetchAndPublishBatch(ctx, "acc_1", []string{aliasA})
+
+	cpKey := checkpointKey{accountID: "acc_1", mailbox: "INBOX", uidValidity: 1}
+	worker.mu.RLock()
+	cp1 := worker.checkpoints[cpKey]
+	worker.mu.RUnlock()
+	if cp1 == nil || cp1.NextUID != 351 {
+		t.Fatalf("阶段一后 checkpoint 应当为 351, 实际: %+v", cp1)
+	}
+
+	// 第二阶段: aliasB 加入，baseline = 100。
+	// 在 Page 1 (100..149) 成功后，当请求 Page 2 (FromUID=150) 时触发 context 取消
+	err = st.CreateVerificationRequest(ctx, &store.VerificationRequest{
+		RequestID:           "vreq_int_b",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok_b",
+		LeaseID:             "lease_b",
+		AliasEmail:          aliasB,
+		Status:              "ready",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "imap",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	origScan := fb.onScanMailboxUIDPage
+	fb.onScanMailboxUIDPage = func(ctx context.Context, q ScanPageQuery) (ScanPageResult, error) {
+		if q.FromUIDInclusive == 150 {
+			cancel() // 在第二页拉取前取消
+			return ScanPageResult{}, context.Canceled
+		}
+		return origScan(ctx, q)
+	}
+
+	// 执行中断扫描
+	_ = worker.fetchAndPublishBatch(cancelCtx, "acc_1", []string{aliasA, aliasB})
+
+	// 核心断言: rewind 中断后，checkpoint 必须停在 150，绝对不能恢复为旧的 351！
+	worker.mu.RLock()
+	cpInterrupted := worker.checkpoints[cpKey]
+	worker.mu.RUnlock()
+
+	if cpInterrupted == nil || cpInterrupted.NextUID != 150 {
+		t.Fatalf("rewind 中断后 checkpoint 必须停在实际推进的 150, 绝不能恢复为 351, 实际: %+v", cpInterrupted)
+	}
+
+	// 第三阶段: 恢复正常 context，继续扫描剩余 150..350
+	fb.onScanMailboxUIDPage = origScan
+	_ = worker.fetchAndPublishBatch(context.Background(), "acc_1", []string{aliasA, aliasB})
+
+	worker.mu.RLock()
+	cpFinal := worker.checkpoints[cpKey]
+	worker.mu.RUnlock()
+
+	if cpFinal == nil || cpFinal.NextUID != 351 {
+		t.Fatalf("恢复后 checkpoint 应当推进完成到 351, 实际: %+v", cpFinal)
+	}
+}
+
+// Test 13: TestVerificationScan_UIDValidityMismatchInvalidatesCheckpointState
+// 验证 UIDVALIDITY 改变时立即失效清除 checkpointState。
+func TestVerificationScan_UIDValidityMismatchInvalidatesCheckpointState(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	aliasA := "alias_validity@icloud.com"
+	now := time.Now().UTC()
+
+	err = st.CreateVerificationRequest(ctx, &store.VerificationRequest{
+		RequestID:           "vreq_val_1",
+		PrincipalKind:       "token",
+		PrincipalID:         "tok",
+		LeaseID:             "lease",
+		AliasEmail:          aliasA,
+		Status:              "ready",
+		CreatedAt:           now.Format(time.RFC3339),
+		ExpiresAt:           now.Add(10 * time.Minute).Format(time.RFC3339),
+		BaselineProvider:    "imap",
+		BaselineMailbox:     "INBOX",
+		BaselineUIDValidity: 1,
+		BaselineUID:         100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	messages := []mail.Message{
+		{
+			ID:          "100",
+			AccountID:   "acc_1",
+			Folder:      "INBOX",
+			UIDValidity: 1,
+			UID:         100,
+			Provider:    "imap",
+			To:          "noise@icloud.com",
+			Subject:     "Noise",
+			Preview:     "Noise",
+		},
+	}
+
+	fb := newScanTestBackend("acc_1", messages, 101)
+	eventBus := mail.NewEventBus(5 * time.Minute)
+	worker := NewMailSyncWorker(fb, st, eventBus, 1*time.Second)
+
+	// 初次扫描: UIDValidity = 1
+	worker.fetchAndPublishBatch(ctx, "acc_1", []string{aliasA})
+
+	cpKey1 := checkpointKey{accountID: "acc_1", mailbox: "INBOX", uidValidity: 1}
+	worker.mu.RLock()
+	if worker.checkpoints[cpKey1] == nil {
+		worker.mu.RUnlock()
+		t.Fatal("初次扫描后 checkpoint 应当存在")
+	}
+	worker.mu.RUnlock()
+
+	// 邮箱重建: UIDValidity 变成 2
+	fb.mailboxBoundaryFunc = func(accID, folder string) (string, uint32, uint32, error) {
+		return "imap", 2, 201, nil
+	}
+	fb.onScanMailboxUIDPage = func(ctx context.Context, q ScanPageQuery) (ScanPageResult, error) {
+		return ScanPageResult{UIDValidity: 2}, nil
+	}
+
+	// 第二轮扫描
+	worker.fetchAndPublishBatch(ctx, "acc_1", []string{aliasA})
+
+	worker.mu.RLock()
+	oldCp := worker.checkpoints[cpKey1]
+	newCp := worker.checkpoints[checkpointKey{accountID: "acc_1", mailbox: "INBOX", uidValidity: 2}]
+	worker.mu.RUnlock()
+
+	if oldCp != nil {
+		t.Fatal("UIDValidity 改变后，旧代际 checkpoint 必须已被清除")
+	}
+	if newCp == nil {
+		t.Fatal("UIDValidity 改变后，新代际 checkpoint 应当被建立")
 	}
 }

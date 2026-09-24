@@ -45,6 +45,11 @@ type checkpointKey struct {
 	uidValidity uint32
 }
 
+type checkpointState struct {
+	NextUID        uint32
+	AliasBaselines map[string]uint32 // normalized alias -> covered baseline UID
+}
+
 // MailSyncWorker 后台增量邮件同步器。
 type MailSyncWorker struct {
 	be             Backend
@@ -60,10 +65,10 @@ type MailSyncWorker struct {
 	wg             sync.WaitGroup
 	fetchWg        sync.WaitGroup
 	mu             sync.RWMutex
-	aliasToAccount map[string]string         // alias (lower) -> accountID
-	published      map[string]time.Time      // "account|folder|uid|recipient" -> 首次发布时间
-	probeMiss      map[string]time.Time      // alias -> 上次盲扫未命中的时间
-	checkpoints    map[checkpointKey]uint32  // (accountID, mailbox, uidValidity) -> nextUID (PR-04A F07)
+	aliasToAccount map[string]string                   // alias (lower) -> accountID
+	published      map[string]time.Time                // "account|folder|uid|recipient" -> 首次发布时间
+	probeMiss      map[string]time.Time                // alias -> 上次盲扫未命中的时间
+	checkpoints    map[checkpointKey]*checkpointState // (accountID, mailbox, uidValidity) -> checkpoint state (PR-04A F07)
 }
 
 // NewMailSyncWorker 创建邮件同步器。st 可为 nil(仅退化为内存归属映射)。
@@ -84,7 +89,7 @@ func NewMailSyncWorker(be Backend, st *store.Store, eventBus *mail.EventBus, int
 		aliasToAccount: make(map[string]string),
 		published:      make(map[string]time.Time),
 		probeMiss:      make(map[string]time.Time),
-		checkpoints:    make(map[checkpointKey]uint32),
+		checkpoints:    make(map[checkpointKey]*checkpointState),
 	}
 }
 
@@ -394,18 +399,21 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 	if w.store != nil {
 		var globalMinUID uint32
 		allHaveBaseline := true
+		currentBaselines := make(map[string]uint32, len(aliases))
 		for _, alias := range aliases {
-			uid, err := w.store.GetMinBaselineUIDByEmail(ctx, alias)
+			norm := strings.ToLower(strings.TrimSpace(alias))
+			uid, err := w.store.GetMinBaselineUIDByEmail(ctx, norm)
 			if err != nil || uid == 0 {
 				allHaveBaseline = false
 				break
 			}
+			currentBaselines[norm] = uid
 			if globalMinUID == 0 || uid < globalMinUID {
 				globalMinUID = uid
 			}
 		}
 		if allHaveBaseline && globalMinUID > 0 {
-			return w.scanAndPublishPages(ctx, accountID, aliases, "INBOX", globalMinUID)
+			return w.scanAndPublishPages(ctx, accountID, aliases, currentBaselines, "INBOX", globalMinUID)
 		}
 	}
 
@@ -479,7 +487,7 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 }
 
 // scanAndPublishPages 执行基于 UID 升序增量分页、固定上界、resumable checkpoint 与 metadata-first 的流式扫描 (PR-04A F07)。
-func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID string, aliases []string, folder string, baselineUID uint32) bool {
+func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID string, aliases []string, currentBaselines map[string]uint32, folder string, baselineUID uint32) bool {
 	if len(aliases) == 0 || baselineUID == 0 {
 		return false
 	}
@@ -515,16 +523,43 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 		}
 	}
 
-	cursor := baselineUID
-	if cpNextUID, exists := w.checkpoints[cpKey]; exists {
-		if cpNextUID >= baselineUID {
-			// checkpoint >= baseline: 继续从 checkpoint
-			cursor = cpNextUID
-		} else {
-			// baseline < checkpoint: 新 subscriber 带来更早 baseline，安全 rewind
-			cursor = baselineUID
-			w.checkpoints[cpKey] = baselineUID
+	cp, exists := w.checkpoints[cpKey]
+	if !exists {
+		cp = &checkpointState{
+			NextUID:        baselineUID,
+			AliasBaselines: make(map[string]uint32, len(currentBaselines)),
 		}
+		w.checkpoints[cpKey] = cp
+	} else if cp.AliasBaselines == nil {
+		cp.AliasBaselines = make(map[string]uint32)
+	}
+
+	cursor := cp.NextUID
+	rewound := false
+
+	// 检查当前所有活跃 subscribers 的覆盖情况:
+	// 场景 1: earlier baseline rewind (新 subscriber 带来更早 baseline)
+	// 场景 2: same baseline new alias rewind (新 subscriber 即使 baseline 与旧 checkpoint 相同或不更早，但尚未被当前 checkpoint 覆盖)
+	// 场景 3: changed baseline rewind (同一 subscriber 重新发起验证且 baseline 变早)
+	for alias, curB := range currentBaselines {
+		coveredB, covered := cp.AliasBaselines[alias]
+		if !covered || curB < coveredB {
+			if curB < cursor {
+				cursor = curB
+				rewound = true
+			}
+		}
+	}
+
+	// 若未触发 rewind，且当前所有活跃 subscriber 的最小基线都晚于当前 cursor（旧 subscriber 均已结束），安全前进
+	if !rewound && baselineUID > cursor {
+		cursor = baselineUID
+		rewound = true
+	}
+
+	// 发生 rewind 时，立即将 NextUID 保持在实际推进位置，防止中断时恢复为旧的更大游标
+	if rewound {
+		cp.NextUID = cursor
 	}
 	w.mu.Unlock()
 
@@ -572,7 +607,14 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 		if len(pageRes.Messages) == 0 {
 			// 本轮范围内已无消息，推进到 scanUpperUID + 1
 			w.mu.Lock()
-			w.checkpoints[cpKey] = scanUpperUID + 1
+			cp.NextUID = scanUpperUID + 1
+			for alias, curB := range currentBaselines {
+				if curB <= scanUpperUID {
+					if prev, ok := cp.AliasBaselines[alias]; !ok || curB < prev {
+						cp.AliasBaselines[alias] = curB
+					}
+				}
+			}
 			w.mu.Unlock()
 			break
 		}
@@ -652,7 +694,14 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 		cursor = nextCursor
 
 		w.mu.Lock()
-		w.checkpoints[cpKey] = cursor
+		cp.NextUID = cursor
+		for alias, curB := range currentBaselines {
+			if curB < cursor {
+				if prev, ok := cp.AliasBaselines[alias]; !ok || curB < prev {
+					cp.AliasBaselines[alias] = curB
+				}
+			}
+		}
 		w.mu.Unlock()
 
 		if !pageRes.HasMore || cursor > scanUpperUID {
