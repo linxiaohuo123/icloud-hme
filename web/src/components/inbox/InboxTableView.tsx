@@ -57,7 +57,12 @@ const moduleInboxSnapshotCache = new Map<string, InboxSnapshotEntry>()
 const MAX_SNAPSHOT_CACHE = 50
 
 function buildSnapshotKey(accId: string, al: string, fld: string, lmt: number, dys: number, isWebMail: boolean) {
-  const normFolder = isWebMail ? 'INBOX' : (fld || 'all').toLowerCase()
+  const trimmed = (fld || 'all').trim()
+  const normFolder = isWebMail
+    ? 'INBOX'
+    : (trimmed.toLowerCase() === 'all'
+      ? 'all'
+      : (trimmed.toLowerCase() === 'inbox' ? 'INBOX' : trimmed))
   const normDays = isWebMail ? 0 : dys
   return `${accId.trim()}::${al.trim()}::${normFolder}::${lmt}::${normDays}`
 }
@@ -105,10 +110,33 @@ function getCachedFolders(accountId: string): MailboxFolder[] | null {
   return entry.folders
 }
 
-export function clearInboxSnapshotCache() {
-  moduleInboxSnapshotCache.clear()
-  moduleFolderCache.clear()
-  moduleMessageCache.clear()
+// eslint-disable-next-line react-refresh/only-export-components
+export function clearInboxSnapshotCache(accountId?: string) {
+  if (accountId) {
+    const acc = accountId.trim()
+    moduleFolderCache.delete(acc)
+    for (const k of Array.from(moduleInboxSnapshotCache.keys())) {
+      if (k.startsWith(acc + '::')) {
+        moduleInboxSnapshotCache.delete(k)
+      }
+    }
+    for (const k of Array.from(moduleMessageCache.keys())) {
+      if (k.startsWith(acc + ':') || k.startsWith(acc + '::')) {
+        moduleMessageCache.delete(k)
+      }
+    }
+  } else {
+    moduleInboxSnapshotCache.clear()
+    moduleFolderCache.clear()
+    moduleMessageCache.clear()
+  }
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function dispatchAccountUpdated(accountId?: string) {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('account-updated', { detail: { accountId } }))
+  }
 }
 
 export default function InboxTableView({
@@ -190,6 +218,7 @@ export default function InboxTableView({
 
   const abortRef = useRef<AbortController | null>(null)
   const accountGenRef = useRef(0)
+  const queryGenRef = useRef(0)
   const messageCacheRef = useRef<Map<string, FullMessage>>(new Map())
   const hasAccountsLoadedRef = useRef(Boolean(accountSummary))
 
@@ -224,6 +253,58 @@ export default function InboxTableView({
   }, [loading])
 
   const isBusyRef = useRef(false)
+
+  // 监听全局登出与账号变更事件，立即使旧任务与在途响应失效，严禁回写陈旧缓存
+  useEffect(() => {
+    const handleLogout = () => {
+      accountGenRef.current += 1
+      abortRef.current?.abort()
+      isBusyRef.current = false
+      messageCacheRef.current.clear()
+      clearInboxSnapshotCache()
+      setLoading(false)
+      setResult(null)
+      setFolders([])
+      setDetail(null)
+    }
+
+    const handleAccountUpdated = (e: Event) => {
+      const customEvent = e as CustomEvent<{ accountId?: string }>
+      const targetId = customEvent.detail?.accountId
+      if (!targetId || targetId === accountId) {
+        accountGenRef.current += 1
+        abortRef.current?.abort()
+        isBusyRef.current = false
+        messageCacheRef.current.clear()
+        if (accountId) {
+          clearInboxSnapshotCache(accountId)
+        }
+        setRetryKey((k) => k + 1)
+      }
+    }
+
+    window.addEventListener('auth-logout', handleLogout)
+    window.addEventListener('account-updated', handleAccountUpdated)
+    return () => {
+      window.removeEventListener('auth-logout', handleLogout)
+      window.removeEventListener('account-updated', handleAccountUpdated)
+    }
+  }, [accountId])
+
+  const prevAccountConfigRef = useRef('')
+  useEffect(() => {
+    if (!accountSummary) return
+    const configSig = `${accountSummary.id}:${accountSummary.has_app_password}:${accountSummary.mailbox?.email || ''}:${accountSummary.mailbox?.imap_host || ''}:${accountSummary.has_proxy}:${accountSummary.status}:${accountSummary.last_validated}`
+    if (prevAccountConfigRef.current && prevAccountConfigRef.current !== configSig) {
+      accountGenRef.current += 1
+      abortRef.current?.abort()
+      isBusyRef.current = false
+      messageCacheRef.current.clear()
+      clearInboxSnapshotCache(accountSummary.id)
+      setRetryKey((k) => k + 1)
+    }
+    prevAccountConfigRef.current = configSig
+  }, [accountSummary])
 
   // 自动刷新轮询定时器：页面在后台时暂停，在途请求未完成（包括后台 revalidate 与正文补全）时跳过打断
   useEffect(() => {
@@ -323,33 +404,33 @@ export default function InboxTableView({
     }
   }, [accountId, externalAliases])
 
-  // 3. 账号变化时拉取文件夹列表 (供 INBOX/Junk 筛选，带 5 分钟 TTL 模块级缓存与 refresh 刷新)
+  // 3. 账号变化或目录过期时拉取文件夹列表 (带 5 分钟 TTL 模块级缓存，普通邮件刷新严禁携带 refresh=true)
   useEffect(() => {
     if (!accountId) return
     const cached = getCachedFolders(accountId)
-    if (cached && retryKey === 0) {
+    if (cached) {
       setFolders(cached)
       return
     }
+    const currentAccountGen = accountGenRef.current
     let cancelled = false
-    const refreshParam = retryKey > 0 ? '&refresh=true' : ''
     request<{ account_id: string; folders: MailboxFolder[] }>(
-      `/api/mailboxes?account_id=${encodeURIComponent(accountId)}${refreshParam}`,
+      `/api/mailboxes?account_id=${encodeURIComponent(accountId)}`,
     )
       .then((data) => {
-        if (cancelled) return
+        if (cancelled || currentAccountGen !== accountGenRef.current) return
         const f = data.folders ?? []
         moduleFolderCache.set(accountId, { folders: f, cachedAt: Date.now() })
         setFolders(f)
       })
       .catch(() => {
-        if (cancelled) return
+        if (cancelled || currentAccountGen !== accountGenRef.current) return
         setFolders([])
       })
     return () => {
       cancelled = true
     }
-  }, [accountId, retryKey])
+  }, [accountId])
 
   // 4. 查询收件箱邮件 (带代际保护 accountGenRef、快照秒级恢复与分阶段小批正文补全)
   useEffect(() => {
@@ -357,7 +438,9 @@ export default function InboxTableView({
     // 首屏 capability 栅栏保护：未完成 capability 解析前暂缓发起带参数查询，防止 WebMail 模式被误传 folder/days 参数 (WEBMAIL-01)
     if (!accountCapabilityReady) return
 
-    const currentGen = ++accountGenRef.current
+    isBusyRef.current = true
+    const currentAccountGen = accountGenRef.current
+    const currentQueryGen = ++queryGenRef.current
     const currentQueryKey = buildSnapshotKey(accountId, alias, folder, limit, days, isWebMailOnly)
     const cachedSnap = fixedAccount ? getSnapshot(currentQueryKey) : null
 
@@ -375,6 +458,8 @@ export default function InboxTableView({
     abortRef.current = controller
     let cancelled = false
 
+    const isStale = () => cancelled || currentAccountGen !== accountGenRef.current || currentQueryGen !== queryGenRef.current
+
     const params = new URLSearchParams({ account_id: accountId })
     if (alias) params.set('alias', alias)
     if (!isWebMailOnly) {
@@ -390,7 +475,7 @@ export default function InboxTableView({
       signal: controller.signal,
     })
       .then((data) => {
-        if (cancelled || currentGen !== accountGenRef.current) return
+        if (isStale()) return
         setError('')
         unsupportedRetryRef.current[accountId] = 0
 
@@ -439,7 +524,7 @@ export default function InboxTableView({
             void (async () => {
               try {
                 for (const chunk of chunks) {
-                  if (cancelled || currentGen !== accountGenRef.current || controller.signal.aborted) {
+                  if (isStale() || controller.signal.aborted) {
                     break
                   }
                   try {
@@ -451,7 +536,7 @@ export default function InboxTableView({
                       },
                       signal: controller.signal,
                     })
-                    if (cancelled || currentGen !== accountGenRef.current) return
+                    if (isStale()) return
                     const list = Array.isArray(batch?.messages) ? batch.messages : []
                     if (list.length === 0) continue
 
@@ -497,7 +582,7 @@ export default function InboxTableView({
                   }
                 }
               } finally {
-                if (!cancelled && currentGen === accountGenRef.current) {
+                if (!isStale()) {
                   isBusyRef.current = false
                   setIsRevalidating(false)
                 }
@@ -513,12 +598,14 @@ export default function InboxTableView({
         }
       })
       .catch((err) => {
-        if (cancelled || currentGen !== accountGenRef.current || (err instanceof ApiError && err.code === 'ABORTED')) return
-        if (err instanceof ApiError && (err.status === 401 || err.code === 'AUTH_REQUIRED')) {
+        const isAuthError = err instanceof ApiError && (err.status === 401 || err.code === 'AUTH_REQUIRED')
+        if (!isAuthError && (isStale() || (err instanceof ApiError && err.code === 'ABORTED'))) return
+        if (isAuthError) {
           clearInboxSnapshotCache()
         }
         isBusyRef.current = false
         setIsRevalidating(false)
+        setLoading(false)
         // 捕获 CAPABILITY_UNSUPPORTED 错误后：最多允许 1 次退避重试 (剥离 folder/days 并记录 effective webmail capability)，严禁陷入无休止重试循环 (WEBMAIL-03, WEBMAIL-04)
         if (err instanceof ApiError && err.code === 'CAPABILITY_UNSUPPORTED') {
           const retried = unsupportedRetryRef.current[accountId] || 0
@@ -534,7 +621,7 @@ export default function InboxTableView({
         }
       })
       .finally(() => {
-        if (!cancelled && currentGen === accountGenRef.current) {
+        if (!isStale()) {
           setLoading(false)
         }
       })

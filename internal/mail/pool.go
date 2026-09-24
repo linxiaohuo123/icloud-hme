@@ -12,6 +12,7 @@ import (
 	"container/list"
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -323,4 +324,16 @@ func isLikelyConnErr(err error) bool {
 		}
 	}
 	return false
+}
+
+// SetClientForTesting 供测试在无需真实 Apple IMAP 认证时注入自定义 Client 验证生产连接池生命周期
+func (p *Pool) SetClientForTesting(appleID, appPassword string, conn net.Conn) {
+	pc := p.getOrCreate(appleID)
+	pc.appPassword = appPassword
+	pc.lastUsed = time.Now()
+	pc.client = &Client{
+		username: appleID,
+		password: appPassword,
+		conn:     conn,
+	}
 }

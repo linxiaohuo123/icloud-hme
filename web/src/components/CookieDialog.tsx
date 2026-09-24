@@ -37,6 +37,9 @@ export default function CookieDialog({ accountId, open, onClose, onSaved }: Cook
       })
       setCookies('')
       onSaved()
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('account-updated', { detail: { accountId } }))
+      }
     } catch (err) {      setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
     } finally {
       setSubmitting(false)

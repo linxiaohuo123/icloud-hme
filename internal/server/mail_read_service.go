@@ -80,6 +80,10 @@ type MailReadService struct {
 
 	flightMu     sync.Mutex
 	inFlightList map[string]*inFlightListCall
+
+	accountGenMu sync.RWMutex
+	accountGen   map[string]uint64
+	globalGen    uint64
 }
 
 // NewMailReadService 创建统一邮件读取服务
@@ -92,7 +96,20 @@ func NewMailReadService(be Backend) *MailReadService {
 		mailboxCache: make(map[string]mailboxCacheEntry),
 		mailboxTTL:   defaultMailboxTTL,
 		inFlightList: make(map[string]*inFlightListCall),
+		accountGen:   make(map[string]uint64),
 	}
+}
+
+func (s *MailReadService) getAccountGen(accountID string) uint64 {
+	s.accountGenMu.RLock()
+	defer s.accountGenMu.RUnlock()
+	return s.globalGen + s.accountGen[strings.TrimSpace(accountID)]
+}
+
+func (s *MailReadService) incAccountGen(accountID string) {
+	s.accountGenMu.Lock()
+	defer s.accountGenMu.Unlock()
+	s.accountGen[strings.TrimSpace(accountID)]++
 }
 
 // CacheLen 返回当前详情缓存条目数
@@ -103,12 +120,14 @@ func (s *MailReadService) CacheLen() int {
 }
 
 func normalizeInboxQueryKey(q InboxQuery) string {
-	folder := strings.ToUpper(strings.TrimSpace(q.Folder))
-	if folder == "" {
+	rawFolder := strings.TrimSpace(q.Folder)
+	folder := rawFolder
+	if folder == "" || strings.EqualFold(folder, "INBOX") {
 		folder = "INBOX"
 	}
 	alias := strings.ToLower(strings.TrimSpace(q.Alias))
-	return fmt.Sprintf("%s:%s:%s:%d:%d:%v:%d", q.AccountID, alias, folder, q.Limit, q.Days, q.WithBody, q.SinceUID)
+	return fmt.Sprintf("%s:%s:%s:%d:%d:%v:%d:%t:%t",
+		q.AccountID, alias, folder, q.Limit, q.Days, q.WithBody, q.SinceUID, q.FolderSpecified, q.DaysSpecified)
 }
 
 func cloneInboxResult(res InboxResult) InboxResult {
@@ -131,21 +150,59 @@ func (s *MailReadService) InvalidateMailboxCache(accountID string) {
 	delete(s.mailboxCache, strings.TrimSpace(accountID))
 }
 
-// InvalidateAccount 清理指定账号关联的目录缓存与消息详情缓存
+// InvalidateAccount 清理指定账号关联的目录缓存与消息详情缓存，取消在途任务并使旧响应失效
 func (s *MailReadService) InvalidateAccount(accountID string) {
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
 		return
 	}
+
+	// 1. 递增账号代际，废弃所有正在执行的旧任务结果回写
+	s.incAccountGen(accountID)
+
+	// 2. 取消并清除该账号所有在途 in-flight 任务
+	s.flightMu.Lock()
+	prefix := accountID + ":"
+	for k, call := range s.inFlightList {
+		if strings.HasPrefix(k, prefix) {
+			call.cancel()
+			delete(s.inFlightList, k)
+		}
+	}
+	s.flightMu.Unlock()
+
+	// 3. 清理目录短缓存
 	s.InvalidateMailboxCache(accountID)
 
+	// 4. 清理消息详情缓存
 	s.cacheMu.Lock()
-	prefix := accountID + ":"
 	for k := range s.cache {
 		if strings.HasPrefix(k, prefix) {
 			delete(s.cache, k)
 		}
 	}
+	s.cacheMu.Unlock()
+}
+
+// InvalidateAll 全局清理所有账号的缓存、在途任务并递增全局代际 (用于管理员登出或全局重置)
+func (s *MailReadService) InvalidateAll() {
+	s.accountGenMu.Lock()
+	s.globalGen++
+	s.accountGenMu.Unlock()
+
+	s.flightMu.Lock()
+	for k, call := range s.inFlightList {
+		call.cancel()
+		delete(s.inFlightList, k)
+	}
+	s.flightMu.Unlock()
+
+	s.mailboxMu.Lock()
+	s.mailboxCache = make(map[string]mailboxCacheEntry)
+	s.mailboxMu.Unlock()
+
+	s.cacheMu.Lock()
+	s.cache = make(map[string]messageCacheEntry)
 	s.cacheMu.Unlock()
 }
 
@@ -238,6 +295,7 @@ func (s *MailReadService) ListMailboxes(ctx context.Context, accountID string, r
 		return nil, &BackendError{Status: 400, Code: "VALIDATION_ERROR", Message: "参数缺失: account_id"}
 	}
 
+	startGen := s.getAccountGen(accountID)
 	now := time.Now()
 	if !refresh {
 		// 1. 检查目录短缓存，避免与优先邮件列表竞争同账号唯一 IMAP 连接
@@ -258,15 +316,18 @@ func (s *MailReadService) ListMailboxes(ctx context.Context, accountID string, r
 		return nil, err
 	}
 
-	s.mailboxMu.Lock()
-	if s.mailboxCache == nil {
-		s.mailboxCache = make(map[string]mailboxCacheEntry)
+	// 3. 校验代际：若在回源期间账号配置变更或失效，严禁回写陈旧目录
+	if s.getAccountGen(accountID) == startGen {
+		s.mailboxMu.Lock()
+		if s.mailboxCache == nil {
+			s.mailboxCache = make(map[string]mailboxCacheEntry)
+		}
+		s.mailboxCache[accountID] = mailboxCacheEntry{
+			folders:   folders,
+			expiresAt: now.Add(s.mailboxTTL),
+		}
+		s.mailboxMu.Unlock()
 	}
-	s.mailboxCache[accountID] = mailboxCacheEntry{
-		folders:   folders,
-		expiresAt: now.Add(s.mailboxTTL),
-	}
-	s.mailboxMu.Unlock()
 
 	out := make([]mail.Folder, len(folders))
 	copy(out, folders)
@@ -301,6 +362,7 @@ func (s *MailReadService) GetMessageDetail(ctx context.Context, accountID, rawID
 		return entry.msg, entry.provider, entry.method, true, nil
 	}
 
+	startGen := s.getAccountGen(accountID)
 	message, err := s.be.GetMessageContext(ctx, accountID, rawID)
 	if err != nil {
 		return nil, "", "", false, err
@@ -325,7 +387,7 @@ func (s *MailReadService) GetMessageDetail(ctx context.Context, accountID, rawID
 	}
 	message.Method = method
 
-	s.putCache(cacheKey, message, provider, method)
+	s.putCache(cacheKey, accountID, startGen, message, provider, method)
 	return message, provider, method, false, nil
 }
 
@@ -335,6 +397,7 @@ func (s *MailReadService) GetMessagesBatch(ctx context.Context, accountID string
 	if accountID == "" {
 		return nil, nil, &BackendError{Status: 400, Code: "VALIDATION_ERROR", Message: "account_id 必填"}
 	}
+	startGen := s.getAccountGen(accountID)
 	if len(reqItems) == 0 {
 		return []*mail.FullMessage{}, []BatchItemResult{}, nil
 	}
@@ -421,7 +484,7 @@ func (s *MailReadService) GetMessagesBatch(ctx context.Context, accountID string
 			} else {
 				msg.Provider = "webmail"
 				msg.Method = "web_api"
-				s.putCache(cacheKey, msg, "webmail", "web_api")
+				s.putCache(cacheKey, accountID, startGen, msg, "webmail", "web_api")
 				results = append(results, BatchItemResult{
 					RequestedRef: rawRef,
 					Message:      msg,
@@ -514,8 +577,8 @@ func (s *MailReadService) GetMessagesBatch(ctx context.Context, accountID string
 					matched.Provider = provider
 					matched.Method = method
 
-					// 仅将真实邮件写进自己请求的规范 cacheKey，绝不串号
-					s.putCache(pi.refObj.CacheKey(), matched, provider, method)
+					// 仅将真实邮件写进自己请求的规范 cacheKey，绝不串号 (校验代际防旧响应回写)
+					s.putCache(pi.refObj.CacheKey(), accountID, startGen, matched, provider, method)
 					results = append(results, BatchItemResult{
 						RequestedRef: pi.rawRef,
 						Message:      matched,
@@ -534,7 +597,10 @@ func (s *MailReadService) GetMessagesBatch(ctx context.Context, accountID string
 	return out, results, nil
 }
 
-func (s *MailReadService) putCache(key string, msg *mail.FullMessage, provider, method string) {
+func (s *MailReadService) putCache(key, accountID string, startGen uint64, msg *mail.FullMessage, provider, method string) {
+	if accountID != "" && s.getAccountGen(accountID) != startGen {
+		return // 账号代际已变，丢弃陈旧详情响应，严禁回写
+	}
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
 	if s.cache == nil {

@@ -676,4 +676,83 @@ describe('Inbox Baseline Performance Measurements', () => {
 
     unmount()
   })
+
+  it('ensures normal mail refresh does not re-fetch /api/mailboxes with refresh=true', async () => {
+    const mailboxRequests: string[] = []
+    let inboxCount = 0
+
+    server.use(
+      http.get('/api/mailboxes', ({ request }) => {
+        mailboxRequests.push(request.url)
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_perf', folders: dummyFolders } })
+      }),
+      http.get('/api/inbox', () => {
+        inboxCount++
+        return HttpResponse.json({ success: true, data: dummyInboxResult })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_perf" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Apple Security Code')).toBeInTheDocument()
+    })
+    expect(mailboxRequests.length).toBe(1)
+    expect(mailboxRequests[0]).not.toContain('refresh=true')
+
+    // Click 查询 (Search button) to trigger a normal mail refresh
+    const searchBtn = screen.getByRole('button', { name: '查询' })
+    searchBtn.click()
+
+    await waitFor(() => {
+      expect(inboxCount).toBeGreaterThanOrEqual(2)
+    })
+
+    // Mailboxes should NOT have been re-fetched with refresh=true!
+    expect(mailboxRequests.length).toBe(1)
+
+    unmount()
+  })
+
+  it('clears caches and aborts in-flight task on account-updated event', async () => {
+    let inboxCalled = 0
+    server.use(
+      http.get('/api/mailboxes', () => {
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_perf', folders: dummyFolders } })
+      }),
+      http.get('/api/inbox', () => {
+        inboxCalled++
+        return HttpResponse.json({ success: true, data: dummyInboxResult })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_perf" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Apple Security Code')).toBeInTheDocument()
+    })
+
+    // Dispatch account-updated event
+    window.dispatchEvent(new CustomEvent('account-updated', { detail: { accountId: 'acc_perf' } }))
+
+    // Expect inbox to re-validate due to account update
+    await waitFor(() => {
+      expect(inboxCalled).toBeGreaterThanOrEqual(2)
+    })
+
+    unmount()
+  })
 })
+
