@@ -127,7 +127,7 @@ jobs:
       - name: Run Smoke Health Script
         run: |
           chmod +x scripts/smoke_health.sh
-          ./scripts/smoke_health.sh http://127.0.0.1:8081
+          bash ./scripts/smoke_health.sh http://127.0.0.1:8081
 
       - name: Verify Docker Container Healthcheck
         run: |

@@ -37,7 +37,7 @@ validate_probe() {
     rm -f "$TEMP_OUT"
 
     case "$BODY" in
-        *html*|*DOCTYPE*|*<!doctype*|*<html*)
+        *"html"*|*"DOCTYPE"*|*"<!doctype"*|*"<html"*|*"<HTML"*)
             echo "[ERROR] ${ENDPOINT} 返回了 HTML SPA 回退页面，非合法 JSON 探针响应!"
             return 1
             ;;
@@ -85,7 +85,7 @@ SPA_BODY=$(cat "$TEMP_SPA")
 rm -f "$TEMP_SPA"
 
 case "$SPA_BODY" in
-    *html*|*DOCTYPE*|*<!doctype*|*<html*)
+    *"html"*|*"DOCTYPE"*|*"<!doctype"*|*"<html"*|*"<HTML"*)
         if [ "$SPA_CODE" = "200" ]; then
             echo "[PASS] 确认输入为真实 200 HTML SPA 回退页面"
         fi
