@@ -97,6 +97,9 @@ type managerBackend struct {
 	summaryMu    sync.Mutex
 	summaryCache []account.Summary
 	summaryAt    time.Time
+
+	// accountMutations 存储每个账号的互斥锁 (*sync.Mutex)，用于串行化单账号的 HME 写操作生命周期与未决门禁
+	accountMutations sync.Map
 }
 
 // summaryCacheTTL 是 ListAccounts 快照的有效期。
@@ -344,6 +347,9 @@ func mapAccountErr(err error) *BackendError {
 func classifyUpstreamErr(fixedMsg string, err error) *BackendError {
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, hme.ErrOutcomeUnknown) {
+		return &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_OUTCOME_UNKNOWN", Message: "上游写操作结果未知，需核对后处理"}
 	}
 	if isSessionError(err.Error()) {
 		return &BackendError{Status: http.StatusUnauthorized, Code: "UPSTREAM_UNAUTHORIZED", Message: "iCloud 会话失效,请更新 Cookie"}

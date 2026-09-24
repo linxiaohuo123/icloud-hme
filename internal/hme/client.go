@@ -77,12 +77,15 @@ type Client struct {
 	Username    string // iCloud 账号 (用于登录)
 	Password    string // iCloud 密码 (用于登录)
 	Verbose     bool
-	httpc       tls_client.HttpClient
-	setupURL    string
-	serviceURL  string
-	dsid        string // 从 validate 响应提取
-	clientID    string // UUID,每次会话生成
-	accountInfo *AccountInfo
+	httpc           tls_client.HttpClient
+	setupURL        string
+	serviceURL      string
+	fixedEndpoint   bool
+	dsid            string // 从 validate 响应提取
+	clientID        string // UUID,每次会话生成
+	accountInfo     *AccountInfo
+	PreReserveHook  func(ctx context.Context, candidate string) error
+	PostReserveHook func(ctx context.Context, candidate, anonymousID string, err error)
 }
 
 // NewClient 创建一个新的 HME 客户端,底层使用 Chrome TLS 指纹。
@@ -520,6 +523,14 @@ func (c *Client) SetServiceURL(u string) {
 	c.serviceURLLocked(u)
 }
 
+// SetFixedServiceURL 用于测试或代理环境，固定服务端点，防止重试时因 ResetServiceEndpoint 重定向至远端 Apple。
+func (c *Client) SetFixedServiceURL(u string) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.serviceURLLocked(u)
+	c.fixedEndpoint = true
+}
+
 // serviceURLLocked 归一化并写入服务端点，调用方须持有 stateMu。
 func (c *Client) serviceURLLocked(u string) {
 	u = strings.TrimRight(u, "/")
@@ -534,6 +545,9 @@ func (c *Client) serviceURLLocked(u string) {
 func (c *Client) ResetServiceEndpoint() {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
+	if c.fixedEndpoint {
+		return
+	}
 	c.serviceURL = ""
 	c.setupURL = ""
 }

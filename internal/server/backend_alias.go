@@ -8,6 +8,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -79,7 +80,7 @@ func (b *managerBackend) CreateAlias(accountID, label string) (*hme.CreateResult
 
 	var result *hme.CreateResult
 	err := b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
-		res, cerr := client.CreateAlias(label, 5)
+		res, cerr := b.durableCreateAlias(context.Background(), client, accountID, label, 5)
 		if cerr != nil {
 			return cerr
 		}
@@ -87,7 +88,7 @@ func (b *managerBackend) CreateAlias(accountID, label string) (*hme.CreateResult
 		return nil
 	})
 	if err != nil {
-		if b.store != nil {
+		if !errors.Is(err, hme.ErrOutcomeUnknown) && b.store != nil {
 			b.store.ReleaseQuota(accountID, 1)
 		}
 		if errors.Is(err, account.ErrHMEClientUnavailable) {
@@ -98,6 +99,201 @@ func (b *managerBackend) CreateAlias(accountID, label string) (*hme.CreateResult
 	_ = b.mgr.AdjustAliasCounts(accountID, 1, 1)
 	b.invalidateAliasCache(accountID)
 	return result, nil
+}
+
+func (b *managerBackend) getAccountMutationLock(accountID string) *sync.Mutex {
+	v, _ := b.accountMutations.LoadOrStore(accountID, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+// reconcileIntentsWithClient 使用给定的 client 对一组未决意图执行核对
+func (b *managerBackend) reconcileIntentsWithClient(ctx context.Context, client *hme.Client, intents []store.HmeReserveIntent) error {
+	if len(intents) == 0 || b.store == nil {
+		return nil
+	}
+	aliases, listErr := client.ListAliasesWithContext(ctx)
+	if listErr != nil {
+		for i := range intents {
+			_ = b.store.UpdateReserveIntentState(ctx, intents[i].IntentID, store.IntentStateOutcomeUnknown, "", "", fmt.Sprintf("reconciliation list failed: %v", listErr))
+			intents[i].State = store.IntentStateOutcomeUnknown
+		}
+		return listErr
+	}
+
+	for i := range intents {
+		it := intents[i]
+		var found *hme.Alias
+		for j := range aliases {
+			if strings.EqualFold(aliases[j].Email, it.CandidateEmail) {
+				found = &aliases[j]
+				break
+			}
+		}
+
+		if found != nil {
+			// FOUND: 证实已在上游成功落盘
+			_ = b.store.UpdateReserveIntentState(ctx, it.IntentID, store.IntentStateSucceeded, found.AnonymousID, "", "")
+			_ = b.store.AddInventoryAlias(it.AccountID, *found, "created", true)
+			_ = b.store.UpsertAliasRoutes(it.AccountID, []string{found.Email})
+			intents[i].State = store.IntentStateSucceeded
+			intents[i].AnonymousID = found.AnonymousID
+		} else {
+			// INCONCLUSIVE_NOT_FOUND: 坚决保持 outcome_unknown，严禁标记失败，严禁产生第二候选！
+			_ = b.store.UpdateReserveIntentState(ctx, it.IntentID, store.IntentStateOutcomeUnknown, "", "", "reconciliation inconclusive: candidate not found in upstream list")
+			intents[i].State = store.IntentStateOutcomeUnknown
+		}
+	}
+	return nil
+}
+
+// durableCreateAlias 执行符合 F03 铁律的持久化创建状态机：
+// 0. Account-level unresolved gate: 在调用任何 Generate 之前，检查是否存在 prepared, reserve_sent, outcome_unknown 的意图；
+//    若存在先核对，核对后若仍未解决，坚决阻断新创建并返回 hme.ErrOutcomeUnknown，严禁 Generate，严禁 Reserve，严禁生成候选 B！
+// 1. Generate candidate A
+// 2. 持久化 intent(A, prepared) 并 Commit SQLite
+// 3. 标记状态为 reserve_sent 并 Commit SQLite
+// 4. 才向网络发送 Reserve(A)
+// 5. 成功 -> succeeded; 明确失败 -> confirmed_failed 并允许重试下一候选; 未知异常 -> outcome_unknown 并坚决阻断重试
+func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Client, accountID, label string, maxRetries int) (*hme.CreateResult, error) {
+	// 针对单账号串行化写操作与未决门禁检查，避免并发 check empty -> Generate 穿透窗口
+	lock := b.getAccountMutationLock(accountID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// 0. Account-level unresolved gate
+	if b.store != nil {
+		unresolved, err := b.store.ListUnresolvedReserveIntents(ctx, accountID)
+		if err != nil {
+			return nil, fmt.Errorf("查询未决 reserve intent 失败: %w", err)
+		}
+		if len(unresolved) > 0 {
+			// 存在未决 intent，先执行该账号的 reconciliation
+			if rErr := b.reconcileIntentsWithClient(ctx, client, unresolved); rErr != nil {
+				log.Printf("[HME] 账号 %s 核对未决意图遭遇错误: %v", accountID, rErr)
+			}
+			// reconciliation 后再次查询
+			unresolvedAfter, err := b.store.ListUnresolvedReserveIntents(ctx, accountID)
+			if err != nil {
+				return nil, fmt.Errorf("核对后再次查询未决 reserve intent 失败: %w", err)
+			}
+			if len(unresolvedAfter) > 0 {
+				// 仍存在任何 unresolved intent：立即阻断，严禁 Generate，严禁 Reserve！
+				return nil, hme.ErrOutcomeUnknown
+			}
+		}
+	}
+
+	if maxRetries <= 0 {
+		maxRetries = 5
+	}
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		if attempt > 0 {
+			client.ResetServiceEndpoint()
+		}
+
+		// 1. Generate candidate A
+		cand, gErr := client.GenerateWithContext(ctx)
+		if gErr != nil {
+			lastErr = fmt.Errorf("generate 失败: %w", gErr)
+			if errors.Is(gErr, hme.ErrAuthFailed) {
+				return nil, gErr
+			}
+			if attempt < maxRetries-1 {
+				continue
+			}
+			break
+		}
+
+		// 2. 持久化 intent(A, prepared) 并 Commit SQLite (必须在 Reserve 发送之前完成)
+		var intentID string
+		if b.store != nil {
+			intent, iErr := b.store.CreateReserveIntent(ctx, accountID, cand, label)
+			if iErr != nil {
+				return nil, fmt.Errorf("持久化 reserve intent 失败: %w", iErr)
+			}
+			intentID = intent.IntentID
+		}
+
+		// 3. 标记状态为 reserve_sent (即将向网络发出写请求)
+		if b.store != nil && intentID != "" {
+			_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateReserveSent, "", "", "")
+		}
+
+		// 4. 发送写请求 Reserve(A)
+		email, anonID, rErr := client.ReserveDetailedWithContext(ctx, cand, label)
+		if rErr != nil {
+			lastErr = rErr
+			if errors.Is(rErr, hme.ErrAuthFailed) {
+				if b.store != nil && intentID != "" {
+					_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateConfirmedFailed, "", "", rErr.Error())
+				}
+				return nil, rErr
+			}
+
+			// 5. 结果未知: 标记 outcome_unknown，铁律阻断重试生成候选 B！
+			if errors.Is(rErr, hme.ErrOutcomeUnknown) {
+				if b.store != nil && intentID != "" {
+					_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateOutcomeUnknown, "", "", rErr.Error())
+				}
+				return nil, rErr
+			}
+
+			// 明确失败 (confirmed_failed, 如 Apple 显式业务拒绝)
+			if b.store != nil && intentID != "" {
+				_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateConfirmedFailed, "", "", rErr.Error())
+			}
+
+			// 只有确知明确拒绝才允许重试下一候选
+			if attempt < maxRetries-1 {
+				continue
+			}
+			break
+		}
+
+		// 6. 成功
+		if b.store != nil && intentID != "" {
+			_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateSucceeded, anonID, "", "")
+		}
+
+		return &hme.CreateResult{
+			Email:       email,
+			AnonymousID: anonID,
+			Label:       label,
+			CreatedAt:   time.Now().Format(time.RFC3339),
+		}, nil
+	}
+
+	if lastErr != nil {
+		return nil, fmt.Errorf("创建别名失败: %w", lastErr)
+	}
+	return nil, fmt.Errorf("创建别名失败,已重试 %d 次", maxRetries)
+}
+
+// ReconcileUnresolvedIntents 扫描所有未决 intent 并向 Apple 核对原候选 A (F03)
+func (b *managerBackend) ReconcileUnresolvedIntents(ctx context.Context) ([]store.HmeReserveIntent, error) {
+	if b.store == nil {
+		return nil, nil
+	}
+	intents, err := b.store.ListUnresolvedReserveIntents(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	if len(intents) == 0 {
+		return nil, nil
+	}
+
+	for i := range intents {
+		_ = b.mgr.WithHMEClient(intents[i].AccountID, func(client *hme.Client) error {
+			return b.reconcileIntentsWithClient(ctx, client, intents[i:i+1])
+		})
+	}
+	return intents, nil
 }
 
 // BatchCreateAlias 批量创建 HME 别名 (1-5个)。
@@ -142,7 +338,7 @@ func (b *managerBackend) BatchCreateAlias(accountID string, count int, labelPref
 			if lbl != "" && count > 1 {
 				lbl = fmt.Sprintf("%s %d", labelPrefix, i+1)
 			}
-			res, createErr := client.CreateAlias(lbl, 3)
+			res, createErr := b.durableCreateAlias(context.Background(), client, accountID, lbl, 3)
 			if createErr != nil {
 				return createErr
 			}
@@ -156,7 +352,13 @@ func (b *managerBackend) BatchCreateAlias(accountID string, count int, labelPref
 		resp.SkippedCount = count - resp.CreatedCount
 		resp.LastError = batchErr.Error()
 		if b.store != nil && resp.SkippedCount > 0 {
-			b.store.ReleaseQuota(accountID, resp.SkippedCount)
+			toRelease := resp.SkippedCount
+			if errors.Is(batchErr, hme.ErrOutcomeUnknown) {
+				toRelease--
+			}
+			if toRelease > 0 {
+				b.store.ReleaseQuota(accountID, toRelease)
+			}
 		}
 		if resp.CreatedCount == 0 {
 			if errors.Is(batchErr, account.ErrHMEClientUnavailable) {
