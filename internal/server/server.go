@@ -378,6 +378,12 @@ func (s *Server) Close() {
 func (s *Server) Handler() http.Handler { return s.r }
 
 func (s *Server) register() {
+	// ===== 健康检查探针 (PR-01 / F01) =====
+	// /livez 存活探针: 仅检查进程存活, 0 I/O, 不含敏感信息, 不依赖外部网络或存储
+	s.r.GET("/livez", s.handleLivez)
+	// /readyz 就绪探针: 检查核心存储健康, 严格 2s 超时, 严禁触碰 Apple, 不含敏感信息
+	s.r.GET("/readyz", s.handleReadyz)
+
 	api := s.r.Group("/api")
 	api.Use(apiCacheControlMiddleware(), bodyLimitMiddleware())
 	{
@@ -542,3 +548,26 @@ func (s *Server) reloadConfigHandler(c *gin.Context) {
 	}
 	ok(c, gin.H{"message": "配置已重新加载"})
 }
+
+// handleLivez 进程存活探针 (PR-01 / F01): 快速返回 200，无副作用，不查数据库。
+func (s *Server) handleLivez(c *gin.Context) {
+	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// handleReadyz 服务就绪探针 (PR-01 / F01): 严格以 2s 超时探测核心数据库可用性，禁止调用 Apple，不泄露凭据。
+func (s *Server) handleReadyz(c *gin.Context) {
+	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+	if s.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unavailable", "error": "store not initialized"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.store.Ping(ctx); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unavailable", "error": "store ping failed"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+

@@ -8,9 +8,11 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -143,6 +145,18 @@ func (s *Store) Close() error {
 		return s.db.Close()
 	}
 	return nil
+}
+
+// Ping 探测底层数据库连通性 (PR-01 用于健康检查 readyz 探针)。
+func (s *Store) Ping(ctx context.Context) error {
+	s.mu.Lock()
+	if s.closed || s.db == nil {
+		s.mu.Unlock()
+		return errors.New("store is closed")
+	}
+	db := s.db
+	s.mu.Unlock()
+	return db.PingContext(ctx)
 }
 
 // tableHasColumn 使用 PRAGMA table_info 精准探测表字段，绝不盲目依赖忽略 ALTER 报错

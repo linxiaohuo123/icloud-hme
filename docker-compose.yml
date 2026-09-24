@@ -7,8 +7,8 @@ services:
     container_name: icloud-hme
     restart: unless-stopped
     ports:
-      # 默认直接对外暴露 8081 端口；若通过 Nginx/Caddy 反代，可在 .env 中配置 ICLOUD_HME_PORT_BINDING=127.0.0.1:8081:8081
-      - "${ICLOUD_HME_PORT_BINDING:-8081:8081}"
+      # 默认仅绑定宿主回环 127.0.0.1:8081 配合反代/本机访问(防未设防公网直连); 跨机直连可在 .env 中指定 ICLOUD_HME_PORT_BINDING=8081:8081
+      - "${ICLOUD_HME_PORT_BINDING:-127.0.0.1:8081:8081}"
     environment:
       # 【必填】在 .env 里设置，缺失时 compose 会直接拒绝启动。
       # 不要在此处写死占位口令:占位值能通过长度校验，等同于把母号凭据交给任何读过本仓库的人。
@@ -35,8 +35,7 @@ services:
       # 不要使用 NFS/SMB 或 Docker Desktop 的 virtiofs，否则可能 SQLITE_IOERR_SHMOPEN。
       - ./data:/app/data
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/api/auth/session"]
-      # 未登录返回 401 属正常，只要能连上就说明进程存活
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/livez"]
       interval: 30s
       timeout: 5s
       retries: 3

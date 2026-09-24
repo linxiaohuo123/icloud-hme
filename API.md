@@ -1150,6 +1150,32 @@ if result.get("success"):
 
 ---
 
+## 健康检查探针
+
+为容器编排（Docker / Kubernetes）提供无敏感数据的轻量级健康探测端点：
+
+### 1. 存活探针: `GET /livez`
+- **认证**：无需认证，公开访问
+- **逻辑**：仅检查进程存活，0 I/O，不访问底层存储，严禁触碰外部 Apple 接口
+- **成功响应** (200 OK)：
+  ```json
+  {"status": "ok"}
+  ```
+
+### 2. 就绪探针: `GET /readyz`
+- **认证**：无需认证，公开访问
+- **逻辑**：检查核心存储 (SQLite) 连通性，严格 2 秒超时，严禁触碰外部 Apple 接口，不泄露系统配置与凭据
+- **成功响应** (200 OK)：
+  ```json
+  {"status": "ok"}
+  ```
+- **失败响应** (503 Service Unavailable)：
+  ```json
+  {"status": "unavailable", "error": "store ping failed"}
+  ```
+
+---
+
 ## 风控安全与架构限制
 
 1. **RFC 6265 Set-Cookie 吊销与去重机制**：

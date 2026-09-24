@@ -39,5 +39,5 @@ EXPOSE 8081
 # 数据目录需与宿主卷属主一致:宿主执行 chown -R 10001:10001 ./data
 USER app
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:8081/api/auth/session >/dev/null 2>&1 || exit 1
+  CMD wget -qO- http://127.0.0.1:8081/livez >/dev/null 2>&1 || exit 1
 ENTRYPOINT ["/app/icloud-hme"]
