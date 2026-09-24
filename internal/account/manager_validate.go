@@ -139,7 +139,7 @@ func (m *Manager) ValidateAccountWithContext(ctx context.Context, id string) err
 		accountInfo      *hme.AccountInfo
 		aliases          []hme.Alias
 	)
-	err := m.WithHMEClient(id, func(client *hme.Client) error {
+	err := m.WithHMEClientContext(ctx, id, func(client *hme.Client) error {
 		if err := client.ValidateSessionWithContext(ctx); err != nil {
 			return err
 		}

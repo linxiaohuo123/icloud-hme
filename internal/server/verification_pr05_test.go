@@ -551,3 +551,75 @@ func TestPR05_ServerCloseWaitsForWorkersBeforeStoreClose(t *testing.T) {
 	close(unblockCreator)
 	_ = st.Close()
 }
+
+// TestPR05_CreateAliasContextCanceledWhileHMEClientBusy 验证当同账号 HME 客户端被并发占用时，
+// CreateAliasContext 能够在等待借锁阶段及时感知 Context 取消并退出，绝不泄漏或盲目发起上游创建 (PR-05 F10)。
+func TestPR05_CreateAliasContextCanceledWhileHMEClientBusy(t *testing.T) {
+	tempDir := t.TempDir()
+	st, err := store.NewStore(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	mgr, err := account.NewManager(tempDir, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc, err := mgr.AddAccount("busy_acc", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = mgr.SaveSession(acc.ID, map[string]string{"X-APPLE-WEBAUTH-TOKEN": "token_busy_1"}, "")
+
+	be := &managerBackend{mgr: mgr, store: st}
+
+	inA := make(chan struct{})
+	unblockA := make(chan struct{})
+	doneA := make(chan struct{})
+
+	// 1. goroutine A 占住账号 entry lock
+	go func() {
+		defer close(doneA)
+		_ = mgr.WithHMEClient(acc.ID, func(c *hme.Client) error {
+			close(inA)
+			<-unblockA
+			return nil
+		})
+	}()
+
+	select {
+	case <-inA:
+	case <-time.After(2 * time.Second):
+		t.Fatal("goroutine A failed to enter lock")
+	}
+
+	// 2. goroutine B 调用 CreateAliasContext，在等待锁时取消 Context
+	ctx, cancel := context.WithCancel(context.Background())
+	errChB := make(chan error, 1)
+
+	go func() {
+		_, createErr := be.CreateAliasContext(ctx, acc.ID, "cancel-label")
+		errChB <- createErr
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel() // 取消 B 的 Context
+
+	select {
+	case err := <-errChB:
+		if err == nil {
+			t.Fatal("期望收到取消错误，实际成功")
+		}
+		var beErr *BackendError
+		if !errors.Is(err, context.Canceled) && !(errors.As(err, &beErr) && beErr.Code == "REQUEST_CANCELED") {
+			t.Fatalf("期望 context.Canceled 或 REQUEST_CANCELED，实际: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CreateAliasContext 在锁被占用时未能及时响应 Context 取消")
+	}
+
+	// 3. 释放 A
+	close(unblockA)
+	<-doneA
+}

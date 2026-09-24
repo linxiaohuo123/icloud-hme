@@ -84,7 +84,7 @@ func (b *managerBackend) CreateAliasContext(ctx context.Context, accountID, labe
 	}
 
 	var result *hme.CreateResult
-	err := b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
+	err := b.mgr.WithHMEClientContext(ctx, accountID, func(client *hme.Client) error {
 		res, cerr := b.durableCreateAlias(ctx, client, accountID, label, 5)
 		if cerr != nil {
 			return cerr
@@ -343,7 +343,7 @@ func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID 
 		SkippedCount: 0,
 	}
 
-	batchErr := b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
+	batchErr := b.mgr.WithHMEClientContext(ctx, accountID, func(client *hme.Client) error {
 		for i := 0; i < count; i++ {
 			lbl := labelPrefix
 			if lbl != "" && count > 1 {
@@ -454,7 +454,7 @@ func (b *managerBackend) RefreshAliases(accountID string) ([]hme.Alias, error) {
 // RefreshAliasesContext 支持 Context 贯穿的强制穿透拉取 (PR-05 F10)。
 func (b *managerBackend) RefreshAliasesContext(ctx context.Context, accountID string) ([]hme.Alias, error) {
 	var aliases []hme.Alias
-	err := b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
+	err := b.mgr.WithHMEClientContext(ctx, accountID, func(client *hme.Client) error {
 		var listErr error
 		aliases, listErr = client.ListAliasesWithContext(ctx)
 		return listErr
@@ -484,7 +484,7 @@ func (b *managerBackend) RefreshAliasesContext(ctx context.Context, accountID st
 	return res, nil
 }
 
-func (b *managerBackend) resolveAliasIdentifiers(accountID, identifier string) (anonymousID string, email string, err error) {
+func (b *managerBackend) resolveAliasIdentifiersContext(ctx context.Context, accountID, identifier string) (anonymousID string, email string, err error) {
 	accountID = strings.TrimSpace(accountID)
 	identifier = strings.TrimSpace(identifier)
 	if accountID == "" || identifier == "" {
@@ -520,7 +520,7 @@ func (b *managerBackend) resolveAliasIdentifiers(accountID, identifier string) (
 		}
 		// 3. 若仍未命中，从上游远端列表拉取并解析（同时刷新缓存）
 		if anonymousID == "" {
-			aliases, lerr := b.ListAliases(accountID)
+			aliases, lerr := b.ListAliasesContext(ctx, accountID)
 			if lerr != nil {
 				return "", "", fmt.Errorf("list aliases from upstream for account %s failed: %w", accountID, lerr)
 			}
@@ -569,7 +569,7 @@ func (b *managerBackend) resolveAliasIdentifiers(accountID, identifier string) (
 	}
 	// 3. 若仍未命中，从上游远端列表拉取并解析（必须在远端操作前完成解析）
 	if email == "" {
-		aliases, lerr := b.ListAliases(accountID)
+		aliases, lerr := b.ListAliasesContext(ctx, accountID)
 		if lerr != nil {
 			return "", "", fmt.Errorf("list aliases from upstream for account %s failed: %w", accountID, lerr)
 		}
@@ -587,6 +587,10 @@ func (b *managerBackend) resolveAliasIdentifiers(accountID, identifier string) (
 	return anonymousID, email, nil
 }
 
+func (b *managerBackend) resolveAliasIdentifiers(accountID, identifier string) (anonymousID string, email string, err error) {
+	return b.resolveAliasIdentifiersContext(context.Background(), accountID, identifier)
+}
+
 // SetAliasActive 停用或激活别名 (兼容保留包装)。
 func (b *managerBackend) SetAliasActive(accountID, anonymousID string, active bool) (bool, error) {
 	return b.SetAliasActiveContext(context.Background(), accountID, anonymousID, active)
@@ -601,7 +605,7 @@ func (b *managerBackend) SetAliasActiveContext(ctx context.Context, accountID, a
 	}
 
 	// 远端修改前可靠解析 account_id、anonymousID、email；不能用 "_" 忽略错误，无法确认目标时上游调用次数必须为 0
-	resolvedAnonID, resolvedEmail, err := b.resolveAliasIdentifiers(accountID, anonymousID)
+	resolvedAnonID, resolvedEmail, err := b.resolveAliasIdentifiersContext(ctx, accountID, anonymousID)
 	if err != nil {
 		return false, &BackendError{Status: http.StatusBadRequest, Code: "ALIAS_NOT_FOUND", Message: fmt.Sprintf("解析别名标识失败: %v", err)}
 	}
@@ -611,7 +615,7 @@ func (b *managerBackend) SetAliasActiveContext(ctx context.Context, accountID, a
 	targetAnonID := resolvedAnonID
 
 	var success bool
-	err = b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
+	err = b.mgr.WithHMEClientContext(ctx, accountID, func(client *hme.Client) error {
 		var opErr error
 		if active {
 			success, opErr = client.ReactivateHMEWithContext(ctx, targetAnonID)

@@ -234,7 +234,7 @@ func (s *Server) Run(addr string) error {
 	s.leasePruner.Start()
 	s.scheduler.Start()
 	s.notifier.Start()
-	go s.autoSyncAccounts()
+	s.startAutoSyncAccounts()
 
 	httpServer := &http.Server{
 		Addr:    addr,
@@ -303,12 +303,17 @@ func (s *Server) startupSyncGap(n int) time.Duration {
 	return gap
 }
 
+// startAutoSyncAccounts 启动账号基数预热协程，严格保证 Add(+1) 发生在 launch 之前 (PR-05 F10)。
+func (s *Server) startAutoSyncAccounts() {
+	s.autoSyncWg.Add(1)
+	go s.autoSyncAccounts()
+}
+
 // autoSyncAccounts 服务启动后自动在后台对齐所有健康账号的别名基数。
 //
 // 账号间按 startupSyncGap 摊平提交并限制并发，避免两个极端:
 // 固定 2 秒会让 2000 账号预热耗时 66 分钟；不限速则会对 Apple 形成突发。
 func (s *Server) autoSyncAccounts() {
-	s.autoSyncWg.Add(1)
 	defer s.autoSyncWg.Done()
 
 	// 【BUG-11 修复】所有等待都响应 s.ctx，SIGTERM 到达时立即退出而非卡在 Sleep 中
