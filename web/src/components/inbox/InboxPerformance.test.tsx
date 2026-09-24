@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { http, HttpResponse } from 'msw'
 import { server } from '../../test/server'
-import InboxTableView, { clearInboxSnapshotCache } from './InboxTableView'
+import InboxTableView, { clearInboxSnapshotCache, getModuleMessageCache } from './InboxTableView'
 import { ToastProvider } from '../ToastProvider'
 import type { AccountSummary, InboxResult, MailboxFolder } from '../../api/types'
 
@@ -753,6 +753,93 @@ describe('Inbox Baseline Performance Measurements', () => {
     })
 
     unmount()
+  })
+
+  it('drops in-flight detail response when unmounted and logged out, preventing stale module cache write-back', async () => {
+    const testMsg = {
+      id: 'msg_lifecycle',
+      uid: 123,
+      message_ref: 'imap:acc_perf:INBOX:1:123',
+      subject: 'Lifecycle Detail Verification',
+      from: 'apple@apple.com',
+      to: 'perf@icloud.com',
+      date: '2026-09-23 20:00:00',
+      folder: 'INBOX',
+      preview: '',
+      body: '',
+    }
+
+    let resolveDetail: (() => void) | null = null
+    const detailPromise = new Promise<void>((resolve) => {
+      resolveDetail = resolve
+    })
+
+    server.use(
+      http.get('/api/mailboxes', () => {
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_perf', folders: dummyFolders } })
+      }),
+      http.get('/api/inbox', () => {
+        return HttpResponse.json({
+          success: true,
+          data: {
+            account_id: 'acc_perf',
+            count: 1,
+            messages: [testMsg],
+            method: 'imap',
+          },
+        })
+      }),
+      http.get('/api/inbox/imap%3Aacc_perf%3AINBOX%3A1%3A123', async () => {
+        await detailPromise
+        return HttpResponse.json({
+          success: true,
+          data: {
+            message: {
+              id: 'msg_lifecycle',
+              message_ref: 'imap:acc_perf:INBOX:1:123',
+              subject: 'Lifecycle Detail Verification',
+              body: 'STALE_SECRET_BODY',
+              from: 'apple@apple.com',
+              to: 'perf@icloud.com',
+              date: '2026-09-23 20:00:00',
+              folder: 'INBOX',
+              content_type: 'text/plain',
+              body_complete: true,
+            },
+          },
+        })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_perf" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Lifecycle Detail Verification')).toBeInTheDocument()
+    })
+
+    // 1. 点击邮件主题触发详情拉取 (请求进入在途挂起状态)
+    const subjectBtn = screen.getByRole('button', { name: 'Lifecycle Detail Verification' })
+    fireEvent.click(subjectBtn)
+
+    // 2. 模拟组件卸载 (如用户跳转至其他路由)
+    unmount()
+
+    // 3. 模拟用户登出 (派发全局 auth-logout 事件)
+    window.dispatchEvent(new CustomEvent('auth-logout'))
+
+    // 4. 在途详情请求终于完成返回
+    resolveDetail!()
+    await new Promise((r) => setTimeout(r, 60))
+
+    // 5. 核心断言：由于会话世代失效与卸载拦截，旧详情绝对不得被回填至模块级缓存！
+    const staleCached = getModuleMessageCache('imap:acc_perf:INBOX:1:123')
+    expect(staleCached).toBeUndefined()
   })
 })
 

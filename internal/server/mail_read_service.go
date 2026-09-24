@@ -67,8 +67,19 @@ type BatchItemResult struct {
 }
 
 // MailReadService 统管邮件读取、规范 MessageRef 校验、单源详情缓存、目录缓存与收件箱请求去重合并
+// MailReadService 统管邮件读取、规范 MessageRef 校验、单源详情缓存、目录缓存与收件箱请求去重合并
+//
+// 锁协议层次 (Lock Ordering Hierarchy):
+// Tier 1: genMu (保护代际自增、失效屏障，以及提交阶段的原子代际校验)
+// Tier 2: flightMu, mailboxMu, cacheMu (相互独立，持锁期间严禁调用网络与外部 I/O)
+// 规则：所有操作要么只拿 Tier 2 锁，要么先拿 Tier 1 (genMu) 再拿 Tier 2 锁，严禁反向加锁。
 type MailReadService struct {
-	be       Backend
+	be Backend
+
+	genMu      sync.RWMutex
+	accountGen map[string]uint64
+	globalGen  uint64
+
 	cacheMu  sync.RWMutex
 	cache    map[string]messageCacheEntry
 	cacheTTL time.Duration
@@ -81,9 +92,7 @@ type MailReadService struct {
 	flightMu     sync.Mutex
 	inFlightList map[string]*inFlightListCall
 
-	accountGenMu sync.RWMutex
-	accountGen   map[string]uint64
-	globalGen    uint64
+	beforeCommitHook func() // 仅测试注入，用于精确模拟检查与提交边界的失效并发竞争
 }
 
 // NewMailReadService 创建统一邮件读取服务
@@ -100,16 +109,19 @@ func NewMailReadService(be Backend) *MailReadService {
 	}
 }
 
-func (s *MailReadService) getAccountGen(accountID string) uint64 {
-	s.accountGenMu.RLock()
-	defer s.accountGenMu.RUnlock()
-	return s.globalGen + s.accountGen[strings.TrimSpace(accountID)]
+// SetBeforeCommitHookForTesting 供测试精确模拟检查与提交边界的并发竞争
+func (s *MailReadService) SetBeforeCommitHookForTesting(hook func()) {
+	s.beforeCommitHook = hook
 }
 
-func (s *MailReadService) incAccountGen(accountID string) {
-	s.accountGenMu.Lock()
-	defer s.accountGenMu.Unlock()
-	s.accountGen[strings.TrimSpace(accountID)]++
+func (s *MailReadService) getAccountGen(accountID string) uint64 {
+	s.genMu.RLock()
+	defer s.genMu.RUnlock()
+	return s.currentGenLocked(accountID)
+}
+
+func (s *MailReadService) currentGenLocked(accountID string) uint64 {
+	return s.globalGen + s.accountGen[strings.TrimSpace(accountID)]
 }
 
 // CacheLen 返回当前详情缓存条目数
@@ -143,11 +155,20 @@ func cloneInboxResult(res InboxResult) InboxResult {
 	}
 }
 
-// InvalidateMailboxCache 清理指定账号的目录缓存
+// InvalidateMailboxCache 清理指定账号的目录缓存并推进代际，保证在途请求无法迟到写回
 func (s *MailReadService) InvalidateMailboxCache(accountID string) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return
+	}
+	s.genMu.Lock()
+	defer s.genMu.Unlock()
+
+	s.accountGen[accountID]++
+
 	s.mailboxMu.Lock()
-	defer s.mailboxMu.Unlock()
-	delete(s.mailboxCache, strings.TrimSpace(accountID))
+	delete(s.mailboxCache, accountID)
+	s.mailboxMu.Unlock()
 }
 
 // InvalidateAccount 清理指定账号关联的目录缓存与消息详情缓存，取消在途任务并使旧响应失效
@@ -157,8 +178,11 @@ func (s *MailReadService) InvalidateAccount(accountID string) {
 		return
 	}
 
-	// 1. 递增账号代际，废弃所有正在执行的旧任务结果回写
-	s.incAccountGen(accountID)
+	// 1. 持有 genMu.Lock() 作为原子失效屏障：世代自增与各缓存清理相对于正在提交的旧任务保持原子排他
+	s.genMu.Lock()
+	defer s.genMu.Unlock()
+
+	s.accountGen[accountID]++
 
 	// 2. 取消并清除该账号所有在途 in-flight 任务
 	s.flightMu.Lock()
@@ -172,7 +196,9 @@ func (s *MailReadService) InvalidateAccount(accountID string) {
 	s.flightMu.Unlock()
 
 	// 3. 清理目录短缓存
-	s.InvalidateMailboxCache(accountID)
+	s.mailboxMu.Lock()
+	delete(s.mailboxCache, accountID)
+	s.mailboxMu.Unlock()
 
 	// 4. 清理消息详情缓存
 	s.cacheMu.Lock()
@@ -186,9 +212,10 @@ func (s *MailReadService) InvalidateAccount(accountID string) {
 
 // InvalidateAll 全局清理所有账号的缓存、在途任务并递增全局代际 (用于管理员登出或全局重置)
 func (s *MailReadService) InvalidateAll() {
-	s.accountGenMu.Lock()
+	s.genMu.Lock()
+	defer s.genMu.Unlock()
+
 	s.globalGen++
-	s.accountGenMu.Unlock()
 
 	s.flightMu.Lock()
 	for k, call := range s.inFlightList {
@@ -204,6 +231,149 @@ func (s *MailReadService) InvalidateAll() {
 	s.cacheMu.Lock()
 	s.cache = make(map[string]messageCacheEntry)
 	s.cacheMu.Unlock()
+}
+
+// commitMailboxCache 原子世代检查与目录缓存提交：持有 genMu.RLock()，防止失效操作穿插
+func (s *MailReadService) commitMailboxCache(accountID string, startGen uint64, folders []mail.Folder) bool {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return false
+	}
+
+	if s.beforeCommitHook != nil {
+		s.beforeCommitHook()
+	}
+
+	s.genMu.RLock()
+	defer s.genMu.RUnlock()
+
+	if s.currentGenLocked(accountID) != startGen {
+		return false
+	}
+
+	s.mailboxMu.Lock()
+	defer s.mailboxMu.Unlock()
+	if s.mailboxCache == nil {
+		s.mailboxCache = make(map[string]mailboxCacheEntry)
+	}
+	s.mailboxCache[accountID] = mailboxCacheEntry{
+		folders:   folders,
+		expiresAt: time.Now().Add(s.mailboxTTL),
+	}
+	return true
+}
+
+type batchCommitItem struct {
+	Key      string
+	Msg      *mail.FullMessage
+	Provider string
+	Method   string
+}
+
+// commitMessageCache 原子世代检查与单封邮件缓存提交：持有 genMu.RLock()，防止失效操作穿插
+func (s *MailReadService) commitMessageCache(key, accountID string, startGen uint64, msg *mail.FullMessage, provider, method string) bool {
+	if key == "" || msg == nil {
+		return false
+	}
+	accountID = strings.TrimSpace(accountID)
+
+	if s.beforeCommitHook != nil {
+		s.beforeCommitHook()
+	}
+
+	if accountID != "" {
+		s.genMu.RLock()
+		defer s.genMu.RUnlock()
+
+		if s.currentGenLocked(accountID) != startGen {
+			return false
+		}
+		s.writeMessageCache(key, msg, provider, method)
+		return true
+	}
+
+	s.writeMessageCache(key, msg, provider, method)
+	return true
+}
+
+// commitMessagesBatch 原子世代检查与批量邮件缓存提交：持有 genMu.RLock()，防止失效操作穿插
+func (s *MailReadService) commitMessagesBatch(accountID string, startGen uint64, items []batchCommitItem) bool {
+	if len(items) == 0 {
+		return false
+	}
+	accountID = strings.TrimSpace(accountID)
+
+	if s.beforeCommitHook != nil {
+		s.beforeCommitHook()
+	}
+
+	if accountID != "" {
+		s.genMu.RLock()
+		defer s.genMu.RUnlock()
+
+		if s.currentGenLocked(accountID) != startGen {
+			return false
+		}
+		s.cacheMu.Lock()
+		defer s.cacheMu.Unlock()
+		s.writeBatchLocked(items)
+		return true
+	}
+
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.writeBatchLocked(items)
+	return true
+}
+
+func (s *MailReadService) writeMessageCache(key string, msg *mail.FullMessage, provider, method string) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if s.cache == nil {
+		s.cache = make(map[string]messageCacheEntry)
+	}
+	now := time.Now()
+	if len(s.cache) >= s.cacheCap {
+		for k, e := range s.cache {
+			if now.After(e.expiresAt) {
+				delete(s.cache, k)
+			}
+		}
+		if len(s.cache) >= s.cacheCap {
+			s.cache = make(map[string]messageCacheEntry)
+		}
+	}
+	s.cache[key] = messageCacheEntry{
+		msg:       msg,
+		expiresAt: now.Add(s.cacheTTL),
+		provider:  provider,
+		method:    method,
+	}
+}
+
+func (s *MailReadService) writeBatchLocked(items []batchCommitItem) {
+	if s.cache == nil {
+		s.cache = make(map[string]messageCacheEntry)
+	}
+	now := time.Now()
+	if len(s.cache)+len(items) > s.cacheCap {
+		for k, e := range s.cache {
+			if now.After(e.expiresAt) {
+				delete(s.cache, k)
+			}
+		}
+		if len(s.cache)+len(items) > s.cacheCap {
+			s.cache = make(map[string]messageCacheEntry)
+		}
+	}
+	for _, item := range items {
+		s.cache[item.Key] = messageCacheEntry{
+			msg:       item.Msg,
+			expiresAt: now.Add(s.cacheTTL),
+			provider:  item.Provider,
+			method:    item.Method,
+		}
+	}
 }
 
 // ListInbox 读取收件箱列表 (基于共享 context 的 in-flight 请求合并)
@@ -316,18 +486,8 @@ func (s *MailReadService) ListMailboxes(ctx context.Context, accountID string, r
 		return nil, err
 	}
 
-	// 3. 校验代际：若在回源期间账号配置变更或失效，严禁回写陈旧目录
-	if s.getAccountGen(accountID) == startGen {
-		s.mailboxMu.Lock()
-		if s.mailboxCache == nil {
-			s.mailboxCache = make(map[string]mailboxCacheEntry)
-		}
-		s.mailboxCache[accountID] = mailboxCacheEntry{
-			folders:   folders,
-			expiresAt: now.Add(s.mailboxTTL),
-		}
-		s.mailboxMu.Unlock()
-	}
+	// 3. 原子世代检查并提交目录缓存，防止 InvalidateAccount/InvalidateAll 穿插
+	s.commitMailboxCache(accountID, startGen, folders)
 
 	out := make([]mail.Folder, len(folders))
 	copy(out, folders)
@@ -387,7 +547,7 @@ func (s *MailReadService) GetMessageDetail(ctx context.Context, accountID, rawID
 	}
 	message.Method = method
 
-	s.putCache(cacheKey, accountID, startGen, message, provider, method)
+	s.commitMessageCache(cacheKey, accountID, startGen, message, provider, method)
 	return message, provider, method, false, nil
 }
 
@@ -484,7 +644,7 @@ func (s *MailReadService) GetMessagesBatch(ctx context.Context, accountID string
 			} else {
 				msg.Provider = "webmail"
 				msg.Method = "web_api"
-				s.putCache(cacheKey, accountID, startGen, msg, "webmail", "web_api")
+				s.commitMessageCache(cacheKey, accountID, startGen, msg, "webmail", "web_api")
 				results = append(results, BatchItemResult{
 					RequestedRef: rawRef,
 					Message:      msg,
@@ -563,6 +723,7 @@ func (s *MailReadService) GetMessagesBatch(ctx context.Context, accountID string
 			}
 
 			// 严格按 requestedRef.CacheKey() 直接 join，严禁 accountless identity fallback
+			var commitItems []batchCommitItem
 			for _, pi := range pendingIMAP {
 				matched := idMap[pi.refObj.CacheKey()]
 				if matched != nil {
@@ -577,8 +738,12 @@ func (s *MailReadService) GetMessagesBatch(ctx context.Context, accountID string
 					matched.Provider = provider
 					matched.Method = method
 
-					// 仅将真实邮件写进自己请求的规范 cacheKey，绝不串号 (校验代际防旧响应回写)
-					s.putCache(pi.refObj.CacheKey(), accountID, startGen, matched, provider, method)
+					commitItems = append(commitItems, batchCommitItem{
+						Key:      pi.refObj.CacheKey(),
+						Msg:      matched,
+						Provider: provider,
+						Method:   method,
+					})
 					results = append(results, BatchItemResult{
 						RequestedRef: pi.rawRef,
 						Message:      matched,
@@ -591,36 +756,9 @@ func (s *MailReadService) GetMessagesBatch(ctx context.Context, accountID string
 					})
 				}
 			}
+			s.commitMessagesBatch(accountID, startGen, commitItems)
 		}
 	}
 
 	return out, results, nil
-}
-
-func (s *MailReadService) putCache(key, accountID string, startGen uint64, msg *mail.FullMessage, provider, method string) {
-	if accountID != "" && s.getAccountGen(accountID) != startGen {
-		return // 账号代际已变，丢弃陈旧详情响应，严禁回写
-	}
-	s.cacheMu.Lock()
-	defer s.cacheMu.Unlock()
-	if s.cache == nil {
-		s.cache = make(map[string]messageCacheEntry)
-	}
-	now := time.Now()
-	if len(s.cache) >= s.cacheCap {
-		for k, e := range s.cache {
-			if now.After(e.expiresAt) {
-				delete(s.cache, k)
-			}
-		}
-		if len(s.cache) >= s.cacheCap {
-			s.cache = make(map[string]messageCacheEntry)
-		}
-	}
-	s.cache[key] = messageCacheEntry{
-		msg:       msg,
-		expiresAt: now.Add(s.cacheTTL),
-		provider:  provider,
-		method:    method,
-	}
 }

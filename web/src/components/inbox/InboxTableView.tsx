@@ -92,8 +92,21 @@ interface FolderCacheEntry {
 }
 const moduleFolderCache = new Map<string, FolderCacheEntry>()
 
+let moduleSessionGen = 0
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function getModuleSessionGen(): number {
+  return moduleSessionGen
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function getModuleMessageCache(key: string): FullMessage | undefined {
+  return moduleMessageCache.get(key)
+}
+
 if (typeof window !== 'undefined') {
   window.addEventListener('auth-logout', () => {
+    moduleSessionGen++
     moduleInboxSnapshotCache.clear()
     moduleFolderCache.clear()
     moduleMessageCache.clear()
@@ -126,6 +139,7 @@ export function clearInboxSnapshotCache(accountId?: string) {
       }
     }
   } else {
+    moduleSessionGen++
     moduleInboxSnapshotCache.clear()
     moduleFolderCache.clear()
     moduleMessageCache.clear()
@@ -217,13 +231,19 @@ export default function InboxTableView({
   const copiedAliasTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const abortRef = useRef<AbortController | null>(null)
+  const detailAbortRef = useRef<AbortController | null>(null)
   const accountGenRef = useRef(0)
   const queryGenRef = useRef(0)
+  const isBusyRef = useRef(false)
   const messageCacheRef = useRef<Map<string, FullMessage>>(new Map())
   const hasAccountsLoadedRef = useRef(Boolean(accountSummary))
 
   useEffect(() => {
     return () => {
+      detailAbortRef.current?.abort()
+      abortRef.current?.abort()
+      accountGenRef.current += 1
+      isBusyRef.current = false
       if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current)
       if (copiedAliasTimerRef.current) clearTimeout(copiedAliasTimerRef.current)
     }
@@ -233,6 +253,7 @@ export default function InboxTableView({
   useEffect(() => {
     if (propAccountId && propAccountId !== accountId) {
       accountGenRef.current += 1
+      detailAbortRef.current?.abort()
       abortRef.current?.abort()
       messageCacheRef.current.clear()
       unsupportedRetryRef.current[propAccountId] = 0
@@ -252,12 +273,11 @@ export default function InboxTableView({
     loadingRef.current = loading
   }, [loading])
 
-  const isBusyRef = useRef(false)
-
   // 监听全局登出与账号变更事件，立即使旧任务与在途响应失效，严禁回写陈旧缓存
   useEffect(() => {
     const handleLogout = () => {
       accountGenRef.current += 1
+      detailAbortRef.current?.abort()
       abortRef.current?.abort()
       isBusyRef.current = false
       messageCacheRef.current.clear()
@@ -273,6 +293,7 @@ export default function InboxTableView({
       const targetId = customEvent.detail?.accountId
       if (!targetId || targetId === accountId) {
         accountGenRef.current += 1
+        detailAbortRef.current?.abort()
         abortRef.current?.abort()
         isBusyRef.current = false
         messageCacheRef.current.clear()
@@ -651,6 +672,7 @@ export default function InboxTableView({
 
   function handleAccountChange(newAccountId: string) {
     accountGenRef.current += 1
+    detailAbortRef.current?.abort()
     abortRef.current?.abort()
     setAccountId(newAccountId)
     setAlias('')
@@ -661,6 +683,7 @@ export default function InboxTableView({
   }
 
   const openMessage = useCallback(async (message: InboxMessage) => {
+    const sessionGen = moduleSessionGen
     const currentGen = accountGenRef.current
     const primaryKey = buildMailCacheKey(accountId, message)
     const cached = moduleMessageCache.get(primaryKey) || messageCacheRef.current.get(primaryKey)
@@ -668,11 +691,22 @@ export default function InboxTableView({
       setDetail(cached)
       return
     }
+
+    detailAbortRef.current?.abort()
+    const controller = new AbortController()
+    detailAbortRef.current = controller
+
     setDetailLoading(true)
     const targetRefOrId = message.message_ref || message.id
     try {
-      const resp = await getMessageDetail(accountId, targetRefOrId)
-      if (currentGen !== accountGenRef.current) return
+      const resp = await getMessageDetail(accountId, targetRefOrId, controller.signal)
+      if (
+        sessionGen !== moduleSessionGen ||
+        currentGen !== accountGenRef.current ||
+        controller.signal.aborted
+      ) {
+        return
+      }
       // 【PR-02 契约】消费规范响应中的 response.message
       const fullMsg = resp.message
       if (fullMsg.message_ref) {
@@ -685,11 +719,15 @@ export default function InboxTableView({
       }
       setDetail(fullMsg)
     } catch (err) {
-      if (currentGen === accountGenRef.current) {
+      if (
+        sessionGen === moduleSessionGen &&
+        currentGen === accountGenRef.current &&
+        !(err instanceof ApiError && err.code === 'ABORTED')
+      ) {
         show(err instanceof ApiError ? err.message : '读取邮件详情失败')
       }
     } finally {
-      if (currentGen === accountGenRef.current) {
+      if (sessionGen === moduleSessionGen && currentGen === accountGenRef.current) {
         setDetailLoading(false)
       }
     }

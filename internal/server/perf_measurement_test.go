@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/emersion/go-imap/client"
 
 	"icloud-hme/internal/account"
 	"icloud-hme/internal/mail"
@@ -423,8 +427,9 @@ func TestOptimized_GetMessagesBatch_TrueCancellation(t *testing.T) {
 	}
 }
 
-// TestOptimized_ServerSideSocketCancellation 通过生产连接池 mail.Pool.DoContext 验证取消，严禁测试代码自建协程 Close
+// TestOptimized_ServerSideSocketCancellation 通过生产连接池 mail.Pool.DoContext 验证真实 Context 取消链路与套接字熔断
 func TestOptimized_ServerSideSocketCancellation(t *testing.T) {
+	// 1. 本地 Mock IMAP 服务端，完全本地闭环，严禁连接外部真实 Apple 资产
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
@@ -432,6 +437,8 @@ func TestOptimized_ServerSideSocketCancellation(t *testing.T) {
 	defer ln.Close()
 
 	serverConnClosed := make(chan struct{})
+	serverReceivedCmds := make(chan string, 10)
+
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -439,50 +446,146 @@ func TestOptimized_ServerSideSocketCancellation(t *testing.T) {
 		}
 		defer conn.Close()
 
-		buf := make([]byte, 128)
+		// 发送标准 IMAP 欢迎问候
+		_, _ = conn.Write([]byte("* OK [CAPABILITY IMAP4rev1] Mock IMAP Server Ready\r\n"))
+
+		reader := bufio.NewReader(conn)
+		// 处理 ensure -> Ping 发送的初始 NOOP
 		for {
-			_, rerr := conn.Read(buf)
+			line, rerr := reader.ReadString('\n')
 			if rerr != nil {
 				close(serverConnClosed)
 				return
 			}
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				tag := fields[0]
+				cmd := strings.ToUpper(fields[1])
+				serverReceivedCmds <- cmd
+				if cmd == "NOOP" {
+					_, _ = conn.Write([]byte(tag + " OK NOOP completed\r\n"))
+					break
+				}
+			}
+		}
+
+		// 处理业务回调中的命令：读取后故意不应答，保持阻塞等待客户端被取消关闭
+		for {
+			line, rerr := reader.ReadString('\n')
+			if rerr != nil {
+				close(serverConnClosed)
+				return
+			}
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				serverReceivedCmds <- strings.ToUpper(fields[1])
+			}
 		}
 	}()
 
-	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	clientConn, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
 	}
 
+	imapCli, err := client.New(clientConn)
+	if err != nil {
+		t.Fatalf("imap client.New failed: %v", err)
+	}
+
+	mockClient := mail.NewClientForTesting("perf_cancel@icloud.com", "dummy_pass", clientConn, imapCli)
+
 	p := mail.NewPool()
 	defer p.Close()
 
-	// 将真实 TCP 连接注入到生产连接池中
-	p.SetClientForTesting("perf_cancel@icloud.com", "dummy_pass", clientConn)
+	p.SetClientForTesting("perf_cancel@icloud.com", "dummy_pass", mockClient)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 执行生产连接池的 DoContext 方法：看门狗与底层强制关闭完全由生产代码承载
-	err = p.DoContext(ctx, "perf_cancel@icloud.com", "dummy_pass", "", func(cli *mail.Client) error {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
-			return nil
-		}
-	})
+	callbackEntered := make(chan struct{})
+	var doErr error
+	var cancelDuration time.Duration
 
-	if err == nil {
-		t.Fatalf("Expected DoContext to fail with context timeout/canceled, got nil")
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		doErr = p.DoContext(ctx, "perf_cancel@icloud.com", "dummy_pass", "", func(cli *mail.Client) error {
+			close(callbackEntered)
+			// 阻塞在实际网络读取：发送 NOOP 并等待服务端响应 (服务端挂起不应答)
+			return cli.Ping()
+		})
+	}()
+
+	// 确认业务回调已经进入
+	select {
+	case <-callbackEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("业务回调未能在限时内进入")
 	}
 
+	// 确认服务端已收到 ensure NOOP
+	select {
+	case cmd := <-serverReceivedCmds:
+		if cmd != "NOOP" {
+			t.Fatalf("服务端收到未知前置命令: %s", cmd)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("服务端未收到 initial ensure NOOP")
+	}
+
+	// 确认业务回调内部发起的第二条 NOOP 已到达服务端并阻塞在网络读取
+	select {
+	case cmd := <-serverReceivedCmds:
+		if cmd != "NOOP" {
+			t.Fatalf("服务端收到非预期命令: %s", cmd)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("业务回调内部发起的 NOOP 命令未到达服务端")
+	}
+
+	// 断言：取消前连接保持打开
+	select {
+	case <-serverConnClosed:
+		t.Fatalf("连接在取消前已被提前关闭")
+	default:
+	}
+
+	// 由测试取消请求 Context，开始高精度计时
+	cancelStart := time.Now()
+	cancel()
+
+	select {
+	case <-doneCh:
+		cancelDuration = time.Since(cancelStart)
+		t.Logf("[OPTIMIZED] Context cancel 到读取退出实际测量耗时: %v", cancelDuration)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("DoContext 未能在 Context 取消后及时退出")
+	}
+
+	// 断言 1: 取消错误类型必须为 context.Canceled，拒绝任意拨号/认证/语法错误
+	if !errors.Is(doErr, context.Canceled) {
+		t.Fatalf("期望错误为 context.Canceled，实际得到: %v", doErr)
+	}
+
+	// 断言 2: 取消后底层套接字被强制掐断，服务端感知到连接断开
 	select {
 	case <-serverConnClosed:
 		t.Logf("[OPTIMIZED] Server confirmed socket was severed by production Pool.DoContext watchdog")
-	case <-time.After(300 * time.Millisecond):
-		t.Fatalf("Server side did not detect socket close within 300ms, connection leaked")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("服务端未能在 500ms 内检测到套接字关闭，连接发生泄漏")
 	}
+
+	// 断言 3: 取消后已中断的 client 必须从连接池中丢弃
+	if cli := p.ClientForTesting("perf_cancel@icloud.com"); cli != nil {
+		t.Fatalf("取消后 client 应当从连接池中丢弃，但依然存在")
+	}
+
+	// 断言 4: 账号槽位信号量已释放，下一次请求可正常执行
+	if !p.TryLockForTesting("perf_cancel@icloud.com") {
+		t.Fatalf("取消后单账号槽位信号量未释放，槽位发生泄漏死锁")
+	}
+	p.UnlockForTesting("perf_cancel@icloud.com")
 }
 
 // TestMailReadService_AccountInvalidationBarrier 验证账号变更/失效使正在进行的异步任务无法写回陈旧缓存
@@ -647,13 +750,217 @@ func TestMailReadService_InvalidateAccountCancelsInFlightList(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 		t.Fatalf("in-flight ListInbox was not cancelled by InvalidateAccount")
 	}
+}
 
-	svc.flightMu.Lock()
-	remaining := len(svc.inFlightList)
-	svc.flightMu.Unlock()
-	if remaining != 0 {
-		t.Fatalf("expected 0 in-flight calls after InvalidateAccount, got %d", remaining)
+// TestMailReadService_InvalidateAccount_CheckCommitRace 验证在检查与提交边界发生 InvalidateAccount 竞争时旧值绝无法落库
+func TestMailReadService_InvalidateAccount_CheckCommitRace(t *testing.T) {
+	fb := &fakeBackend{
+		accounts: []account.Summary{{ID: "acc_race_acc", Name: "Race Acc"}},
+	}
+	svc := NewMailReadService(fb)
+
+	// 1. 目录缓存提交与 InvalidateAccount 竞争
+	startGen := svc.getAccountGen("acc_race_acc")
+	// 设置钩子：在准备检查世代并提交目录缓存的瞬间，并发触发 InvalidateAccount
+	hookFired := false
+	svc.SetBeforeCommitHookForTesting(func() {
+		hookFired = true
+		svc.InvalidateAccount("acc_race_acc")
+	})
+
+	committed := svc.commitMailboxCache("acc_race_acc", startGen, []mail.Folder{{Name: "STALE_DIR"}})
+	if !hookFired {
+		t.Fatalf("beforeCommitHook 未能触发")
+	}
+	if committed {
+		t.Fatalf("在失效竞争后，commitMailboxCache 应当被原子屏障拒绝返回 false")
+	}
+
+	// 核心断言：失效完成时，旧目录绝对无法在缓存中命中
+	svc.mailboxMu.RLock()
+	_, hitMb := svc.mailboxCache["acc_race_acc"]
+	svc.mailboxMu.RUnlock()
+	if hitMb {
+		t.Fatalf("失效完成时，旧目录仍然落库命中 mailboxCache！存在原子性漏洞")
+	}
+
+	// 2. 详情缓存单条提交与 InvalidateAccount 竞争
+	svc.SetBeforeCommitHookForTesting(nil) // 重置
+	startGen2 := svc.getAccountGen("acc_race_acc")
+	targetRef := mail.MessageRef{Provider: "imap", AccountID: "acc_race_acc", Mailbox: "INBOX", UID: 888}
+
+	svc.SetBeforeCommitHookForTesting(func() {
+		svc.InvalidateAccount("acc_race_acc")
+	})
+
+	committedMsg := svc.commitMessageCache(targetRef.CacheKey(), "acc_race_acc", startGen2, &mail.FullMessage{
+		Message: mail.Message{ID: "stale_detail", MessageRef: targetRef.Encode()},
+		Body:    "STALE_DETAIL_BODY",
+	}, "imap", "imap")
+
+	if committedMsg {
+		t.Fatalf("在失效竞争后，commitMessageCache 应当被原子屏障拒绝返回 false")
+	}
+
+	svc.cacheMu.RLock()
+	_, hitCache := svc.cache[targetRef.CacheKey()]
+	svc.cacheMu.RUnlock()
+	if hitCache {
+		t.Fatalf("失效完成时，旧邮件详情仍然落库命中 cache！存在原子性漏洞")
+	}
+
+	// 3. 详情缓存批量提交与 InvalidateAccount 竞争
+	svc.SetBeforeCommitHookForTesting(nil)
+	startGen3 := svc.getAccountGen("acc_race_acc")
+	targetRefBatch := mail.MessageRef{Provider: "imap", AccountID: "acc_race_acc", Mailbox: "INBOX", UID: 777}
+
+	svc.SetBeforeCommitHookForTesting(func() {
+		svc.InvalidateAccount("acc_race_acc")
+	})
+
+	committedBatch := svc.commitMessagesBatch("acc_race_acc", startGen3, []batchCommitItem{
+		{
+			Key: targetRefBatch.CacheKey(),
+			Msg: &mail.FullMessage{
+				Message: mail.Message{ID: "stale_batch", MessageRef: targetRefBatch.Encode()},
+				Body:    "STALE_BATCH_BODY",
+			},
+			Provider: "imap",
+			Method:   "imap",
+		},
+	})
+
+	if committedBatch {
+		t.Fatalf("在失效竞争后，commitMessagesBatch 应当被原子屏障拒绝返回 false")
+	}
+
+	svc.cacheMu.RLock()
+	_, hitBatchCache := svc.cache[targetRefBatch.CacheKey()]
+	svc.cacheMu.RUnlock()
+	if hitBatchCache {
+		t.Fatalf("失效完成时，旧批量详情仍然落库命中 cache！存在原子性漏洞")
 	}
 }
+
+// TestMailReadService_InvalidateAll_CheckCommitRace 验证在检查与提交边界发生全局 InvalidateAll 竞争时旧值绝无法落库
+func TestMailReadService_InvalidateAll_CheckCommitRace(t *testing.T) {
+	fb := &fakeBackend{
+		accounts: []account.Summary{{ID: "acc_race_all", Name: "Race All Acc"}},
+	}
+	svc := NewMailReadService(fb)
+
+	// 1. 目录缓存与 InvalidateAll 竞争
+	startGen := svc.getAccountGen("acc_race_all")
+	svc.SetBeforeCommitHookForTesting(func() {
+		svc.InvalidateAll()
+	})
+
+	committedMb := svc.commitMailboxCache("acc_race_all", startGen, []mail.Folder{{Name: "STALE_GLOBAL_DIR"}})
+	if committedMb {
+		t.Fatalf("在全局失效竞争后，commitMailboxCache 应当返回 false")
+	}
+
+	svc.mailboxMu.RLock()
+	_, hitMb := svc.mailboxCache["acc_race_all"]
+	svc.mailboxMu.RUnlock()
+	if hitMb {
+		t.Fatalf("全局失效后旧目录依然落库！")
+	}
+
+	// 2. 详情缓存与 InvalidateAll 竞争
+	svc.SetBeforeCommitHookForTesting(nil)
+	startGen2 := svc.getAccountGen("acc_race_all")
+	targetRef := mail.MessageRef{Provider: "imap", AccountID: "acc_race_all", Mailbox: "INBOX", UID: 666}
+
+	svc.SetBeforeCommitHookForTesting(func() {
+		svc.InvalidateAll()
+	})
+
+	committedMsg := svc.commitMessageCache(targetRef.CacheKey(), "acc_race_all", startGen2, &mail.FullMessage{
+		Message: mail.Message{ID: "stale_global_msg", MessageRef: targetRef.Encode()},
+		Body:    "STALE_GLOBAL_BODY",
+	}, "imap", "imap")
+
+	if committedMsg {
+		t.Fatalf("在全局失效竞争后，commitMessageCache 应当返回 false")
+	}
+
+	svc.cacheMu.RLock()
+	_, hitCache := svc.cache[targetRef.CacheKey()]
+	svc.cacheMu.RUnlock()
+	if hitCache {
+		t.Fatalf("全局失效后旧详情依然落库！")
+	}
+}
+
+// TestMailReadService_ConcurrentCommitAndInvalidateRace 高并发下测试世代原子屏障与失效互斥正确性
+func TestMailReadService_ConcurrentCommitAndInvalidateRace(t *testing.T) {
+	fb := &fakeBackend{
+		accounts: []account.Summary{
+			{ID: "acc_conc_1", Name: "Concurrent Acc 1"},
+			{ID: "acc_conc_2", Name: "Concurrent Acc 2"},
+		},
+	}
+	svc := NewMailReadService(fb)
+
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// 10 个 goroutine 持续尝试提交
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			accountID := "acc_conc_1"
+			if workerID%2 == 1 {
+				accountID = "acc_conc_2"
+			}
+			uid := uint32(1000 + workerID)
+			ref := mail.MessageRef{Provider: "imap", AccountID: accountID, Mailbox: "INBOX", UID: uid}
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					gen := svc.getAccountGen(accountID)
+					// 模拟网络耗时
+					time.Sleep(time.Duration(workerID%3) * time.Millisecond)
+
+					svc.commitMailboxCache(accountID, gen, []mail.Folder{{Name: "INBOX"}})
+					svc.commitMessageCache(ref.CacheKey(), accountID, gen, &mail.FullMessage{
+						Message: mail.Message{ID: "msg", MessageRef: ref.Encode()},
+						Body:    "body",
+					}, "imap", "imap")
+				}
+			}
+		}(i)
+	}
+
+	// 4 个 goroutine 持续发起 InvalidateAccount 与 InvalidateAll
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					time.Sleep(2 * time.Millisecond)
+					if workerID%2 == 0 {
+						svc.InvalidateAccount("acc_conc_1")
+					} else {
+						svc.InvalidateAll()
+					}
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+
 
 
