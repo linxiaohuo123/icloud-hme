@@ -55,8 +55,13 @@ type aliasCacheItem struct {
 	fetchedAt time.Time
 }
 
-// CreateAlias 创建 HME 别名。
+// CreateAlias 创建 HME 别名 (兼容保留包装)。
 func (b *managerBackend) CreateAlias(accountID, label string) (*hme.CreateResult, error) {
+	return b.CreateAliasContext(context.Background(), accountID, label)
+}
+
+// CreateAliasContext 支持 Context 贯穿的 HME 别名创建 (PR-05 F10)。
+func (b *managerBackend) CreateAliasContext(ctx context.Context, accountID, label string) (*hme.CreateResult, error) {
 	// 1. 检查别名上限熔断 (总数或活跃数达到上限)
 	if acc, ok := b.mgr.GetAccount(accountID); ok && (acc.AliasTotal >= account.MaxAliasesPerAccount || acc.AliasActive >= account.MaxAliasesPerAccount) {
 		return nil, &BackendError{
@@ -80,7 +85,7 @@ func (b *managerBackend) CreateAlias(accountID, label string) (*hme.CreateResult
 
 	var result *hme.CreateResult
 	err := b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
-		res, cerr := b.durableCreateAlias(context.Background(), client, accountID, label, 5)
+		res, cerr := b.durableCreateAlias(ctx, client, accountID, label, 5)
 		if cerr != nil {
 			return cerr
 		}
@@ -297,7 +302,13 @@ func (b *managerBackend) ReconcileUnresolvedIntents(ctx context.Context) ([]stor
 }
 
 // BatchCreateAlias 批量创建 HME 别名 (1-5个)。
+// BatchCreateAlias 批量创建 HME 别名 (兼容保留包装)。
 func (b *managerBackend) BatchCreateAlias(accountID string, count int, labelPrefix string) (*BatchCreateResult, error) {
+	return b.BatchCreateAliasContext(context.Background(), accountID, count, labelPrefix)
+}
+
+// BatchCreateAliasContext 支持 Context 贯穿的批量创建 (PR-05 F10)。
+func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID string, count int, labelPrefix string) (*BatchCreateResult, error) {
 	accountID = strings.TrimSpace(accountID)
 	labelPrefix = strings.TrimSpace(labelPrefix)
 	if count < 1 || count > 5 {
@@ -338,7 +349,7 @@ func (b *managerBackend) BatchCreateAlias(accountID string, count int, labelPref
 			if lbl != "" && count > 1 {
 				lbl = fmt.Sprintf("%s %d", labelPrefix, i+1)
 			}
-			res, createErr := b.durableCreateAlias(context.Background(), client, accountID, lbl, 3)
+			res, createErr := b.durableCreateAlias(ctx, client, accountID, lbl, 3)
 			if createErr != nil {
 				return createErr
 			}
@@ -422,20 +433,30 @@ func (b *managerBackend) invalidateAliasCache(accountID string) {
 	}
 }
 
-// ListAliases 列出账号的 HME 别名(带 15 分钟内存 TTL 缓存, 避免每次刷新页面阻塞跨洋请求 Apple)。
+// ListAliases 列出账号的 HME 别名 (兼容保留包装)。
 func (b *managerBackend) ListAliases(accountID string) ([]hme.Alias, error) {
+	return b.ListAliasesContext(context.Background(), accountID)
+}
+
+// ListAliasesContext 支持 Context 贯穿的别名列表查询 (PR-05 F10)。
+func (b *managerBackend) ListAliasesContext(ctx context.Context, accountID string) ([]hme.Alias, error) {
 	if cached, ok := b.getCachedAliases(accountID); ok {
 		return cached, nil
 	}
-	return b.RefreshAliases(accountID)
+	return b.RefreshAliasesContext(ctx, accountID)
 }
 
-// RefreshAliases 强制穿透缓存，从 Apple 官方拉取最新别名列表并回填缓存。
+// RefreshAliases 强制穿透缓存 (兼容保留包装)。
 func (b *managerBackend) RefreshAliases(accountID string) ([]hme.Alias, error) {
+	return b.RefreshAliasesContext(context.Background(), accountID)
+}
+
+// RefreshAliasesContext 支持 Context 贯穿的强制穿透拉取 (PR-05 F10)。
+func (b *managerBackend) RefreshAliasesContext(ctx context.Context, accountID string) ([]hme.Alias, error) {
 	var aliases []hme.Alias
 	err := b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
 		var listErr error
-		aliases, listErr = client.ListAliases()
+		aliases, listErr = client.ListAliasesWithContext(ctx)
 		return listErr
 	})
 	if err != nil {
@@ -566,8 +587,13 @@ func (b *managerBackend) resolveAliasIdentifiers(accountID, identifier string) (
 	return anonymousID, email, nil
 }
 
-// SetAliasActive 停用或激活别名。
+// SetAliasActive 停用或激活别名 (兼容保留包装)。
 func (b *managerBackend) SetAliasActive(accountID, anonymousID string, active bool) (bool, error) {
+	return b.SetAliasActiveContext(context.Background(), accountID, anonymousID, active)
+}
+
+// SetAliasActiveContext 支持 Context 贯穿的停用或激活别名 (PR-05 F10)。
+func (b *managerBackend) SetAliasActiveContext(ctx context.Context, accountID, anonymousID string, active bool) (bool, error) {
 	accountID = strings.TrimSpace(accountID)
 	anonymousID = strings.TrimSpace(anonymousID)
 	if accountID == "" || anonymousID == "" {
@@ -588,9 +614,9 @@ func (b *managerBackend) SetAliasActive(accountID, anonymousID string, active bo
 	err = b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
 		var opErr error
 		if active {
-			success, opErr = client.ReactivateHME(targetAnonID)
+			success, opErr = client.ReactivateHMEWithContext(ctx, targetAnonID)
 		} else {
-			success, opErr = client.DeactivateHME(targetAnonID)
+			success, opErr = client.DeactivateHMEWithContext(ctx, targetAnonID)
 		}
 		return opErr
 	})

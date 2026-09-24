@@ -336,7 +336,7 @@ func TestFault_06_SchedulerStopsOnOutcomeUnknown(t *testing.T) {
 	}
 
 	var creatorCalls int32
-	mockCreator := func(id, label string) (*hme.CreateResult, error) {
+	mockCreator := func(ctx context.Context, id, label string) (*hme.CreateResult, error) {
 		atomic.AddInt32(&creatorCalls, 1)
 		return nil, &BackendError{
 			Status:  http.StatusBadGateway,

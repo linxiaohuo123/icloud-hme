@@ -327,12 +327,12 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		var err error
 
 		if req.AccountID != "" {
-			res, err = s.be.CreateAlias(req.AccountID, req.Label)
+			res, err = s.be.CreateAliasContext(ctx, req.AccountID, req.Label)
 			accountID = req.AccountID
 		} else {
 			cands := selectAccountCandidates(s.be.ListAccounts(), req.Tag, s.store)
 			for _, candID := range cands {
-				res, err = s.be.CreateAlias(candID, req.Label)
+				res, err = s.be.CreateAliasContext(ctx, candID, req.Label)
 				if err == nil && res != nil {
 					accountID = candID
 					break

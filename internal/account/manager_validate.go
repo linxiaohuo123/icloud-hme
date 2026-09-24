@@ -8,6 +8,7 @@
 package account
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -106,13 +107,18 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 }
 
 // ValidateAccount 对指定账号执行一次会话校验并刷新状态(供后台健康监控周期调用)。
+func (m *Manager) ValidateAccount(id string) error {
+	return m.ValidateAccountWithContext(context.Background(), id)
+}
+
+// ValidateAccountWithContext 支持 Context 贯穿的账号会话校验 (PR-05 F10)。
 //
 // 成功: 状态回 active、刷新 LastValidated 与别名计数，并保存 validate 响应刷新的
 // Cookie(等效一次会话保活)。
 // 凭据级失败(401/403): 账号标记 error 并返回包装 ErrCookieExpired 的错误，
 // 调度器与预热池会随之跳过该账号。
 // 瞬时失败(网络抖动、超时): 不改变账号状态，返回原始错误由调用方记录。
-func (m *Manager) ValidateAccount(id string) error {
+func (m *Manager) ValidateAccountWithContext(ctx context.Context, id string) error {
 	m.mu.RLock()
 	acc, ok := m.accounts[id]
 	if !ok {
@@ -134,13 +140,13 @@ func (m *Manager) ValidateAccount(id string) error {
 		aliases          []hme.Alias
 	)
 	err := m.WithHMEClient(id, func(client *hme.Client) error {
-		if err := client.ValidateSession(); err != nil {
+		if err := client.ValidateSessionWithContext(ctx); err != nil {
 			return err
 		}
 		serviceURL = client.ServiceURL()
 		accountInfo = client.AccountInfo()
 		// 顺带刷新别名计数，让配额水位始终有近 30 分钟内的真实值
-		if list, listErr := client.ListAliases(); listErr == nil {
+		if list, listErr := client.ListAliasesWithContext(ctx); listErr == nil {
 			aliases = list
 		}
 		// 必须在 ListAliases 之后克隆: 列表接口也可能 Set-Cookie。

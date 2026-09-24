@@ -1,13 +1,14 @@
 /**
- * [INPUT]: 依赖 sync, time, icloud-hme/internal/account, icloud-hme/internal/hme
+ * [INPUT]: 依赖 context, errors, fmt, sort, sync, time, icloud-hme/internal/account, icloud-hme/internal/hme
  * [OUTPUT]: 对外提供 PrewarmedAlias, AliasBuffer, NewAliasBuffer
- * [POS]: server 的别名预热缓冲池与令牌桶补货器，实现内存缓冲出号与防 429 频控
+ * [POS]: server 的别名预热缓冲池与令牌桶补货器 (PR-05 F10)，实现内存缓冲出号、按需创建与 Context 贯穿
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -68,9 +69,22 @@ func (b *AliasBuffer) Stop() {
 	})
 }
 
-// Acquire 提取一个可用别名。
-// 优先从预存通道弹出；通道为空时走现场按需创建。绝不自动后台预热补货。
+// Acquire 提取一个可用别名 (兼容保留包装)。
 func (b *AliasBuffer) Acquire(label string) (*hme.CreateResult, string, error) {
+	return b.AcquireContext(context.Background(), label)
+}
+
+// AcquireContext 支持 Context 贯穿的别名提取 (PR-05 F10)。
+// 优先从预存通道弹出；通道为空时走现场按需创建。绝不自动后台预热补货。
+func (b *AliasBuffer) AcquireContext(ctx context.Context, label string) (*hme.CreateResult, string, error) {
+	select {
+	case <-b.stopCh:
+		return nil, "", errors.New("alias buffer stopped")
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
+	default:
+	}
+
 	// 1. 尝试从缓冲队列秒级弹出 (如有预存)
 	select {
 	case item := <-b.queue:
@@ -79,11 +93,24 @@ func (b *AliasBuffer) Acquire(label string) (*hme.CreateResult, string, error) {
 	}
 
 	// 2. 缓冲池为空，走同步现场创建
-	return b.syncCreate(label)
+	return b.syncCreateContext(ctx, label)
 }
 
-// syncCreate 现场同步创建降级逻辑。
+// syncCreate 现场同步创建降级逻辑 (兼容保留包装)。
 func (b *AliasBuffer) syncCreate(label string) (*hme.CreateResult, string, error) {
+	return b.syncCreateContext(context.Background(), label)
+}
+
+// syncCreateContext 现场同步创建降级逻辑 (PR-05 F10)。
+func (b *AliasBuffer) syncCreateContext(ctx context.Context, label string) (*hme.CreateResult, string, error) {
+	select {
+	case <-b.stopCh:
+		return nil, "", errors.New("alias buffer stopped")
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
+	default:
+	}
+
 	accounts := b.be.ListAccounts()
 	var candidates []account.Summary
 	for _, acc := range accounts {
@@ -101,13 +128,24 @@ func (b *AliasBuffer) syncCreate(label string) (*hme.CreateResult, string, error
 	})
 
 	for _, target := range candidates {
-		res, err := b.be.CreateAlias(target.ID, label)
+		select {
+		case <-b.stopCh:
+			return nil, "", errors.New("alias buffer stopped")
+		case <-ctx.Done():
+			return nil, "", ctx.Err()
+		default:
+		}
+
+		res, err := b.be.CreateAliasContext(ctx, target.ID, label)
 		if err == nil && res != nil {
 			return res, target.ID, nil
 		}
 		if err != nil {
 			var be *BackendError
 			if (errors.As(err, &be) && be.Code == "UPSTREAM_OUTCOME_UNKNOWN") || errors.Is(err, hme.ErrOutcomeUnknown) {
+				return nil, "", err
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil, "", err
 			}
 		}

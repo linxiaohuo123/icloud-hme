@@ -63,21 +63,26 @@ type fakeBackend struct {
 	reloadCount      int
 
 	onClose       func()
-	onCreateAlias func(accountID, label string) (*hme.CreateResult, error)
-	onListAliases      func(accountID string) ([]hme.Alias, error)
+	onCreateAlias        func(accountID, label string) (*hme.CreateResult, error)
+	onCreateAliasContext func(ctx context.Context, accountID, label string) (*hme.CreateResult, error)
+	onBatchCreateAliasContext func(ctx context.Context, accountID string, count int, labelPrefix string) (*BatchCreateResult, error)
+	onListAliases        func(accountID string) ([]hme.Alias, error)
+	onListAliasesContext func(ctx context.Context, accountID string) ([]hme.Alias, error)
 	onListInbox        func(q InboxQuery) (InboxResult, error)
 	onListInboxContext func(ctx context.Context, q InboxQuery) (InboxResult, error)
 	onListMailboxes        func(accountID string) ([]mail.Folder, error)
 	onListMailboxesContext func(ctx context.Context, accountID string) ([]mail.Folder, error)
 
-	validateID   string
-	validateFunc func(id string) error
+	validateID               string
+	validateFunc             func(id string) error
+	onValidateAccountContext func(ctx context.Context, id string) error
 
 	onScanMailboxUIDPage        func(ctx context.Context, q ScanPageQuery) (ScanPageResult, error)
 	onGetMailboxBoundaryContext func(ctx context.Context, accountID, folder string) (string, uint32, uint32, error)
 	onGetMessagesContext        func(ctx context.Context, accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error)
 
-	onSetAliasActive    func(accountID, anonymousID string, active bool) (bool, error)
+	onSetAliasActive        func(accountID, anonymousID string, active bool) (bool, error)
+	onSetAliasActiveContext func(ctx context.Context, accountID, anonymousID string, active bool) (bool, error)
 	onDeleteAlias       func(accountID, anonymousID string) error
 	getMessageFunc      func(accountID string, id string) (*mail.FullMessage, error)
 	getMessagesFunc     func(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error)
@@ -174,6 +179,16 @@ func (f *fakeBackend) Close() {
 }
 
 func (f *fakeBackend) CreateAlias(accountID, label string) (*hme.CreateResult, error) {
+	return f.CreateAliasContext(context.Background(), accountID, label)
+}
+
+func (f *fakeBackend) CreateAliasContext(ctx context.Context, accountID, label string) (*hme.CreateResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.onCreateAliasContext != nil {
+		return f.onCreateAliasContext(ctx, accountID, label)
+	}
 	if f.onCreateAlias != nil {
 		return f.onCreateAlias(accountID, label)
 	}
@@ -181,6 +196,16 @@ func (f *fakeBackend) CreateAlias(accountID, label string) (*hme.CreateResult, e
 }
 
 func (f *fakeBackend) ListAliases(accountID string) ([]hme.Alias, error) {
+	return f.ListAliasesContext(context.Background(), accountID)
+}
+
+func (f *fakeBackend) ListAliasesContext(ctx context.Context, accountID string) ([]hme.Alias, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.onListAliasesContext != nil {
+		return f.onListAliasesContext(ctx, accountID)
+	}
 	if f.onListAliases != nil {
 		return f.onListAliases(accountID)
 	}
@@ -188,16 +213,29 @@ func (f *fakeBackend) ListAliases(accountID string) ([]hme.Alias, error) {
 }
 
 func (f *fakeBackend) RefreshAliases(accountID string) ([]hme.Alias, error) {
-	return f.ListAliases(accountID)
+	return f.RefreshAliasesContext(context.Background(), accountID)
+}
+
+func (f *fakeBackend) RefreshAliasesContext(ctx context.Context, accountID string) ([]hme.Alias, error) {
+	return f.ListAliasesContext(ctx, accountID)
 }
 
 func (f *fakeBackend) SetAliasActive(accountID, anonymousID string, active bool) (bool, error) {
+	return f.SetAliasActiveContext(context.Background(), accountID, anonymousID, active)
+}
+
+func (f *fakeBackend) SetAliasActiveContext(ctx context.Context, accountID, anonymousID string, active bool) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	f.aliasActID, f.aliasActActive = anonymousID, active
 	var (
 		ok  = true
 		err = f.aliasActErr
 	)
-	if f.onSetAliasActive != nil {
+	if f.onSetAliasActiveContext != nil {
+		ok, err = f.onSetAliasActiveContext(ctx, accountID, anonymousID, active)
+	} else if f.onSetAliasActive != nil {
 		ok, err = f.onSetAliasActive(accountID, anonymousID, active)
 	}
 	if err != nil || !ok {
@@ -255,6 +293,16 @@ func (f *fakeBackend) DeleteAlias(accountID, anonymousID string) error {
 }
 
 func (f *fakeBackend) BatchCreateAlias(accountID string, count int, labelPrefix string) (*BatchCreateResult, error) {
+	return f.BatchCreateAliasContext(context.Background(), accountID, count, labelPrefix)
+}
+
+func (f *fakeBackend) BatchCreateAliasContext(ctx context.Context, accountID string, count int, labelPrefix string) (*BatchCreateResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.onBatchCreateAliasContext != nil {
+		return f.onBatchCreateAliasContext(ctx, accountID, count, labelPrefix)
+	}
 	created := make([]hme.CreateResult, 0, count)
 	for i := 0; i < count; i++ {
 		created = append(created, hme.CreateResult{
@@ -454,7 +502,17 @@ func (f *fakeBackend) DeleteMessage(accountID string, uid uint32) error { return
 
 // ValidateAccount 记录被校验的账号;validateFunc 非空时委托其决定返回结果。
 func (f *fakeBackend) ValidateAccount(id string) error {
+	return f.ValidateAccountContext(context.Background(), id)
+}
+
+func (f *fakeBackend) ValidateAccountContext(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.validateID = id
+	if f.onValidateAccountContext != nil {
+		return f.onValidateAccountContext(ctx, id)
+	}
 	if f.validateFunc != nil {
 		return f.validateFunc(id)
 	}

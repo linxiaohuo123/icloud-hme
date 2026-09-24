@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, database/sql, errors, strings, time, icloud-hme/internal/store (Store, ErrVerificationRequestNotFound)
- * [OUTPUT]: 对外提供 VerificationRequest, VerificationCompletion, ActiveVerificationWatch, VerificationEventInput 类型, ErrConflictActiveRequest, ErrServerBusy, ErrTooManyRequests 错误及 CreateVerificationRequestAtomic, CreateVerificationRequest, GetVerificationRequest, CompleteVerificationRequest, CompleteVerificationRequestResult, CompleteMatchingVerificationRequests, InvalidateVerificationRequestsForGenerationMismatch, ExpireVerificationRequest, InvalidateVerificationRequest, UpdateVerificationRequestResult, GetActiveVerificationRequestByLease, CountActiveVerificationRequests, CountActiveVerificationRequestsByPrincipal, GetMinBaselineUIDByEmail, ListActiveVerificationWatches, HasActiveVerificationRequests
- * [POS]: internal/store 的持久化取码请求与基线游标状态机领域 (PR-06/PR-08/PR-04B)，提供终态原子 CAS 与容量仲裁、权威持久化和持久化活跃观察查询
+ * [OUTPUT]: 对外提供 VerificationRequest, VerificationCompletion, ActiveVerificationWatch, VerificationEventInput 类型, ErrConflictActiveRequest, ErrServerBusy, ErrTooManyRequests 错误及 CheckVerificationRequestAdmission, CreateVerificationRequestAtomic, CreateVerificationRequest, GetVerificationRequest, CompleteVerificationRequest, CompleteVerificationRequestResult, CompleteMatchingVerificationRequests, InvalidateVerificationRequestsForGenerationMismatch, ExpireVerificationRequest, InvalidateVerificationRequest, UpdateVerificationRequestResult, GetActiveVerificationRequestByLease, CountActiveVerificationRequests, CountActiveVerificationRequestsByPrincipal, GetMinBaselineUIDByEmail, ListActiveVerificationWatches, HasActiveVerificationRequests
+ * [POS]: internal/store 的持久化取码请求与基线游标状态机领域 (PR-06/PR-08/PR-04B/PR-05)，提供终态原子 CAS 与容量仲裁、前置准入预检、权威持久化和持久化活跃观察查询
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -72,6 +72,77 @@ type VerificationEventInput struct {
 	Code        string
 	MagicLink   string
 	Now         time.Time
+}
+
+// CheckVerificationRequestAdmission 在碰 IMAP 前做轻量 SQLite 准入预检 (PR-05 F09)
+// 只做只读与过期判定，快速拒绝明显超限请求，不得访问网络。最终原子性仍由 CreateVerificationRequestAtomic 权威保障。
+func (s *Store) CheckVerificationRequestAdmission(
+	ctx context.Context,
+	principalKind string,
+	principalID string,
+	leaseID string,
+	maxGlobal int,
+	maxPerPrincipal int,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+
+	// 1. 清理已过期的任务状态 (不再阻塞同 lease 的新任务，也不占活跃配额)
+	_, _ = s.db.ExecContext(ctx, `
+		UPDATE verification_requests
+		SET status = 'expired'
+		WHERE status IN ('pending', 'ready') AND expires_at < ?
+	`, nowStr)
+
+	// 2. 检查同 lease 是否存在活跃任务 (避免同 lease 重复打 IMAP)
+	var leaseActiveCount int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(1)
+		FROM verification_requests
+		WHERE lease_id = ? AND status IN ('pending', 'ready') AND expires_at >= ?
+	`, leaseID, nowStr).Scan(&leaseActiveCount)
+	if err != nil {
+		return err
+	}
+	if leaseActiveCount > 0 {
+		return ErrConflictActiveRequest
+	}
+
+	// 3. 检查 principal 活跃任务上限 (不超过 maxPerPrincipal)
+	if maxPerPrincipal > 0 {
+		var tokenActiveCount int
+		err := s.db.QueryRowContext(ctx, `
+			SELECT COUNT(1)
+			FROM verification_requests
+			WHERE principal_kind = ? AND principal_id = ? AND status IN ('pending', 'ready') AND expires_at >= ?
+		`, principalKind, principalID, nowStr).Scan(&tokenActiveCount)
+		if err != nil {
+			return err
+		}
+		if tokenActiveCount >= maxPerPrincipal {
+			return ErrTooManyRequests
+		}
+	}
+
+	// 4. 检查全局活跃任务上限 (不超过 maxGlobal)
+	if maxGlobal > 0 {
+		var globalActiveCount int
+		err := s.db.QueryRowContext(ctx, `
+			SELECT COUNT(1)
+			FROM verification_requests
+			WHERE status IN ('pending', 'ready') AND expires_at >= ?
+		`, nowStr).Scan(&globalActiveCount)
+		if err != nil {
+			return err
+		}
+		if globalActiveCount >= maxGlobal {
+			return ErrServerBusy
+		}
+	}
+
+	return nil
 }
 
 // CreateVerificationRequestAtomic 在单事务/临界区内原子完成过期清理、活跃冲突检查、容量判定与任务插入 (PR-08 Final Hardening §4)

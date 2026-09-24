@@ -19,6 +19,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -44,6 +45,8 @@ type CookieMonitor struct {
 	throttle   time.Duration // 账号间节流间隔; 0 表示按账号数自动摊平
 	logs       *scheduler.RingBuffer
 	stopCh     chan struct{}
+	ctx        context.Context
+	cancel     context.CancelFunc
 	once       sync.Once
 	stopOnce   sync.Once
 	wg         sync.WaitGroup
@@ -69,12 +72,15 @@ func NewCookieMonitor(be Backend, interval time.Duration, notifier EventSink) *C
 	if interval < 5*time.Minute {
 		interval = 5 * time.Minute
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &CookieMonitor{
 		be:         be,
 		notifier:   notifier,
 		interval:   interval,
 		logs:       scheduler.NewRingBuffer(100),
 		stopCh:     make(chan struct{}),
+		ctx:        ctx,
+		cancel:     cancel,
 		prevStatus: make(map[string]string),
 		prevQuota:  make(map[string]int),
 	}
@@ -147,6 +153,9 @@ func (m *CookieMonitor) loop() {
 // Stop 停止监控协程并平稳等待退出(线程安全且幂等，PR-07 §10.4)。
 func (m *CookieMonitor) Stop() {
 	m.stopOnce.Do(func() {
+		if m.cancel != nil {
+			m.cancel()
+		}
 		close(m.stopCh)
 	})
 	m.wg.Wait()
@@ -202,7 +211,7 @@ func (m *CookieMonitor) validateAccount(id, name string) {
 	prev := m.prevStatus[id]
 	m.mu.Unlock()
 
-	err := m.be.ValidateAccount(id)
+	err := m.be.ValidateAccountContext(m.ctx, id)
 	switch {
 	case err == nil:
 		m.logs.Add(fmt.Sprintf("账号=%s Cookie 校验通过", name))
