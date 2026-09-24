@@ -441,7 +441,7 @@ func TestStoreMigration(t *testing.T) {
 	}
 }
 
-// 解析失败的遗留 JSON 绝不能被归档，必须保留现场以便重试或人工修复。
+// 解析失败的遗留 JSON 必须 Fail-Closed 拒绝启动，且绝不能被归档，必须保留现场以便重试或人工修复。
 func TestStoreMigrationKeepsCorruptSource(t *testing.T) {
 	tempDir := t.TempDir()
 
@@ -449,16 +449,13 @@ func TestStoreMigrationKeepsCorruptSource(t *testing.T) {
 	_ = os.WriteFile(corruptPath, []byte(`{"tag_1": {`), 0644)
 
 	s, err := NewStore(tempDir)
-	if err != nil {
-		t.Fatalf("NewStore with corrupt legacy file should not fail: %v", err)
+	if err == nil {
+		s.Close()
+		t.Fatalf("NewStore with corrupt legacy file must fail (fail-closed)")
 	}
-	defer s.Close()
 
 	if _, err := os.Stat(corruptPath); err != nil {
 		t.Fatalf("corrupt tags.json must be preserved for manual repair, stat err=%v", err)
-	}
-	if len(s.ListTags()) != 0 {
-		t.Fatalf("corrupt file should migrate nothing")
 	}
 }
 

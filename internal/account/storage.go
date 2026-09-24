@@ -64,7 +64,9 @@ func (m *Manager) load() error {
 	if err != nil || len(bytes.TrimSpace(raw)) == 0 {
 		if bakAccounts, bakErr := m.recoverBackup(); bakErr == nil && len(bakAccounts) > 0 {
 			m.accounts = bakAccounts
-			m.migrateToSQLite() // 发现老数据则立即迁移
+			if err := m.migrateToSQLite(); err != nil {
+				return err
+			}
 			return nil
 		}
 		if err != nil && os.IsNotExist(err) {
@@ -79,33 +81,40 @@ func (m *Manager) load() error {
 	if err != nil {
 		if bakAccounts, bakErr := m.recoverBackup(); bakErr == nil && len(bakAccounts) > 0 {
 			m.accounts = bakAccounts
-			m.migrateToSQLite()
+			if err := m.migrateToSQLite(); err != nil {
+				return err
+			}
 			return nil
 		}
 		return err
 	}
 	m.accounts = accounts
-	m.migrateToSQLite() // JSON 加载成功 → 迁移到 SQLite
+	if err := m.migrateToSQLite(); err != nil {
+		return err
+	}
 	return nil
 }
 
-// migrateToSQLite 将内存中的 accounts 一次性批量写入 SQLite 并归档 JSON 文件。
-func (m *Manager) migrateToSQLite() {
+// migrateToSQLite 将内存中的 accounts 一次性批量写入 SQLite 并归档 JSON 文件 (Fail-Closed: 失败直接返回 error 杜绝脑裂)。
+func (m *Manager) migrateToSQLite() error {
 	if m.store == nil || len(m.accounts) == 0 {
-		return
+		return nil
 	}
 	recs := make([]*store.AccountRecord, 0, len(m.accounts))
 	for _, acc := range m.accounts {
 		recs = append(recs, accountToRecord(acc))
 	}
 	if err := m.store.SaveAccountsBatch(recs); err != nil {
-		return // 迁移失败不阻塞启动，下次启动重试
+		return fmt.Errorf("迁移账号至 SQLite 失败: %w", err)
 	}
 	// 归档 JSON 源文件
 	_ = os.Remove(m.dataFile + ".migrated")
-	_ = os.Rename(m.dataFile, m.dataFile+".migrated")
+	if err := os.Rename(m.dataFile, m.dataFile+".migrated"); err != nil {
+		// 记录归档失败日志但 SQLite 已安全落库
+	}
 	_ = os.Remove(m.dataFile + ".bak")
 	_ = os.Remove(m.dataFile + ".tmp")
+	return nil
 }
 
 func (m *Manager) recoverBackup() (map[string]*Account, error) {

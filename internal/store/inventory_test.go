@@ -159,8 +159,8 @@ func TestPR03_D03_TwoIndependentStoreConnections(t *testing.T) {
 	// 存入仅有的一封可用别名
 	_ = st1.AddInventoryAlias("acc_1", hme.Alias{Email: "single_stock@icloud.com", Active: true}, "replenish", true)
 
-	// 创建第二个独立的 Store 实例连接同一个 SQLite 文件
-	st2, err := NewStore(tempDir)
+	// 创建第二个独立的 Store 实例连接同一个 SQLite 文件 (测试专用绕过单实例锁以测试底层并发事务)
+	st2, err := newStoreWithoutLockForTest(tempDir)
 	if err != nil {
 		t.Fatalf("store 2 init failed: %v", err)
 	}

@@ -1,6 +1,6 @@
 /**
- * [INPUT]: 依赖 encoding/json, log, os, path/filepath, time
- * [OUTPUT]: 对外提供 Store.migrateLegacyJSON 方法，负责 tags/tokens/leases/schedules 遗留 JSON 文件的事务级自动无损迁移
+ * [INPUT]: 依赖 encoding/json, fmt, log, os, path/filepath, time
+ * [OUTPUT]: 对外提供 Store.migrateLegacyJSON 方法，负责 tags/tokens/leases/schedules 遗留 JSON 文件的事务级自动无损迁移 (Fail-Closed)
  * [POS]: internal/store 的遗留兼容迁移层
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -9,6 +9,7 @@ package store
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -17,37 +18,52 @@ import (
 
 // migrateLegacyJSON 把遗留 JSON 存储迁移进 SQLite。
 //
+// migrateLegacyJSON 把遗留 JSON 存储迁移进 SQLite (Fail-Closed: 任何错误立即中断并返回 error)。
+//
 // 【数据安全红线】迁移必须无损且可重试：
 //   - 任一字段都不允许丢弃(列清单必须与当前 schema 对齐)；
 //   - 解析失败或逐条写入失败时，绝不归档源文件，保留现场供下次启动重试或人工修复；
 //   - 归档文件名带时间戳，避免后续启动的清理动作覆盖掉人工备份。
-func (s *Store) migrateLegacyJSON() {
-	s.migrateTagsFile()
-	s.migrateTokensFile()
-	s.migrateLeasesFile()
-	s.migrateSchedulesFile()
+func (s *Store) migrateLegacyJSON() error {
+	if err := s.migrateTagsFile(); err != nil {
+		return err
+	}
+	if err := s.migrateTokensFile(); err != nil {
+		return err
+	}
+	if err := s.migrateLeasesFile(); err != nil {
+		return err
+	}
+	if err := s.migrateSchedulesFile(); err != nil {
+		return err
+	}
+	return nil
 }
 
-func (s *Store) migrateTagsFile() {
+func (s *Store) migrateTagsFile() error {
 	file := filepath.Join(s.dataDir, "tags.json")
 	data, err := os.ReadFile(file)
 	if err != nil {
-		return // 文件不存在: 无需迁移
+		if os.IsNotExist(err) {
+			return nil // 文件不存在: 无需迁移
+		}
+		return fmt.Errorf("read %s failed: %w", file, err)
 	}
 	var tags map[string]*BusinessTag
 	if err := json.Unmarshal(data, &tags); err != nil {
 		s.keepLegacyFile(file, "解析失败", err)
-		return
+		return fmt.Errorf("parse %s failed: %w", file, err)
 	}
 	if len(tags) == 0 {
 		s.archiveLegacyFile(file, true)
-		return
+		return nil
 	}
 	if err := s.insertLegacyTags(tags); err != nil {
 		s.keepLegacyFile(file, "迁移失败", err)
-		return
+		return fmt.Errorf("migrate %s into db failed: %w", file, err)
 	}
 	s.archiveLegacyFile(file, false)
+	return nil
 }
 
 func (s *Store) insertLegacyTags(tags map[string]*BusinessTag) error {
@@ -72,26 +88,30 @@ func (s *Store) insertLegacyTags(tags map[string]*BusinessTag) error {
 	return tx.Commit()
 }
 
-func (s *Store) migrateTokensFile() {
+func (s *Store) migrateTokensFile() error {
 	file := filepath.Join(s.dataDir, "tokens.json")
 	data, err := os.ReadFile(file)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read %s failed: %w", file, err)
 	}
 	var tokens map[string]*APIToken
 	if err := json.Unmarshal(data, &tokens); err != nil {
 		s.keepLegacyFile(file, "解析失败", err)
-		return
+		return fmt.Errorf("parse %s failed: %w", file, err)
 	}
 	if len(tokens) == 0 {
 		s.archiveLegacyFile(file, true)
-		return
+		return nil
 	}
 	if err := s.insertLegacyTokens(tokens); err != nil {
 		s.keepLegacyFile(file, "迁移失败", err)
-		return
+		return fmt.Errorf("migrate %s into db failed: %w", file, err)
 	}
 	s.archiveLegacyFile(file, false)
+	return nil
 }
 
 func (s *Store) insertLegacyTokens(tokens map[string]*APIToken) error {
@@ -121,26 +141,30 @@ func (s *Store) insertLegacyTokens(tokens map[string]*APIToken) error {
 	return tx.Commit()
 }
 
-func (s *Store) migrateLeasesFile() {
+func (s *Store) migrateLeasesFile() error {
 	file := filepath.Join(s.dataDir, "leases.json")
 	data, err := os.ReadFile(file)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read %s failed: %w", file, err)
 	}
 	var leases []*LeaseRecord
 	if err := json.Unmarshal(data, &leases); err != nil {
 		s.keepLegacyFile(file, "解析失败", err)
-		return
+		return fmt.Errorf("parse %s failed: %w", file, err)
 	}
 	if len(leases) == 0 {
 		s.archiveLegacyFile(file, true)
-		return
+		return nil
 	}
 	if err := s.insertLegacyLeases(leases); err != nil {
 		s.keepLegacyFile(file, "迁移失败", err)
-		return
+		return fmt.Errorf("migrate %s into db failed: %w", file, err)
 	}
 	s.archiveLegacyFile(file, false)
+	return nil
 }
 
 func (s *Store) insertLegacyLeases(leases []*LeaseRecord) error {
@@ -166,26 +190,30 @@ func (s *Store) insertLegacyLeases(leases []*LeaseRecord) error {
 	return tx.Commit()
 }
 
-func (s *Store) migrateSchedulesFile() {
+func (s *Store) migrateSchedulesFile() error {
 	file := filepath.Join(s.dataDir, "schedules.json")
 	data, err := os.ReadFile(file)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read %s failed: %w", file, err)
 	}
 	var schedules map[string]*ScheduleConfig
 	if err := json.Unmarshal(data, &schedules); err != nil {
 		s.keepLegacyFile(file, "解析失败", err)
-		return
+		return fmt.Errorf("parse %s failed: %w", file, err)
 	}
 	if len(schedules) == 0 {
 		s.archiveLegacyFile(file, true)
-		return
+		return nil
 	}
 	if err := s.insertLegacySchedules(schedules); err != nil {
 		s.keepLegacyFile(file, "迁移失败", err)
-		return
+		return fmt.Errorf("migrate %s into db failed: %w", file, err)
 	}
 	s.archiveLegacyFile(file, false)
+	return nil
 }
 
 func (s *Store) insertLegacySchedules(schedules map[string]*ScheduleConfig) error {
