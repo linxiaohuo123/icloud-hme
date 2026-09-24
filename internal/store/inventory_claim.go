@@ -31,11 +31,32 @@ func (s *Store) ClaimInventoryAlias(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	currentHash := reqHash
+	legacyHash := ""
+	if idx := strings.Index(reqHash, "|legacy:"); idx != -1 {
+		currentHash = reqHash[:idx]
+		legacyHash = reqHash[idx+len("|legacy:"):]
+	}
+
+	isHashMatch := func(stored string) bool {
+		if stored == "" || currentHash == "" {
+			return true
+		}
+		if stored == currentHash {
+			return true
+		}
+		if legacyHash != "" && stored == legacyHash {
+			return true
+		}
+		return false
+	}
+
 	// 1. 幂等预检：相同幂等键直出原结果或阻断冲突
+	var retryOp *Operation
 	if idempKey != "" {
 		var op Operation
 		err := s.db.QueryRowContext(ctx, `
-			SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, candidate_email, result_ref, error_code, created_at, updated_at
+			SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, COALESCE(candidate_email, ''), COALESCE(result_ref, ''), COALESCE(error_code, ''), created_at, updated_at
 			FROM operations
 			WHERE principal_kind = ? AND principal_id = ? AND operation_kind = ? AND idempotency_key = ?
 		`, principalKind, principalID, operationKind, idempKey).Scan(
@@ -43,7 +64,7 @@ func (s *Store) ClaimInventoryAlias(
 		)
 
 		if err == nil {
-			if reqHash != "" && op.RequestHash != "" && op.RequestHash != reqHash {
+			if !isHashMatch(op.RequestHash) {
 				return nil, nil, ErrIdempotencyConflict
 			}
 			if op.State == "succeeded" {
@@ -69,13 +90,15 @@ func (s *Store) ClaimInventoryAlias(
 				return nil, &op, ErrOperationPending
 			}
 			if op.State == "failed" {
-				if op.ErrorCode == "NO_AVAILABLE_INVENTORY" {
-					return nil, &op, ErrNoAvailableInventory
+				if op.ErrorCode == "NO_AVAILABLE_INVENTORY" && op.ResultRef == "" {
+					// F05: 可证明无副作用的池空历史，允许进入下方事务进行重试
+					retryOp = &op
+				} else {
+					if op.ErrorCode != "" {
+						return nil, &op, fmt.Errorf("operation failed with code: %s", op.ErrorCode)
+					}
+					return nil, &op, errors.New("previous operation failed")
 				}
-				if op.ErrorCode != "" {
-					return nil, &op, fmt.Errorf("operation failed with code: %s", op.ErrorCode)
-				}
-				return nil, &op, errors.New("previous operation failed")
 			}
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return nil, nil, fmt.Errorf("idempotency pre-check query failed: %w", err)
@@ -92,28 +115,29 @@ func (s *Store) ClaimInventoryAlias(
 	opID := newOpaqueID("op_")
 	var currentOp *Operation
 	if idempKey != "" {
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO operations (
-				operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-		`, opID, principalKind, principalID, operationKind, idempKey, reqHash, now, now)
-		if err != nil {
-			if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		if retryOp != nil {
+			opID = retryOp.OperationID
+			res, updateErr := tx.ExecContext(ctx, `
+				UPDATE operations
+				SET state = 'pending', error_code = '', request_hash = ?, updated_at = ?
+				WHERE operation_id = ? AND state = 'failed'
+			`, currentHash, now, opID)
+			if updateErr != nil {
+				return nil, nil, fmt.Errorf("update retry operation failed: %w", updateErr)
+			}
+			rows, _ := res.RowsAffected()
+			if rows == 0 {
 				_ = tx.Rollback()
-				// 并发重入，释放事务后可靠查询既有操作
 				var existingOp Operation
 				qErr := s.db.QueryRowContext(ctx, `
-					SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, candidate_email, result_ref, error_code, created_at, updated_at
+					SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, COALESCE(candidate_email, ''), COALESCE(result_ref, ''), COALESCE(error_code, ''), created_at, updated_at
 					FROM operations
-					WHERE principal_kind = ? AND principal_id = ? AND operation_kind = ? AND idempotency_key = ?
-				`, principalKind, principalID, operationKind, idempKey).Scan(
+					WHERE operation_id = ?
+				`, opID).Scan(
 					&existingOp.OperationID, &existingOp.PrincipalKind, &existingOp.PrincipalID, &existingOp.OperationKind, &existingOp.IdempotencyKey, &existingOp.RequestHash, &existingOp.State, &existingOp.CandidateEmail, &existingOp.ResultRef, &existingOp.ErrorCode, &existingOp.CreatedAt, &existingOp.UpdatedAt,
 				)
 				if qErr != nil {
-					return nil, nil, fmt.Errorf("failed to read existing operation after unique conflict: %w", qErr)
-				}
-				if reqHash != "" && existingOp.RequestHash != "" && existingOp.RequestHash != reqHash {
-					return nil, &existingOp, ErrIdempotencyConflict
+					return nil, nil, fmt.Errorf("failed to read operation after concurrent retry: %w", qErr)
 				}
 				if existingOp.State == "succeeded" {
 					var alloc AliasAllocation
@@ -130,29 +154,76 @@ func (s *Store) ClaimInventoryAlias(
 				if existingOp.State == "pending" {
 					return nil, &existingOp, ErrOperationPending
 				}
-				if existingOp.State == "failed" {
-					if existingOp.ErrorCode == "NO_AVAILABLE_INVENTORY" {
-						return nil, &existingOp, ErrNoAvailableInventory
-					}
-					if existingOp.ErrorCode != "" {
-						return nil, &existingOp, fmt.Errorf("operation failed with code: %s", existingOp.ErrorCode)
-					}
-					return nil, &existingOp, errors.New("previous operation failed")
-				}
-				return nil, &existingOp, fmt.Errorf("unknown operation state: %s", existingOp.State)
+				return nil, &existingOp, errors.New("concurrent retry state mismatch")
 			}
-			return nil, nil, fmt.Errorf("记录操作失败: %w", err)
-		}
-		currentOp = &Operation{
-			OperationID:    opID,
-			PrincipalKind:  principalKind,
-			PrincipalID:    principalID,
-			OperationKind:  operationKind,
-			IdempotencyKey: idempKey,
-			RequestHash:    reqHash,
-			State:          "pending",
-			CreatedAt:      now,
-			UpdatedAt:      now,
+			currentOp = retryOp
+			currentOp.State = "pending"
+			currentOp.RequestHash = currentHash
+			currentOp.ErrorCode = ""
+			currentOp.UpdatedAt = now
+		} else {
+			_, err = tx.ExecContext(ctx, `
+				INSERT INTO operations (
+					operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, created_at, updated_at
+				) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+			`, opID, principalKind, principalID, operationKind, idempKey, currentHash, now, now)
+			if err != nil {
+				if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+					_ = tx.Rollback()
+					// 并发重入，释放事务后可靠查询既有操作
+					var existingOp Operation
+					qErr := s.db.QueryRowContext(ctx, `
+						SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, COALESCE(candidate_email, ''), COALESCE(result_ref, ''), COALESCE(error_code, ''), created_at, updated_at
+						FROM operations
+						WHERE principal_kind = ? AND principal_id = ? AND operation_kind = ? AND idempotency_key = ?
+					`, principalKind, principalID, operationKind, idempKey).Scan(
+						&existingOp.OperationID, &existingOp.PrincipalKind, &existingOp.PrincipalID, &existingOp.OperationKind, &existingOp.IdempotencyKey, &existingOp.RequestHash, &existingOp.State, &existingOp.CandidateEmail, &existingOp.ResultRef, &existingOp.ErrorCode, &existingOp.CreatedAt, &existingOp.UpdatedAt,
+					)
+					if qErr != nil {
+						return nil, nil, fmt.Errorf("failed to read existing operation after unique conflict: %w", qErr)
+					}
+					if !isHashMatch(existingOp.RequestHash) {
+						return nil, &existingOp, ErrIdempotencyConflict
+					}
+					if existingOp.State == "succeeded" {
+						var alloc AliasAllocation
+						allocErr := s.db.QueryRowContext(ctx, `
+							SELECT allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status
+							FROM alias_allocations
+							WHERE allocation_id = ?
+						`, existingOp.ResultRef).Scan(&alloc.AllocationID, &alloc.AliasEmail, &alloc.AccountID, &alloc.OwnerKind, &alloc.OwnerID, &alloc.BusinessTag, &alloc.AllocatedAt, &alloc.Status)
+						if allocErr != nil {
+							return nil, &existingOp, fmt.Errorf("inconsistent operation state: allocation record not found for result_ref %s: %w", existingOp.ResultRef, allocErr)
+						}
+						return &alloc, &existingOp, nil
+					}
+					if existingOp.State == "pending" {
+						return nil, &existingOp, ErrOperationPending
+					}
+					if existingOp.State == "failed" {
+						if existingOp.ErrorCode == "NO_AVAILABLE_INVENTORY" {
+							return nil, &existingOp, ErrNoAvailableInventory
+						}
+						if existingOp.ErrorCode != "" {
+							return nil, &existingOp, fmt.Errorf("operation failed with code: %s", existingOp.ErrorCode)
+						}
+						return nil, &existingOp, errors.New("previous operation failed")
+					}
+					return nil, &existingOp, fmt.Errorf("unknown operation state: %s", existingOp.State)
+				}
+				return nil, nil, fmt.Errorf("记录操作失败: %w", err)
+			}
+			currentOp = &Operation{
+				OperationID:    opID,
+				PrincipalKind:  principalKind,
+				PrincipalID:    principalID,
+				OperationKind:  operationKind,
+				IdempotencyKey: idempKey,
+				RequestHash:    currentHash,
+				State:          "pending",
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}
 		}
 	} else {
 		currentOp = &Operation{
@@ -160,6 +231,7 @@ func (s *Store) ClaimInventoryAlias(
 			PrincipalKind: principalKind,
 			PrincipalID:   principalID,
 			OperationKind: operationKind,
+			RequestHash:   currentHash,
 			State:         "succeeded",
 			CreatedAt:     now,
 			UpdatedAt:     now,
@@ -304,11 +376,11 @@ func (s *Store) ClaimInventoryAlias(
 		return nil, currentOp, fmt.Errorf("写入 lease_records 失败: %w", err)
 	}
 
-	// 7. 更新操作记录为 succeeded
+	// 7. 更新操作记录为 succeeded (F06: 若无幂等键亦真实持久化操作记录，杜绝幽灵 operation_id)
 	if idempKey != "" {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE operations
-			SET state = 'succeeded', result_ref = ?, candidate_email = ?, updated_at = ?
+			SET state = 'succeeded', result_ref = ?, candidate_email = ?, error_code = '', updated_at = ?
 			WHERE operation_id = ?
 		`, allocID, candEmail, now, opID)
 		if err != nil {
@@ -321,7 +393,21 @@ func (s *Store) ClaimInventoryAlias(
 		currentOp.State = "succeeded"
 		currentOp.ResultRef = allocID
 		currentOp.CandidateEmail = candEmail
+		currentOp.ErrorCode = ""
 		currentOp.UpdatedAt = now
+	} else {
+		noKeyIdemp := "none:" + opID
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO operations (
+				operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, candidate_email, result_ref, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, ?, ?)
+		`, opID, principalKind, principalID, operationKind, noKeyIdemp, currentHash, candEmail, allocID, now, now)
+		if err != nil {
+			return nil, currentOp, fmt.Errorf("写入无键 operation 失败: %w", err)
+		}
+		currentOp.State = "succeeded"
+		currentOp.ResultRef = allocID
+		currentOp.CandidateEmail = candEmail
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -520,7 +606,7 @@ func (s *Store) IsEmailOwnedByToken(ctx context.Context, email, tokenID string) 
 func (s *Store) GetOperation(ctx context.Context, operationID, principalKind, principalID string) (*Operation, error) {
 	var op Operation
 	err := s.db.QueryRowContext(ctx, `
-		SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, candidate_email, result_ref, error_code, created_at, updated_at
+		SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, COALESCE(candidate_email, ''), COALESCE(result_ref, ''), COALESCE(error_code, ''), created_at, updated_at
 		FROM operations
 		WHERE operation_id = ? AND principal_kind = ? AND principal_id = ?
 	`, operationID, principalKind, principalID).Scan(
@@ -531,6 +617,9 @@ func (s *Store) GetOperation(ctx context.Context, operationID, principalKind, pr
 			return nil, errors.New("operation not found")
 		}
 		return nil, err
+	}
+	if strings.HasPrefix(op.IdempotencyKey, "none:") {
+		op.IdempotencyKey = ""
 	}
 	return &op, nil
 }

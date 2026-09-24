@@ -97,8 +97,7 @@ func (s *Server) externalV2AllocateHandler(c *gin.Context) {
 				opID = allocRes.Operation.OperationID
 			}
 			c.JSON(http.StatusAccepted, gin.H{
-				"code":    0,
-				"message": "operation is pending",
+				"success": true,
 				"data": gin.H{
 					"operation_id": opID,
 					"status":       "pending",

@@ -9,6 +9,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -45,6 +47,48 @@ type AllocationRequest struct {
 	IdempotencyKey     string
 	RequestHash        string
 	RequireIdempotency bool
+}
+
+// AllocationFingerprintV2 规范化幂等指纹结构 (F04: 杜绝字符串拼接碰撞，包含 mode 语义)
+type AllocationFingerprintV2 struct {
+	Version   int    `json:"v"`
+	Tag       string `json:"tag"`
+	AccountID string `json:"account_id"`
+	Label     string `json:"label"`
+	Mode      string `json:"mode"`
+}
+
+// ComputeAllocationRequestHash 计算规范的 v2 请求指纹
+func ComputeAllocationRequestHash(tag, accountID, label, mode string) string {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		tag = "default"
+	}
+	accountID = strings.TrimSpace(accountID)
+	label = strings.TrimSpace(label)
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		mode = "pool"
+	}
+	fp := AllocationFingerprintV2{
+		Version:   2,
+		Tag:       tag,
+		AccountID: accountID,
+		Label:     label,
+		Mode:      mode,
+	}
+	data, _ := json.Marshal(fp)
+	h := sha256.Sum256(data)
+	return fmt.Sprintf("v2:%x", h[:])
+}
+
+// ComputeLegacyAllocationRequestHash 计算历史版本请求指纹 (用于兼容历史操作记录比对)
+func ComputeLegacyAllocationRequestHash(tag, accountID, label string) string {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		tag = "default"
+	}
+	return fmt.Sprintf("tag=%s&account_id=%s&label=%s", tag, strings.TrimSpace(accountID), strings.TrimSpace(label))
 }
 
 // AllocationResult 统一出号结果
@@ -163,7 +207,9 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 	}
 
 	if req.RequestHash == "" {
-		req.RequestHash = fmt.Sprintf("tag=%s&account_id=%s&label=%s", req.Tag, strings.TrimSpace(req.AccountID), strings.TrimSpace(req.Label))
+		v2Hash := ComputeAllocationRequestHash(req.Tag, req.AccountID, req.Label, mode)
+		legacyHash := ComputeLegacyAllocationRequestHash(req.Tag, req.AccountID, req.Label)
+		req.RequestHash = v2Hash + "|legacy:" + legacyHash
 	}
 
 	var poolAccountIDs []string
