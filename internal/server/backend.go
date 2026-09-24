@@ -345,6 +345,9 @@ func classifyUpstreamErr(fixedMsg string, err error) *BackendError {
 	if err == nil {
 		return nil
 	}
+	if errors.Is(err, hme.ErrOutcomeUnknown) {
+		return &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_OUTCOME_UNKNOWN", Message: "上游写操作结果未知，需核对后处理"}
+	}
 	if isSessionError(err.Error()) {
 		return &BackendError{Status: http.StatusUnauthorized, Code: "UPSTREAM_UNAUTHORIZED", Message: "iCloud 会话失效,请更新 Cookie"}
 	}

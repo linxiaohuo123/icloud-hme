@@ -8,6 +8,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -103,6 +104,12 @@ func (b *AliasBuffer) syncCreate(label string) (*hme.CreateResult, string, error
 		res, err := b.be.CreateAlias(target.ID, label)
 		if err == nil && res != nil {
 			return res, target.ID, nil
+		}
+		if err != nil {
+			var be *BackendError
+			if (errors.As(err, &be) && be.Code == "UPSTREAM_OUTCOME_UNKNOWN") || errors.Is(err, hme.ErrOutcomeUnknown) {
+				return nil, "", err
+			}
 		}
 	}
 	return nil, "", fmt.Errorf("所有可用账号创建别名均失败")

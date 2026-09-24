@@ -380,6 +380,10 @@ func (s *Scheduler) processAccount(a account.Summary, countPerAccount int, stopC
 		if err != nil {
 			errTotal++
 			errStr := err.Error()
+			if strings.Contains(errStr, "UPSTREAM_OUTCOME_UNKNOWN") || strings.Contains(errStr, "outcome unknown") || strings.Contains(errStr, "结果未知") {
+				s.logs.Add(fmt.Sprintf("[%s] 遭遇上游写操作结果未知 (%v)，立即停止本轮补货以防重复创号", accName, err))
+				break
+			}
 			if strings.Contains(errStr, "RATE_LIMITED") || strings.Contains(errStr, "配额") {
 				s.logs.Add(fmt.Sprintf("[%s] 本小时额度已用满 (%d/%d)", accName, cfg.HourlyQuota, cfg.HourlyQuota))
 				break

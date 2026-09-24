@@ -337,6 +337,13 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 					accountID = candID
 					break
 				}
+				// F03 闭环: 若上游写操作结果未知，严禁换账号重试同一业务操作，必须立即阻断并上抛！
+				if err != nil {
+					var be *BackendError
+					if (errors.As(err, &be) && be.Code == "UPSTREAM_OUTCOME_UNKNOWN") || errors.Is(err, hme.ErrOutcomeUnknown) {
+						break
+					}
+				}
 			}
 		}
 

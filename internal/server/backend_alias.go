@@ -87,7 +87,7 @@ func (b *managerBackend) CreateAlias(accountID, label string) (*hme.CreateResult
 		return nil
 	})
 	if err != nil {
-		if b.store != nil {
+		if !errors.Is(err, hme.ErrOutcomeUnknown) && b.store != nil {
 			b.store.ReleaseQuota(accountID, 1)
 		}
 		if errors.Is(err, account.ErrHMEClientUnavailable) {
@@ -156,7 +156,13 @@ func (b *managerBackend) BatchCreateAlias(accountID string, count int, labelPref
 		resp.SkippedCount = count - resp.CreatedCount
 		resp.LastError = batchErr.Error()
 		if b.store != nil && resp.SkippedCount > 0 {
-			b.store.ReleaseQuota(accountID, resp.SkippedCount)
+			toRelease := resp.SkippedCount
+			if errors.Is(batchErr, hme.ErrOutcomeUnknown) {
+				toRelease--
+			}
+			if toRelease > 0 {
+				b.store.ReleaseQuota(accountID, toRelease)
+			}
 		}
 		if resp.CreatedCount == 0 {
 			if errors.Is(batchErr, account.ErrHMEClientUnavailable) {

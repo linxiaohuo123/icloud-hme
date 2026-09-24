@@ -24,6 +24,8 @@ var (
 	ErrIdempotencyConflict = errors.New("idempotency conflict: request hash mismatch")
 	// ErrOperationPending 幂等操作仍在执行中
 	ErrOperationPending = errors.New("operation is pending")
+	// ErrOperationOutcomeUnknown 幂等操作结果未知 (需要一致性核对，严禁覆盖或换号生成第二候选)
+	ErrOperationOutcomeUnknown = errors.New("operation outcome unknown, reconciliation required")
 	// ErrAllocationNotFound 未找到分配记录
 	ErrAllocationNotFound = errors.New("allocation not found")
 	// ErrAllocationConflict 别名已归属于其他主体或历史分配冲突
