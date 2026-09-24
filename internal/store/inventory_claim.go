@@ -38,12 +38,25 @@ func (s *Store) ClaimInventoryAlias(
 		legacyHash = reqHash[idx+len("|legacy:"):]
 	}
 
-	isHashMatch := func(stored string) bool {
+	// isStoredMatch 严格判定操作指纹是否等价 (Fail-Closed 原则):
+	// 1. stored 为空时绝对判定为冲突 (严禁 wildcard 通配匹配);
+	// 2. stored 以 v2: 开头时, 仅且仅当 stored == currentHash 才放行, 严禁降级比较 legacy;
+	// 3. stored 为旧版 legacy 格式时:
+	//    - 只有 operation 状态为 succeeded 时才允许有限兼容比对 (旧版 failed 记录无法安全证明无副作用/参数等价, 严禁升级重试);
+	//    - 只有 legacyHash 非空且 stored == legacyHash 时才放行;
+	// 4. 其他任何无法证明等价的情况一律判定为冲突 (409 IDEMPOTENCY_CONFLICT).
+	isStoredMatch := func(stored, state string) bool {
 		if stored == "" || currentHash == "" {
-			return true
+			return false
 		}
 		if stored == currentHash {
 			return true
+		}
+		if strings.HasPrefix(stored, "v2:") {
+			return false
+		}
+		if state != "succeeded" {
+			return false
 		}
 		if legacyHash != "" && stored == legacyHash {
 			return true
@@ -64,7 +77,7 @@ func (s *Store) ClaimInventoryAlias(
 		)
 
 		if err == nil {
-			if !isHashMatch(op.RequestHash) {
+			if !isStoredMatch(op.RequestHash, op.State) {
 				return nil, nil, ErrIdempotencyConflict
 			}
 			if op.State == "succeeded" {
@@ -84,14 +97,18 @@ func (s *Store) ClaimInventoryAlias(
 				if op.CandidateEmail != "" && !strings.EqualFold(alloc.AliasEmail, op.CandidateEmail) {
 					return nil, &op, fmt.Errorf("inconsistent operation state: email mismatch (%s vs %s)", alloc.AliasEmail, op.CandidateEmail)
 				}
+				// 额外核对业务标签: 若基于 legacyHash 匹配，必须能证明 business_tag 确实匹配
+				if !strings.HasPrefix(op.RequestHash, "v2:") && tag != "" && alloc.BusinessTag != "" && !strings.EqualFold(alloc.BusinessTag, tag) {
+					return nil, &op, ErrIdempotencyConflict
+				}
 				return &alloc, &op, nil
 			}
 			if op.State == "pending" {
 				return nil, &op, ErrOperationPending
 			}
 			if op.State == "failed" {
-				if op.ErrorCode == "NO_AVAILABLE_INVENTORY" && op.ResultRef == "" {
-					// F05: 可证明无副作用的池空历史，允许进入下方事务进行重试
+				if strings.HasPrefix(op.RequestHash, "v2:") && op.ErrorCode == "NO_AVAILABLE_INVENTORY" && op.ResultRef == "" {
+					// F05: 仅限规范 v2 且可证明无副作用的池空历史，允许进入下方事务进行重试
 					retryOp = &op
 				} else {
 					if op.ErrorCode != "" {
@@ -182,7 +199,7 @@ func (s *Store) ClaimInventoryAlias(
 					if qErr != nil {
 						return nil, nil, fmt.Errorf("failed to read existing operation after unique conflict: %w", qErr)
 					}
-					if !isHashMatch(existingOp.RequestHash) {
+					if !isStoredMatch(existingOp.RequestHash, existingOp.State) {
 						return nil, &existingOp, ErrIdempotencyConflict
 					}
 					if existingOp.State == "succeeded" {
@@ -194,6 +211,9 @@ func (s *Store) ClaimInventoryAlias(
 						`, existingOp.ResultRef).Scan(&alloc.AllocationID, &alloc.AliasEmail, &alloc.AccountID, &alloc.OwnerKind, &alloc.OwnerID, &alloc.BusinessTag, &alloc.AllocatedAt, &alloc.Status)
 						if allocErr != nil {
 							return nil, &existingOp, fmt.Errorf("inconsistent operation state: allocation record not found for result_ref %s: %w", existingOp.ResultRef, allocErr)
+						}
+						if !strings.HasPrefix(existingOp.RequestHash, "v2:") && tag != "" && alloc.BusinessTag != "" && !strings.EqualFold(alloc.BusinessTag, tag) {
+							return nil, &existingOp, ErrIdempotencyConflict
 						}
 						return &alloc, &existingOp, nil
 					}

@@ -282,11 +282,12 @@ func TestContract_F06_PendingResponseUnifiedFormat(t *testing.T) {
 	})
 
 	idempKey := "key_pending_sample"
+	v2Hash := ComputeAllocationRequestHash("default", "", "", "pool")
 	// 预先向 operations 插入一条 pending 操作
 	_, _ = st.DB().Exec(`
 		INSERT INTO operations (operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, created_at, updated_at)
-		VALUES ('op_pending_1', 'token', 'tok_f06_pending', 'v2_allocate', ?, 'tag=default&account_id=&label=', 'pending', '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z')
-	`, idempKey)
+		VALUES ('op_pending_1', 'token', 'tok_f06_pending', 'v2_allocate', ?, ?, 'pending', '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z')
+	`, idempKey, v2Hash)
 
 	req, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"default"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -523,3 +524,131 @@ func TestContract_LegacyFingerprintCompatibilityReplay(t *testing.T) {
 		t.Fatalf("旧指纹回放结果不匹配: expected=(%s, %s), got=(%s, %s)", email, allocID, out.Data.Email, out.Data.LeaseID)
 	}
 }
+
+// TestContract_LegacyHashModeAmbiguityMustConflict 验证旧版无 mode 指纹在明确不同 mode 时必须报 409
+func TestContract_LegacyHashModeAmbiguityMustConflict(t *testing.T) {
+	st, _, ts := setupAllocTestServer(t)
+	defer st.Close()
+	defer ts.Close()
+
+	_ = st.SaveToken(store.APIToken{ID: "tok_legacy_mode", Token: "sec_legacy_mode", Scopes: "allocate"})
+
+	idempKey := "key_legacy_mode_ambiguity"
+	legacyHash := "tag=default&account_id=&label="
+	email := "legacy_mode@icloud.com"
+	allocID := "alloc_legacy_m01"
+	opID := "op_legacy_m01"
+	now := "2026-09-20T00:00:00Z"
+
+	_, _ = st.DB().Exec(`
+		INSERT INTO alias_allocations (allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status)
+		VALUES (?, ?, 'acc_1', 'token', 'tok_legacy_mode', 'default', ?, 'allocated')
+	`, allocID, email, now)
+	_, _ = st.DB().Exec(`
+		INSERT INTO operations (operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, candidate_email, result_ref, created_at, updated_at)
+		VALUES (?, 'token', 'tok_legacy_mode', 'v2_allocate', ?, ?, 'succeeded', ?, ?, ?, ?)
+	`, opID, idempKey, legacyHash, email, allocID, now, now)
+
+	// 新请求使用相同 tag/label，但明确指定 mode="pool_only"
+	req, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"default","mode":"pool_only"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sec_legacy_mode")
+	req.Header.Set("Idempotency-Key", idempKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("请求网络异常: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("旧指纹mode歧义期望 409 Conflict, 实际得到: %d", resp.StatusCode)
+	}
+}
+
+// TestContract_LegacyConcatenationCollisionMustNotReplay 验证旧版拼接碰撞请求绝不能错误回放
+func TestContract_LegacyConcatenationCollisionMustNotReplay(t *testing.T) {
+	st, _, ts := setupAllocTestServer(t)
+	defer st.Close()
+	defer ts.Close()
+
+	_ = st.SaveToken(store.APIToken{ID: "tok_legacy_collision", Token: "sec_legacy_collision", Scopes: "allocate"})
+
+	idempKey := "key_legacy_collision"
+	// A: tag="default&account_id=&label=x", label="y"
+	// B: tag="default", label="x&account_id=&label=y"
+	// 两者旧版拼接均为 "tag=default&account_id=&label=x&account_id=&label=y"
+	legacyCollisionHash := "tag=default&account_id=&label=x&account_id=&label=y"
+	emailA := "legacy_collision_a@icloud.com"
+	allocIDA := "alloc_legacy_col_a"
+	opIDA := "op_legacy_col_a"
+	now := "2026-09-20T00:00:00Z"
+
+	_, _ = st.DB().Exec(`
+		INSERT INTO alias_allocations (allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status)
+		VALUES (?, ?, 'acc_1', 'token', 'tok_legacy_collision', 'default&account_id=&label=x', ?, 'allocated')
+	`, allocIDA, emailA, now)
+	_, _ = st.DB().Exec(`
+		INSERT INTO operations (operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, candidate_email, result_ref, created_at, updated_at)
+		VALUES (?, 'token', 'tok_legacy_collision', 'v2_allocate', ?, ?, 'succeeded', ?, ?, ?, ?)
+	`, opIDA, idempKey, legacyCollisionHash, emailA, allocIDA, now, now)
+
+	// 使用相同 Idempotency-Key 请求 B
+	reqB, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"default","label":"x&account_id=&label=y"}`))
+	reqB.Header.Set("Content-Type", "application/json")
+	reqB.Header.Set("Authorization", "Bearer sec_legacy_collision")
+	reqB.Header.Set("Idempotency-Key", idempKey)
+
+	respB, err := http.DefaultClient.Do(reqB)
+	if err != nil {
+		t.Fatalf("请求网络异常: %v", err)
+	}
+	defer respB.Body.Close()
+
+	if respB.StatusCode != http.StatusConflict {
+		t.Fatalf("旧指纹拼接碰撞期望 409 Conflict, 实际得到: %d", respB.StatusCode)
+	}
+}
+
+// TestContract_EmptyStoredRequestHashMustNotWildcardMatch 验证空 stored request_hash 严格 fail-closed
+func TestContract_EmptyStoredRequestHashMustNotWildcardMatch(t *testing.T) {
+	st, _, ts := setupAllocTestServer(t)
+	defer st.Close()
+	defer ts.Close()
+
+	_ = st.SaveToken(store.APIToken{ID: "tok_empty_stored", Token: "sec_empty_stored", Scopes: "allocate"})
+
+	idempKey := "key_empty_stored_hash"
+	opID := "op_empty_stored_01"
+	now := "2026-09-20T00:00:00Z"
+
+	// 插入相同 principal + key，但 request_hash 为空
+	_, _ = st.DB().Exec(`
+		INSERT INTO operations (operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, created_at, updated_at)
+		VALUES (?, 'token', 'tok_empty_stored', 'v2_allocate', ?, '', 'succeeded', ?, ?)
+	`, opID, idempKey, now, now)
+
+	// 新请求发起 v2 分配
+	req, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"default"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sec_empty_stored")
+	req.Header.Set("Idempotency-Key", idempKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("请求网络异常: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("空 stored request_hash 期望 fail-closed 409 Conflict, 实际得到: %d", resp.StatusCode)
+	}
+
+	// 确认底层没有因为空 hash 产生新的分配
+	var count int
+	_ = st.DB().QueryRow(`SELECT COUNT(1) FROM alias_allocations WHERE owner_id = 'tok_empty_stored'`).Scan(&count)
+	if count != 0 {
+		t.Fatalf("空 stored hash 被错误放行并生成了分配凭据: count=%d", count)
+	}
+}
+
