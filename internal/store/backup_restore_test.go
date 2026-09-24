@@ -10,6 +10,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -456,5 +457,208 @@ func TestPR06_FutureBackupRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "newer than supported version") {
 		t.Fatalf("错误信息未包含指定契约 'newer than supported version': %v", err)
+	}
+}
+
+// TestPR06_RestoreRefusesWhileDatabaseInUse 验证运行中的数据库禁止执行 Restore
+func TestPR06_RestoreRefusesWhileDatabaseInUse(t *testing.T) {
+	dataDir := t.TempDir()
+	st, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatalf("NewStore failed: %v", err)
+	}
+	defer st.Close()
+
+	if err := st.SaveSetting("critical_key", "live_data"); err != nil {
+		t.Fatalf("SaveSetting failed: %v", err)
+	}
+
+	// 制作一个合法的待恢复备份
+	backupDir := t.TempDir()
+	validBackup := filepath.Join(backupDir, "valid_backup.db")
+	backupStore, err := NewStore(filepath.Join(backupDir, "src"))
+	if err != nil {
+		t.Fatalf("backupStore failed: %v", err)
+	}
+	if err := backupStore.SaveSetting("critical_key", "backup_data"); err != nil {
+		t.Fatalf("backupStore save setting failed: %v", err)
+	}
+	ctx := context.Background()
+	if err := backupStore.CreateBackup(ctx, validBackup); err != nil {
+		t.Fatalf("CreateBackup failed: %v", err)
+	}
+	backupStore.Close()
+
+	// 2. 保持 st 不关闭，直接调用 RestoreDatabase
+	err = RestoreDatabase(ctx, dataDir, validBackup)
+	if err == nil {
+		t.Fatalf("预期 RestoreDatabase 在数据库被占用时报错，但返回了 nil")
+	}
+	// 4. 必须返回 database in use
+	if !strings.Contains(err.Error(), "database is in use") {
+		t.Fatalf("预期包含 'database is in use'，实际得到: %v", err)
+	}
+
+	// 5. live DB 数据完全不变
+	if val := st.GetSetting("critical_key"); val != "live_data" {
+		t.Fatalf("live DB 数据被篡改: 期望 live_data，实际: %s", val)
+	}
+
+	// 6. backup 也完全不变
+	bakDB, err := sql.Open("sqlite", filepath.ToSlash(validBackup)+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bakVal string
+	if err := bakDB.QueryRow("SELECT value FROM settings WHERE key = 'critical_key'").Scan(&bakVal); err != nil || bakVal != "backup_data" {
+		_ = bakDB.Close()
+		t.Fatalf("backup 文件被意外修改: %s (%v)", bakVal, err)
+	}
+	_ = bakDB.Close()
+
+	// 7. Close Store
+	if err := st.Close(); err != nil {
+		t.Fatalf("st.Close failed: %v", err)
+	}
+
+	// 8. 再次 Restore 才允许成功 (不要 sleep)
+	if err := RestoreDatabase(ctx, dataDir, validBackup); err != nil {
+		t.Fatalf("Store 关闭后再次 RestoreDatabase 失败: %v", err)
+	}
+
+	// 校验恢复后的结果
+	reopened, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatalf("恢复后打开 Store 失败: %v", err)
+	}
+	defer reopened.Close()
+	if val := reopened.GetSetting("critical_key"); val != "backup_data" {
+		t.Fatalf("恢复后数据不符合预期: 期望 backup_data，实际: %s", val)
+	}
+}
+
+// TestPR06_PreRestoreBackupFailureLeavesLiveDatabaseUntouched 验证前置备份失败时立即 fail closed，不破坏现有库
+func TestPR06_PreRestoreBackupFailureLeavesLiveDatabaseUntouched(t *testing.T) {
+	dataDir := t.TempDir()
+	st, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatalf("NewStore failed: %v", err)
+	}
+	if err := st.SaveSetting("critical_key", "original"); err != nil {
+		t.Fatalf("SaveSetting failed: %v", err)
+	}
+	st.Close()
+
+	// 2. 创建有效 restore backup: critical_key=backup
+	backupDir := t.TempDir()
+	validBackup := filepath.Join(backupDir, "valid.db")
+	backupStore, err := NewStore(filepath.Join(backupDir, "src"))
+	if err != nil {
+		t.Fatalf("backupStore init failed: %v", err)
+	}
+	if err := backupStore.SaveSetting("critical_key", "backup"); err != nil {
+		t.Fatalf("backupStore save setting failed: %v", err)
+	}
+	ctx := context.Background()
+	if err := backupStore.CreateBackup(ctx, validBackup); err != nil {
+		t.Fatalf("CreateBackup failed: %v", err)
+	}
+	backupStore.Close()
+
+	// 3. 在 pre-restore backup 前确定性注入 error
+	injectedErr := errors.New("injected pre-restore backup failure")
+	SetBeforePreRestoreBackupHookForTest(func() error {
+		return injectedErr
+	})
+	defer SetBeforePreRestoreBackupHookForTest(nil)
+
+	// 4. RestoreDatabase 必须失败
+	err = RestoreDatabase(ctx, dataDir, validBackup)
+	if err == nil {
+		t.Fatalf("预期 RestoreDatabase 注入失败，但返回成功")
+	}
+
+	// 5. 重新 NewStore
+	reopened, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatalf("重新打开 Store 失败: %v", err)
+	}
+	defer reopened.Close()
+
+	// 6. critical_key 仍严格为 original
+	// 7. 没有 swap，8. 没有删除 live data，9. 不应留下假成功的 restore
+	if val := reopened.GetSetting("critical_key"); val != "original" {
+		t.Fatalf("critical_key 未能保持 original: 得到 %s", val)
+	}
+}
+
+// TestPR06_PostSwapValidationFailureRestoresExactPreRestoreState 验证 swap 后验证失败必须从权威一致性快照回滚
+func TestPR06_PostSwapValidationFailureRestoresExactPreRestoreState(t *testing.T) {
+	dataDir := t.TempDir()
+	st, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatalf("NewStore failed: %v", err)
+	}
+	if err := st.SaveSetting("critical_key", "original"); err != nil {
+		t.Fatalf("SaveSetting failed: %v", err)
+	}
+	st.Close()
+
+	// 2. 创建有效 restore backup: critical_key=new
+	backupDir := t.TempDir()
+	validBackup := filepath.Join(backupDir, "valid_new.db")
+	backupStore, err := NewStore(filepath.Join(backupDir, "src"))
+	if err != nil {
+		t.Fatalf("backupStore init failed: %v", err)
+	}
+	if err := backupStore.SaveSetting("critical_key", "new"); err != nil {
+		t.Fatalf("backupStore save setting failed: %v", err)
+	}
+	ctx := context.Background()
+	if err := backupStore.CreateBackup(ctx, validBackup); err != nil {
+		t.Fatalf("CreateBackup failed: %v", err)
+	}
+	backupStore.Close()
+
+	// 3. 使用 hook 在新 DB 已 swap 后、NewStore 验证前注入失败
+	injectedErr := errors.New("injected post-swap validation failure")
+	SetBeforeRestoredDatabaseValidationHookForTest(func() error {
+		return injectedErr
+	})
+	defer SetBeforeRestoredDatabaseValidationHookForTest(nil)
+
+	// 4. 调用 Restore，预期返回 error
+	err = RestoreDatabase(ctx, dataDir, validBackup)
+	if err == nil {
+		t.Fatalf("预期 RestoreDatabase 失败，但返回成功")
+	}
+
+	// 5. 随后重新 NewStore
+	reopened, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatalf("重新打开 Store 失败: %v", err)
+	}
+	defer reopened.Close()
+
+	// 6. key 必须仍为 original
+	if val := reopened.GetSetting("critical_key"); val != "original" {
+		t.Fatalf("回滚后数据未恢复为 original: 得到 %s", val)
+	}
+
+	// 7. 且 pre-restore snapshot 存在
+	backupsDir := filepath.Join(dataDir, "backups")
+	entries, err := os.ReadDir(backupsDir)
+	if err != nil {
+		t.Fatalf("读取 backups 目录失败: %v", err)
+	}
+	foundPreRestore := false
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "pre-restore-") && strings.HasSuffix(entry.Name(), ".db") {
+			foundPreRestore = true
+			break
+		}
+	}
+	if !foundPreRestore {
+		t.Fatalf("未找到 pre-restore-*.db 快照文件")
 	}
 }

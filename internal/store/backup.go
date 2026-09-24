@@ -16,8 +16,29 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
+
+var (
+	backupHookMu                                sync.RWMutex
+	beforePreRestoreBackupHookForTest           func() error
+	beforeRestoredDatabaseValidationHookForTest func() error
+)
+
+// SetBeforePreRestoreBackupHookForTest 设置恢复前置备份注入挂钩 (测试专用)
+func SetBeforePreRestoreBackupHookForTest(hook func() error) {
+	backupHookMu.Lock()
+	defer backupHookMu.Unlock()
+	beforePreRestoreBackupHookForTest = hook
+}
+
+// SetBeforeRestoredDatabaseValidationHookForTest 设置新库替换后验证前注入挂钩 (测试专用)
+func SetBeforeRestoredDatabaseValidationHookForTest(hook func() error) {
+	backupHookMu.Lock()
+	defer backupHookMu.Unlock()
+	beforeRestoredDatabaseValidationHookForTest = hook
+}
 
 // quickCheck 执行 PRAGMA quick_check 检查数据库物理完整性
 func quickCheck(db *sql.DB) error {
@@ -110,8 +131,56 @@ func (s *Store) CreateBackup(ctx context.Context, destination string) error {
 	return createOnlineBackup(ctx, s.db, destination)
 }
 
+// restoreFileFromSnapshot 使用临时文件 -> fsync -> 原子 rename 从一致性快照恢复目标文件
+func restoreFileFromSnapshot(srcSnapshot, dstFile string) error {
+	tmpPath := dstFile + ".rollback.tmp"
+	_ = os.Remove(tmpPath)
+
+	src, err := os.Open(srcSnapshot)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(dst, src); err != nil {
+		_ = dst.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	if err := dst.Sync(); err != nil {
+		_ = dst.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	if err := dst.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	if err := os.Rename(tmpPath, dstFile); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	_ = os.Chmod(dstFile, 0600)
+	return nil
+}
+
 // RestoreDatabase 实现离线数据库一致性恢复 (package-level API)
 func RestoreDatabase(ctx context.Context, dataDir string, backupPath string) error {
+	// 0. 尝试取得数据目录独占排他锁；若已被运行中的 Store/Server 持有则立即硬拒绝，绝不触碰生产库
+	lock, err := acquireDataDirLock(dataDir)
+	if err != nil {
+		return fmt.Errorf("database is in use; stop icloud-hme before restore: %w", err)
+	}
+	defer lock.Close()
+
 	// 1. 校验 backup 文件存在且为普通文件
 	stat, err := os.Stat(backupPath)
 	if err != nil {
@@ -152,24 +221,46 @@ func RestoreDatabase(ctx context.Context, dataDir string, backupPath string) err
 
 	liveDBPath := filepath.Join(dataDir, "icloud_hme.db")
 
-	// 5. 如果当前 dataDir 已有数据库：先生成一致性的 pre-restore-<timestamp>.db 快照，绝不能简单复制主 db 文件
+	// 5. 如果当前 dataDir 已有数据库：先生成一致性的 pre-restore-<timestamp>.db 快照 (Fail-Closed: 失败直接中断，绝不继续破坏现场)
+	var preRestorePath string
 	if liveStat, err := os.Stat(liveDBPath); err == nil && liveStat.Size() > 0 {
 		backupsDir := filepath.Join(dataDir, "backups")
-		_ = os.MkdirAll(backupsDir, 0700)
+		if err := os.MkdirAll(backupsDir, 0700); err != nil {
+			return fmt.Errorf("create backups directory failed: %w", err)
+		}
+		_ = os.Chmod(backupsDir, 0700)
+
 		baseName := fmt.Sprintf("pre-restore-%s", time.Now().UTC().Format("20060102T150405Z"))
-		preRestorePath := filepath.Join(backupsDir, baseName+".db")
+		targetPath := filepath.Join(backupsDir, baseName+".db")
 		for seq := 1; ; seq++ {
-			if _, err := os.Stat(preRestorePath); os.IsNotExist(err) {
+			if _, err := os.Stat(targetPath); os.IsNotExist(err) {
 				break
 			}
-			preRestorePath = filepath.Join(backupsDir, fmt.Sprintf("%s_%d.db", baseName, seq))
+			targetPath = filepath.Join(backupsDir, fmt.Sprintf("%s_%d.db", baseName, seq))
+		}
+
+		backupHookMu.RLock()
+		preHook := beforePreRestoreBackupHookForTest
+		backupHookMu.RUnlock()
+		if preHook != nil {
+			if err := preHook(); err != nil {
+				return fmt.Errorf("pre-restore backup hook failed: %w", err)
+			}
 		}
 
 		liveDB, openErr := sql.Open("sqlite", fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)", filepath.ToSlash(liveDBPath)))
-		if openErr == nil {
-			_ = createOnlineBackup(ctx, liveDB, preRestorePath)
-			_ = liveDB.Close()
+		if openErr != nil {
+			return fmt.Errorf("open live database for pre-restore backup failed: %w", openErr)
 		}
+		bakErr := createOnlineBackup(ctx, liveDB, targetPath)
+		closeErr := liveDB.Close()
+		if bakErr != nil {
+			return fmt.Errorf("pre-restore backup failed: %w", bakErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close live database after pre-restore backup failed: %w", closeErr)
+		}
+		preRestorePath = targetPath
 	}
 
 	// 6. 将 restore source 复制到 icloud_hme.db.restore.tmp，权限 0600
@@ -226,19 +317,44 @@ func RestoreDatabase(ctx context.Context, dataDir string, backupPath string) err
 	_ = os.Remove(filepath.Join(dataDir, "icloud_hme.db-wal"))
 	_ = os.Remove(filepath.Join(dataDir, "icloud_hme.db-shm"))
 
-	// 10. 再由正常 NewStore 打开恢复后的数据库 (自动校验 integrity、按需执行 migration 及 schema validation)
-	st, err := NewStore(dataDir)
-	if err != nil {
-		// 恢复失败：回滚现场
+	// 10. Hook & NewStore 验证：若校验失败，必须从一致性快照 preRestorePath 进行回滚
+	backupHookMu.RLock()
+	valHook := beforeRestoredDatabaseValidationHookForTest
+	backupHookMu.RUnlock()
+
+	var validationErr error
+	if valHook != nil {
+		validationErr = valHook()
+	}
+	if validationErr == nil {
+		// 校验恢复库完整性与架构兼容性 (因当前函数已持有独占锁，newStoreWithLock 传 nil lock 避免重复申请)
+		st, err := newStoreWithLock(dataDir, nil)
+		if err != nil {
+			validationErr = err
+		} else {
+			_ = st.Close()
+		}
+	}
+
+	if validationErr != nil {
+		// 恢复验证失败：必须从权威一致性快照 preRestorePath 进行回滚！
+		// 恢复 rollback snapshot 采用: temp -> fsync -> atomic rename，并清理新 restore 产生的 WAL/SHM
+		_ = os.Remove(filepath.Join(dataDir, "icloud_hme.db-wal"))
+		_ = os.Remove(filepath.Join(dataDir, "icloud_hme.db-shm"))
 		_ = os.Remove(liveDBPath)
-		if hasLiveDB {
+
+		if preRestorePath != "" {
+			if rErr := restoreFileFromSnapshot(preRestorePath, liveDBPath); rErr != nil {
+				return fmt.Errorf("validation failed: %w; rollback to pre-restore snapshot failed: %v", validationErr, rErr)
+			}
+		} else if hasLiveDB {
 			_ = os.Rename(liveBakPath, liveDBPath)
 		}
-		return fmt.Errorf("failed to open restored database via NewStore: %w", err)
+		// preRestorePath 永久保留，绝不删除
+		return fmt.Errorf("failed to validate restored database: %w", validationErr)
 	}
-	_ = st.Close()
 
-	// 恢复确认成功，清理临时 rollback 副本 (注意：pre-restore-*.db 必须永久保留，绝不删除)
+	// 恢复确认成功，清理临时 rollback 副本 (注意：preRestorePath 必须永久保留，绝不删除)
 	_ = os.Remove(liveBakPath)
 
 	return nil

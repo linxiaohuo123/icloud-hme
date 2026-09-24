@@ -53,6 +53,7 @@ func newOpaqueID(prefix string) string {
 type Store struct {
 	mu             sync.Mutex
 	backupMu       sync.Mutex
+	instanceLock   dataDirLock
 	dataDir        string
 	db             *sql.DB
 	activityCh     chan string
@@ -73,6 +74,25 @@ func NewStore(dataDir string) (*Store, error) {
 	if dataDir == "" {
 		dataDir = "data"
 	}
+	lock, err := acquireDataDirLock(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("acquire data directory lock failed: %w", err)
+	}
+
+	st, err := newStoreWithLock(dataDir, lock)
+	if err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	return st, nil
+}
+
+// newStoreWithoutLockForTest 测试专用：创建连接到同一目录但不申请目录排他锁的 Store (用于同进程多连接并发事务测试)
+func newStoreWithoutLockForTest(dataDir string) (*Store, error) {
+	return newStoreWithLock(dataDir, nil)
+}
+
+func newStoreWithLock(dataDir string, lock dataDirLock) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return nil, fmt.Errorf("创建数据目录失败: %w", err)
 	}
@@ -99,11 +119,12 @@ func NewStore(dataDir string) (*Store, error) {
 	db.SetConnMaxLifetime(time.Hour)
 
 	s := &Store{
-		dataDir:     dataDir,
-		db:          db,
-		activityCh:  make(chan string, 256),
-		stopCh:      make(chan struct{}),
-		flusherDone: make(chan struct{}),
+		instanceLock: lock,
+		dataDir:      dataDir,
+		db:           db,
+		activityCh:   make(chan string, 256),
+		stopCh:       make(chan struct{}),
+		flusherDone:  make(chan struct{}),
 	}
 
 	if err := s.initSchema(dbExistedBefore); err != nil {
@@ -149,10 +170,17 @@ func (s *Store) Close() error {
 	// 等待最后一次批量刷盘完全执行完毕，杜绝与 db.Close() 竞态
 	<-s.flusherDone
 
+	var dbErr error
 	if s.db != nil {
-		return s.db.Close()
+		dbErr = s.db.Close()
 	}
-	return nil
+	if s.instanceLock != nil {
+		if lockErr := s.instanceLock.Close(); lockErr != nil && dbErr == nil {
+			dbErr = lockErr
+		}
+		s.instanceLock = nil
+	}
+	return dbErr
 }
 
 // LockForTest 测试专用：模拟业务长事务占有业务大锁。

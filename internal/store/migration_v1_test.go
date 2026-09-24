@@ -470,3 +470,170 @@ func TestMIG11_FreshInstallEqualsMigratedSchema(t *testing.T) {
 		}
 	}
 }
+
+// MIG12: 验证关键 UNIQUE 契约在无约束历史库升级时被强制补全且生效
+func TestMIG12_CriticalUniqueConstraintsEnforced(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "icloud_hme.db")
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 构造 user_version=0 的 operations 表：包含所有字段，但故意没有 UNIQUE 约束与 UNIQUE 索引
+	v0DDL := `
+		CREATE TABLE operations (
+			operation_id TEXT PRIMARY KEY,
+			principal_kind TEXT NOT NULL,
+			principal_id TEXT NOT NULL,
+			operation_kind TEXT NOT NULL,
+			idempotency_key TEXT NOT NULL,
+			request_hash TEXT NOT NULL DEFAULT '',
+			state TEXT NOT NULL,
+			candidate_email TEXT DEFAULT '',
+			result_ref TEXT DEFAULT '',
+			error_code TEXT DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		CREATE TABLE api_tokens (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			token TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			last_used_at TEXT
+		);
+		PRAGMA user_version = 0;
+	`
+	if _, err := rawDB.Exec(v0DDL); err != nil {
+		t.Fatal(err)
+	}
+
+	// 写入无重复的一条数据
+	insertOp := `INSERT INTO operations (operation_id, principal_kind, principal_id, operation_kind, idempotency_key, state, created_at, updated_at)
+		VALUES ('op_1', 'token', 'tok_1', 'allocate', 'idem_key_1', 'succeeded', '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z')`
+	if _, err := rawDB.Exec(insertOp); err != nil {
+		t.Fatal(err)
+	}
+	_ = rawDB.Close()
+
+	// 启动 NewStore 执行升级
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("MIG12 失败: 历史库升级失败: %v", err)
+	}
+	defer st.Close()
+
+	// 1. 验证 user_version 升为 1
+	var v int
+	if err := st.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 1 {
+		t.Fatalf("MIG12 失败: user_version 未升至 1: %d (%v)", v, err)
+	}
+
+	// 2. 验证 UNIQUE 存在
+	hasUQ, err := hasUniqueConstraint(st.db, "operations", []string{"principal_kind", "principal_id", "operation_kind", "idempotency_key"})
+	if err != nil || !hasUQ {
+		t.Fatalf("MIG12 失败: operations 关键 UNIQUE 契约缺失: hasUQ=%v, err=%v", hasUQ, err)
+	}
+
+	// 3. 尝试插入第二条相同 idempotency tuple 的记录，必须发生 SQLite 约束违背
+	duplicateInsert := `INSERT INTO operations (operation_id, principal_kind, principal_id, operation_kind, idempotency_key, state, created_at, updated_at)
+		VALUES ('op_2', 'token', 'tok_1', 'allocate', 'idem_key_1', 'failed', '2026-09-24T00:01:00Z', '2026-09-24T00:01:00Z')`
+	_, insertErr := st.db.Exec(duplicateInsert)
+	if insertErr == nil {
+		t.Fatalf("MIG12 失败: 插入重复 idempotency tuple 成功，UNIQUE 约束未生效")
+	}
+	if !strings.Contains(insertErr.Error(), "UNIQUE") && !strings.Contains(insertErr.Error(), "constraint") {
+		t.Fatalf("MIG12 失败: 错误非预期约束错误: %v", insertErr)
+	}
+}
+
+// MIG13: 验证历史数据存在重复冲突时升级 fail closed，回滚事务且保留所有数据与预迁移备份
+func TestMIG13_DuplicateLegacyRowsFailClosed(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "icloud_hme.db")
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 构造 v0 库，operations 没有 unique 约束，并且故意写入两条相同 idempotency tuple 的数据
+	v0DDL := `
+		CREATE TABLE operations (
+			operation_id TEXT PRIMARY KEY,
+			principal_kind TEXT NOT NULL,
+			principal_id TEXT NOT NULL,
+			operation_kind TEXT NOT NULL,
+			idempotency_key TEXT NOT NULL,
+			request_hash TEXT NOT NULL DEFAULT '',
+			state TEXT NOT NULL,
+			candidate_email TEXT DEFAULT '',
+			result_ref TEXT DEFAULT '',
+			error_code TEXT DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		PRAGMA user_version = 0;
+	`
+	if _, err := rawDB.Exec(v0DDL); err != nil {
+		t.Fatal(err)
+	}
+
+	ins1 := `INSERT INTO operations (operation_id, principal_kind, principal_id, operation_kind, idempotency_key, state, created_at, updated_at)
+		VALUES ('op_dup_1', 'token', 'tok_shared', 'allocate', 'same_idem_key', 'succeeded', '2026-09-24T00:00:00Z', '2026-09-24T00:00:00Z')`
+	ins2 := `INSERT INTO operations (operation_id, principal_kind, principal_id, operation_kind, idempotency_key, state, created_at, updated_at)
+		VALUES ('op_dup_2', 'token', 'tok_shared', 'allocate', 'same_idem_key', 'failed', '2026-09-24T00:01:00Z', '2026-09-24T00:01:00Z')`
+	if _, err := rawDB.Exec(ins1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rawDB.Exec(ins2); err != nil {
+		t.Fatal(err)
+	}
+	_ = rawDB.Close()
+
+	// 启动 NewStore 执行升级，预期必须失败 (fail closed)
+	st, err := NewStore(dir)
+	if err == nil {
+		st.Close()
+		t.Fatalf("MIG13 失败: 存在重复记录时 NewStore 预期报错，但返回成功")
+	}
+
+	// 重新通过原生连接检查数据库状态
+	checkDB, err := sql.Open("sqlite", filepath.ToSlash(dbPath)+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer checkDB.Close()
+
+	// 1. user_version 仍为 0
+	var v int
+	if err := checkDB.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 0 {
+		t.Fatalf("MIG13 失败: user_version 未保持 0: %d (%v)", v, err)
+	}
+
+	// 2. 原两条 rows 都还在，没有静默删除
+	var rowCount int
+	if err := checkDB.QueryRow("SELECT COUNT(*) FROM operations WHERE idempotency_key = 'same_idem_key'").Scan(&rowCount); err != nil {
+		t.Fatal(err)
+	}
+	if rowCount != 2 {
+		t.Fatalf("MIG13 失败: 重复记录被静默删除或修改，期望 2 行，实际: %d 行", rowCount)
+	}
+
+	// 3. pre-migration backup 存在
+	backupsDir := filepath.Join(dir, "backups")
+	entries, err := os.ReadDir(backupsDir)
+	if err != nil {
+		t.Fatalf("读取 backups 目录失败: %v", err)
+	}
+	foundPreMigration := false
+	for _, entry := range entries {
+		if (strings.HasPrefix(entry.Name(), "pre-migrate-") || strings.HasPrefix(entry.Name(), "pre-migration-")) && strings.HasSuffix(entry.Name(), ".db") {
+			foundPreMigration = true
+			break
+		}
+	}
+	if !foundPreMigration {
+		t.Fatalf("MIG13 失败: 未找到 pre-migration 备份文件")
+	}
+}

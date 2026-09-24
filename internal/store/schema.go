@@ -10,6 +10,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -84,6 +85,116 @@ func ensureColumn(exec schemaExecutor, tableName, colName, colDef string) error 
 		}
 	}
 	return nil
+}
+
+// hasUniqueConstraint 检查指定表是否具有覆盖指定列且列顺序完全匹配的 UNIQUE 约束或索引
+func hasUniqueConstraint(exec schemaExecutor, table string, columns []string) (bool, error) {
+	rows, err := exec.Query(fmt.Sprintf("PRAGMA index_list(%s)", table))
+	if err != nil {
+		return false, fmt.Errorf("query index_list for %s failed: %w", table, err)
+	}
+	defer rows.Close()
+
+	var uniqueIndexes []string
+	for rows.Next() {
+		var seq int
+		var name string
+		var unique int
+		var origin string
+		var partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			return false, fmt.Errorf("scan index_list for %s failed: %w", table, err)
+		}
+		if unique == 1 {
+			uniqueIndexes = append(uniqueIndexes, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate index_list for %s failed: %w", table, err)
+	}
+
+	for _, idxName := range uniqueIndexes {
+		infoRows, err := exec.Query(fmt.Sprintf("PRAGMA index_info('%s')", strings.ReplaceAll(idxName, "'", "''")))
+		if err != nil {
+			return false, fmt.Errorf("query index_info for %s failed: %w", idxName, err)
+		}
+		var idxCols []string
+		for infoRows.Next() {
+			var seqno, cid int
+			var colName string
+			if err := infoRows.Scan(&seqno, &cid, &colName); err != nil {
+				infoRows.Close()
+				return false, fmt.Errorf("scan index_info for %s failed: %w", idxName, err)
+			}
+			idxCols = append(idxCols, colName)
+		}
+		infoRows.Close()
+		if err := infoRows.Err(); err != nil {
+			return false, fmt.Errorf("iterate index_info for %s failed: %w", idxName, err)
+		}
+
+		if len(idxCols) == len(columns) {
+			match := true
+			for i := range columns {
+				if !strings.EqualFold(idxCols[i], columns[i]) {
+					match = false
+					break
+				}
+			}
+			if match {
+				return true, nil
+			}
+		}
+	}
+
+	// 检查主键 (兼容 INTEGER PRIMARY KEY 或未在 index_list 显式列出的主键)
+	pkRows, err := exec.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, fmt.Errorf("query table_info for %s failed: %w", table, err)
+	}
+	defer pkRows.Close()
+
+	type pkCol struct {
+		name string
+		pk   int
+	}
+	var pkCols []pkCol
+	for pkRows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt any
+		if err := pkRows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, fmt.Errorf("scan table_info for %s failed: %w", table, err)
+		}
+		if pk > 0 {
+			pkCols = append(pkCols, pkCol{name: name, pk: pk})
+		}
+	}
+	if err := pkRows.Err(); err != nil {
+		return false, fmt.Errorf("iterate table_info for %s failed: %w", table, err)
+	}
+
+	if len(pkCols) == len(columns) {
+		for i := 0; i < len(pkCols)-1; i++ {
+			for j := i + 1; j < len(pkCols); j++ {
+				if pkCols[i].pk > pkCols[j].pk {
+					pkCols[i], pkCols[j] = pkCols[j], pkCols[i]
+				}
+			}
+		}
+		match := true
+		for i := range columns {
+			if !strings.EqualFold(pkCols[i].name, columns[i]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // migrateV0ToV1 事务化执行 Version 0 (Legacy/Unversioned) -> Version 1 的全部表结构、字段补充、索引与数据回填
@@ -374,6 +485,47 @@ func migrateV0ToV1(tx *sql.Tx) error {
 		return fmt.Errorf("创建索引失败: %w", err)
 	}
 
+	// 4.1 确保关键业务 UNIQUE Contract (如果缺失则创建明确的 UNIQUE INDEX；若存在历史重复数据则由 SQLite 约束直接 fail closed 回滚)
+	criticalUniques := []struct {
+		table   string
+		index   string
+		columns []string
+	}{
+		{
+			table:   "operations",
+			index:   "uq_operations_idempotency",
+			columns: []string{"principal_kind", "principal_id", "operation_kind", "idempotency_key"},
+		},
+		{
+			table:   "api_tokens",
+			index:   "uq_api_tokens_token",
+			columns: []string{"token"},
+		},
+		{
+			table:   "business_tags",
+			index:   "uq_business_tags_tag",
+			columns: []string{"tag"},
+		},
+		{
+			table:   "alias_allocations",
+			index:   "uq_alias_allocations_alias_email",
+			columns: []string{"alias_email"},
+		},
+	}
+
+	for _, cu := range criticalUniques {
+		has, err := hasUniqueConstraint(tx, cu.table, cu.columns)
+		if err != nil {
+			return fmt.Errorf("check unique constraint for %s failed: %w", cu.table, err)
+		}
+		if !has {
+			q := fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s (%s)", cu.index, cu.table, strings.Join(cu.columns, ", "))
+			if _, err := tx.Exec(q); err != nil {
+				return fmt.Errorf("create unique index %s on %s failed: %w", cu.index, cu.table, err)
+			}
+		}
+	}
+
 	if err := callMigrationStepHook("before_user_version"); err != nil {
 		return err
 	}
@@ -562,6 +714,33 @@ func validateSchema(db *sql.DB) error {
 		err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?", idx).Scan(&count)
 		if err != nil || count == 0 {
 			return fmt.Errorf("schema validation failed: index %s is missing", idx)
+		}
+	}
+
+	// 5. 检查关键 UNIQUE 契约 (绝不在正常启动时自动重建，违背即判定 schema 受损并 fail closed)
+	criticalUniques := []struct {
+		table   string
+		columns []string
+	}{
+		{"business_tags", []string{"tag"}},
+		{"api_tokens", []string{"token"}},
+		{"alias_allocations", []string{"alias_email"}},
+		{"operations", []string{"principal_kind", "principal_id", "operation_kind", "idempotency_key"}},
+		{"alias_inventory", []string{"email"}},
+		{"verification_requests", []string{"request_id"}},
+		{"hme_reserve_intents", []string{"intent_id"}},
+		{"alias_allocations", []string{"allocation_id"}},
+		{"operations", []string{"operation_id"}},
+	}
+	for _, cu := range criticalUniques {
+		has, err := hasUniqueConstraint(db, cu.table, cu.columns)
+		if err != nil {
+			return fmt.Errorf("schema validation failed: check unique constraint on %s(%s) error: %w",
+				cu.table, strings.Join(cu.columns, ", "), err)
+		}
+		if !has {
+			return fmt.Errorf("schema validation failed: unique constraint on %s(%s) is missing",
+				cu.table, strings.Join(cu.columns, ", "))
 		}
 	}
 
