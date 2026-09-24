@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 internal/mail, internal/account
- * [OUTPUT]: 对外提供 managerBackend 的邮件收发与邮箱管理方法 (ListInbox, ListMailboxes, GetMessage, GetMessages, DeleteMessage)、parseMessageID 与 InboxQuery, InboxResult, MessageRef 类型
+ * [OUTPUT]: 对外提供 managerBackend 的邮件收发与邮箱管理方法 (ListInbox, ListMailboxes, GetMessage, GetMessages, DeleteMessage, ScanMailboxUIDPage, GetMailboxBoundaryContext)、parseMessageID 与 InboxQuery, InboxResult, ScanPageQuery, ScanPageResult, MessageRef 类型
  * [POS]: internal/server 的邮件业务门面实现；IMAP folder:uid 与 WebMail ThreadID 分流，批量详情降级尽力返回 WebMail 列表
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -40,6 +40,24 @@ type InboxResult struct {
 	Count     int            `json:"count"`
 	Messages  []mail.Message `json:"messages"`
 	Method    string         `json:"method"`
+}
+
+// ScanPageQuery 定义内部专用增量分页扫描参数 (PR-04A F07)。
+type ScanPageQuery struct {
+	AccountID        string
+	Folder           string
+	UIDValidity      uint32
+	FromUIDInclusive uint32
+	ToUIDInclusive   uint32
+	PageSize         int
+}
+
+// ScanPageResult 定义内部专用增量分页扫描结果 (PR-04A F07)。
+type ScanPageResult struct {
+	UIDValidity uint32         `json:"uid_validity"`
+	Messages    []mail.Message `json:"messages"`
+	NextUID     uint32         `json:"next_uid"`
+	HasMore     bool           `json:"has_more"`
 }
 
 // MessageRef 别名映射至 mail.MessageRef，确保统一规范身份
@@ -442,10 +460,19 @@ func (b *managerBackend) DeleteMessage(accountID string, uid uint32) error {
 	return nil
 }
 
-func (b *managerBackend) GetMailboxBoundary(accountID, folder string) (string, uint32, uint32, error) {
+func (b *managerBackend) GetMailboxBoundaryContext(ctx context.Context, accountID, folder string) (string, uint32, uint32, error) {
+	if err := ctx.Err(); err != nil {
+		return "", 0, 0, err
+	}
+	if folder == "" {
+		folder = "INBOX"
+	}
 	var uidValidity, uidNext uint32
 	var imapErr error
-	poolErr := b.mgr.WithMailClient(accountID, func(mc *mail.Client) error {
+	poolErr := b.mgr.WithMailClientContext(ctx, accountID, func(mc *mail.Client) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		v, n, err := mc.GetMailboxBoundary(folder)
 		if err != nil {
 			imapErr = err
@@ -457,6 +484,9 @@ func (b *managerBackend) GetMailboxBoundary(accountID, folder string) (string, u
 	})
 	if poolErr == nil && imapErr == nil {
 		return "imap", uidValidity, uidNext, nil
+	}
+	if ctx.Err() != nil {
+		return "", 0, 0, ctx.Err()
 	}
 
 	acc, ok := b.mgr.GetAccount(accountID)
@@ -471,6 +501,77 @@ func (b *managerBackend) GetMailboxBoundary(accountID, folder string) (string, u
 		Status:  http.StatusServiceUnavailable,
 		Code:    "BASELINE_UNAVAILABLE",
 		Message: "无法获取邮件基线边界: 邮箱客户端未就绪",
+	}
+}
+
+func (b *managerBackend) GetMailboxBoundary(accountID, folder string) (string, uint32, uint32, error) {
+	return b.GetMailboxBoundaryContext(context.Background(), accountID, folder)
+}
+
+// ScanMailboxUIDPage 执行内部专用增量分页扫描 (PR-04A F07)。
+func (b *managerBackend) ScanMailboxUIDPage(ctx context.Context, q ScanPageQuery) (ScanPageResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ScanPageResult{}, err
+	}
+	folder := strings.TrimSpace(q.Folder)
+	if folder == "" || strings.EqualFold(folder, "all") {
+		folder = "INBOX"
+	}
+	var res ScanPageResult
+	poolErr := b.mgr.WithMailClientContext(ctx, q.AccountID, func(mc *mail.Client) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		pageRes, err := mc.ScanMailboxUIDPage(mail.ScanPageOptions{
+			Folder:           folder,
+			FromUIDInclusive: q.FromUIDInclusive,
+			ToUIDInclusive:   q.ToUIDInclusive,
+			PageSize:         q.PageSize,
+		})
+		if err != nil {
+			return err
+		}
+		if q.UIDValidity > 0 && pageRes.UIDValidity != q.UIDValidity {
+			return mail.ErrUIDValidityMismatch
+		}
+		for i := range pageRes.Messages {
+			pageRes.Messages[i].AccountID = q.AccountID
+			pageRes.Messages[i].Provider = "imap"
+			f := pageRes.Messages[i].Folder
+			if f == "" || strings.EqualFold(f, "inbox") {
+				f = "INBOX"
+			}
+			pageRes.Messages[i].Folder = f
+			ref := mail.MessageRef{
+				Provider:    "imap",
+				AccountID:   q.AccountID,
+				Mailbox:     f,
+				UIDValidity: pageRes.UIDValidity,
+				UID:         pageRes.Messages[i].UID,
+			}
+			pageRes.Messages[i].MessageRef = ref.Encode()
+		}
+		res = ScanPageResult{
+			UIDValidity: pageRes.UIDValidity,
+			Messages:    pageRes.Messages,
+			NextUID:     pageRes.NextUID,
+			HasMore:     pageRes.HasMore,
+		}
+		return nil
+	})
+	if poolErr == nil {
+		return res, nil
+	}
+	if ctx.Err() != nil {
+		return ScanPageResult{}, ctx.Err()
+	}
+	if errors.Is(poolErr, mail.ErrUIDValidityMismatch) {
+		return ScanPageResult{}, mail.ErrUIDValidityMismatch
+	}
+	return ScanPageResult{}, &BackendError{
+		Status:  http.StatusBadRequest,
+		Code:    "CAPABILITY_UNSUPPORTED",
+		Message: "增量分页扫描仅支持 IMAP 模式: " + poolErr.Error(),
 	}
 }
 

@@ -71,6 +71,8 @@ type Backend interface {
 	GetMessages(string, []mail.MessageRef) ([]*mail.FullMessage, error)
 	GetMessagesContext(context.Context, string, []mail.MessageRef) ([]*mail.FullMessage, error)
 	GetMailboxBoundary(string, string) (string, uint32, uint32, error)
+	GetMailboxBoundaryContext(context.Context, string, string) (string, uint32, uint32, error)
+	ScanMailboxUIDPage(context.Context, ScanPageQuery) (ScanPageResult, error)
 	DeleteMessage(string, uint32) error
 	ValidateAccount(string) error
 	CheckProxy(string) (bool, int64, string, error)

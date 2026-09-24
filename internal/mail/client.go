@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 github.com/emersion/go-imap, golang.org/x/net/proxy
  * [OUTPUT]: 对外提供 Client、NewClient、NewClientWithServer、Message、FullMessage
- * [POS]: internal/mail 的 IMAP 邮件读取客户端核心，连接建立与列表搜索；内容拉取由 client_fetch.go 承载，隧道拨号由 dial.go 承载
+ * [POS]: internal/mail 的 IMAP 邮件读取客户端核心，连接建立与列表搜索；内容拉取由 client_fetch.go 承载，增量扫描由 client_scan.go 承载，隧道拨号由 dial.go 承载
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 

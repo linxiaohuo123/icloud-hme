@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 sync, time, net/mail, icloud-hme/internal/mail, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 MailSyncWorker, NewMailSyncWorker
- * [POS]: server 的后台邮件同步器 (PR-07 §10.2 & §10.4)，实现同账号增量批量拉取、账号间有界并发、慢账号隔离与优雅停机平稳等待
+ * [POS]: server 的后台邮件同步器 (PR-07 §10.2 & §10.4, PR-04A F07)，实现同账号增量 UID 升序分页扫描、固定上界、resumable checkpoint、metadata-first 过滤与正文按需批量拉取
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -9,6 +9,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"log"
 	stdmail "net/mail"
 	"strings"
@@ -31,11 +32,18 @@ const unknownAliasMissTTL = 10 * time.Minute
 // maxAliasRouteCache 限制内存路由缓存的条目数。
 const maxAliasRouteCache = 50000
 
-// PR-07 §10.2: 账号间有界并发与慢账号超时隔离常量
+// PR-07 §10.2 & PR-04A F07: 账号间有界并发、慢账号超时隔离与增量扫描分页大小常量
 const (
 	maxConcurrentAccountSync = 5
 	accountSyncTimeout       = 8 * time.Second
+	verificationScanPageSize = 50
 )
+
+type checkpointKey struct {
+	accountID   string
+	mailbox     string
+	uidValidity uint32
+}
 
 // MailSyncWorker 后台增量邮件同步器。
 type MailSyncWorker struct {
@@ -52,9 +60,10 @@ type MailSyncWorker struct {
 	wg             sync.WaitGroup
 	fetchWg        sync.WaitGroup
 	mu             sync.RWMutex
-	aliasToAccount map[string]string    // alias (lower) -> accountID
-	published      map[string]time.Time // "account|folder|uid|recipient" -> 首次发布时间
-	probeMiss      map[string]time.Time // alias -> 上次盲扫未命中的时间
+	aliasToAccount map[string]string         // alias (lower) -> accountID
+	published      map[string]time.Time      // "account|folder|uid|recipient" -> 首次发布时间
+	probeMiss      map[string]time.Time      // alias -> 上次盲扫未命中的时间
+	checkpoints    map[checkpointKey]uint32  // (accountID, mailbox, uidValidity) -> nextUID (PR-04A F07)
 }
 
 // NewMailSyncWorker 创建邮件同步器。st 可为 nil(仅退化为内存归属映射)。
@@ -75,6 +84,7 @@ func NewMailSyncWorker(be Backend, st *store.Store, eventBus *mail.EventBus, int
 		aliasToAccount: make(map[string]string),
 		published:      make(map[string]time.Time),
 		probeMiss:      make(map[string]time.Time),
+		checkpoints:    make(map[checkpointKey]uint32),
 	}
 }
 
@@ -374,12 +384,32 @@ accountLoop:
 	}
 }
 
-// fetchAndPublishBatch 按账号增量批量拉取邮件并分发给多个别名等待者 (PR-07 §10.2 & PR-08 Final Hardening §3)。
-// 单账号仅发起 1 次 ListInboxContext，真实支持上下文超时与取消，且支持增量游标 (SinceUID, Issue 14)。
+// fetchAndPublishBatch 按账号增量批量拉取邮件并分发给多个别名等待者 (PR-07 §10.2 & PR-08 Final Hardening §3 & PR-04A F07)。
 func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID string, aliases []string) bool {
 	if len(aliases) == 0 {
 		return false
 	}
+
+	// PR-04A F07: 若所有待查别名均具备严格基线，单 alias 与多 alias 统一走 UID 升序增量分页扫描引擎
+	if w.store != nil {
+		var globalMinUID uint32
+		allHaveBaseline := true
+		for _, alias := range aliases {
+			uid, err := w.store.GetMinBaselineUIDByEmail(ctx, alias)
+			if err != nil || uid == 0 {
+				allHaveBaseline = false
+				break
+			}
+			if globalMinUID == 0 || uid < globalMinUID {
+				globalMinUID = uid
+			}
+		}
+		if allHaveBaseline && globalMinUID > 0 {
+			return w.scanAndPublishPages(ctx, accountID, aliases, "INBOX", globalMinUID)
+		}
+	}
+
+	// 降级兜底: 无 baseline 的非严格验证码模式 (例如盲扫野别名或无 store 模式)
 	var q InboxQuery
 	if len(aliases) == 1 {
 		q = InboxQuery{
@@ -390,13 +420,6 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 			Days:      1,
 			WithBody:  true,
 		}
-		if w.store != nil {
-			if uid, err := w.store.GetMinBaselineUIDByEmail(ctx, aliases[0]); err == nil && uid > 0 {
-				q.SinceUID = uid
-				q.Folder = "INBOX"
-				q.Limit = 50
-			}
-		}
 	} else {
 		q = InboxQuery{
 			AccountID: accountID,
@@ -404,25 +427,6 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 			Limit:     10,
 			Days:      1,
 			WithBody:  true,
-		}
-		if w.store != nil {
-			var globalMinUID uint32
-			allHaveBaseline := true
-			for _, alias := range aliases {
-				uid, err := w.store.GetMinBaselineUIDByEmail(ctx, alias)
-				if err != nil || uid == 0 {
-					allHaveBaseline = false
-					break
-				}
-				if globalMinUID == 0 || uid < globalMinUID {
-					globalMinUID = uid
-				}
-			}
-			if allHaveBaseline && globalMinUID > 0 {
-				q.SinceUID = globalMinUID
-				q.Folder = "INBOX"
-				q.Limit = 50
-			}
 		}
 	}
 
@@ -450,7 +454,6 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 		}
 
 		for target := range aliasSet {
-			// 定向匹配：必须核验邮件收件人确实包含 target (PR-06 V06, V07)
 			if !msgMatchesRecipient(msg, target) {
 				continue
 			}
@@ -472,6 +475,191 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 			hasMatch = true
 		}
 	}
+	return hasMatch
+}
+
+// scanAndPublishPages 执行基于 UID 升序增量分页、固定上界、resumable checkpoint 与 metadata-first 的流式扫描 (PR-04A F07)。
+func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID string, aliases []string, folder string, baselineUID uint32) bool {
+	if len(aliases) == 0 || baselineUID == 0 {
+		return false
+	}
+	if folder == "" {
+		folder = "INBOX"
+	}
+
+	// 1. 固定 upper bound: 每轮 account scan 开始时获取 UIDVALIDITY 与 UIDNEXT (RFC 3501 UIDNEXT-1)
+	provider, uidValidity, uidNext, err := w.be.GetMailboxBoundaryContext(ctx, accountID, folder)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("[MailSync] 获取账号 %s 邮箱边界失败: %v", accountID, err)
+		}
+		return false
+	}
+	if provider != "imap" || uidValidity == 0 || uidNext <= 1 {
+		return false
+	}
+	scanUpperUID := uidNext - 1
+
+	// 2. Resumable checkpoint 决策与跨代际失效清理
+	cpKey := checkpointKey{
+		accountID:   accountID,
+		mailbox:     folder,
+		uidValidity: uidValidity,
+	}
+
+	w.mu.Lock()
+	// UIDVALIDITY 改变: 旧 checkpoint 失效并清除
+	for k := range w.checkpoints {
+		if k.accountID == accountID && k.mailbox == folder && k.uidValidity != uidValidity {
+			delete(w.checkpoints, k)
+		}
+	}
+
+	cursor := baselineUID
+	if cpNextUID, exists := w.checkpoints[cpKey]; exists {
+		if cpNextUID >= baselineUID {
+			// checkpoint >= baseline: 继续从 checkpoint
+			cursor = cpNextUID
+		} else {
+			// baseline < checkpoint: 新 subscriber 带来更早 baseline，安全 rewind
+			cursor = baselineUID
+			w.checkpoints[cpKey] = baselineUID
+		}
+	}
+	w.mu.Unlock()
+
+	// 若 cursor 已经越过固定上界，说明本轮已无新邮件需要扫描
+	if cursor > scanUpperUID {
+		return false
+	}
+
+	aliasSet := make(map[string]struct{}, len(aliases))
+	for _, a := range aliases {
+		aliasSet[strings.ToLower(strings.TrimSpace(a))] = struct{}{}
+	}
+
+	hasMatch := false
+
+	// 3. 分页增量扫描循环 (UID 从旧到新 UID ascending，pageSize=50)
+	for cursor <= scanUpperUID {
+		if err := ctx.Err(); err != nil {
+			break
+		}
+
+		pageRes, err := w.be.ScanMailboxUIDPage(ctx, ScanPageQuery{
+			AccountID:        accountID,
+			Folder:           folder,
+			UIDValidity:      uidValidity,
+			FromUIDInclusive: cursor,
+			ToUIDInclusive:   scanUpperUID,
+			PageSize:         verificationScanPageSize,
+		})
+		if err != nil {
+			if errors.Is(err, mail.ErrUIDValidityMismatch) {
+				w.mu.Lock()
+				delete(w.checkpoints, cpKey)
+				w.mu.Unlock()
+			}
+			break
+		}
+		if pageRes.UIDValidity != uidValidity {
+			w.mu.Lock()
+			delete(w.checkpoints, cpKey)
+			w.mu.Unlock()
+			break
+		}
+
+		if len(pageRes.Messages) == 0 {
+			// 本轮范围内已无消息，推进到 scanUpperUID + 1
+			w.mu.Lock()
+			w.checkpoints[cpKey] = scanUpperUID + 1
+			w.mu.Unlock()
+			break
+		}
+
+		// 第一阶段: Metadata-first，对活跃 aliases 做结构化收件人匹配，筛选 candidate UID
+		var candidateUIDs []uint32
+		for _, msg := range pageRes.Messages {
+			for target := range aliasSet {
+				if msgMatchesRecipient(msg, target) {
+					candidateUIDs = append(candidateUIDs, msg.UID)
+					break
+				}
+			}
+		}
+
+		// 第二阶段: 仅对 candidate UID 单批拉取正文并提取验证码
+		if len(candidateUIDs) > 0 {
+			refs := make([]mail.MessageRef, 0, len(candidateUIDs))
+			for _, u := range candidateUIDs {
+				refs = append(refs, mail.MessageRef{
+					Provider:    "imap",
+					AccountID:   accountID,
+					Mailbox:     folder,
+					UIDValidity: uidValidity,
+					UID:         u,
+				})
+			}
+			fullMsgs, err := w.be.GetMessagesContext(ctx, accountID, refs)
+			if err != nil {
+				// 网络错误或取消: 不得提前推进未处理的本页 checkpoint
+				break
+			}
+
+			for _, fullMsg := range fullMsgs {
+				if fullMsg == nil {
+					continue
+				}
+				bodyText := fullMsg.Preview
+				if bodyText == "" {
+					bodyText = fullMsg.Body
+				}
+				otp := mail.ExtractOTP(fullMsg.Subject, bodyText)
+				if otp == nil {
+					continue
+				}
+
+				for target := range aliasSet {
+					if !msgMatchesRecipient(fullMsg.Message, target) {
+						continue
+					}
+					if !w.markPublished(accountID, fullMsg.Folder, fullMsg.UIDValidity, fullMsg.UID, fullMsg.ThreadID, fullMsg.Provider, target) {
+						continue
+					}
+					w.eventBus.PublishEvent(&mail.CachedOTP{
+						EventID:     fullMsg.MessageRef,
+						AccountID:   accountID,
+						Email:       target,
+						Folder:      fullMsg.Folder,
+						UIDValidity: fullMsg.UIDValidity,
+						UID:         fullMsg.UID,
+						OTP:         otp,
+						Subject:     fullMsg.Subject,
+						From:        fullMsg.From,
+						Date:        fullMsg.Date,
+					})
+					hasMatch = true
+				}
+			}
+		}
+
+		// 只有一整 page 成功完成处理后，才能向前推进 checkpoint
+		maxUIDInPage := pageRes.Messages[len(pageRes.Messages)-1].UID
+		nextCursor := maxUIDInPage + 1
+		if pageRes.NextUID > nextCursor {
+			nextCursor = pageRes.NextUID
+		}
+		cursor = nextCursor
+
+		w.mu.Lock()
+		w.checkpoints[cpKey] = cursor
+		w.mu.Unlock()
+
+		if !pageRes.HasMore || cursor > scanUpperUID {
+			break
+		}
+	}
+
 	return hasMatch
 }
 

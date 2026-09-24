@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 bytes, encoding/base64, fmt, io, mime, mime/multipart, mime/quotedprintable, net/mail, strings, time, github.com/emersion/go-imap, github.com/emersion/go-message/charset
- * [OUTPUT]: 对外提供 toMessage, toMessageWithBody, readBody, decodeHeader, decodeAppleRelay, folderRole, folderSortRank
+ * [OUTPUT]: 对外提供 toMessage, toMessageWithBody, toMessageWithHeaderOnly, readBody, decodeHeader, decodeAppleRelay, folderRole, folderSortRank
  * [POS]: internal/mail 的 MIME 多级解析与字符集转码中心，负责将原始邮件协议流清洗为高层结构体
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -99,6 +99,24 @@ func toMessageWithBody(msg *imap.Message, folder ...string) Message {
 		recipients := extractStructuralRecipients(m.To, em.Header)
 		m.match = strings.Join(recipients, "\n")
 		break
+	}
+	return m
+}
+
+// toMessageWithHeaderOnly 仅解析 Envelope 与指定 Header 节 (不拉取正文)，供 PR-04A metadata-first 过滤使用。
+func toMessageWithHeaderOnly(msg *imap.Message, section *imap.BodySectionName, folder ...string) Message {
+	m := toMessage(msg, folder...)
+	if section != nil {
+		if r := msg.GetBody(section); r != nil {
+			if em, err := mail.ReadMessage(r); err == nil {
+				recipients := extractStructuralRecipients(m.To, em.Header)
+				m.match = strings.Join(recipients, "\n")
+			}
+		}
+	}
+	if m.match == "" {
+		recipients := extractStructuralRecipients(m.To, nil)
+		m.match = strings.Join(recipients, "\n")
 	}
 	return m
 }
