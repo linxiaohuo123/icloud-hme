@@ -433,6 +433,9 @@ func TestMailSyncWorker_UIDNextIsInclusive(t *testing.T) {
 	var capturedQuery InboxQuery
 	fb := &fakeBackend{
 		accounts: []account.Summary{{ID: "acc_1", Status: "active", HasAppPassword: true}},
+		mailboxBoundaryFunc: func(accID, folder string) (string, uint32, uint32, error) {
+			return "imap", 10, 1000000, nil
+		},
 		onListInboxContext: func(c context.Context, q InboxQuery) (InboxResult, error) {
 			capturedQuery = q
 			return InboxResult{
@@ -520,6 +523,9 @@ func TestMailSyncWorker_StrictVerificationUsesInbox(t *testing.T) {
 	var capturedQuery InboxQuery
 	fb := &fakeBackend{
 		accounts: []account.Summary{{ID: "acc_1", Status: "active", HasAppPassword: true}},
+		mailboxBoundaryFunc: func(accID, folder string) (string, uint32, uint32, error) {
+			return "imap", 20, 1000000, nil
+		},
 		onListInboxContext: func(c context.Context, q InboxQuery) (InboxResult, error) {
 			capturedQuery = q
 			return InboxResult{}, nil

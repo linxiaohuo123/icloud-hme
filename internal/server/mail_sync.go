@@ -69,6 +69,8 @@ type MailSyncWorker struct {
 	published      map[string]time.Time                // "account|folder|uid|recipient" -> 首次发布时间
 	probeMiss      map[string]time.Time                // alias -> 上次盲扫未命中的时间
 	checkpoints    map[checkpointKey]*checkpointState // (accountID, mailbox, uidValidity) -> checkpoint state (PR-04A F07)
+
+	beforeVerificationPersistHook func(ctx context.Context, target string, uid uint32) error // test hook (PR-04B)
 }
 
 // NewMailSyncWorker 创建邮件同步器。st 可为 nil(仅退化为内存归属映射)。
@@ -91,6 +93,13 @@ func NewMailSyncWorker(be Backend, st *store.Store, eventBus *mail.EventBus, int
 		probeMiss:      make(map[string]time.Time),
 		checkpoints:    make(map[checkpointKey]*checkpointState),
 	}
+}
+
+// SetBeforeVerificationPersistHookForTest 设置用于测试的持久化前故障注入 hook (PR-04B)
+func (w *MailSyncWorker) SetBeforeVerificationPersistHookForTest(fn func(ctx context.Context, target string, uid uint32) error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.beforeVerificationPersistHook = fn
 }
 
 // markPublished 判断该封邮件是否首次针对该收件人发布，并登记指纹。
@@ -264,13 +273,39 @@ func (w *MailSyncWorker) syncOnce() {
 		}
 	}()
 
-	// 【安全与节流铁律】：仅在外部有活跃订阅等待验证码时才轮询，
-	// 杜绝 7x24 小时每两秒狂刷 Apple 接口导致大号 Session 或 IP 被风控封锁。
-	if !w.eventBus.HasSubscribers() {
+	// PR-04B: 扫描需求来源为 EventBus subscribers UNION 数据库中未过期的活跃 verification requests
+	hasSubscribers := w.eventBus.HasSubscribers()
+	var persistentAliases []string
+	if w.store != nil {
+		watches, err := w.store.ListActiveVerificationWatches(w.ctx)
+		if err == nil && len(watches) > 0 {
+			for _, watch := range watches {
+				persistentAliases = append(persistentAliases, watch.AliasEmail)
+			}
+		}
+	}
+
+	if !hasSubscribers && len(persistentAliases) == 0 {
 		return
 	}
 
-	subscribedEmails := w.eventBus.SubscribedEmails()
+	watchedSet := make(map[string]struct{})
+	for _, email := range w.eventBus.SubscribedEmails() {
+		norm := strings.ToLower(strings.TrimSpace(email))
+		if norm != "" {
+			watchedSet[norm] = struct{}{}
+		}
+	}
+	for _, email := range persistentAliases {
+		norm := strings.ToLower(strings.TrimSpace(email))
+		if norm != "" {
+			watchedSet[norm] = struct{}{}
+		}
+	}
+	if len(watchedSet) == 0 {
+		return
+	}
+
 	accounts := w.be.ListAccounts()
 	if len(accounts) == 0 {
 		return
@@ -281,12 +316,11 @@ func (w *MailSyncWorker) syncOnce() {
 	var unknownAliases []string
 
 	w.mu.RLock()
-	for _, email := range subscribedEmails {
-		norm := strings.ToLower(strings.TrimSpace(email))
-		if accID, ok := w.aliasToAccount[norm]; ok {
-			accountQueries[accID] = append(accountQueries[accID], norm)
+	for email := range watchedSet {
+		if accID, ok := w.aliasToAccount[email]; ok {
+			accountQueries[accID] = append(accountQueries[accID], email)
 		} else {
-			unknownAliases = append(unknownAliases, norm)
+			unknownAliases = append(unknownAliases, email)
 		}
 	}
 	w.mu.RUnlock()
@@ -389,35 +423,58 @@ accountLoop:
 	}
 }
 
-// fetchAndPublishBatch 按账号增量批量拉取邮件并分发给多个别名等待者 (PR-07 §10.2 & PR-08 Final Hardening §3 & PR-04A F07)。
+// fetchAndPublishBatch 按账号增量批量拉取邮件并分发给多个别名等待者 (PR-07 §10.2 & PR-08 Final Hardening §3 & PR-04A F07 & PR-04B)。
 func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID string, aliases []string) bool {
 	if len(aliases) == 0 {
 		return false
 	}
 
-	// PR-04A F07: 若所有待查别名均具备严格基线，单 alias 与多 alias 统一走 UID 升序增量分页扫描引擎
+	// PR-04B 核心隔离: 分流 strict (具备 baseline 的持久化 verification requests) 与 legacy (无 baseline 的普通订阅者)
+	var strictAliases, legacyAliases []string
+	currentBaselines := make(map[string]uint32)
+	var globalMinUID uint32
+
 	if w.store != nil {
-		var globalMinUID uint32
-		allHaveBaseline := true
-		currentBaselines := make(map[string]uint32, len(aliases))
 		for _, alias := range aliases {
 			norm := strings.ToLower(strings.TrimSpace(alias))
-			uid, err := w.store.GetMinBaselineUIDByEmail(ctx, norm)
-			if err != nil || uid == 0 {
-				allHaveBaseline = false
-				break
+			if norm == "" {
+				continue
 			}
-			currentBaselines[norm] = uid
-			if globalMinUID == 0 || uid < globalMinUID {
-				globalMinUID = uid
+			uid, err := w.store.GetMinBaselineUIDByEmail(ctx, norm)
+			if err == nil && uid > 0 {
+				strictAliases = append(strictAliases, norm)
+				currentBaselines[norm] = uid
+				if globalMinUID == 0 || uid < globalMinUID {
+					globalMinUID = uid
+				}
+			} else {
+				legacyAliases = append(legacyAliases, norm)
 			}
 		}
-		if allHaveBaseline && globalMinUID > 0 {
-			return w.scanAndPublishPages(ctx, accountID, aliases, currentBaselines, "INBOX", globalMinUID)
+	} else {
+		for _, alias := range aliases {
+			norm := strings.ToLower(strings.TrimSpace(alias))
+			if norm != "" {
+				legacyAliases = append(legacyAliases, norm)
+			}
 		}
 	}
 
-	// 降级兜底: 无 baseline 的非严格验证码模式 (例如盲扫野别名或无 store 模式)
+	var strictMatched, legacyMatched bool
+	if len(strictAliases) > 0 && globalMinUID > 0 {
+		strictMatched = w.scanAndPublishPages(ctx, accountID, strictAliases, currentBaselines, "INBOX", globalMinUID)
+	}
+	if len(legacyAliases) > 0 {
+		legacyMatched = w.fetchAndPublishLegacyBatch(ctx, accountID, legacyAliases)
+	}
+	return strictMatched || legacyMatched
+}
+
+// fetchAndPublishLegacyBatch 针对无 baseline 的旧模式订阅者执行基于 ListInboxContext 的单批拉取
+func (w *MailSyncWorker) fetchAndPublishLegacyBatch(ctx context.Context, accountID string, aliases []string) bool {
+	if len(aliases) == 0 {
+		return false
+	}
 	var q InboxQuery
 	if len(aliases) == 1 {
 		q = InboxQuery{
@@ -465,6 +522,22 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 			if !msgMatchesRecipient(msg, target) {
 				continue
 			}
+			if w.store != nil {
+				completedReqs, err := w.store.CompleteMatchingVerificationRequests(ctx, store.VerificationEventInput{
+					AliasEmail:  target,
+					Provider:    msg.Provider,
+					Mailbox:     msg.Folder,
+					UIDValidity: msg.UIDValidity,
+					UID:         msg.UID,
+					MessageRef:  msg.MessageRef,
+					Code:        otp.Code,
+					MagicLink:   otp.MagicLink,
+					Now:         time.Now().UTC(),
+				})
+				if err == nil && len(completedReqs) > 0 {
+					hasMatch = true
+				}
+			}
 			if !w.markPublished(accountID, msg.Folder, msg.UIDValidity, msg.UID, msg.ThreadID, msg.Provider, target) {
 				continue
 			}
@@ -508,7 +581,7 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 	}
 	scanUpperUID := uidNext - 1
 
-	// 2. Resumable checkpoint 决策与跨代际失效清理
+	// 2. Resumable checkpoint 决策与跨代际失效清理 (必须在 UIDVALIDITY 确定后立即清理旧代际 checkpoint)
 	cpKey := checkpointKey{
 		accountID:   accountID,
 		mailbox:     folder,
@@ -533,7 +606,37 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 	} else if cp.AliasBaselines == nil {
 		cp.AliasBaselines = make(map[string]uint32)
 	}
+	w.mu.Unlock()
 
+	// 3. 代际突变清理与基线重新校准 (PR-04B Blocker 2)
+	// 无论当前是否有内存 subscriber，先检查所有待查别名在当前 mailbox 的 UIDVALIDITY。
+	// 若代际突变，则将数据库中对应未决任务原子置为 invalidated，并重新获取有效的 strict aliases 与 baseline
+	if w.store != nil {
+		for _, alias := range aliases {
+			_, _ = w.store.InvalidateVerificationRequestsForGenerationMismatch(ctx, alias, folder, uidValidity)
+		}
+		var activeAliases []string
+		newBaselines := make(map[string]uint32, len(aliases))
+		var newMinBaseline uint32
+		for _, alias := range aliases {
+			uid, err := w.store.GetMinBaselineUIDByEmail(ctx, alias)
+			if err == nil && uid > 0 {
+				activeAliases = append(activeAliases, alias)
+				newBaselines[alias] = uid
+				if newMinBaseline == 0 || uid < newMinBaseline {
+					newMinBaseline = uid
+				}
+			}
+		}
+		aliases = activeAliases
+		currentBaselines = newBaselines
+		baselineUID = newMinBaseline
+		if len(aliases) == 0 || baselineUID == 0 {
+			return false
+		}
+	}
+
+	w.mu.Lock()
 	cursor := cp.NextUID
 	rewound := false
 
@@ -648,6 +751,7 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 				break
 			}
 
+			pageDurableFailed := false
 			for _, fullMsg := range fullMsgs {
 				if fullMsg == nil {
 					continue
@@ -665,23 +769,71 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 					if !msgMatchesRecipient(fullMsg.Message, target) {
 						continue
 					}
-					if !w.markPublished(accountID, fullMsg.Folder, fullMsg.UIDValidity, fullMsg.UID, fullMsg.ThreadID, fullMsg.Provider, target) {
-						continue
+
+					// Hook: 供测试注入在持久化前的故障 (PR-04B)
+					w.mu.RLock()
+					hook := w.beforeVerificationPersistHook
+					w.mu.RUnlock()
+					if hook != nil {
+						if err := hook(ctx, target, fullMsg.UID); err != nil {
+							log.Printf("[MailSync] 测试故障注入失败 (%s UID=%d): %v", target, fullMsg.UID, err)
+							pageDurableFailed = true
+							break
+						}
 					}
-					w.eventBus.PublishEvent(&mail.CachedOTP{
-						EventID:     fullMsg.MessageRef,
-						AccountID:   accountID,
-						Email:       target,
-						Folder:      fullMsg.Folder,
-						UIDValidity: fullMsg.UIDValidity,
-						UID:         fullMsg.UID,
-						OTP:         otp,
-						Subject:     fullMsg.Subject,
-						From:        fullMsg.From,
-						Date:        fullMsg.Date,
-					})
-					hasMatch = true
+
+					// PR-04B 核心规则: 先写 verification_requests durable result，成功后再做 EventBus Publish。
+					// 数据库成功是 correctness，EventBus publish 只是 optimization。
+					if w.store != nil {
+						completedReqs, err := w.store.CompleteMatchingVerificationRequests(ctx, store.VerificationEventInput{
+							AliasEmail:  target,
+							Provider:    "imap",
+							Mailbox:     folder,
+							UIDValidity: fullMsg.UIDValidity,
+							UID:         fullMsg.UID,
+							MessageRef:  fullMsg.MessageRef,
+							Code:        otp.Code,
+							MagicLink:   otp.MagicLink,
+							Now:         time.Now().UTC(),
+						})
+						if err != nil {
+							// 数据库持久化失败:
+							// 当前 page 视为未完成，不推进 checkpoint，不 markPublished，留给下轮重试
+							log.Printf("[MailSync] 持久化验证码终态失败 (%s UID=%d): %v", target, fullMsg.UID, err)
+							pageDurableFailed = true
+							break
+						}
+						if len(completedReqs) > 0 {
+							hasMatch = true
+						}
+					}
+
+					// 数据库落库成功（或无 store 模式）后，执行内存去重并做 EventBus 广播优化。
+					// 即便 markPublished 返回 false (例如已广播过)，数据库完成状态仍然是权威状态。
+					if w.markPublished(accountID, fullMsg.Folder, fullMsg.UIDValidity, fullMsg.UID, fullMsg.ThreadID, fullMsg.Provider, target) {
+						w.eventBus.PublishEvent(&mail.CachedOTP{
+							EventID:     fullMsg.MessageRef,
+							AccountID:   accountID,
+							Email:       target,
+							Folder:      fullMsg.Folder,
+							UIDValidity: fullMsg.UIDValidity,
+							UID:         fullMsg.UID,
+							OTP:         otp,
+							Subject:     fullMsg.Subject,
+							From:        fullMsg.From,
+							Date:        fullMsg.Date,
+						})
+						hasMatch = true
+					}
 				}
+				if pageDurableFailed {
+					break
+				}
+			}
+
+			if pageDurableFailed {
+				// 本页有持久化失败，不可推进 checkpoint，直接中断本轮扫描等待下一轮
+				break
 			}
 		}
 

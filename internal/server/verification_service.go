@@ -225,6 +225,15 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		s.syncWorker.Trigger()
 	}
 
+	// Blocker 3 修复: Post-subscribe DB recheck (PR-04B)
+	// 订阅建立并触发 worker 后立即复查数据库。若任务已被后台 worker 或并发流程落库为终态
+	// (succeeded / expired / invalidated)，直接返回权威结果，不依赖 EventBus 内存唤醒，消除 subscribe race。
+	if freshReq, ferr := s.store.GetVerificationRequest(ctx, requestID, string(p.Kind), p.ID); ferr == nil && freshReq != nil {
+		if freshReq.Status == "succeeded" || freshReq.Status == "expired" || freshReq.Status == "invalidated" {
+			return mapVerificationRecordToResult(freshReq)
+		}
+	}
+
 	handleItem := func(item *mail.CachedOTP) (*VerificationResult, error) {
 		// 原子核查 Token 撤销状态
 		if p.Kind == auth.PrincipalToken {
@@ -251,12 +260,13 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 
 		code := item.OTP.Code
 		magicLink := item.OTP.MagicLink
-		if code == "" && magicLink != "" {
-			code = magicLink
-		}
-		// 终态原子 CAS (P0-3): 必须将当前时间传入数据库原子校验 expires_at，非 winner 绝不消费
+		// 终态原子 CAS (P0-3, PR-04B): 独立持久化 Code 与 MagicLink，不再粗暴相互覆盖
 		nowUTC := time.Now().UTC()
-		curReq, won, err := s.store.CompleteVerificationRequest(ctx, vreq.RequestID, code, item.EventID, nowUTC)
+		curReq, won, err := s.store.CompleteVerificationRequestResult(ctx, vreq.RequestID, store.VerificationCompletion{
+			Code:            code,
+			MagicLink:       magicLink,
+			MatchedEventRef: item.EventID,
+		}, nowUTC)
 		if err != nil {
 			return nil, &BackendError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "持久化验证码终态失败: " + err.Error()}
 		}
@@ -356,8 +366,8 @@ func mapVerificationRecordToResult(rec *store.VerificationRequest) (*Verificatio
 	}
 	switch rec.Status {
 	case "succeeded":
-		magicLink := ""
-		if strings.HasPrefix(rec.Code, "http://") || strings.HasPrefix(rec.Code, "https://") {
+		magicLink := rec.MagicLink
+		if magicLink == "" && (strings.HasPrefix(rec.Code, "http://") || strings.HasPrefix(rec.Code, "https://")) {
 			magicLink = rec.Code
 		}
 		return &VerificationResult{

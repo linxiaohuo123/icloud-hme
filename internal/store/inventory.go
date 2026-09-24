@@ -175,7 +175,8 @@ func (s *Store) initInventorySchema() error {
 		baseline_uidvalidity INTEGER DEFAULT 0,
 		baseline_uid INTEGER DEFAULT 0,
 		matched_event_ref TEXT DEFAULT '',
-		code TEXT DEFAULT ''
+		code TEXT DEFAULT '',
+		magic_link TEXT DEFAULT ''
 	);
 	`
 	if _, err := s.db.Exec(ddl); err != nil {
@@ -258,6 +259,7 @@ func (s *Store) initInventorySchema() error {
 		{"baseline_uid", "INTEGER DEFAULT 0"},
 		{"matched_event_ref", "TEXT DEFAULT ''"},
 		{"code", "TEXT DEFAULT ''"},
+		{"magic_link", "TEXT DEFAULT ''"},
 	}
 	for _, col := range vreqCols {
 		if err := ensureColumn(s.db, "verification_requests", col[0], col[1]); err != nil {
