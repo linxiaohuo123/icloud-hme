@@ -8,9 +8,11 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -54,8 +56,10 @@ type Store struct {
 	db          *sql.DB
 	activityCh  chan string
 	stopCh      chan struct{}
-	flusherDone chan struct{}
-	closed      bool
+	flusherDone    chan struct{}
+	closed         atomic.Bool
+	hookMu         sync.RWMutex
+	beforePingHook func(ctx context.Context)
 }
 
 // DB 返回底层数据库句柄 (仅用于测试/诊断注入)
@@ -128,11 +132,10 @@ func NewStore(dataDir string) (*Store, error) {
 // Close 关闭底层数据库连接与后台协程
 func (s *Store) Close() error {
 	s.mu.Lock()
-	if s.closed {
+	if s.closed.Swap(true) {
 		s.mu.Unlock()
 		return nil
 	}
-	s.closed = true
 	close(s.stopCh)
 	s.mu.Unlock()
 
@@ -143,6 +146,43 @@ func (s *Store) Close() error {
 		return s.db.Close()
 	}
 	return nil
+}
+
+// LockForTest 测试专用：模拟业务长事务占有业务大锁。
+func (s *Store) LockForTest() {
+	s.mu.Lock()
+}
+
+// UnlockForTest 测试专用：释放模拟业务大锁。
+func (s *Store) UnlockForTest() {
+	s.mu.Unlock()
+}
+
+// SetBeforePingHookForTest 设置探活前置挂钩 (仅用于单元测试中的可控同步点)。
+func (s *Store) SetBeforePingHookForTest(hook func(ctx context.Context)) {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	s.beforePingHook = hook
+}
+
+// Ping 探测底层数据库连通性 (PR-01 用于健康检查 readyz 探针)。
+// 严格避免争抢 s.mu 业务大锁，通过 atomic.Bool 安全读取关闭状态并直接透传给 db.PingContext(ctx)，
+// 原生保证 context 超时与取消能立即从驱动层返回，杜绝探针在业务互斥锁上死等。
+func (s *Store) Ping(ctx context.Context) error {
+	if s == nil || s.closed.Load() {
+		return errors.New("store is closed")
+	}
+	s.hookMu.RLock()
+	hook := s.beforePingHook
+	s.hookMu.RUnlock()
+	if hook != nil {
+		hook(ctx)
+	}
+	db := s.db
+	if db == nil {
+		return errors.New("store is closed")
+	}
+	return db.PingContext(ctx)
 }
 
 // tableHasColumn 使用 PRAGMA table_info 精准探测表字段，绝不盲目依赖忽略 ALTER 报错
