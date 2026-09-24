@@ -55,11 +55,11 @@ HTTP JSON API，所有接口均采用标准 JSON 格式交互。
    - **令牌按作用域授权（最小权限）**，详见下方「作用域模型」。
 3. **作用域模型 (Scopes)**：
 
-   | 作用域 | 授权范围 | 覆盖端点 |
+   | 作用域 | 授权范围 | 覆盖端点与限制 |
    | --- | --- | --- |
-   | `allocate` | 出号 | `POST /api/create`、`/api/create/batch`、`/api/quick-create`、`/api/alias/lease`、`/api/allocate`、`/api/external/v1/allocate` |
-   | `verify` | 取码读信 | `GET /api/verify-code`、`/api/external/v1/verify-code`、`/api/inbox*`、`/api/messages*`、`/api/mailboxes` |
-   | `admin` | 全部管理面 | 账号、别名维护、业务标识、令牌、流水、调度、系统设置、代理检测、`POST /api/reload` |
+   | `allocate` | 出号 (仅限库存池) | 外部 v2 接口 `POST /api/external/v2/allocate` 及兼容出号端点 `/api/allocate`、`/api/quick-create`、`/api/alias/lease`、`/api/external/v1/allocate`。<br>**外部令牌严禁指定母号 account_id，严禁现场远程建号 (mode=create)，仅限认领可用库存**。 |
+   | `verify` | 关联租约取码 | `POST /api/external/v2/verification-requests`、`GET /api/external/v2/verification-requests/:id`、`GET /api/verify-code`、`/api/external/v1/verify-code`。<br>**仅限提取归属于该令牌的别名验证码；严禁调用管理员 inbox/messages/mailboxes 接口翻看全局邮件**。 |
+   | `admin` | 全部管理面 | 现场远程建号 (`POST /api/create`、`/create/batch`)、账号维护、全局收件箱 (`/api/inbox*`、`/api/messages*`、`/api/mailboxes`)、业务标识、令牌管理、流水、调度、系统设置、代理检测、`POST /api/reload`。 |
 
    - `POST /api/tokens` 未显式传 `scopes` 时，**默认只发放 `allocate,verify`**，即对外令牌无法触达任何管理面接口，也无法读取或收割其它令牌。
    - 需要管理员级令牌时显式传 `"scopes": "admin"`。
@@ -1105,24 +1105,127 @@ MAGIC=$(echo "$RESULT" | jq -r '.data.magic_link')
 echo "捕获验证码: $CODE, 激活链接: $MAGIC"
 ```
 
-### 场景二：Python 极速自动化封装 (v2 规范化标准)
+---
+
+## 外部自动化 API (v2 规范化契约)
+
+专为外部自动化注册机与多主体调用设计的工业级规范接口：
+
+### 1. 幂等出号: `POST /api/external/v2/allocate`
+- **请求头**：
+  - `Authorization: Bearer <TOKEN>` (必填)
+  - `Idempotency-Key: <UUID>` (外部令牌**强制必填**，管理员可选)
+- **请求体 JSON**：
+  ```json
+  {
+    "tag": "default",
+    "label": "reg_task_1",
+    "mode": "pool"
+  }
+  ```
+  - `mode`: `"pool"` (默认，仅从可用库存池分配)，外部令牌严禁指定 `"create"`；
+  - `tag`: 业务标签，必须在令牌允许的 `allowed_tags` 内；
+  - `account_id`: 外部令牌**严禁指定母号** (防跨号定向盗领)。
+- **请求指纹规范 (F04)**：
+  系统使用包含 `version: 2, tag, account_id, label, mode` 的规范结构体计算 SHA-256 指纹 (`v2:<hex>`)，杜绝拼接碰撞与 mode 歧义。历史旧格式自动向下兼容回放。
+- **响应状态码与格式**：
+  - **200 OK**：出号成功 (或同键同参数成功回放)
+    ```json
+    {
+      "success": true,
+      "data": {
+        "operation_id": "op_xxxxxx",
+        "lease_id": "alloc_xxxxxx",
+        "allocation_id": "alloc_xxxxxx",
+        "email": "alias@icloud.com",
+        "alias_email": "alias@icloud.com",
+        "account_id": "acc_xxxxxx",
+        "source": "pool",
+        "allocated_at": "2026-09-24T00:00:00Z",
+        "status": "allocated"
+      }
+    }
+    ```
+  - **202 Accepted (Pending)**：操作处理中
+    ```json
+    {
+      "success": true,
+      "data": {
+        "operation_id": "op_xxxxxx",
+        "status": "pending"
+      }
+    }
+    ```
+  - **409 Conflict (`IDEMPOTENCY_CONFLICT`)**：
+    相同 `Idempotency-Key` 使用了不同的请求参数（包括 tag、label、mode 等），严格拒绝。
+  - **503 Service Unavailable (`POOL_EMPTY`)**：
+    库存池暂无可用别名，响应头包含 `Retry-After: 60`。
+    **【池空同键重试契约 (F05)】**：池空时操作记录为可证明无分配副作用的失败。当下游客户端在等待 `Retry-After` 后（或管理员补货后），**允许且推荐使用原相同 Idempotency-Key 进行重试**，补货后重试将原子转入成功分配并返回 200 OK。
+
+### 2. 操作状态查询: `GET /api/external/v2/operations/:operation_id`
+- **请求头**：`Authorization: Bearer <TOKEN>` (仅允许操作归属主体查询)
+- **无幽灵 ID 保证 (F06)**：所有对外发放的 `operation_id`（包括有键与无键请求）均已在底层 `operations` 表真实持久化，杜绝 404 幽灵记录。
+- **响应示例** (200 OK)：
+  ```json
+  {
+    "success": true,
+    "data": {
+      "operation_id": "op_xxxxxx",
+      "principal_kind": "token",
+      "principal_id": "tok_xxxxxx",
+      "operation_kind": "v2_allocate",
+      "idempotency_key": "uuid_key",
+      "state": "succeeded",
+      "candidate_email": "alias@icloud.com",
+      "result_ref": "alloc_xxxxxx",
+      "created_at": "2026-09-24T00:00:00Z",
+      "updated_at": "2026-09-24T00:00:00Z"
+    }
+  }
+  ```
+
+### 场景二：Python 极速自动化封装 (v2 健壮规范示例)
 
 ```python
 import uuid
+import time
 import requests
 
 BASE = "http://127.0.0.1:8081"
 HEADERS = {"Authorization": "Bearer your_token_here"}
+TIMEOUT = 10  # 严禁无超时请求
+
+def allocate_alias(tag="default", label="PyTask"):
+    idemp_key = str(uuid.uuid4())
+    url = f"{BASE}/api/external/v2/allocate"
+    payload = {"tag": tag, "label": label, "mode": "pool"}
+    
+    while True:
+        resp = requests.post(url, headers={**HEADERS, "Idempotency-Key": idemp_key}, json=payload, timeout=TIMEOUT)
+        
+        # 1. 成功分配
+        if resp.status_code == 200:
+            data = resp.json().get("data", {})
+            return data["email"], data["allocation_id"]
+        
+        # 2. 处理中 (Pending)
+        if resp.status_code == 202:
+            op_id = resp.json().get("data", {}).get("operation_id")
+            time.sleep(1)
+            continue
+        
+        # 3. 池空临时不可用 (遵循 Retry-After 同键重试契约)
+        if resp.status_code == 503 and resp.json().get("code") == "POOL_EMPTY":
+            retry_after = int(resp.headers.get("Retry-After", 60))
+            print(f"库存池为空，等待 {retry_after} 秒后同键重试...")
+            time.sleep(min(retry_after, 5))  # 示例演示等待
+            continue
+            
+        # 4. 其他不可重试错误 (如 409 参数冲突, 403 权限不足)
+        resp.raise_for_status()
 
 # 1. 幂等出号
-alloc_resp = requests.post(
-    f"{BASE}/api/external/v2/allocate",
-    headers={**HEADERS, "Idempotency-Key": str(uuid.uuid4())},
-    json={"tag": "default", "label": "PyTask"},
-).json()
-
-email = alloc_resp["data"]["email"]
-lease_id = alloc_resp["data"]["allocation_id"]
+email, lease_id = allocate_alias(tag="default", label="PyTask")
 print(f"Allocated: {email} (lease: {lease_id})")
 
 # 2. 创建取码意图并锁定 IMAP 基线
@@ -1130,18 +1233,19 @@ vreq_resp = requests.post(
     f"{BASE}/api/external/v2/verification-requests",
     headers=HEADERS,
     json={"lease_id": lease_id},
+    timeout=TIMEOUT,
 ).json()
-
 vreq_id = vreq_resp["data"]["request_id"]
 print(f"Verification request ready: {vreq_id}")
 
 # 3. 目标网站触发发信...
 
-# 4. 获取验证码
+# 4. 获取验证码 (支持长轮询 timeout)
 result = requests.get(
     f"{BASE}/api/external/v2/verification-requests/{vreq_id}",
     headers=HEADERS,
     params={"timeout": 30},
+    timeout=35,
 ).json()
 
 if result.get("success"):
