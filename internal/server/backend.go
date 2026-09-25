@@ -234,8 +234,7 @@ func (b *managerBackend) SetAppPassword(id, icloudEmail, appPassword string) (ac
 		if strings.Contains(msg, "不能为空") {
 			return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: msg}
 		}
-		// IMAP 连接失败属于上游错误,不拼接详细错误
-		return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "IMAP 验证失败,请检查邮箱与 App 专用密码"}
+		return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "IMAP 验证失败: " + msg}
 	}
 	b.invalidateSummaryCache()
 	sum, ok := b.mgr.GetAccount(id)
@@ -255,7 +254,7 @@ func (b *managerBackend) SetMailbox(id string, config account.MailboxConfig) (ac
 		if strings.Contains(msg, "不能为空") || strings.Contains(msg, "无效") {
 			return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: msg}
 		}
-		return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "收件邮箱验证失败,请检查邮箱、授权码和 IMAP 配置"}
+		return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "收件邮箱验证失败: " + msg}
 	}
 	b.invalidateSummaryCache()
 	sum, ok := b.mgr.GetAccount(id)

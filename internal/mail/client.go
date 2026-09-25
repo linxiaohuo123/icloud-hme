@@ -184,10 +184,28 @@ func (c *Client) Connect() error {
 		return fmt.Errorf("IMAP 初始化失败: %w", err)
 	}
 	_ = rawConn.SetDeadline(time.Now().Add(IMAPCommandTimeout))
-	if err := cli.Login(c.username, c.password); err != nil {
+	loginErr := cli.Login(c.username, c.password)
+	if loginErr != nil && (strings.Contains(strings.ToLower(c.server), "mail.me.com") || strings.Contains(strings.ToLower(c.server), "icloud.com")) {
+		lower := strings.ToLower(c.username)
+		if strings.HasSuffix(lower, "@icloud.com") || strings.HasSuffix(lower, "@me.com") || strings.HasSuffix(lower, "@mac.com") {
+			shortName := strings.Split(c.username, "@")[0]
+			if errRetry := cli.Login(shortName, c.password); errRetry == nil {
+				loginErr = nil
+			}
+		} else if !strings.Contains(c.username, "@") {
+			fullEmail := c.username + "@icloud.com"
+			if errRetry := cli.Login(fullEmail, c.password); errRetry == nil {
+				loginErr = nil
+			}
+		}
+	}
+	if loginErr != nil {
 		_ = cli.Logout()
 		_ = rawConn.Close()
-		return fmt.Errorf("IMAP 登录失败 — 请检查邮箱账号、授权码和服务器地址: %w", err)
+		if strings.Contains(loginErr.Error(), "Authentication Failed") || strings.Contains(loginErr.Error(), "AUTHENTICATIONFAILED") {
+			return fmt.Errorf("IMAP 登录失败 (Authentication Failed) — 请检查账号与授权码；若密码无误，通常是该 Apple ID 尚未在苹果设备或网页端开通 iCloud 邮件（Mailbox does not exist）: %w", loginErr)
+		}
+		return fmt.Errorf("IMAP 登录失败 — 请检查邮箱账号、授权码和服务器地址: %w", loginErr)
 	}
 	_ = rawConn.SetDeadline(time.Time{})
 	c.conn = tlsConn

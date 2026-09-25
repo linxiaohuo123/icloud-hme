@@ -302,7 +302,7 @@ func (c *WebClient) searchContext(ctx context.Context, payload string) ([]Messag
 	}
 	if resp.StatusCode != 200 {
 		snippet := string(body)
-		if strings.Contains(snippet, "Non iCloud Mail user") || strings.Contains(snippet, "Empty Mail ID") {
+		if strings.Contains(snippet, "Non iCloud Mail user") || strings.Contains(snippet, "Empty Mail ID") || strings.Contains(snippet, "INVALID_REQUEST") {
 			return nil, fmt.Errorf("账号未开通 iCloud 邮件功能 (Non iCloud Mail user)")
 		}
 		return nil, fmt.Errorf("获取邮件失败: HTTP %d - %s", resp.StatusCode, truncate(snippet, 300))

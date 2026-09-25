@@ -627,11 +627,11 @@ func classifyInboxErr(err error) *BackendError {
 		return nil
 	}
 	msg := err.Error()
-	if strings.Contains(msg, "Non iCloud Mail user") || strings.Contains(msg, "未开通 iCloud 邮件") {
+	if strings.Contains(msg, "Non iCloud Mail user") || strings.Contains(msg, "未开通 iCloud 邮件") || strings.Contains(msg, "INVALID_REQUEST") || strings.Contains(msg, "Empty Mail ID") {
 		return &BackendError{
 			Status:  http.StatusBadRequest,
 			Code:    "NON_ICLOUD_MAIL_USER",
-			Message: "该 Apple ID 未开通 @icloud.com 原生邮箱。邮件已被转寄至您的注册邮箱，请在【账号管理】中配置收件邮箱（如 QQ 邮箱 IMAP 授权码），或在苹果设备上开启 iCloud 邮件。",
+			Message: "该 Apple ID 未开通 @icloud.com 原生邮箱（或尚未初始化）。发往别名的邮件已被苹果转寄至您的注册邮箱，请在【账号管理】中配置收件邮箱（如 QQ/163 邮箱 IMAP 授权码），或在苹果设备上开启 iCloud 邮件。",
 		}
 	}
 	if isSessionError(msg) {

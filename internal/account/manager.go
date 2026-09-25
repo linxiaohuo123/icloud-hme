@@ -491,6 +491,12 @@ func (m *Manager) SetAppPassword(id, icloudEmail, appPassword string) error {
 	if icloudEmail == "" {
 		return fmt.Errorf("iCloud 邮箱不能为空")
 	}
+	if !strings.Contains(icloudEmail, "@") {
+		icloudEmail = icloudEmail + "@icloud.com"
+	}
+	if !isICloudDomain(icloudEmail) {
+		return fmt.Errorf("iCloud 邮箱格式无效，必须是以 @icloud.com, @me.com 或 @mac.com 结尾的地址 (当前: %s)", icloudEmail)
+	}
 	if appPassword == "" {
 		return fmt.Errorf("App 专用密码不能为空")
 	}

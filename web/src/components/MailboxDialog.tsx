@@ -42,6 +42,7 @@ export default function MailboxDialog({ accountId, current, open, onClose, onSav
     setProvider(value)
     const presets: Record<string, [string, number]> = {
       qq: ['imap.qq.com', 993],
+      '163': ['imap.163.com', 993],
       gmail: ['imap.gmail.com', 993],
       outlook: ['outlook.office365.com', 993],
     }
@@ -82,6 +83,7 @@ export default function MailboxDialog({ accountId, current, open, onClose, onSav
           onChange={(val) => changeProvider(val)}
           options={[
             { value: 'qq', label: 'QQ 邮箱' },
+            { value: '163', label: '163 邮箱' },
             { value: 'gmail', label: 'Gmail' },
             { value: 'outlook', label: 'Outlook' },
             { value: 'custom', label: '其他' },
