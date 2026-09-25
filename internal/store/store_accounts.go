@@ -10,6 +10,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -387,6 +388,86 @@ func (s *Store) SaveEncryptedSetting(key, plaintext string, aad []byte) error {
 		return fmt.Errorf("encrypt setting %s failed: %w", key, err)
 	}
 	return s.SaveSetting(key, enc)
+}
+
+// ValidateProtectedSecrets 验证数据库中所有受保护凭据的加密契约与可解密性。
+// 职责：验证已有 protected fields (accounts.cookies, app_password, mailbox, proxy, notify_settings)。
+// 每一个非空值必须符合当前加密契约 (enc:v1:) 且能用当前 cipher + 正确 AAD 解密。
+// 绝不外发网络请求连接 Apple、IMAP 或通知渠道，为纯本地数据库验证 (PR-09)。
+func (s *Store) ValidateProtectedSecrets() error {
+	if s == nil || s.db == nil {
+		return errors.New("store is not initialized")
+	}
+
+	// 1. 扫描 accounts 表中所有已有账号的受保护字段
+	rows, err := s.db.Query(`SELECT id, cookies, app_password, mailbox, proxy FROM accounts`)
+	if err != nil {
+		return fmt.Errorf("query accounts for protected secrets validation failed: %w", err)
+	}
+	defer rows.Close()
+
+	type accSecret struct {
+		id, cookies, appPassword, mailbox, proxy string
+	}
+	var accs []accSecret
+	for rows.Next() {
+		var a accSecret
+		if err := rows.Scan(&a.id, &a.cookies, &a.appPassword, &a.mailbox, &a.proxy); err != nil {
+			return fmt.Errorf("scan account row for protected secrets failed: %w", err)
+		}
+		accs = append(accs, a)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate accounts for protected secrets failed: %w", err)
+	}
+	_ = rows.Close()
+
+	for _, a := range accs {
+		fields := []struct {
+			name string
+			val  string
+		}{
+			{"cookies", a.cookies},
+			{"app_password", a.appPassword},
+			{"mailbox", a.mailbox},
+			{"proxy", a.proxy},
+		}
+
+		for _, f := range fields {
+			if f.val == "" {
+				continue
+			}
+			if !security.IsEncrypted(f.val) {
+				return fmt.Errorf("account %s field %s is not encrypted", a.id, f.name)
+			}
+			if s.cipher == nil {
+				return fmt.Errorf("master key is required to validate protected secret %s for account %s", f.name, a.id)
+			}
+			if _, err := s.cipher.Decrypt(f.val, security.AccountAAD(a.id, f.name)); err != nil {
+				return fmt.Errorf("decrypt account %s field %s failed: %w", a.id, f.name, err)
+			}
+		}
+	}
+
+	// 2. 校验 settings 表中的 notify_settings
+	var notifyVal string
+	err = s.db.QueryRow(`SELECT value FROM settings WHERE key = 'notify_settings'`).Scan(&notifyVal)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("query notify_settings failed: %w", err)
+	}
+	if err == nil && notifyVal != "" {
+		if !security.IsEncrypted(notifyVal) {
+			return fmt.Errorf("setting notify_settings is not encrypted")
+		}
+		if s.cipher == nil {
+			return fmt.Errorf("master key is required to validate protected setting notify_settings")
+		}
+		if _, err := s.cipher.Decrypt(notifyVal, security.NotifySettingsAAD()); err != nil {
+			return fmt.Errorf("decrypt setting notify_settings failed: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // joinStrings 简单拼接，避免引入 strings 包的额外依赖（store.go 已有 strings 导入）。

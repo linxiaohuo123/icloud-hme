@@ -16,8 +16,10 @@ if not exist "icloud-hme.exe" (
 if not exist ".env" (
     if not exist "data\.env" (
         echo [错误] 未找到 .env 配置文件！
-        echo        请复制 .env.example 为 .env 并设置 ICLOUD_HME_ADMIN_PASSWORD 强口令。
-        echo        出于安全考虑，服务不再提供任何默认密码。
+        echo        请复制 .env.example 为 .env 并配置以下两项必填安全密钥：
+        echo        1. ICLOUD_HME_ADMIN_PASSWORD (管理员后台登录强口令)
+        echo        2. ICLOUD_HME_MASTER_KEY     (32字节Base64凭据根密钥，丢失无法恢复V2凭据)
+        echo        出于安全考虑，服务不提供任何默认凭据。
         echo.
         pause
         exit /b 1
@@ -31,7 +33,7 @@ for /f "tokens=5" %%a in ('netstat -aon ^| findstr :8081 ^| findstr LISTENING') 
 )
 
 echo [2/2] 正在启动服务 (默认监听: http://127.0.0.1:8081)...
-echo [提示] 管理员密码取自 .env 中的 ICLOUD_HME_ADMIN_PASSWORD。
+echo [提示] 管理员密码与 Master Key 取自 .env 配置文件。
 echo [提示] 若需排查问题，可在下方命令末尾追加 -debug 以启用调试日志(不影响鉴权)。
 echo.
 

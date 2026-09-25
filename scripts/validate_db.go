@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 database/sql, os, path/filepath, fmt, strings, icloud-hme/internal/store
- * [OUTPUT]: 对外提供 CreateConsistentSnapshot 与 RunValidation 生产数据库 WAL 一致性快照与 11 项 Fail-Closed 深度巡检能力
- * [POS]: scripts/ 的生产发布数据库只读验收核心引擎
+ * [INPUT]: 依赖 database/sql, os, path/filepath, fmt, strings, icloud-hme/internal/security, icloud-hme/internal/store
+ * [OUTPUT]: 对外提供 CreateConsistentSnapshot 与 RunValidation 生产数据库 WAL 一致性快照与深度 Fail-Closed 验收巡检能力
+ * [POS]: scripts/ 的生产发布数据库只读验收核心引擎 (PR-09)
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"icloud-hme/internal/security"
 	"icloud-hme/internal/store"
 	_ "modernc.org/sqlite"
 )
@@ -148,17 +149,32 @@ func RunValidation(srcPath string) (bool, error) {
 		return false, fmt.Errorf("读取迁移前基线行数失败: %w", err)
 	}
 
-	// 4. 对临时副本执行 Store 生产迁移
-	fmt.Println("[3/5] 正在对临时副本执行 internal/store 迁移与表结构补齐...")
-	st, err := store.NewStore(tempDir)
+	// 4. 对临时副本执行 Store 生产迁移 (PR-07/PR-09: 基于 Master Key 验证真实 V1->V2 迁移)
+	fmt.Println("[3/5] 正在对临时副本执行 internal/store 迁移与表结构补齐 (基于 Master Key)...")
+	masterKey, err := security.LoadMasterKey()
+	if err != nil {
+		return false, fmt.Errorf("读取 Master Key 失败: %w", err)
+	}
+	cipher, err := security.NewSecretCipher(masterKey)
+	if err != nil {
+		return false, fmt.Errorf("Master Key 无效: %w", err)
+	}
+
+	st, err := store.NewStoreWithCipher(tempDir, cipher)
 	if err != nil {
 		return false, fmt.Errorf("数据库迁移执行失败! 服务启动已被安全阻断: %w", err)
 	}
-	_ = st.Close()
-	fmt.Println("[3/5] Store 迁移与拓扑初始化执行完毕，句柄已安全关闭。")
 
-	// 5. 打开迁移后副本执行 11 项深度验收巡检 (Fail-Closed)
-	fmt.Println("[4/5] 正在对迁移后数据库执行 11 项深度一致性与完整性巡检...")
+	// 纯本地验证受保护凭据可解密性 (PR-09)
+	if valErr := st.ValidateProtectedSecrets(); valErr != nil {
+		_ = st.Close()
+		return false, fmt.Errorf("受保护凭据解密验证失败: %w", valErr)
+	}
+	_ = st.Close()
+	fmt.Println("[3/5] Store 迁移与受保护凭据验证完毕，句柄已安全关闭。")
+
+	// 5. 打开迁移后副本执行一致性与架构终态巡检 (Fail-Closed)
+	fmt.Println("[4/5] 正在对迁移后数据库执行深度一致性与架构巡检...")
 	db, err := sql.Open("sqlite", tempDBPath)
 	if err != nil {
 		return false, fmt.Errorf("打开迁移后副本失败: %w", err)
@@ -171,6 +187,42 @@ func RunValidation(srcPath string) (bool, error) {
 	}
 
 	hasBlocker := false
+
+	// Check 0: user_version 契约与 api_tokens 明文隔离
+	var userVer int
+	if err := db.QueryRow("PRAGMA user_version;").Scan(&userVer); err != nil {
+		fmt.Printf("❌ 0. user_version 读取失败: %v\n", err)
+		hasBlocker = true
+	} else if userVer != store.CurrentSchemaVersion {
+		fmt.Printf("❌ 0. user_version 校验: FAIL (预期 %d, 实际 %d)\n", store.CurrentSchemaVersion, userVer)
+		hasBlocker = true
+	} else {
+		fmt.Printf("✅ 0. user_version 校验: %d (版本一致)\n", userVer)
+	}
+
+	tRows, err := db.Query("PRAGMA table_info(api_tokens);")
+	if err != nil {
+		fmt.Printf("❌ 0. api_tokens 列结构读取失败: %v\n", err)
+		hasBlocker = true
+	} else {
+		hasTokenCol := false
+		for tRows.Next() {
+			var cid int
+			var name, ctype string
+			var notnull, pk int
+			var dflt any
+			if err := tRows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil && name == "token" {
+				hasTokenCol = true
+			}
+		}
+		_ = tRows.Close()
+		if hasTokenCol {
+			fmt.Println("❌ 0. api_tokens 表严禁保留明文 token 列: FAIL")
+			hasBlocker = true
+		} else {
+			fmt.Println("✅ 0. api_tokens 安全架构: 无明文 token 列")
+		}
+	}
 
 	// Check 1: SQLite integrity_check
 	var integrityResult string

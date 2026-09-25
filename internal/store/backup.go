@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 context, database/sql, fmt, io, os, path/filepath, strings, time, icloud-hme/internal/store
- * [OUTPUT]: 对外提供 CreateBackup 方法与 package-level RestoreDatabase 离线恢复能力及 quickCheck 探针
- * [POS]: internal/store 的一致性快照生成与离线恢复容灾层 (PR-06 Baseline)
+ * [INPUT]: 依赖 context, database/sql, fmt, io, os, path/filepath, strings, time, icloud-hme/internal/security, icloud-hme/internal/store
+ * [OUTPUT]: 对外提供 CreateBackup, CreateDatabaseBackup 与 package-level RestoreDatabase / RestoreDatabaseWithCipher 离线恢复能力及 quickCheck 探针
+ * [POS]: internal/store 的一致性快照生成与离线恢复容灾层 (PR-09)
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"icloud-hme/internal/security"
 )
 
 var (
@@ -131,6 +133,62 @@ func (s *Store) CreateBackup(ctx context.Context, destination string) error {
 	return createOnlineBackup(ctx, s.db, destination)
 }
 
+// CreateDatabaseBackup 执行完全只读的离线数据库一致性备份，严禁触发任何数据库 schema 迁移或状态变更。
+// 契约红线：
+// 1. 获取 dataDir 实例独占排他锁；
+// 2. 若运行中的 server/store 持锁，立即返回 database in use；
+// 3. 检查 dataDir/icloud_hme.db 必须真实存在且为有效文件；
+// 4. 直接打开 SQLite 连接 (严禁调用 NewStore / NewStoreWithCipher / schema migration)；
+// 5. quick_check 检查物理完整性；
+// 6. 使用 VACUUM INTO 创建一致性 snapshot；
+// 7. 对 snapshot quick_check；
+// 8. 权限收敛为 0600；
+// 9. destination 不允许覆盖；
+// 10. 成功后退出。
+func CreateDatabaseBackup(ctx context.Context, dataDir string, destination string) error {
+	// 1. acquire 当前已有的 dataDir instance lock
+	// 2. 如果运行中的 server/store 持锁：返回 database in use
+	lock, err := acquireDataDirLock(dataDir)
+	if err != nil {
+		return fmt.Errorf("database is in use; stop icloud-hme before backup: %w", err)
+	}
+	defer lock.Close()
+
+	// 3. 检查：dataDir/icloud_hme.db 必须真实存在
+	liveDBPath := filepath.Join(dataDir, "icloud_hme.db")
+	stat, err := os.Stat(liveDBPath)
+	if err != nil {
+		return fmt.Errorf("source database not found: %w", err)
+	}
+	if stat.IsDir() || stat.Size() == 0 {
+		return fmt.Errorf("source database is empty or not a regular file: %s", liveDBPath)
+	}
+
+	// 4. 直接以只读模式 (mode=ro) 打开 SQLite 连接，从驱动与连接层面杜绝写源库 (严禁调用 NewStore / NewStoreWithCipher / schema migration)
+	srcDSN := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(5000)", filepath.ToSlash(liveDBPath))
+	db, err := sql.Open("sqlite", srcDSN)
+	if err != nil {
+		return fmt.Errorf("open source database failed: %w", err)
+	}
+	defer db.Close()
+
+	// 5. PRAGMA quick_check 源库完整性
+	if err := quickCheck(db); err != nil {
+		return fmt.Errorf("source database integrity check failed: %w", err)
+	}
+
+	// 6. 使用 VACUUM INTO 创建一致性 snapshot
+	// 7. 对 snapshot quick_check
+	// 8. 权限 0600
+	// 9. destination 不允许覆盖 (createOnlineBackup 内部第一步严格校验 destination 是否已存在并拒绝覆盖)
+	if err := createOnlineBackup(ctx, db, destination); err != nil {
+		return err
+	}
+
+	// 10. 成功后退出
+	return nil
+}
+
 // restoreFileFromSnapshot 使用临时文件 -> fsync -> 原子 rename 从一致性快照恢复目标文件
 func restoreFileFromSnapshot(srcSnapshot, dstFile string) error {
 	tmpPath := dstFile + ".rollback.tmp"
@@ -172,8 +230,13 @@ func restoreFileFromSnapshot(srcSnapshot, dstFile string) error {
 	return nil
 }
 
-// RestoreDatabase 实现离线数据库一致性恢复 (package-level API)
+// RestoreDatabase 实现离线数据库一致性恢复 (package-level API 兼容封装)
 func RestoreDatabase(ctx context.Context, dataDir string, backupPath string) error {
+	return RestoreDatabaseWithCipher(ctx, dataDir, backupPath, nil)
+}
+
+// RestoreDatabaseWithCipher 实现具备 Master Key 加密感知的离线数据库一致性恢复 (package-level API, PR-09)
+func RestoreDatabaseWithCipher(ctx context.Context, dataDir string, backupPath string, cipher *security.SecretCipher) error {
 	// 0. 尝试取得数据目录独占排他锁；若已被运行中的 Store/Server 持有则立即硬拒绝，绝不触碰生产库
 	lock, err := acquireDataDirLock(dataDir)
 	if err != nil {
@@ -328,10 +391,13 @@ func RestoreDatabase(ctx context.Context, dataDir string, backupPath string) err
 	}
 	if validationErr == nil {
 		// 校验恢复库完整性与架构兼容性 (因当前函数已持有独占锁，newStoreWithLock 传 nil lock 避免重复申请)
-		st, err := newStoreWithLock(dataDir, nil, nil)
+		st, err := newStoreWithLock(dataDir, nil, cipher)
 		if err != nil {
 			validationErr = err
 		} else {
+			if valErr := st.ValidateProtectedSecrets(); valErr != nil {
+				validationErr = valErr
+			}
 			_ = st.Close()
 		}
 	}
