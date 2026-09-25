@@ -5,10 +5,11 @@
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { request, ApiError } from '../api/client'
-import type { AccountSummary, Alias } from '../api/types'
+import type { Alias } from '../api/types'
+import { useAccounts, invalidateAccounts } from '../hooks/useAccounts'
 import AsyncState from '../components/AsyncState'
 import EditAliasDialog from '../components/EditAliasDialog'
 import BatchEditAliasDialog from '../components/BatchEditAliasDialog'
@@ -45,12 +46,21 @@ const srOnly: CSSProperties = {
 }
 
 export default function AliasesPage() {
-  const [accounts, setAccounts] = useState<AccountSummary[]>([])
-  const [accountId, setAccountId] = useState('all')
+  const [searchParams, setSearchParams] = useSearchParams()
+  const { show, showCopyable } = useToast()
+  const queryAccId = searchParams.get('account_id')
+
+  const { accounts } = useAccounts()
+  const [accountId, setAccountId] = useState(() => queryAccId || 'all')
   const [aliases, setAliases] = useState<Alias[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [retryKey, setRetryKey] = useState(0)
+
+  // 跨账号筛选竞态保护
+  const refreshGenRef = useRef(0)
+  const refreshAbortRef = useRef<AbortController | null>(null)
+  const currentAccountIdRef = useRef(accountId)
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<'all' | 'active' | 'inactive'>('all')
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
@@ -88,37 +98,19 @@ export default function AliasesPage() {
     }
   }
 
-  const [searchParams, setSearchParams] = useSearchParams()
-  const { show, showCopyable } = useToast()
-
-  const queryAccId = searchParams.get('account_id')
-
-  // 加载账号列表 (仅在挂载或重试时拉取)
+  // 保持当前选中的 accountId 实时同步
   useEffect(() => {
-    let cancelled = false
-    request<AccountSummary[]>('/api/accounts')
-      .then((data) => {
-        if (cancelled) return
-        setAccounts(data)
-        const valid = data.find((a) => a.id === queryAccId)
-        const target = valid ? valid.id : (!queryAccId || queryAccId === 'all' ? 'all' : (data[0]?.id ?? 'all'))
-        setAccountId(target)
-        if (data.length === 0) {
-          setLoading(false)
-        }
-      })
-      .catch((err) => {
-        if (cancelled) return
-        setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
-        setLoading(false)
-      })
-    return () => {
-      cancelled = true
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅在挂载或重试时拉取账号列表，URL 变动由专用同步 Effect 驱动
-  }, [retryKey])
+    currentAccountIdRef.current = accountId
+  }, [accountId])
 
-  // 监听 URL 外部变动（如前进/后退）并同步 accountId
+  // 组件卸载时终止所有刷新请求
+  useEffect(() => {
+    return () => {
+      refreshAbortRef.current?.abort()
+    }
+  }, [])
+
+  // 监听 URL 外部变动（如前进/后退）或账号列表就绪并同步 accountId
   useEffect(() => {
     if (accounts.length === 0) return
     const valid = accounts.find((a) => a.id === queryAccId)
@@ -251,20 +243,46 @@ export default function AliasesPage() {
 
   async function handleRefreshPool() {
     setLoading(true)
+    refreshGenRef.current++
+    const gen = refreshGenRef.current
+    refreshAbortRef.current?.abort()
+    const controller = new AbortController()
+    refreshAbortRef.current = controller
+    const requestedAccountId = accountId
+
     try {
-      const url = accountId === 'all'
+      const url = requestedAccountId === 'all'
         ? '/api/aliases?account_id=all&refresh=true'
-        : `/api/aliases?account_id=${encodeURIComponent(accountId)}&refresh=true`
-      const data = await request<{ account_id: string; count: number; aliases: Alias[] }>(url)
-      setAliases(data.aliases ?? [])
-      setError('')
-      // 同步刷新母账号统计指标，绝不触发对别名列表的重复拉取
-      request<AccountSummary[]>('/api/accounts').then(setAccounts).catch(() => {})
-      show('号池已与 Apple 同步最新数据')
+        : `/api/aliases?account_id=${encodeURIComponent(requestedAccountId)}&refresh=true`
+      const data = await request<{ account_id: string; count: number; aliases: Alias[] }>(url, {
+        signal: controller.signal,
+      })
+      // 必须确认: requested account selection 仍等于当前 accountId，且 generation 匹配且未被 abort
+      if (
+        gen === refreshGenRef.current &&
+        currentAccountIdRef.current === requestedAccountId &&
+        !controller.signal.aborted
+      ) {
+        setAliases(data.aliases ?? [])
+        setError('')
+        invalidateAccounts(requestedAccountId === 'all' ? undefined : requestedAccountId)
+        show('号池已与 Apple 同步最新数据')
+      }
     } catch (err) {
-      show(err instanceof ApiError ? err.message : '刷新号池失败')
+      if (
+        gen === refreshGenRef.current &&
+        currentAccountIdRef.current === requestedAccountId &&
+        !controller.signal.aborted
+      ) {
+        show(err instanceof ApiError ? err.message : '刷新号池失败')
+      }
     } finally {
-      setLoading(false)
+      if (
+        gen === refreshGenRef.current &&
+        currentAccountIdRef.current === requestedAccountId
+      ) {
+        setLoading(false)
+      }
     }
   }
 
@@ -303,6 +321,7 @@ export default function AliasesPage() {
           { method: 'DELETE', body: JSON.stringify({ account_id: targetAccId }) },
         )
         show('别名已删除')
+        invalidateAccounts(targetAccId)
         setSelectedIds((prev) => {
           if (!prev.has(deletedId)) return prev
           const next = new Set(prev)
@@ -315,6 +334,7 @@ export default function AliasesPage() {
           { method: 'POST', body: JSON.stringify({ account_id: targetAccId }) },
         )
         show(type === 'deactivate' ? '别名已停用' : '别名已激活')
+        invalidateAccounts(targetAccId)
       }
       setConfirm(null)
       setRetryKey((k) => k + 1)
@@ -784,6 +804,7 @@ export default function AliasesPage() {
           onClose={() => setBatchCreateOpen(false)}
           onSuccess={(res) => {
             show(`已成功生成 ${res.created_count} 个别名`)
+            invalidateAccounts(res.account_id)
             setRetryKey((k) => k + 1)
           }}
         />

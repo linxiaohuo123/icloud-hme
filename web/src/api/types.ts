@@ -138,14 +138,27 @@ export interface BusinessTag {
   last_assigned_at?: string
 }
 
-/** 外部 API 访问令牌 */
-export interface APIToken {
+/** 外部 API 访问令牌列表项 (安全记录，不包含明文令牌) */
+export interface APITokenRecord {
   id: string
   name: string
-  token?: string
+  token_prefix: string
   created_at: string
   last_used_at?: string
+  scopes?: string
+  expires_at?: string
+  revoked_at?: string
+  rotated_at?: string
+  needs_rotation: boolean
 }
+
+/** 创建或轮换 API 令牌时的响应体 (唯一可见明文 token 的载体) */
+export interface CreatedAPIToken extends APITokenRecord {
+  token: string
+}
+
+/** 兼容类型别名 */
+export type APIToken = APITokenRecord
 
 /** 已领用别名审计记录 */
 export interface LeaseRecord {
@@ -200,16 +213,39 @@ export interface ScheduleStatus {
   interval_seconds: number
 }
 
-/** 通知配置 */
-export interface NotifySettings {
-  feishu_webhook: string
-  bark_url: string
-  telegram_token: string
+/** 通知配置服务端响应契约 */
+export interface NotifySettingsResponse {
+  feishu_configured: boolean
+  feishu_webhook_masked: string
+  feishu_webhook?: string
+  bark_configured: boolean
+  bark_url_masked: string
+  bark_url?: string
+  telegram_configured: boolean
+  telegram_token_masked: string
+  telegram_token?: string
   telegram_chat: string
   event_kinds: Record<string, boolean> | null
   quota_threshold: number
   resend_minutes?: number
 }
+
+/** 通知配置更新请求契约 (Secret 字段按需提交，避免脱敏掩码回写) */
+export interface UpdateNotifySettingsRequest {
+  feishu_webhook?: string
+  bark_url?: string
+  telegram_token?: string
+  telegram_chat?: string
+  clear_feishu?: boolean
+  clear_bark?: boolean
+  clear_telegram?: boolean
+  event_kinds?: Record<string, boolean> | null
+  quota_threshold?: number
+  resend_minutes?: number
+}
+
+/** 兼容类型别名 */
+export type NotifySettings = NotifySettingsResponse
 
 /** 单渠道测试推送结果 */
 export interface NotifyChannelResult {

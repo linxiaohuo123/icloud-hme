@@ -1,27 +1,24 @@
 /**
- * [INPUT]: 依赖 react, api/client 的 request/ApiError, api/types 的 NotifySettings/NotifyChannelResult, components/ToastProvider, components/icons
+ * [INPUT]: 依赖 react, api/client 的 request/ApiError, api/types 的 NotifyChannelResult/NotifySettingsResponse/UpdateNotifySettingsRequest, components/ToastProvider, components/icons
  * [OUTPUT]: 对外提供 SettingsPage 系统设置组件 (通知渠道配置、事件开关、配额阈值与一键测试推送)
- * [POS]: web/src/pages 的系统设置页面，通知配置随存随生效
+ * [POS]: web/src/pages 的系统设置页面，通知配置脱敏显示、按需安全更新与 Fail-Closed 契约对齐
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 import { useEffect, useState } from 'react'
 import { ApiError, request } from '../api/client'
-import type { NotifyChannelResult, NotifySettings } from '../api/types'
+import type {
+  NotifyChannelResult,
+  NotifySettingsResponse,
+  UpdateNotifySettingsRequest,
+} from '../api/types'
 import { useToast } from '../components/ToastProvider'
 import { IconCheck, IconShield, IconSliders, IconZap } from '../components/icons'
 
-const DEFAULT_SETTINGS: NotifySettings = {
-  feishu_webhook: '',
-  bark_url: '',
-  telegram_token: '',
-  telegram_chat: '',
-  event_kinds: {
-    cookie_expired: true,
-    cookie_recovered: true,
-    quota_low: true,
-  },
-  quota_threshold: 0,
+const DEFAULT_EVENT_KINDS: Record<string, boolean> = {
+  cookie_expired: true,
+  cookie_recovered: true,
+  quota_low: true,
 }
 
 const EVENT_ITEMS: Array<{ key: string; label: string; desc: string }> = [
@@ -37,20 +34,39 @@ const CHANNEL_LABELS: Record<string, string> = {
 }
 
 export default function SettingsPage() {
-  const [settings, setSettings] = useState<NotifySettings>(DEFAULT_SETTINGS)
+  const [serverSettings, setServerSettings] = useState<NotifySettingsResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
   const [error, setError] = useState('')
   const [testResults, setTestResults] = useState<NotifyChannelResult[] | null>(null)
+
+  // 渠道 Secret 输入与清除状态 (输入框初始均为空，绝不以脱敏掩码作为输入值)
+  const [feishuInput, setFeishuInput] = useState('')
+  const [clearFeishu, setClearFeishu] = useState(false)
+
+  const [barkInput, setBarkInput] = useState('')
+  const [clearBark, setClearBark] = useState(false)
+
+  const [telegramTokenInput, setTelegramTokenInput] = useState('')
+  const [clearTelegram, setClearTelegram] = useState(false)
+  const [telegramChatInput, setTelegramChatInput] = useState('')
+
+  // 策略与开关状态
+  const [eventKinds, setEventKinds] = useState<Record<string, boolean>>(DEFAULT_EVENT_KINDS)
+  const [quotaThreshold, setQuotaThreshold] = useState<number>(0)
+
   const { show } = useToast()
 
   useEffect(() => {
     let unmounted = false
-    request<NotifySettings>('/api/settings/notify')
+    request<NotifySettingsResponse>('/api/settings/notify')
       .then((data) => {
         if (unmounted) return
-        setSettings({ ...DEFAULT_SETTINGS, ...data })
+        setServerSettings(data)
+        setEventKinds(data.event_kinds || DEFAULT_EVENT_KINDS)
+        setQuotaThreshold(data.quota_threshold ?? 0)
+        setTelegramChatInput(data.telegram_chat || '')
       })
       .catch((err: unknown) => {
         if (!unmounted) {
@@ -65,19 +81,15 @@ export default function SettingsPage() {
     }
   }, [show])
 
-  function update<K extends keyof NotifySettings>(key: K, value: NotifySettings[K]) {
-    setSettings((prev) => ({ ...prev, [key]: value }))
-  }
-
   function eventEnabled(key: string): boolean {
-    if (!settings.event_kinds) return true
-    return settings.event_kinds[key] ?? true
+    return eventKinds[key] ?? true
   }
 
   function toggleEvent(key: string) {
-    const kinds = { ...(settings.event_kinds ?? {}) }
-    kinds[key] = !eventEnabled(key)
-    update('event_kinds', kinds)
+    setEventKinds((prev) => ({
+      ...prev,
+      [key]: !eventEnabled(key),
+    }))
   }
 
   async function handleSave() {
@@ -85,11 +97,50 @@ export default function SettingsPage() {
     setSaving(true)
     setError('')
     try {
-      const saved = await request<NotifySettings>('/api/settings/notify', {
+      const payload: UpdateNotifySettingsRequest = {
+        event_kinds: eventKinds,
+        quota_threshold: quotaThreshold,
+      }
+
+      if (clearFeishu) {
+        payload.clear_feishu = true
+      } else if (feishuInput.trim()) {
+        payload.feishu_webhook = feishuInput.trim()
+      }
+
+      if (clearBark) {
+        payload.clear_bark = true
+      } else if (barkInput.trim()) {
+        payload.bark_url = barkInput.trim()
+      }
+
+      if (clearTelegram) {
+        payload.clear_telegram = true
+      } else {
+        if (telegramTokenInput.trim()) {
+          payload.telegram_token = telegramTokenInput.trim()
+        }
+        if (telegramChatInput.trim() !== (serverSettings?.telegram_chat ?? '')) {
+          payload.telegram_chat = telegramChatInput.trim()
+        }
+      }
+
+      const saved = await request<NotifySettingsResponse>('/api/settings/notify', {
         method: 'PUT',
-        body: JSON.stringify(settings),
+        body: JSON.stringify(payload),
       })
-      setSettings({ ...DEFAULT_SETTINGS, ...saved })
+
+      setServerSettings(saved)
+      setFeishuInput('')
+      setClearFeishu(false)
+      setBarkInput('')
+      setClearBark(false)
+      setTelegramTokenInput('')
+      setClearTelegram(false)
+      setTelegramChatInput(saved.telegram_chat || '')
+      setEventKinds(saved.event_kinds || DEFAULT_EVENT_KINDS)
+      setQuotaThreshold(saved.quota_threshold ?? 0)
+
       show('通知配置已保存')
     } catch (err) {
       const message = err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态'
@@ -162,44 +213,176 @@ export default function SettingsPage() {
           </div>
 
           <div className="card-body">
+            {/* 飞书 */}
             <div className="form-field">
-              <label htmlFor="feishu_webhook">飞书自定义机器人 Webhook</label>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                <label htmlFor="feishu_webhook">飞书自定义机器人 Webhook</label>
+                {serverSettings?.feishu_configured && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    {clearFeishu ? (
+                      <>
+                        <span className="badge badge-error">已标记清除</span>
+                        <button
+                          type="button"
+                          className="btn btn-xs btn-secondary"
+                          onClick={() => setClearFeishu(false)}
+                        >
+                          撤销清除
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <span className="badge badge-active" title={serverSettings.feishu_webhook_masked}>
+                          已配置: {serverSettings.feishu_webhook_masked || '已设置'}
+                        </span>
+                        <button
+                          type="button"
+                          className="btn btn-xs btn-ghost-danger"
+                          onClick={() => {
+                            setClearFeishu(true)
+                            setFeishuInput('')
+                          }}
+                        >
+                          清除配置
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
               <input
                 id="feishu_webhook"
                 className="input"
                 type="text"
-                placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/xxxx"
-                value={settings.feishu_webhook}
-                onChange={(e) => update('feishu_webhook', e.target.value)}
+                placeholder={
+                  serverSettings?.feishu_configured && !clearFeishu
+                    ? '留空保持已配置 Webhook，或输入新地址覆盖'
+                    : 'https://open.feishu.cn/open-apis/bot/v2/hook/xxxx'
+                }
+                value={feishuInput}
+                onChange={(e) => {
+                  setFeishuInput(e.target.value)
+                  if (e.target.value.trim()) {
+                    setClearFeishu(false)
+                  }
+                }}
                 autoComplete="off"
               />
               <span className="hint">飞书群 → 设置 → 群机器人 → 添加自定义机器人，粘贴 Webhook 地址</span>
             </div>
 
+            {/* Bark */}
             <div className="form-field">
-              <label htmlFor="bark_url">Bark 推送地址 (iOS)</label>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                <label htmlFor="bark_url">Bark 推送地址 (iOS)</label>
+                {serverSettings?.bark_configured && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    {clearBark ? (
+                      <>
+                        <span className="badge badge-error">已标记清除</span>
+                        <button
+                          type="button"
+                          className="btn btn-xs btn-secondary"
+                          onClick={() => setClearBark(false)}
+                        >
+                          撤销清除
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <span className="badge badge-active" title={serverSettings.bark_url_masked}>
+                          已配置: {serverSettings.bark_url_masked || '已设置'}
+                        </span>
+                        <button
+                          type="button"
+                          className="btn btn-xs btn-ghost-danger"
+                          onClick={() => {
+                            setClearBark(true)
+                            setBarkInput('')
+                          }}
+                        >
+                          清除配置
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
               <input
                 id="bark_url"
                 className="input"
                 type="text"
-                placeholder="https://api.day.app/你的DeviceKey"
-                value={settings.bark_url}
-                onChange={(e) => update('bark_url', e.target.value)}
+                placeholder={
+                  serverSettings?.bark_configured && !clearBark
+                    ? '留空保持已配置地址，或输入新地址覆盖'
+                    : 'https://api.day.app/你的DeviceKey'
+                }
+                value={barkInput}
+                onChange={(e) => {
+                  setBarkInput(e.target.value)
+                  if (e.target.value.trim()) {
+                    setClearBark(false)
+                  }
+                }}
                 autoComplete="off"
               />
               <span className="hint">App Store 安装 Bark 后复制推送 URL，保留到 DeviceKey 即可</span>
             </div>
 
+            {/* Telegram */}
             <div className="form-grid-2">
               <div className="form-field">
-                <label htmlFor="telegram_token">Telegram Bot Token</label>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                  <label htmlFor="telegram_token">Telegram Bot Token</label>
+                  {serverSettings?.telegram_configured && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      {clearTelegram ? (
+                        <>
+                          <span className="badge badge-error">已标记清除</span>
+                          <button
+                            type="button"
+                            className="btn btn-xs btn-secondary"
+                            onClick={() => setClearTelegram(false)}
+                          >
+                            撤销清除
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <span className="badge badge-active" title={serverSettings.telegram_token_masked}>
+                            已配置: {serverSettings.telegram_token_masked || '已设置'}
+                          </span>
+                          <button
+                            type="button"
+                            className="btn btn-xs btn-ghost-danger"
+                            onClick={() => {
+                              setClearTelegram(true)
+                              setTelegramTokenInput('')
+                            }}
+                          >
+                            清除
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
                 <input
                   id="telegram_token"
                   className="input"
                   type="text"
-                  placeholder="123456789:AAF..."
-                  value={settings.telegram_token}
-                  onChange={(e) => update('telegram_token', e.target.value)}
+                  placeholder={
+                    serverSettings?.telegram_configured && !clearTelegram
+                      ? '留空保持已配置 Token，或输入新 Token 覆盖'
+                      : '123456789:AAF...'
+                  }
+                  value={telegramTokenInput}
+                  onChange={(e) => {
+                    setTelegramTokenInput(e.target.value)
+                    if (e.target.value.trim()) {
+                      setClearTelegram(false)
+                    }
+                  }}
                   autoComplete="off"
                 />
                 <span className="hint">与 @BotFather 创建机器人获取；需能直连 api.telegram.org</span>
@@ -212,9 +395,10 @@ export default function SettingsPage() {
                   className="input"
                   type="text"
                   placeholder="如 123456789"
-                  value={settings.telegram_chat}
-                  onChange={(e) => update('telegram_chat', e.target.value)}
+                  value={telegramChatInput}
+                  onChange={(e) => setTelegramChatInput(e.target.value)}
                   autoComplete="off"
+                  disabled={clearTelegram}
                 />
                 <span className="hint">与 @userinfobot 对话可查询自己的 Chat ID</span>
               </div>
@@ -267,8 +451,8 @@ export default function SettingsPage() {
                   type="number"
                   min={0}
                   max={2000}
-                  value={settings.quota_threshold}
-                  onChange={(e) => update('quota_threshold', Number(e.target.value))}
+                  value={quotaThreshold}
+                  onChange={(e) => setQuotaThreshold(Number(e.target.value))}
                 />
                 <span className="input-suffix">个别名</span>
               </div>

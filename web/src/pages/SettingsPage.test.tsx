@@ -6,18 +6,21 @@ import SettingsPage from './SettingsPage'
 import { server } from '../test/server'
 import { setCSRFToken } from '../api/client'
 import { ToastProvider } from '../components/ToastProvider'
-import type { NotifySettings } from '../api/types'
+import type { NotifySettingsResponse, UpdateNotifySettingsRequest } from '../api/types'
 
-const stored: NotifySettings = {
-  feishu_webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/abc',
-  bark_url: '',
-  telegram_token: '',
-  telegram_chat: '',
+const storedResponse: NotifySettingsResponse = {
+  feishu_configured: true,
+  feishu_webhook_masked: 'https://open.feishu.cn/open-apis/bot/v2/hook/abc****',
+  bark_configured: true,
+  bark_url_masked: 'https://api.day.app/dev****',
+  telegram_configured: true,
+  telegram_token_masked: '123456****',
+  telegram_chat: '987654321',
   event_kinds: { cookie_expired: true, cookie_recovered: false, quota_low: true },
   quota_threshold: 700,
 }
 
-function mockGet(data: NotifySettings = stored) {
+function mockGet(data: NotifySettingsResponse = storedResponse) {
   server.use(http.get('/api/settings/notify', () => HttpResponse.json({ success: true, data })))
 }
 
@@ -35,41 +38,133 @@ describe('SettingsPage', () => {
     server.resetHandlers()
   })
 
-  it('加载并回显已保存的通知配置', async () => {
+  it('TestNotifyMaskedSecretIsNeverTreatedAsRealInput: 输入框默认为空且展示脱敏徽章', async () => {
     mockGet()
     renderPage()
-    expect(await screen.findByLabelText('飞书自定义机器人 Webhook')).toHaveValue(stored.feishu_webhook)
+
+    // 密文输入框均必须为空，绝不以脱敏掩码作为输入值
+    const feishuInput = await screen.findByLabelText('飞书自定义机器人 Webhook')
+    expect(feishuInput).toHaveValue('')
+    expect(screen.getByLabelText('Bark 推送地址 (iOS)')).toHaveValue('')
+    expect(screen.getByLabelText('Telegram Bot Token')).toHaveValue('')
+
+    // 非密文字段正常回显
+    expect(screen.getByLabelText('Telegram Chat ID')).toHaveValue('987654321')
     expect(screen.getByLabelText('配额水位阈值 (活跃别名数)')).toHaveValue(700)
-    // cookie_recovered 为 false, 复选框未勾选
-    expect(screen.getByLabelText(/Cookie 恢复/)).not.toBeChecked()
-    expect(screen.getByLabelText(/Cookie 失效/)).toBeChecked()
+
+    // 脱敏徽章与清除按钮正确展示
+    expect(screen.getByText(/已配置: https:\/\/open\.feishu\.cn.*abc\*\*\*\*/)).toBeInTheDocument()
+    expect(screen.getByText(/已配置: https:\/\/api\.day\.app.*dev\*\*\*\*/)).toBeInTheDocument()
+    expect(screen.getByText(/已配置: 123456\*\*\*\*/)).toBeInTheDocument()
   })
 
-  it('保存时把表单状态原样 PUT 到后端', async () => {
+  it('TestNotifySavingQuotaDoesNotResendMaskedSecrets: 仅改动配额时绝不回传脱敏掩码', async () => {
     mockGet()
-    const putBodies: NotifySettings[] = []
+    const putBodies: UpdateNotifySettingsRequest[] = []
     server.use(
       http.put('/api/settings/notify', async ({ request }) => {
-        putBodies.push((await request.json()) as NotifySettings)
-        return HttpResponse.json({ success: true, data: stored })
+        putBodies.push((await request.json()) as UpdateNotifySettingsRequest)
+        return HttpResponse.json({ success: true, data: { ...storedResponse, quota_threshold: 850 } })
       }),
     )
+
+    renderPage()
+    const quotaInput = await screen.findByLabelText('配额水位阈值 (活跃别名数)')
+    await userEvent.clear(quotaInput)
+    await userEvent.type(quotaInput, '850')
+
+    await userEvent.click(screen.getByRole('button', { name: '保存配置' }))
+
+    await waitFor(() => expect(putBodies).toHaveLength(1))
+    const body = putBodies[0]
+    expect(body.quota_threshold).toBe(850)
+    // Secret 字段必须为 undefined，严禁回传脱敏值或空值覆盖
+    expect(body.feishu_webhook).toBeUndefined()
+    expect(body.bark_url).toBeUndefined()
+    expect(body.telegram_token).toBeUndefined()
+    expect(JSON.stringify(body)).not.toContain('****')
+  })
+
+  it('TestNotifySecretReplacementSendsOnlyNewValue: 替换 Secret 时仅提交用户真实输入的明文', async () => {
+    mockGet()
+    const putBodies: UpdateNotifySettingsRequest[] = []
+    server.use(
+      http.put('/api/settings/notify', async ({ request }) => {
+        putBodies.push((await request.json()) as UpdateNotifySettingsRequest)
+        return HttpResponse.json({ success: true, data: storedResponse })
+      }),
+    )
+
+    renderPage()
+    const feishuInput = await screen.findByLabelText('飞书自定义机器人 Webhook')
+    const newWebhook = 'https://open.feishu.cn/open-apis/bot/v2/hook/new-real-secret-1234'
+    await userEvent.type(feishuInput, newWebhook)
+
+    await userEvent.click(screen.getByRole('button', { name: '保存配置' }))
+
+    await waitFor(() => expect(putBodies).toHaveLength(1))
+    const body = putBodies[0]
+    expect(body.feishu_webhook).toBe(newWebhook)
+    // 其他未修改的 secret 不得发送
+    expect(body.bark_url).toBeUndefined()
+    expect(body.telegram_token).toBeUndefined()
+    expect(JSON.stringify(body)).not.toContain('****')
+  })
+
+  it('TestNotifyExplicitClearUsesClearFlag: 显式清除必须携带 clear 标记', async () => {
+    mockGet()
+    const putBodies: UpdateNotifySettingsRequest[] = []
+    server.use(
+      http.put('/api/settings/notify', async ({ request }) => {
+        putBodies.push((await request.json()) as UpdateNotifySettingsRequest)
+        return HttpResponse.json({
+          success: true,
+          data: { ...storedResponse, feishu_configured: false, feishu_webhook_masked: '' },
+        })
+      }),
+    )
+
     renderPage()
     await screen.findByLabelText('飞书自定义机器人 Webhook')
+
+    // 点击飞书清除配置
+    const clearBtns = screen.getAllByRole('button', { name: '清除配置' })
+    await userEvent.click(clearBtns[0])
+
+    expect(screen.getByText('已标记清除')).toBeInTheDocument()
+
     await userEvent.click(screen.getByRole('button', { name: '保存配置' }))
+
     await waitFor(() => expect(putBodies).toHaveLength(1))
-    expect(putBodies[0].feishu_webhook).toBe(stored.feishu_webhook)
-    expect(putBodies[0].quota_threshold).toBe(700)
-    expect(putBodies[0].event_kinds?.cookie_recovered).toBe(false)
+    const body = putBodies[0]
+    expect(body.clear_feishu).toBe(true)
+    expect(body.feishu_webhook).toBeUndefined()
+  })
+
+  it('TestNotifyResponseNeverDisplaysRawSecret: 页面与 DOM 绝不包含明文密钥', async () => {
+    mockGet({
+      ...storedResponse,
+      feishu_webhook_masked: 'https://open.feishu.cn/open-apis/bot/v2/hook/masked****',
+    })
+    renderPage()
+    await screen.findByText(/已配置: https:\/\/open\.feishu\.cn.*masked\*\*\*\*/)
+
+    const dom = document.body.innerHTML
+    // 确保绝对不包含真实未脱敏的 secret 标记
+    expect(dom).not.toContain('unmasked-super-secret')
+    // 输入框值为空
+    expect(screen.getByLabelText('飞书自定义机器人 Webhook')).toHaveValue('')
+    expect(screen.getByLabelText('Bark 推送地址 (iOS)')).toHaveValue('')
+    expect(screen.getByLabelText('Telegram Bot Token')).toHaveValue('')
   })
 
   it('切换事件开关并保存', async () => {
     mockGet()
-    const putBodies: NotifySettings[] = []
+    const putBodies: UpdateNotifySettingsRequest[] = []
     server.use(
       http.put('/api/settings/notify', async ({ request }) => {
-        putBodies.push((await request.json()) as NotifySettings)
-        return HttpResponse.json({ success: true, data: stored })
+        putBodies.push((await request.json()) as UpdateNotifySettingsRequest)
+        return HttpResponse.json({ success: true, data: storedResponse })
       }),
     )
     renderPage()
@@ -78,6 +173,8 @@ describe('SettingsPage', () => {
     await userEvent.click(screen.getByRole('button', { name: '保存配置' }))
     await waitFor(() => expect(putBodies).toHaveLength(1))
     expect(putBodies[0].event_kinds?.cookie_recovered).toBe(true)
+    // 没有修改 secret，不发任何 secret
+    expect(putBodies[0].feishu_webhook).toBeUndefined()
   })
 
   it('测试推送展示逐渠道结果', async () => {

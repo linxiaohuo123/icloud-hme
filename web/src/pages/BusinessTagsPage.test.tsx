@@ -26,8 +26,10 @@ const tokens: APIToken[] = [
   {
     id: 'tok_1',
     name: '注册机-01',
+    token_prefix: 'ihme_live_tok1',
     created_at: '2026-09-18T10:00:00+08:00',
     last_used_at: undefined,
+    needs_rotation: false,
   },
 ]
 
@@ -240,5 +242,186 @@ describe('BusinessTagsPage', () => {
 
     await user.click(screen.getByTitle('查看出号记录'))
     expect(await screen.findByText('used-probe:/used?tag=tiktok')).toBeInTheDocument()
+  })
+
+  it('TestTokenListNeverStoresPlaintextSecret: 令牌列表只展示脱敏前缀，绝不存储或泄漏明文 Secret', async () => {
+    const sensitiveTokens = [
+      {
+        id: 'tok_sec_1',
+        name: '安全检测令牌',
+        token_prefix: 'sec_pref',
+        created_at: '2026-09-18T10:00:00+08:00',
+        scopes: 'allocate,verify',
+        needs_rotation: false,
+      },
+    ]
+    server.use(
+      http.get('/api/tags', () => HttpResponse.json({ success: true, data: tags })),
+      http.get('/api/tokens', () => HttpResponse.json({ success: true, data: sensitiveTokens })),
+    )
+    renderPage()
+    expect(await screen.findByText('安全检测令牌')).toBeInTheDocument()
+    expect(screen.getByText('sec_pref****')).toBeInTheDocument()
+    // DOM 中绝不包含任何未脱敏长密钥
+    expect(screen.queryByText(/sec_pref[a-zA-Z0-9]{10,}/)).toBeNull()
+  })
+
+  it('TestLegacyTokenNeedsRotationShown: 历史遗留令牌展示"待轮换"醒目标签', async () => {
+    const legacyTokens = [
+      {
+        id: 'tok_legacy_1',
+        name: '老旧令牌',
+        token_prefix: 'leg_pref',
+        created_at: '2026-09-18T10:00:00+08:00',
+        scopes: 'admin',
+        needs_rotation: true,
+      },
+    ]
+    server.use(
+      http.get('/api/tags', () => HttpResponse.json({ success: true, data: tags })),
+      http.get('/api/tokens', () => HttpResponse.json({ success: true, data: legacyTokens })),
+    )
+    renderPage()
+    expect(await screen.findByText('待轮换')).toBeInTheDocument()
+    expect(screen.getByTitle(/建议立即轮换/)).toBeInTheDocument()
+  })
+
+  it('TestRotateTokenShowsSecretOnce: 点击轮换调用 POST /api/tokens/:id/rotate，新令牌仅在横幅展示一次', async () => {
+    const user = userEvent.setup()
+    let rotateCalled = false
+    const activeTokens = [
+      {
+        id: 'tok_rot_1',
+        name: '待轮换令牌',
+        token_prefix: 'rot_pref',
+        created_at: '2026-09-18T10:00:00+08:00',
+        scopes: 'allocate,verify',
+        needs_rotation: false,
+      },
+    ]
+    server.use(
+      http.get('/api/tags', () => HttpResponse.json({ success: true, data: tags })),
+      http.get('/api/tokens', () => HttpResponse.json({ success: true, data: activeTokens })),
+      http.post('/api/tokens/tok_rot_1/rotate', () => {
+        rotateCalled = true
+        return HttpResponse.json({
+          success: true,
+          data: {
+            id: 'tok_rot_1',
+            name: '待轮换令牌',
+            token_prefix: 'new_rot_',
+            token: 'new_rotated_plaintext_secret_999',
+            created_at: '2026-09-18T10:00:00+08:00',
+            scopes: 'allocate,verify',
+            needs_rotation: false,
+          },
+        })
+      }),
+    )
+    renderPage()
+    expect(await screen.findByText('待轮换令牌')).toBeInTheDocument()
+
+    const rotateBtn = screen.getByRole('button', { name: /轮换/ })
+    await user.click(rotateBtn)
+
+    await waitFor(() => expect(rotateCalled).toBe(true))
+    // 横幅中展示了一次性新密钥
+    expect(await screen.findByText('new_rotated_plaintext_secret_999')).toBeInTheDocument()
+  })
+
+  it('TestRotateRefreshKeepsSameTokenID: 轮换成功后保持相同的 Token ID', async () => {
+    const user = userEvent.setup()
+    let tokensData = [
+      {
+        id: 'tok_stable_id',
+        name: '稳定标识令牌',
+        token_prefix: 'old_pref',
+        created_at: '2026-09-18T10:00:00+08:00',
+        scopes: 'allocate,verify',
+        needs_rotation: true,
+      },
+    ]
+    server.use(
+      http.get('/api/tags', () => HttpResponse.json({ success: true, data: tags })),
+      http.get('/api/tokens', () => HttpResponse.json({ success: true, data: tokensData })),
+      http.post('/api/tokens/tok_stable_id/rotate', () => {
+        tokensData = [
+          {
+            id: 'tok_stable_id',
+            name: '稳定标识令牌',
+            token_prefix: 'new_pref',
+            created_at: '2026-09-18T10:00:00+08:00',
+            scopes: 'allocate,verify',
+            needs_rotation: false,
+          },
+        ]
+        return HttpResponse.json({
+          success: true,
+          data: {
+            ...tokensData[0],
+            token: 'new_secret_abc',
+          },
+        })
+      }),
+    )
+    renderPage()
+    expect(await screen.findByText('old_pref****')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: /轮换/ }))
+    expect(await screen.findByText('new_secret_abc')).toBeInTheDocument()
+    // 列表刷新后，Token ID 保持一致，前缀更新为新值且不再待轮换
+    expect(await screen.findByText('new_pref****')).toBeInTheDocument()
+    expect(screen.getByText('正常')).toBeInTheDocument()
+    expect(screen.queryByText('待轮换')).toBeNull()
+  })
+
+  it('TestRevokedTokenCannotBeRotatedFromUI: 已作废令牌在 UI 上显示"已作废"，不提供作废或轮换按钮', async () => {
+    const revokedTokens = [
+      {
+        id: 'tok_rev_1',
+        name: '作废令牌',
+        token_prefix: 'rev_pref',
+        created_at: '2026-09-18T10:00:00+08:00',
+        revoked_at: '2026-09-20T10:00:00+08:00',
+        scopes: 'allocate',
+        needs_rotation: false,
+      },
+    ]
+    server.use(
+      http.get('/api/tags', () => HttpResponse.json({ success: true, data: tags })),
+      http.get('/api/tokens', () => HttpResponse.json({ success: true, data: revokedTokens })),
+    )
+    renderPage()
+    expect(await screen.findByText('作废令牌')).toBeInTheDocument()
+    // 状态与操作列均明确展示已作废
+    const revokedTexts = screen.getAllByText('已作废')
+    expect(revokedTexts.length).toBeGreaterThanOrEqual(1)
+    // 不显示轮换或作废按钮
+    expect(screen.queryByRole('button', { name: /轮换/ })).toBeNull()
+    expect(screen.queryByTitle('作废令牌')).toBeNull()
+  })
+
+  it('TestExpiredTokenStatusRenderedCorrectly: 已过期令牌渲染"已过期"状态，不提供作废或轮换按钮', async () => {
+    const expiredTokens = [
+      {
+        id: 'tok_exp_1',
+        name: '过期令牌',
+        token_prefix: 'exp_pref',
+        created_at: '2026-01-01T00:00:00Z',
+        expires_at: '2026-01-02T00:00:00Z',
+        scopes: 'allocate',
+        needs_rotation: false,
+      },
+    ]
+    server.use(
+      http.get('/api/tags', () => HttpResponse.json({ success: true, data: tags })),
+      http.get('/api/tokens', () => HttpResponse.json({ success: true, data: expiredTokens })),
+    )
+    renderPage()
+    expect(await screen.findByText('过期令牌')).toBeInTheDocument()
+    const expiredTexts = screen.getAllByText('已过期')
+    expect(expiredTexts.length).toBeGreaterThanOrEqual(1)
+    expect(screen.queryByRole('button', { name: /轮换/ })).toBeNull()
+    expect(screen.queryByTitle('作废令牌')).toBeNull()
   })
 })

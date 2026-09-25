@@ -46,52 +46,101 @@ export default function SchedulePage() {
     })
   }
 
-  const fetchLogs = useCallback(() => {
-    request<ScheduleLog[]>('/api/schedule/logs')
-      .then((data) => {
-        if (Array.isArray(data)) {
-          setLogs(data)
-        }
-      })
-      .catch(() => {})
-  }, [])
+  const pollGenerationRef = useRef(0)
+  const pollAbortRef = useRef<AbortController | null>(null)
+  const pollInFlightRef = useRef(false)
 
-  const fetchStatus = useCallback(() => {
-    request<ScheduleStatus>('/api/schedule/status')
-      .then((data) => {
-        if (data && typeof data === 'object') {
-          setStatus(data)
-        }
-      })
-      .catch(() => {})
-  }, [])
+  const runPoll = useCallback(async () => {
+    // 中止上一轮未决请求，递增代数
+    pollAbortRef.current?.abort()
+    pollGenerationRef.current++
+    const gen = pollGenerationRef.current
+    const controller = new AbortController()
+    pollAbortRef.current = controller
+    pollInFlightRef.current = true
 
-  const fetchConfigs = useCallback(() => {
-    request<ScheduleConfig[]>('/api/schedule/configs')
-      .then((data) => {
-        if (!Array.isArray(data)) return
-        setConfigs(() => {
-          const map: Record<string, ScheduleConfig> = {}
-          data.forEach((c) => {
-            map[c.account_id] = c
+    try {
+      const [logsData, configsData, statusData] = await Promise.all([
+        request<ScheduleLog[]>('/api/schedule/logs', { signal: controller.signal }).catch(() => null),
+        request<ScheduleConfig[]>('/api/schedule/configs', { signal: controller.signal }).catch(() => null),
+        request<ScheduleStatus>('/api/schedule/status', { signal: controller.signal }).catch(() => null),
+      ])
+
+      // 必须满足 latest-wins：仅当代数完全一致且未中止时允许提交到状态
+      if (gen === pollGenerationRef.current && !controller.signal.aborted) {
+        if (Array.isArray(logsData)) {
+          setLogs(logsData)
+        }
+        if (Array.isArray(configsData)) {
+          setConfigs(() => {
+            const map: Record<string, ScheduleConfig> = {}
+            configsData.forEach((c) => {
+              map[c.account_id] = c
+            })
+            return map
           })
-          return map
-        })
-      })
-      .catch(() => {})
+        }
+        if (statusData && typeof statusData === 'object') {
+          setStatus(statusData)
+        }
+      }
+    } finally {
+      if (gen === pollGenerationRef.current) {
+        pollInFlightRef.current = false
+      }
+    }
   }, [])
 
   useEffect(() => {
-    fetchLogs()
-    fetchConfigs()
-    fetchStatus()
-    const timer = setInterval(() => {
-      fetchLogs()
-      fetchConfigs()
-      fetchStatus()
-    }, 3000)
-    return () => clearInterval(timer)
-  }, [fetchLogs, fetchConfigs, fetchStatus])
+    let timer: ReturnType<typeof setInterval> | null = null
+
+    const start = () => {
+      if (timer) clearInterval(timer)
+      void runPoll()
+      timer = setInterval(() => {
+        if (typeof document !== 'undefined' && document.hidden) return
+        void runPoll()
+      }, 3000)
+    }
+
+    const stop = () => {
+      if (timer) {
+        clearInterval(timer)
+        timer = null
+      }
+      pollAbortRef.current?.abort()
+    }
+
+    const handleVisibilityChange = () => {
+      if (typeof document !== 'undefined' && document.hidden) {
+        stop()
+      } else {
+        start()
+      }
+    }
+
+    const handleLogout = () => {
+      stop()
+    }
+
+    start()
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleVisibilityChange)
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('auth-logout', handleLogout)
+    }
+
+    return () => {
+      stop()
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisibilityChange)
+      }
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('auth-logout', handleLogout)
+      }
+    }
+  }, [runPoll])
 
   // 新日志到达时跟随滚动到底部; 用户手动上翻阅读历史时不打扰
   useEffect(() => {
@@ -108,6 +157,10 @@ export default function SchedulePage() {
 
   const handleToggleAccount = useCallback(
     async (acc: AccountSummary) => {
+      // 1. PUT 开始前：使所有 mutation 前的 poll response 失效并中止
+      pollAbortRef.current?.abort()
+      pollGenerationRef.current++
+
       const cur = configsRef.current[acc.id] || {
         account_id: acc.id,
         enabled: false,
@@ -126,17 +179,24 @@ export default function SchedulePage() {
           method: 'PUT',
           body: updated,
         })
+        // 2. PUT 成功后，local commit 立即生效
         setConfigs((prev) => ({ ...prev, [acc.id]: updated }))
         show(`账号 [${acc.name || acc.real_email}] 定时任务已${updated.enabled ? '开启' : '关闭'}`)
+        // 3. 执行最新权威 revalidate
+        void runPoll()
       } catch (err) {
         show(err instanceof ApiError ? err.message : '更新配置失败')
       }
     },
-    [show],
+    [show, runPoll],
   )
 
   const handleUpdateScheduleMode = useCallback(
     async (accId: string, patch: Partial<ScheduleConfig>) => {
+      // 1. PUT 开始前：使所有 mutation 前的 poll response 失效并中止
+      pollAbortRef.current?.abort()
+      pollGenerationRef.current++
+
       const cur = configsRef.current[accId] || {
         account_id: accId,
         enabled: false,
@@ -152,15 +212,20 @@ export default function SchedulePage() {
         })
         setConfigs((prev) => ({ ...prev, [accId]: updated }))
         show('调度策略已更新')
+        void runPoll()
       } catch (err) {
         show(err instanceof ApiError ? err.message : '更新调度策略失败')
       }
     },
-    [show],
+    [show, runPoll],
   )
 
   const handleUpdateQuota = useCallback(
     async (accId: string, quota: number) => {
+      // 1. PUT 开始前：使所有 mutation 前的 poll response 失效并中止
+      pollAbortRef.current?.abort()
+      pollGenerationRef.current++
+
       const cur = configsRef.current[accId] || {
         account_id: accId,
         enabled: false,
@@ -175,15 +240,20 @@ export default function SchedulePage() {
         })
         setConfigs((prev) => ({ ...prev, [accId]: updated }))
         show('每小时配额已更新')
+        void runPoll()
       } catch (err) {
         show(err instanceof ApiError ? err.message : '更新配额失败')
       }
     },
-    [show],
+    [show, runPoll],
   )
 
   const handleUpdateLabel = useCallback(
     async (accId: string, label: string) => {
+      // 1. PUT 开始前：使所有 mutation 前的 poll response 失效并中止
+      pollAbortRef.current?.abort()
+      pollGenerationRef.current++
+
       const cur = configsRef.current[accId] || {
         account_id: accId,
         enabled: false,
@@ -200,11 +270,12 @@ export default function SchedulePage() {
         })
         setConfigs((prev) => ({ ...prev, [accId]: updated }))
         show('别名备注模板已更新')
+        void runPoll()
       } catch (err) {
         show(err instanceof ApiError ? err.message : '更新别名备注模板失败')
       }
     },
-    [show],
+    [show, runPoll],
   )
 
   const handleApplyPreset = useCallback(
@@ -400,7 +471,7 @@ export default function SchedulePage() {
           terminalRef={terminalRef}
           triggering={triggering}
           onTriggerNow={handleTriggerNow}
-          onRefreshLogs={fetchLogs}
+          onRefreshLogs={() => void runPoll()}
         />
       </div>
     </div>

@@ -5,10 +5,11 @@
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
 import { ApiError, request } from '../api/client'
 import type { AccountSummary, Alias } from '../api/types'
+import { invalidateAccounts } from '../hooks/useAccounts'
 import BatchEditAliasDialog from '../components/BatchEditAliasDialog'
 import ConfirmDialog from '../components/ConfirmDialog'
 import CookieDialog from '../components/CookieDialog'
@@ -35,6 +36,12 @@ export default function AccountWorkspace() {
   const [aliasLoading, setAliasLoading] = useState(true)
   const [quickCreating, setQuickCreating] = useState(false)
 
+  // 跨账号竞态保护与请求取消
+  const workspaceGenRef = useRef(0)
+  const accountAbortRef = useRef<AbortController | null>(null)
+  const aliasAbortRef = useRef<AbortController | null>(null)
+  const currentAccountIdRef = useRef<string | undefined>(accountId)
+
   // 别名筛选状态
   const [selectedAliasForInbox, setSelectedAliasForInbox] = useState(
     searchParams.get('alias') || '',
@@ -51,61 +58,132 @@ export default function AccountWorkspace() {
 
   const { show, showCopyable } = useToast()
 
+  // 保持 currentAccountIdRef 实时同步
+  useEffect(() => {
+    currentAccountIdRef.current = accountId
+  }, [accountId])
+
+  // 卸载时取消所有在途请求
+  useEffect(() => {
+    return () => {
+      accountAbortRef.current?.abort()
+      aliasAbortRef.current?.abort()
+    }
+  }, [])
+
   const loadAccountData = useCallback(
     async (forceRefresh = false) => {
       if (!accountId) return
       const requestedId = accountId
+
+      // 递增全局代数，作废此前所有未决请求
+      workspaceGenRef.current++
+      const gen = workspaceGenRef.current
+
+      accountAbortRef.current?.abort()
+      aliasAbortRef.current?.abort()
+
+      const accountCtrl = new AbortController()
+      const aliasCtrl = new AbortController()
+      accountAbortRef.current = accountCtrl
+      aliasAbortRef.current = aliasCtrl
+
       setAccountLoading(true)
       setAliasLoading(true)
+
       try {
         // ── 第一阶段: 单账号精准载入 (毫秒级，按需获取) ──
-        const found = await request<AccountSummary>(`/api/accounts/${encodeURIComponent(requestedId)}`)
-        setAccount((prev) => (accountId !== requestedId ? prev : (found ?? null)))
+        const found = await request<AccountSummary>(
+          `/api/accounts/${encodeURIComponent(requestedId)}`,
+          { signal: accountCtrl.signal },
+        )
+        if (
+          gen === workspaceGenRef.current &&
+          currentAccountIdRef.current === requestedId &&
+          !accountCtrl.signal.aborted
+        ) {
+          setAccount(found ?? null)
+        }
       } catch (err) {
-        if (accountId === requestedId) {
+        if (
+          gen === workspaceGenRef.current &&
+          currentAccountIdRef.current === requestedId &&
+          !accountCtrl.signal.aborted
+        ) {
           show(err instanceof ApiError ? err.message : '获取账号信息失败')
         }
       } finally {
-        if (accountId === requestedId) {
+        if (
+          gen === workspaceGenRef.current &&
+          currentAccountIdRef.current === requestedId
+        ) {
           setAccountLoading(false)
         }
       }
 
-      if (accountId !== requestedId) return
+      // 如果在此期间路由已切走或 generation 已被 supersede，中断第二阶段
+      if (
+        gen !== workspaceGenRef.current ||
+        currentAccountIdRef.current !== requestedId ||
+        accountCtrl.signal.aborted
+      ) {
+        return
+      }
 
       // ── 第二阶段: 别名列表 (可能跨洋请求 Apple, 秒级) ──
       const aliasUrl = forceRefresh
         ? `/api/aliases?account_id=${encodeURIComponent(requestedId)}&refresh=true`
         : `/api/aliases?account_id=${encodeURIComponent(requestedId)}`
       try {
-        const aliasData = await request<{ aliases?: Alias[] }>(aliasUrl)
-        const aliasList = Array.isArray(aliasData?.aliases) ? aliasData.aliases : []
-        const activeCount = aliasList.filter((a) => a.active).length
-        // 防竞态: 慢请求返回时若用户已切走，丢弃结果，杜绝跨账号数据覆盖
-        setAliases((prev) => (accountId !== requestedId ? prev : aliasList))
-        setAccount((prev) =>
-          prev && prev.id === requestedId
-            ? {
-                ...prev,
-                alias_total: aliasList.length,
-                alias_active: activeCount,
-              }
-            : prev,
-        )
-        window.dispatchEvent(new CustomEvent('account-updated'))
-        if (forceRefresh) {
-          show('已与 Apple 服务器完成数据对账')
+        const aliasData = await request<{ aliases?: Alias[] }>(aliasUrl, {
+          signal: aliasCtrl.signal,
+        })
+        if (
+          gen === workspaceGenRef.current &&
+          currentAccountIdRef.current === requestedId &&
+          !aliasCtrl.signal.aborted
+        ) {
+          const aliasList = Array.isArray(aliasData?.aliases) ? aliasData.aliases : []
+          const activeCount = aliasList.filter((a) => a.active).length
+          setAliases(aliasList)
+          setAccount((prev) =>
+            prev && prev.id === requestedId
+              ? {
+                  ...prev,
+                  alias_total: aliasList.length,
+                  alias_active: activeCount,
+                }
+              : prev,
+          )
+          // 普通 GET 绝不广播 account-updated
+          if (forceRefresh) {
+            show('已与 Apple 服务器完成数据对账')
+          }
         }
       } catch (err) {
-        show(err instanceof ApiError ? err.message : '获取别名列表失败')
+        if (
+          gen === workspaceGenRef.current &&
+          currentAccountIdRef.current === requestedId &&
+          !aliasCtrl.signal.aborted
+        ) {
+          show(err instanceof ApiError ? err.message : '获取别名列表失败')
+        }
       } finally {
-        setAliasLoading(false)
+        if (
+          gen === workspaceGenRef.current &&
+          currentAccountIdRef.current === requestedId
+        ) {
+          setAliasLoading(false)
+        }
       }
     },
     [accountId, show],
   )
 
   useEffect(() => {
+    // 切换账号时重置局部数据并拉取
+    setAccount(null)
+    setAliases([])
     void loadAccountData()
   }, [loadAccountData])
 
@@ -118,6 +196,7 @@ export default function AccountWorkspace() {
         { method: 'POST' },
       )
       showCopyable('别名已生成', created.email)
+      invalidateAccounts(accountId)
       void loadAccountData()
     } catch (err) {
       show(err instanceof ApiError ? err.message : '出号失败')
@@ -137,6 +216,7 @@ export default function AccountWorkspace() {
         body: { account_id: accountId },
       })
       show(item.active ? '别名已停用' : '别名已重新启用')
+      invalidateAccounts(accountId)
       void loadAccountData()
     } catch (err) {
       show(err instanceof ApiError ? err.message : '操作失败')
@@ -154,6 +234,7 @@ export default function AccountWorkspace() {
         },
       )
       show('别名已彻底删除')
+      invalidateAccounts(accountId)
       const deletedId = confirmDeleteAlias.anonymousId
       setConfirmDeleteAlias(null)
       setSelectedIds((prev) => {
@@ -298,6 +379,7 @@ export default function AccountWorkspace() {
             onClose={() => setCookieOpen(false)}
             onSaved={() => {
               setCookieOpen(false)
+              invalidateAccounts(account.id)
               void loadAccountData()
             }}
           />
@@ -308,6 +390,7 @@ export default function AccountWorkspace() {
             onClose={() => setMailboxOpen(false)}
             onSaved={() => {
               setMailboxOpen(false)
+              invalidateAccounts(account.id)
               void loadAccountData()
             }}
           />
@@ -317,6 +400,7 @@ export default function AccountWorkspace() {
             onClose={() => setCreateAliasOpen(false)}
             onCreated={() => {
               setCreateAliasOpen(false)
+              invalidateAccounts(account.id)
               void loadAccountData()
             }}
           />
