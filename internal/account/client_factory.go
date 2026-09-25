@@ -128,10 +128,14 @@ func (m *Manager) MailClient(id string) (*mail.Client, error) {
 	if !ok {
 		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
+	proxy := snap.Proxy
+	if os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "true" || os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "1" {
+		proxy = ""
+	}
 	if snap.Mailbox != nil && snap.Mailbox.Email != "" && snap.Mailbox.Password != "" {
 		mc := mail.NewClientWithServer(snap.Mailbox.Email, snap.Mailbox.Password, snap.Mailbox.IMAPHost, snap.Mailbox.IMAPPort)
-		if snap.Proxy != "" {
-			mc.SetProxy(snap.Proxy)
+		if proxy != "" {
+			mc.SetProxy(proxy)
 		}
 		return mc, nil
 	}
@@ -145,7 +149,7 @@ func (m *Manager) MailClient(id string) (*mail.Client, error) {
 	if snap.AppPassword == "" {
 		return nil, fmt.Errorf("账号未设置 App 专用密码")
 	}
-	return mail.NewClientWithProxy(imapEmail, snap.AppPassword, snap.Proxy), nil
+	return mail.NewClientWithProxy(imapEmail, snap.AppPassword, proxy), nil
 }
 
 // WithMailClientContext 使用连接池中的长连接执行 fn，支持真实 Context 超时与取消 (Issue 13)。
@@ -167,12 +171,21 @@ func (m *Manager) WithMailClientContext(ctx context.Context, id string, fn func(
 	m.mu.RUnlock()
 	if mailbox != nil && mailbox.Email != "" && mailbox.Password != "" {
 		mc := mail.NewClientWithServer(mailbox.Email, mailbox.Password, mailbox.IMAPHost, mailbox.IMAPPort)
-		if proxyURL != "" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "true" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "1" {
+		useProxy := proxyURL != "" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "true" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "1"
+		if useProxy {
 			mc.SetProxy(proxyURL)
 		}
 		if err := mc.Connect(); err != nil {
+			if useProxy {
+				direct := mail.NewClientWithServer(mailbox.Email, mailbox.Password, mailbox.IMAPHost, mailbox.IMAPPort)
+				if directErr := direct.Connect(); directErr == nil {
+					mc = direct
+					goto connectedCustomMailbox
+				}
+			}
 			return err
 		}
+connectedCustomMailbox:
 		defer mc.Disconnect()
 
 		stopWatch := make(chan struct{})

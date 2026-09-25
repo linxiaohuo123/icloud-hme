@@ -454,12 +454,21 @@ func (m *Manager) SetMailbox(id string, config MailboxConfig) error {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
 	mc := mail.NewClientWithServer(config.Email, config.Password, config.IMAPHost, config.IMAPPort)
-	if proxyURL != "" {
+	useProxy := proxyURL != "" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "true" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "1"
+	if useProxy {
 		mc.SetProxy(proxyURL)
 	}
 	if err := mc.Connect(); err != nil {
+		if useProxy {
+			directMC := mail.NewClientWithServer(config.Email, config.Password, config.IMAPHost, config.IMAPPort)
+			if directErr := directMC.Connect(); directErr == nil {
+				mc = directMC
+				goto connectedMailbox
+			}
+		}
 		return err
 	}
+connectedMailbox:
 	_, err := mc.InboxCount()
 	mc.Disconnect()
 	if err != nil {
@@ -477,6 +486,8 @@ func (m *Manager) SetMailbox(id string, config MailboxConfig) error {
 
 // SetAppPassword 设置 iCloud 邮箱和 App 专用密码,并测试 IMAP 连接。
 func (m *Manager) SetAppPassword(id, icloudEmail, appPassword string) error {
+	icloudEmail = strings.TrimSpace(icloudEmail)
+	appPassword = strings.TrimSpace(appPassword)
 	if icloudEmail == "" {
 		return fmt.Errorf("iCloud 邮箱不能为空")
 	}
@@ -495,16 +506,25 @@ func (m *Manager) SetAppPassword(id, icloudEmail, appPassword string) error {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
 
-	// 测试连接(锁外，透传账号配置的代理)
+	// 测试连接(锁外，遵循直连开关并支持代理故障直连降级)
 	var mc *mail.Client
-	if proxyURL != "" {
+	useProxy := proxyURL != "" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "true" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "1"
+	if useProxy {
 		mc = mail.NewClientWithProxy(icloudEmail, appPassword, proxyURL)
 	} else {
 		mc = mail.NewClient(icloudEmail, appPassword)
 	}
 	if err := mc.Connect(); err != nil {
+		if useProxy {
+			directMC := mail.NewClient(icloudEmail, appPassword)
+			if directErr := directMC.Connect(); directErr == nil {
+				mc = directMC
+				goto connectedAppPwd
+			}
+		}
 		return err
 	}
+connectedAppPwd:
 	count, err := mc.InboxCount()
 	mc.Disconnect()
 	if err != nil {

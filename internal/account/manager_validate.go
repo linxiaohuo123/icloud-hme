@@ -235,8 +235,7 @@ func isAuthFailure(msg string) bool {
 // 规则:
 //  1. primaryEmail 是 @icloud.com/@me.com/@mac.com → 直接用
 //  2. appleId 是上述域名 → 直接用
-//  3. appleId 是第三方邮箱(如 @qq.com) → 取 local part 拼 @icloud.com
-//  4. appleId 为纯数字/手机号，而 primaryEmail 是第三方邮箱 → 取 primaryEmail local part 拼 @icloud.com
+//  3. 若均非原生 iCloud 域名，则返回空（严禁盲猜拼接，避免误导 IMAP 认证失败）
 func deriveICloudEmail(info *hme.AccountInfo) string {
 	primary := strings.TrimSpace(info.PrimaryEmail)
 	appleID := strings.TrimSpace(info.AppleID)
@@ -247,15 +246,7 @@ func deriveICloudEmail(info *hme.AccountInfo) string {
 	if isICloudDomain(appleID) {
 		return appleID
 	}
-	target := appleID
-	if !strings.Contains(target, "@") {
-		target = primary
-	}
-	if strings.Contains(target, "@") {
-		local := strings.SplitN(target, "@", 2)[0]
-		return local + "@icloud.com"
-	}
-	return firstNonEmpty(primary, appleID)
+	return ""
 }
 
 func isICloudDomain(email string) bool {

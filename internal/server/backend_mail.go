@@ -164,6 +164,31 @@ func (b *managerBackend) ListInboxContext(ctx context.Context, q InboxQuery) (In
 		return InboxResult{}, ctx.Err()
 	}
 
+	// 检查当前账号配置的邮件凭据
+	var hasMailbox, hasAppPassword bool
+	if snap, ok := b.mgr.GetAccount(q.AccountID); ok && snap != nil {
+		hasMailbox = snap.Mailbox != nil && snap.Mailbox.Email != "" && snap.Mailbox.Password != ""
+		hasAppPassword = snap.AppPassword != ""
+	}
+
+	// 1. 若配置了外部收件邮箱 (Mailbox: QQ/163/Gmail 等)，邮件在第三方邮箱中，严禁回退到 Apple WebMail，直接报出真实错误
+	if hasMailbox {
+		return InboxResult{}, &BackendError{
+			Status:  http.StatusBadGateway,
+			Code:    "UPSTREAM_FAILURE",
+			Message: "收件邮箱读取失败: " + poolErr.Error(),
+		}
+	}
+
+	// 2. 若未开通 @icloud.com 原生邮箱的第三方账号且尝试了 IMAP
+	if poolErr != nil && strings.Contains(poolErr.Error(), "未设置 iCloud 邮箱") {
+		return InboxResult{}, &BackendError{
+			Status:  http.StatusBadRequest,
+			Code:    "NON_ICLOUD_MAIL_USER",
+			Message: "该 Apple ID 未设置 @icloud.com 原生邮箱。发往别名的邮件已被苹果转寄至您的注册邮箱，请在【账号管理】中点击「接入收件邮箱」（如 QQ 邮箱 IMAP 授权码），或在苹果设备上开启 iCloud 邮件。",
+		}
+	}
+
 	// IMAP 失败,继续尝试 Web API
 	if q.FolderSpecified || q.DaysSpecified {
 		return InboxResult{}, &BackendError{
@@ -176,6 +201,13 @@ func (b *managerBackend) ListInboxContext(ctx context.Context, q InboxQuery) (In
 	// 回退到 Web API (Cookie 认证,无需 App Password)
 	wmc, err := b.mgr.WebMailClient(q.AccountID)
 	if err != nil {
+		if hasAppPassword && poolErr != nil {
+			return InboxResult{}, &BackendError{
+				Status:  http.StatusBadGateway,
+				Code:    "UPSTREAM_FAILURE",
+				Message: "IMAP 读取失败: " + poolErr.Error(),
+			}
+		}
 		return InboxResult{}, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "无可用邮件客户端: 需要 App Password 或 Cookie"}
 	}
 
@@ -183,11 +215,25 @@ func (b *managerBackend) ListInboxContext(ctx context.Context, q InboxQuery) (In
 	if q.Alias != "" {
 		messages, err = wmc.FindByAliasContext(ctx, q.Alias, q.Limit)
 		if err != nil {
+			if hasAppPassword && poolErr != nil {
+				return InboxResult{}, &BackendError{
+					Status:  http.StatusBadGateway,
+					Code:    "UPSTREAM_FAILURE",
+					Message: fmt.Sprintf("IMAP 读取失败 (%s); WebMail 回退亦失败 (%s)", poolErr.Error(), err.Error()),
+				}
+			}
 			return InboxResult{}, classifyInboxErr(err)
 		}
 	} else {
 		messages, err = wmc.ListInboxContext(ctx, q.Limit)
 		if err != nil {
+			if hasAppPassword && poolErr != nil {
+				return InboxResult{}, &BackendError{
+					Status:  http.StatusBadGateway,
+					Code:    "UPSTREAM_FAILURE",
+					Message: fmt.Sprintf("IMAP 读取失败 (%s); WebMail 回退亦失败 (%s)", poolErr.Error(), err.Error()),
+				}
+			}
 			return InboxResult{}, classifyInboxErr(err)
 		}
 	}

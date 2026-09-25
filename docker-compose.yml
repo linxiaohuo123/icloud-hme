@@ -30,6 +30,8 @@ services:
       - ICLOUD_HME_LEASE_RETENTION=${ICLOUD_HME_LEASE_RETENTION:-}
       # 可信反代地址。留空 = 不信任代理头(XFF 不可伪造，但反代下限流退化为全局单桶)。
       - ICLOUD_HME_TRUSTED_PROXIES=${ICLOUD_HME_TRUSTED_PROXIES:-}
+      # IMAP/收件邮箱是否强制直连 (跳过账号配置的代理，防代理屏蔽 993 端口)
+      - ICLOUD_HME_IMAP_DIRECT=${ICLOUD_HME_IMAP_DIRECT:-}
       # 时区设置
       - TZ=${TZ:-Asia/Shanghai}
     volumes:
