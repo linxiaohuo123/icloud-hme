@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, errors, strings, sync, time, strconv, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 MailReadService, NewMailReadService, BatchItemResult, batchMessageItemReq
- * [POS]: internal/server 的邮件读取与统一详情缓存应用服务，封装收件箱读取、基于 MessageRef 的规范身份 Join 与缓存对称隔离
+ * [POS]: internal/server 的邮件读取与统一详情缓存应用服务，封装收件箱读取、基于 MessageRef 的规范身份 Join 与缓存对称隔离，接入 MailPerf 观测 (batch_messages 埋点)
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -551,8 +551,29 @@ func (s *MailReadService) GetMessageDetail(ctx context.Context, accountID, rawID
 	return message, provider, method, false, nil
 }
 
-// GetMessagesBatch 批量读取多封邮件详情 (PR-02 & PR-08: 基于规范 MessageRef 的 Identity Join，严禁按下标对齐)
+// GetMessagesBatch 批量读取多封邮件详情 (PR-02 & PR-08: 基于规范 MessageRef 的 Identity Join，严禁按下标对齐)。
+// 接入 MailPerf 观测 (PR-MAIL-00)：记录批量请求规模、返回与逐项失败计数及总耗时。
 func (s *MailReadService) GetMessagesBatch(ctx context.Context, accountID string, reqItems []batchMessageItemReq) ([]*mail.FullMessage, []BatchItemResult, error) {
+	opStart := time.Now()
+	out, results, err := s.getMessagesBatchIMAPJoin(ctx, accountID, reqItems)
+	itemErrors := 0
+	for i := range results {
+		if results[i].Error != "" {
+			itemErrors++
+		}
+	}
+	mail.LogMailPerf("batch_messages",
+		"account", accountID,
+		"requested", len(reqItems),
+		"returned", len(out),
+		"item_errors", itemErrors,
+		"total_ms", time.Since(opStart).Milliseconds(),
+		"err", err != nil,
+	)
+	return out, results, err
+}
+
+func (s *MailReadService) getMessagesBatchIMAPJoin(ctx context.Context, accountID string, reqItems []batchMessageItemReq) ([]*mail.FullMessage, []BatchItemResult, error) {
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
 		return nil, nil, &BackendError{Status: 400, Code: "VALIDATION_ERROR", Message: "account_id 必填"}

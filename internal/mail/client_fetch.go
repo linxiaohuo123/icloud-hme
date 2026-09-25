@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 fmt, net/mail, sort, strings, github.com/emersion/go-imap
+ * [INPUT]: 依赖 fmt, net/mail, sort, strings, time, github.com/emersion/go-imap
  * [OUTPUT]: 对外提供 (*Client).GetFull, (*Client).GetFullInFolder, (*Client).GetFullInFolderWithValidity, (*Client).GetFullBatchInFolder, (*Client).GetFullBatchInFolderWithValidity, (*Client).GetMailboxBoundary, (*Client).Delete, (*Client).DeleteInFolder
  * [POS]: internal/mail 的邮件正文提取与邮箱管理逻辑，支持单封/批量完整内容拉取、UIDVALIDITY 严格校验与邮件物理删除
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -12,6 +12,7 @@ import (
 	"net/mail"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/emersion/go-imap"
 )
@@ -27,10 +28,16 @@ func (c *Client) GetFullInFolder(folder string, uid uint32) (*FullMessage, error
 }
 
 // GetFullInFolderWithValidity 获取指定文件夹中单封邮件的完整内容，支持严格校验 UIDVALIDITY。
-func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, uid uint32) (*FullMessage, error) {
+func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, uid uint32) (full *FullMessage, retErr error) {
 	if c.cli == nil {
 		return nil, fmt.Errorf("未连接")
 	}
+	opStart := time.Now()
+	bodyRequested := 0
+	bodyReceived := 0
+	defer func() {
+		LogMailPerf("get_full", "server", c.perfServer(), "folder", folder, "uid", uid, "body_fetch_requested", bodyRequested, "body_fetch_received", bodyReceived, "total_ms", time.Since(opStart).Milliseconds(), "err", retErr != nil)
+	}()
 	folders, err := c.resolveFolders(folder)
 	if err != nil {
 		return nil, err
@@ -50,6 +57,8 @@ func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, 
 		items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate, imap.FetchFlags, section.FetchItem()}
 		messages := make(chan *imap.Message, 1)
 		done := make(chan error, 1)
+		// FIX-8: 只统计真正发出 BODY FETCH 的次数 (folder=all 会在多个 folder 依次尝试)
+		bodyRequested++
 		go func() {
 			done <- c.cli.UidFetch(seqset, items, messages)
 		}()
@@ -72,13 +81,14 @@ func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, 
 			}
 			msgModel.MessageRef = ref.Encode()
 
-			full := &FullMessage{
+			full = &FullMessage{
 				Message:      msgModel,
 				BodyComplete: true,
 				Provider:     "imap",
 				Method:       "imap",
 			}
 			if r := msg.GetBody(section); r != nil {
+				bodyReceived++
 				if em, err := mail.ReadMessage(r); err == nil {
 					body, _ := readBody(em)
 					full.Body = strings.TrimSpace(body)
@@ -97,7 +107,7 @@ func (c *Client) GetFullBatchInFolder(folder string, uids []uint32) ([]*FullMess
 }
 
 // GetFullBatchInFolderWithValidity 批量获取指定文件夹中的完整邮件内容，并校验 UIDVALIDITY。
-func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uint32, uids []uint32) ([]*FullMessage, error) {
+func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uint32, uids []uint32) (out []*FullMessage, retErr error) {
 	if c.cli == nil {
 		return nil, fmt.Errorf("未连接")
 	}
@@ -107,6 +117,12 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 	if folder == "" || strings.EqualFold(folder, "all") {
 		folder = "INBOX"
 	}
+	opStart := time.Now()
+	bodyRequested := 0
+	bodyReceived := 0
+	defer func() {
+		LogMailPerf("get_full_batch", "server", c.perfServer(), "folder", folder, "requested", len(uids), "body_fetch_requested", bodyRequested, "body_fetch_received", bodyReceived, "total_ms", time.Since(opStart).Milliseconds(), "err", retErr != nil)
+	}()
 	status, err := c.cli.Select(folder, true)
 	if err != nil {
 		return nil, err
@@ -124,14 +140,18 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 	items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate, imap.FetchFlags, section.FetchItem()}
 	messages := make(chan *imap.Message, len(uids))
 	done := make(chan error, 1)
+	// FIX-8: SELECT / UIDVALIDITY 校验通过、真正即将执行 UidFetch 时才计入 requested
+	bodyRequested = len(uids)
 	go func() {
 		done <- c.cli.UidFetch(seqset, items, messages)
 	}()
 
-	var out []*FullMessage
 	for msg := range messages {
 		if msg == nil {
 			continue
+		}
+		if msgHasBodySection(msg) {
+			bodyReceived++
 		}
 		message := toMessage(msg, folder)
 		message.UIDValidity = status.UidValidity
