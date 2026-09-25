@@ -10,40 +10,62 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"sync"
 
 	"icloud-hme/internal/security"
 )
 
+var (
+	v2CleanupHookMu                    sync.RWMutex
+	beforeV2PhysicalCleanupHookForTest func() error
+)
+
+// SetBeforeV2PhysicalCleanupHookForTest 设置 V2 物理清理前的故障注入挂钩 (测试专用)
+func SetBeforeV2PhysicalCleanupHookForTest(hook func() error) {
+	v2CleanupHookMu.Lock()
+	defer v2CleanupHookMu.Unlock()
+	beforeV2PhysicalCleanupHookForTest = hook
+}
+
 // migrateV1ToV2 执行 Version 1 -> Version 2 的安全迁移:
-// 1. 验证 Master Key 存在性 (若存在未加密凭据且无 Master Key 则立即 fail closed);
-// 2. api_tokens 表重构 (SQLite table rebuild): 转换为 token_hash + token_prefix，彻底剔除 token 明文列;
-// 3. accounts 表凭据字段 (cookies, app_password, mailbox, proxy) AES-256-GCM + AAD 认证加密;
-// 4. settings.notify_settings 认证加密;
-// 5. 写入 user_version = 2;
-// 6. 事务提交后执行 wal_checkpoint(TRUNCATE) + VACUUM 彻底消除 live DB 磁盘明文残留。
+// 状态机严格划分为三个阶段：
+// Phase 1 (逻辑事务):
+//   1. 检查是否存在受保护凭据 (无论明文还是 enc:v1 均强制要求 Master Key);
+//   2. 重建 api_tokens 表 (SQLite table rebuild 剔除 token 明文列，已有 V2 结构则幂等跳过);
+//   3. 加密 accounts 凭据与 settings.notify_settings (已有 enc:v1 密文自检验算后保留);
+//   4. 提交事务 (此时数据库已处于逻辑 V2 数据，但 user_version 仍保持为 1)。
+// Phase 2 (安全物理收敛):
+//   5. PRAGMA wal_checkpoint(TRUNCATE) 截断 WAL;
+//   6. VACUUM 磁盘页面重整，抹除所有明文物理碎片;
+//   7. PRAGMA wal_checkpoint(TRUNCATE) 截断 VACUUM 产生的 WAL;
+//   8. quick_check 验证物理完整性。
+// Phase 3 (终态声明):
+//   9. PRAGMA user_version = 2 写入版本号;
+//   10. validateSchema 校验完整性终态。
 func (s *Store) migrateV1ToV2() error {
-	// 1. 检查是否存在需加密的存量明文凭据
-	hasPlaintextCredentials, err := s.hasPlaintextCredentials()
+	// 1. 检查是否存在受保护凭据 (无论明文还是 enc:v1)
+	hasProtected, err := s.hasProtectedCredentials()
 	if err != nil {
 		return fmt.Errorf("检查存量凭据加密状态失败: %w", err)
 	}
 
-	if hasPlaintextCredentials && s.cipher == nil {
+	if hasProtected && s.cipher == nil {
 		return fmt.Errorf("master key is required for v1 to v2 migration: encryption key not configured")
 	}
 
+	// Phase 1: 逻辑数据与表结构迁移事务
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("开启 v1 到 v2 迁移事务失败: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// 2. 重建 api_tokens 表 (清除明文 token 列)
+	// 重建 api_tokens 表 (若无旧 token 列则幂等跳过)
 	if err := s.rebuildTokensTableTx(tx); err != nil {
 		return fmt.Errorf("重建 api_tokens 表失败: %w", err)
 	}
 
-	// 3. 迁移 accounts 凭据
+	// 迁移 accounts 凭据与 notify_settings
 	if s.cipher != nil {
 		if err := s.encryptAccountsTx(tx); err != nil {
 			return fmt.Errorf("加密 accounts 凭据失败: %w", err)
@@ -53,16 +75,21 @@ func (s *Store) migrateV1ToV2() error {
 		}
 	}
 
-	// 4. 更新 user_version = 2
-	if _, err := tx.Exec("PRAGMA user_version = 2;"); err != nil {
-		return fmt.Errorf("写入 schema user_version 2 失败: %w", err)
-	}
-
+	// 提交 Phase 1 事务 (注意：此时 user_version 仍为 1，杜绝物理清理未完成就标记 V2)
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交 v1 到 v2 迁移事务失败: %w", err)
 	}
 
-	// 5. 安全清理磁盘历史明文残留 (WAL 截断 + 页面重整 VACUUM)
+	// Phase 2: 安全物理收敛 (WAL 截断 + 页面重整 VACUUM + quick_check)
+	v2CleanupHookMu.RLock()
+	hook := beforeV2PhysicalCleanupHookForTest
+	v2CleanupHookMu.RUnlock()
+	if hook != nil {
+		if err := hook(); err != nil {
+			return fmt.Errorf("injected v2 physical cleanup failure: %w", err)
+		}
+	}
+
 	if _, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
 		return fmt.Errorf("wal checkpoint failed: %w", err)
 	}
@@ -73,17 +100,31 @@ func (s *Store) migrateV1ToV2() error {
 		return fmt.Errorf("post-vacuum wal checkpoint failed: %w", err)
 	}
 
+	var qc string
+	if err := s.db.QueryRow("PRAGMA quick_check;").Scan(&qc); err != nil || qc != "ok" {
+		return fmt.Errorf("post-cleanup quick_check failed: %s (err: %v)", qc, err)
+	}
+
+	// Phase 3: 只有安全清理全部成功后，才正式将 user_version 标为 2
+	if _, err := s.db.Exec("PRAGMA user_version = 2;"); err != nil {
+		return fmt.Errorf("写入 schema user_version 2 失败: %w", err)
+	}
+
+	if err := validateSchema(s.db); err != nil {
+		return fmt.Errorf("v2 schema validation failed: %w", err)
+	}
+
 	return nil
 }
 
-func (s *Store) hasPlaintextCredentials() (bool, error) {
+func (s *Store) hasProtectedCredentials() (bool, error) {
 	var count int
 	err := s.db.QueryRow(`
 		SELECT COUNT(*) FROM accounts
-		WHERE (cookies != '' AND cookies NOT LIKE 'enc:v1:%')
-		   OR (app_password != '' AND app_password NOT LIKE 'enc:v1:%')
-		   OR (mailbox != '' AND mailbox NOT LIKE 'enc:v1:%')
-		   OR (proxy != '' AND proxy NOT LIKE 'enc:v1:%')
+		WHERE cookies != ''
+		   OR app_password != ''
+		   OR mailbox != ''
+		   OR proxy != ''
 	`).Scan(&count)
 	if err != nil {
 		return false, err
@@ -95,7 +136,7 @@ func (s *Store) hasPlaintextCredentials() (bool, error) {
 	var notifyCount int
 	err = s.db.QueryRow(`
 		SELECT COUNT(*) FROM settings
-		WHERE key = 'notify_settings' AND value != '' AND value NOT LIKE 'enc:v1:%'
+		WHERE key = 'notify_settings' AND value != ''
 	`).Scan(&notifyCount)
 	if err != nil {
 		return false, err

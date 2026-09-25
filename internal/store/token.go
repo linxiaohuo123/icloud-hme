@@ -247,6 +247,13 @@ func (s *Store) SaveToken(token APIToken) error {
 
 // CreateToken 创建新的高熵 API 令牌，仅在返回值中一次性暴露完整明文令牌
 func (s *Store) CreateToken(name, scopes, expiresAt string) (*CreatedToken, error) {
+	expiresAt = strings.TrimSpace(expiresAt)
+	if expiresAt != "" {
+		if _, err := time.Parse(time.RFC3339, expiresAt); err != nil {
+			return nil, fmt.Errorf("invalid expires_at format (must be RFC3339): %w", err)
+		}
+	}
+
 	rawToken, err := GenerateSecureToken()
 	if err != nil {
 		return nil, err
@@ -308,6 +315,12 @@ func (s *Store) RotateToken(id string) (*CreatedToken, error) {
 
 	if revokedAt != "" {
 		return nil, errors.New("cannot rotate a revoked token")
+	}
+
+	if expiresAt != "" {
+		if _, err := time.Parse(time.RFC3339, expiresAt); err != nil {
+			return nil, fmt.Errorf("cannot rotate token with malformed expires_at: %w", err)
+		}
 	}
 
 	newToken, err := GenerateSecureToken()
@@ -398,10 +411,10 @@ func (s *Store) ValidateTokenPrincipal(tokenStr string) (id, name, scopes string
 		return "", "", "", false
 	}
 
-	// 2. 检查是否已过期
+	// 2. 检查是否已过期 (malformed expires_at 必须 fail closed，绝不能把格式错误当作永不过期)
 	if expiresAt != "" {
 		expTime, parseErr := time.Parse(time.RFC3339, expiresAt)
-		if parseErr == nil && !time.Now().UTC().Before(expTime) {
+		if parseErr != nil || !time.Now().UTC().Before(expTime) {
 			return "", "", "", false
 		}
 	}
@@ -438,10 +451,12 @@ func (s *Store) GetToken(ctx context.Context, id string) (*APIToken, error) {
 		return nil, errors.New("token revoked")
 	}
 	if tok.ExpiresAt != "" {
-		if expTime, parseErr := time.Parse(time.RFC3339, tok.ExpiresAt); parseErr == nil {
-			if !time.Now().UTC().Before(expTime) {
-				return nil, errors.New("token expired")
-			}
+		expTime, parseErr := time.Parse(time.RFC3339, tok.ExpiresAt)
+		if parseErr != nil {
+			return nil, fmt.Errorf("token has malformed expires_at: %w", parseErr)
+		}
+		if !time.Now().UTC().Before(expTime) {
+			return nil, errors.New("token expired")
 		}
 	}
 	tok.NeedsRotation = (needsRot == 1)

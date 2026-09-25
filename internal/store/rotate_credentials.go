@@ -14,14 +14,27 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"icloud-hme/internal/security"
 )
 
+var (
+	rotationCleanupHookMu                    sync.RWMutex
+	beforeRotationPhysicalCleanupHookForTest func() error
+)
+
+// SetBeforeRotationPhysicalCleanupHookForTest 设置凭据轮换物理清理前的故障注入挂钩 (测试专用)
+func SetBeforeRotationPhysicalCleanupHookForTest(hook func() error) {
+	rotationCleanupHookMu.Lock()
+	defer rotationCleanupHookMu.Unlock()
+	beforeRotationPhysicalCleanupHookForTest = hook
+}
+
 // RotateCredentials 执行离线 Master Key 凭据密钥轮换:
 // 1. acquire exclusive lock (确保服务已停止)
-// 2. 校验旧 key 与新 key 均合法且不同
+// 2. 校验旧 key 与新 key 均合法且不同 (通过密文探针安全比对)
 // 3. 创建 pre-rotation consistent backup
 // 4. 开启事务
 // 5. 使用 oldCipher + 对应 AAD 解密 accounts 表每条记录的 cookies, app_password, mailbox, proxy
@@ -29,10 +42,22 @@ import (
 // 7. 每个新 ciphertext 在写入前立即用 newCipher 自检解密验证
 // 8. 使用 oldCipher 解密 notify_settings，并用 newCipher 加密与自检
 // 9. commit 事务 (任何错误立即 rollback，杜绝部分轮换)
-// 10. quick_check 验证物理完整性
+// 10. 安全物理清理: wal_checkpoint(TRUNCATE) + VACUUM + wal_checkpoint(TRUNCATE) + quick_check
+// 11. 清理阶段若发生任何异常，自动从 pre-rotation 快照全量回滚，确保旧 Master Key 依然为权威 key
 func RotateCredentials(dataDir string, oldCipher, newCipher *security.SecretCipher) error {
 	if oldCipher == nil || newCipher == nil {
 		return errors.New("旧密钥加密机与新密钥加密机均不能为空")
+	}
+
+	// 2. 校验旧 key 与新 key 均合法且不同 (通过密文探针安全比对，绝不暴露明文密钥或哈希)
+	probePlain := []byte("master-key-equality-probe-sentinel")
+	probeAAD := []byte("icloud-hme:internal:key-probe")
+	probeCiphertext, err := newCipher.Encrypt(probePlain, probeAAD)
+	if err != nil {
+		return fmt.Errorf("new master key validation probe failed: %w", err)
+	}
+	if decrypted, err := oldCipher.Decrypt(probeCiphertext, probeAAD); err == nil && string(decrypted) == string(probePlain) {
+		return errors.New("new master key must differ from current master key")
 	}
 
 	absDir, err := filepath.Abs(dataDir)
@@ -184,9 +209,61 @@ func RotateCredentials(dataDir string, oldCipher, newCipher *security.SecretCiph
 		return fmt.Errorf("提交轮换事务失败: %w", err)
 	}
 
-	// 9. 物理完整性自检
-	if err := quickCheck(db); err != nil {
-		return fmt.Errorf("轮换后数据库完整性校验失败: %w", err)
+	// 9. 安全物理清理 (WAL checkpoint + VACUUM 磁盘重整 + WAL checkpoint + quick_check)
+	rotationCleanupHookMu.RLock()
+	hook := beforeRotationPhysicalCleanupHookForTest
+	rotationCleanupHookMu.RUnlock()
+
+	var cleanupErr error
+	if hook != nil {
+		cleanupErr = hook()
+	}
+	if cleanupErr == nil {
+		if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+			cleanupErr = fmt.Errorf("rotation wal_checkpoint failed: %w", err)
+		}
+	}
+	if cleanupErr == nil {
+		if _, err := db.Exec("VACUUM;"); err != nil {
+			cleanupErr = fmt.Errorf("rotation vacuum failed: %w", err)
+		}
+	}
+	if cleanupErr == nil {
+		if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+			cleanupErr = fmt.Errorf("rotation post-vacuum wal_checkpoint failed: %w", err)
+		}
+	}
+	if cleanupErr == nil {
+		if err := quickCheck(db); err != nil {
+			cleanupErr = fmt.Errorf("quick check failed: %w", err)
+		}
+	}
+
+	// 10. 如果清理失败，绝对不能留下“半成功”的新密文库，必须从 pre-rotation 快照回滚为旧密钥权威库
+	if cleanupErr != nil {
+		_ = db.Close()
+
+		// 清理因 commit 产生的 WAL/SHM 与 live DB
+		_ = os.Remove(filepath.Join(absDir, "icloud_hme.db-wal"))
+		_ = os.Remove(filepath.Join(absDir, "icloud_hme.db-shm"))
+		_ = os.Remove(dbPath)
+
+		// 从轮换前一致性快照恢复
+		if rErr := restoreFileFromSnapshot(backupPath, dbPath); rErr != nil {
+			return fmt.Errorf("rotation cleanup failed: %w; rollback to pre-rotation snapshot failed: %v", cleanupErr, rErr)
+		}
+
+		// 验证恢复后的数据库完整性
+		checkDB, err := sql.Open("sqlite", dsn)
+		if err != nil {
+			return fmt.Errorf("rotation cleanup failed: %w; open restored db failed: %v", cleanupErr, err)
+		}
+		defer checkDB.Close()
+		if err := quickCheck(checkDB); err != nil {
+			return fmt.Errorf("rotation cleanup failed: %w; restored db quick check failed: %v", cleanupErr, err)
+		}
+
+		return fmt.Errorf("rotation cleanup failed (rolled back to original key): %w", cleanupErr)
 	}
 
 	return nil

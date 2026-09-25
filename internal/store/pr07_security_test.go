@@ -12,6 +12,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -135,10 +136,11 @@ func TestPR07_MigratedDatabaseContainsNoPlaintextSecrets(t *testing.T) {
 		t.Fatalf("关闭 Store 失败: %v", err)
 	}
 
-	// 3. 读取磁盘数据库文件的原始物理字节流，断言绝不包含明文 sentinel
-	fileBytes, err := os.ReadFile(dbPath)
-	if err != nil {
-		t.Fatalf("读取 sqlite 物理文件失败: %v", err)
+	// 3. 读取磁盘数据库文件的原始物理字节流 (含 WAL / SHM 边车文件)，断言绝不包含明文 sentinel
+	scanFiles := []string{
+		dbPath,
+		dbPath + "-wal",
+		dbPath + "-shm",
 	}
 
 	sentinels := []struct {
@@ -153,9 +155,18 @@ func TestPR07_MigratedDatabaseContainsNoPlaintextSecrets(t *testing.T) {
 		{"Notify Webhook Sentinel", sentinelNotifyHook},
 	}
 
-	for _, s := range sentinels {
-		if bytes.Contains(fileBytes, []byte(s.sentinel)) {
-			t.Fatalf("【安全红线踩雷】V2 物理数据库文件中依然检测到明文残留: %s (%q)", s.name, s.sentinel)
+	for _, fPath := range scanFiles {
+		content, err := os.ReadFile(fPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			t.Fatalf("读取磁盘文件 %s 失败: %v", fPath, err)
+		}
+		for _, s := range sentinels {
+			if bytes.Contains(content, []byte(s.sentinel)) {
+				t.Fatalf("【安全红线踩雷】V2 物理文件 (%s) 中依然检测到明文残留: %s (%q)", filepath.Base(fPath), s.name, s.sentinel)
+			}
 		}
 	}
 }
@@ -265,7 +276,9 @@ func TestPR07_BackupContainsOnlyEncryptedCredentialsAndTokenHashes(t *testing.T)
 	}
 }
 
-// TestPR07_WrongMasterKeyFailsClosed 验证使用错误主密钥加载时，必须 Fail-Closed 绝不静默放行或返回脏数据。
+// TestPR07_WrongMasterKeyFailsClosed 验证使用错误主密钥加载时，虽可打开 schema，
+// 但在随后 GetAccount / ListAllAccounts 解密凭据时必须 Fail-Closed 绝不静默放行或返回脏数据。
+// (在生产环境中，因 account.NewManager 启动时会预加载账号列表，故正常 server startup 亦会直接失败)。
 func TestPR07_WrongMasterKeyFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	keyA := genTestKey(0x33)
@@ -473,3 +486,346 @@ func TestPR07_MasterKeyRotationRoundTrip(t *testing.T) {
 		t.Fatalf("轮换后用旧密钥读取账号应失败，但成功了")
 	}
 }
+
+// TestPR07_V2CleanupFailureDoesNotFinalizeSchemaVersion 验证 V1->V2 物理清理失败时不得标记 user_version=2，
+// 且重启重试后能够安全完成并抹除磁盘物理明文碎片。
+func TestPR07_V2CleanupFailureDoesNotFinalizeSchemaVersion(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "icloud_hme.db")
+
+	const (
+		sentinelCookie  = "SENTINEL_V1_COOKIE_FAIL_TEST_123"
+		sentinelAppPass = "SENTINEL_V1_APP_PASS_FAIL_TEST_456"
+		sentinelToken   = "am_sentinel_v1_token_fail_test_789"
+	)
+
+	// 1. 构造真实 V1 DB 并写入明文数据
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("创建数据库失败: %v", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("开启事务失败: %v", err)
+	}
+	if err := MigrateV0ToV1ForTest(tx); err != nil {
+		t.Fatalf("MigrateV0ToV1ForTest 失败: %v", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	cookieJSON, _ := json.Marshal(map[string]string{"session": sentinelCookie})
+	if _, err := tx.Exec(`
+		INSERT INTO accounts (id, name, real_email, icloud_email, cookies, host, service_url, proxy, app_password, mailbox, status, created_at, updated_at)
+		VALUES ('acc_v2_fail_test', 'Fail Test', 'fail@test.com', 'fail@icloud.com', ?, 'host.com', 'https://service', '', ?, '', 'active', ?, ?)
+	`, string(cookieJSON), sentinelAppPass, now, now); err != nil {
+		t.Fatalf("写入账号失败: %v", err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO api_tokens (id, name, token, created_at, scopes)
+		VALUES ('tok_v2_fail_test', 'Fail Tok', ?, ?, 'admin')
+	`, sentinelToken, now); err != nil {
+		t.Fatalf("写入 token 失败: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("提交 V1 事务失败: %v", err)
+	}
+	_ = db.Close()
+
+	key := genTestKey(0x55)
+	cipher, _ := security.NewSecretCipher(key)
+
+	// 2. 注入 physical cleanup failure
+	SetBeforeV2PhysicalCleanupHookForTest(func() error {
+		return errors.New("simulated physical cleanup crash")
+	})
+	defer SetBeforeV2PhysicalCleanupHookForTest(nil)
+
+	// 3. NewStoreWithCipher 必须失败
+	stFail, err := NewStoreWithCipher(dir, cipher)
+	if err == nil {
+		stFail.Close()
+		t.Fatalf("注入清理失败时 NewStoreWithCipher 应该报错，但返回了成功")
+	}
+
+	// 4. 检查：user_version 仍然是 1
+	chkDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("打开检查 DB 失败: %v", err)
+	}
+	var v int
+	if err := chkDB.QueryRow("PRAGMA user_version;").Scan(&v); err != nil {
+		t.Fatalf("查询 user_version 失败: %v", err)
+	}
+	if v != 1 {
+		t.Fatalf("物理清理失败时 user_version 绝不能变成 2，必须保持 1，当前为: %d", v)
+	}
+	_ = chkDB.Close()
+
+	// 5. 移除 hook
+	SetBeforeV2PhysicalCleanupHookForTest(nil)
+
+	// 6. 再次 NewStoreWithCipher，必须幂等重试成功
+	stSuccess, err := NewStoreWithCipher(dir, cipher)
+	if err != nil {
+		t.Fatalf("移除故障后重试 NewStoreWithCipher 失败: %v", err)
+	}
+
+	// 7. 检查 user_version == 2
+	if err := stSuccess.db.QueryRow("PRAGMA user_version;").Scan(&v); err != nil || v != 2 {
+		t.Fatalf("重试成功后 user_version 必须为 2，当前为: %d (err: %v)", v, err)
+	}
+
+	// 验证业务能通过解密读取数据
+	acc, err := stSuccess.GetAccount("acc_v2_fail_test")
+	if err != nil {
+		t.Fatalf("重试后 GetAccount 失败: %v", err)
+	}
+	if acc.AppPassword != sentinelAppPass {
+		t.Fatalf("重试后解密密码不符: %s", acc.AppPassword)
+	}
+	_, _, _, ok := stSuccess.ValidateTokenPrincipal(sentinelToken)
+	if !ok {
+		t.Fatalf("重试后 token 认证失败")
+	}
+
+	_ = stSuccess.Close()
+
+	// 8. 扫描磁盘物理文件 (含 live DB, WAL, SHM)，明文 sentinel 绝不存在
+	scanFiles := []string{
+		dbPath,
+		dbPath + "-wal",
+		dbPath + "-shm",
+	}
+	sentinels := []string{sentinelCookie, sentinelAppPass, sentinelToken}
+	for _, fPath := range scanFiles {
+		content, err := os.ReadFile(fPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			t.Fatalf("读取磁盘文件 %s 失败: %v", fPath, err)
+		}
+		for _, s := range sentinels {
+			if bytes.Contains(content, []byte(s)) {
+				t.Fatalf("物理文件 %s 中残留明文 sentinel: %q", filepath.Base(fPath), s)
+			}
+		}
+	}
+}
+
+// TestPR07_MalformedTokenExpiryFailsClosed 验证畸形 expires_at 必须 Fail-Closed
+func TestPR07_MalformedTokenExpiryFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	key := genTestKey(0x66)
+	cipher, _ := security.NewSecretCipher(key)
+
+	st, err := NewStoreWithCipher(dir, cipher)
+	if err != nil {
+		t.Fatalf("NewStoreWithCipher failed: %v", err)
+	}
+	defer st.Close()
+
+	// 1. CreateToken 传入非法 expiresAt 必须直接报错
+	if _, err := st.CreateToken("MalformedCreate", "admin", "not-a-valid-time"); err == nil {
+		t.Fatalf("CreateToken 接收非法 expires_at 必须报错拒绝，但返回了成功")
+	}
+
+	// 2. 创建正常 Token
+	created, err := st.CreateToken("ValidExpiryTok", "admin", time.Now().Add(24*time.Hour).Format(time.RFC3339))
+	if err != nil {
+		t.Fatalf("CreateToken 失败: %v", err)
+	}
+
+	// 3. raw SQL 直接篡改 expires_at 为非法格式
+	if _, err := st.db.Exec(`UPDATE api_tokens SET expires_at = 'not-a-valid-rfc3339', last_used_at = NULL WHERE id = ?`, created.ID); err != nil {
+		t.Fatalf("篡改 expires_at 失败: %v", err)
+	}
+
+	// 4. ValidateTokenPrincipal 必须认证失败 (ok == false)
+	_, _, _, ok := st.ValidateTokenPrincipal(created.Token)
+	if ok {
+		t.Fatalf("面对畸形 expires_at，ValidateTokenPrincipal 必须 Fail-Closed 判定为认证失败，但返回了 true")
+	}
+
+	// 5. last_used_at 不得更新
+	var lastUsed sql.NullString
+	if err := st.db.QueryRow(`SELECT last_used_at FROM api_tokens WHERE id = ?`, created.ID).Scan(&lastUsed); err != nil {
+		t.Fatalf("查询 last_used_at 失败: %v", err)
+	}
+	if lastUsed.Valid && lastUsed.String != "" {
+		t.Fatalf("认证失败不得推进 last_used_at，当前为: %s", lastUsed.String)
+	}
+
+	// 6. GetToken 面对畸形 expires_at 必须返回 error
+	if _, err := st.GetToken(context.Background(), created.ID); err == nil {
+		t.Fatalf("GetToken 面对畸形 expires_at 必须返回 error，但返回了 nil")
+	}
+
+	// 7. RotateToken 面对畸形 expires_at 必须拒绝轮换
+	if _, err := st.RotateToken(created.ID); err == nil {
+		t.Fatalf("RotateToken 面对畸形 expires_at 必须拒绝轮换，但返回了成功")
+	}
+}
+
+// TestPR07_RotationCleanupFailureRollsBackToOldKey 验证当轮换事务 commit 后、物理清理失败时，
+// 必须安全回滚到 pre-rotation 快照，旧 Master Key 依然为权威 key，新 key 不得成为权威 key。
+func TestPR07_RotationCleanupFailureRollsBackToOldKey(t *testing.T) {
+	dir := t.TempDir()
+	keyA := genTestKey(0x77)
+	keyB := genTestKey(0x88)
+	cipherA, _ := security.NewSecretCipher(keyA)
+	cipherB, _ := security.NewSecretCipher(keyB)
+
+	// 1. key A 创建 DB 并写入凭据
+	stA, err := NewStoreWithCipher(dir, cipherA)
+	if err != nil {
+		t.Fatalf("NewStoreWithCipher A failed: %v", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	err = stA.SaveAccount(&AccountRecord{
+		ID:          "acc_rot_rollback",
+		Name:        "Rollback Account",
+		RealEmail:   "rb@test.com",
+		CookiesJSON: `{"token":"session_a_value"}`,
+		AppPassword: "app_password_a",
+		MailboxJSON: `{"pass":"mailbox_a"}`,
+		Proxy:       "http://proxy_a@host:8080",
+		Status:      "active",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	})
+	if err != nil {
+		t.Fatalf("SaveAccount failed: %v", err)
+	}
+	if err := stA.Close(); err != nil {
+		t.Fatalf("Close stA failed: %v", err)
+	}
+
+	// 2. 设置物理清理 hook 注入 failure
+	SetBeforeRotationPhysicalCleanupHookForTest(func() error {
+		return errors.New("simulated rotation cleanup failure")
+	})
+	defer SetBeforeRotationPhysicalCleanupHookForTest(nil)
+
+	// 3. 执行 RotateCredentials，必须返回 error
+	err = RotateCredentials(dir, cipherA, cipherB)
+	if err == nil {
+		t.Fatalf("注入清理失败时 RotateCredentials 必须报错，但返回了 nil")
+	}
+
+	// 4. 用 key A 重新打开，必须能够正常读取全部凭据
+	stAAgain, err := NewStoreWithCipher(dir, cipherA)
+	if err != nil {
+		t.Fatalf("回滚后用旧 key A 打开 Store 失败: %v", err)
+	}
+	defer stAAgain.Close()
+
+	accA, err := stAAgain.GetAccount("acc_rot_rollback")
+	if err != nil {
+		t.Fatalf("回滚后旧 key A 读取账号失败: %v", err)
+	}
+	if accA.AppPassword != "app_password_a" {
+		t.Fatalf("回滚后凭据内容受损: %s", accA.AppPassword)
+	}
+
+	// 5. 用 key B 打开读取必须失败 (key B 不得成为权威 key)
+	_ = stAAgain.Close()
+	stB, err := NewStoreWithCipher(dir, cipherB)
+	if err != nil {
+		t.Fatalf("用 key B 打开 Store 失败: %v", err)
+	}
+	defer stB.Close()
+
+	if _, err := stB.GetAccount("acc_rot_rollback"); err == nil {
+		t.Fatalf("回滚后 key B 不得成为权威 key，但读取成功了")
+	}
+
+	// 6. 验证 pre-rotation backup 依然完好保留
+	entries, err := os.ReadDir(filepath.Join(dir, "backups"))
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("pre-rotation backup 必须保留，未找到备份文件: %v", err)
+	}
+}
+
+// TestPR07_RotationRemovesOldCiphertextFromLiveFiles 验证轮换成功后，旧 ciphertext 完全从 live 文件中消除
+func TestPR07_RotationRemovesOldCiphertextFromLiveFiles(t *testing.T) {
+	dir := t.TempDir()
+	keyA := genTestKey(0x99)
+	keyB := genTestKey(0xAA)
+	cipherA, _ := security.NewSecretCipher(keyA)
+	cipherB, _ := security.NewSecretCipher(keyB)
+
+	// 1. key A 写 credential sentinel
+	stA, err := NewStoreWithCipher(dir, cipherA)
+	if err != nil {
+		t.Fatalf("NewStoreWithCipher A failed: %v", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	err = stA.SaveAccount(&AccountRecord{
+		ID:          "acc_rot_clean",
+		Name:        "Clean Account",
+		RealEmail:   "clean@test.com",
+		CookiesJSON: `{"token":"sentinel_cookie_value_for_rotation_cleanup"}`,
+		AppPassword: "app_pass_sentinel_cleanup",
+		Status:      "active",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	})
+	if err != nil {
+		t.Fatalf("SaveAccount failed: %v", err)
+	}
+
+	// 2. raw SQL 读取轮换前的旧 ciphertext envelope
+	var oldCookiesCiphertext string
+	if err := stA.db.QueryRow("SELECT cookies FROM accounts WHERE id = 'acc_rot_clean'").Scan(&oldCookiesCiphertext); err != nil {
+		t.Fatalf("读取旧 cookies 密文失败: %v", err)
+	}
+	if !strings.HasPrefix(oldCookiesCiphertext, security.EnvelopePrefixV1) {
+		t.Fatalf("旧 cookies 不是 enc:v1 密文: %s", oldCookiesCiphertext)
+	}
+
+	if err := stA.Close(); err != nil {
+		t.Fatalf("Close stA failed: %v", err)
+	}
+
+	// 3. 执行 RotateCredentials A -> B
+	if err := RotateCredentials(dir, cipherA, cipherB); err != nil {
+		t.Fatalf("RotateCredentials failed: %v", err)
+	}
+
+	// 4. 扫描 live 物理文件 (排除 backups 目录)
+	liveFiles := []string{
+		filepath.Join(dir, "icloud_hme.db"),
+		filepath.Join(dir, "icloud_hme.db-wal"),
+		filepath.Join(dir, "icloud_hme.db-shm"),
+	}
+
+	for _, fPath := range liveFiles {
+		content, err := os.ReadFile(fPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			t.Fatalf("读取磁盘文件 %s 失败: %v", fPath, err)
+		}
+		if bytes.Contains(content, []byte(oldCookiesCiphertext)) {
+			t.Fatalf("【安全红线踩雷】轮换后的 live 文件 %s 中依然残留旧 key 密文 envelope: %s", filepath.Base(fPath), oldCookiesCiphertext)
+		}
+	}
+}
+
+// TestPR07_RotationRejectsSameMasterKey 验证当新旧密钥相同时，RotateCredentials 必须明确拒绝
+func TestPR07_RotationRejectsSameMasterKey(t *testing.T) {
+	dir := t.TempDir()
+	key := genTestKey(0xBB)
+	cipher1, _ := security.NewSecretCipher(key)
+	cipher2, _ := security.NewSecretCipher(key)
+
+	err := RotateCredentials(dir, cipher1, cipher2)
+	if err == nil {
+		t.Fatalf("新旧密钥相同时 RotateCredentials 应该拒绝，但返回成功")
+	}
+	if !strings.Contains(err.Error(), "new master key must differ from current master key") {
+		t.Fatalf("期望错误提示 'new master key must differ from current master key'，实际为: %v", err)
+	}
+}
+
