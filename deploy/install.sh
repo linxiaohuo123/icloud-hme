@@ -135,6 +135,21 @@ if [ "$HAS_DB" = true ] && [ "$HAS_MASTER_KEY" = false ]; then
     exit 1
 fi
 
+# 生成 32 字节 Base64 编码的 Master Key (CSPRNG, 严禁固定 fallback, 失败直接中断)
+generate_master_key() {
+    local key=""
+    if command -v openssl >/dev/null 2>&1; then
+        key="$(openssl rand -base64 32)"
+    elif [ -r /dev/urandom ]; then
+        key="$(head -c 32 /dev/urandom 2>/dev/null | base64 | tr -d '\r\n' || true)"
+    fi
+    if [ -z "$key" ]; then
+        echo "!! 生成随机 Master Key 失败: 系统可靠 CSPRNG 不可用。安装已安全阻断。" >&2
+        exit 1
+    fi
+    echo "$key"
+}
+
 if [ "$HAS_ENV_FILE" = false ]; then
     echo "==> 初始化新环境配置文件: $ENV_FILE"
 
@@ -150,17 +165,7 @@ if [ "$HAS_ENV_FILE" = false ]; then
         exit 1
     fi
 
-    # 生成 32 字节 Base64 编码的 Master Key (CSPRNG, 严禁固定 fallback, 失败直接中断)
-    GEN_MASTER_KEY=""
-    if command -v openssl >/dev/null 2>&1; then
-        GEN_MASTER_KEY="$(openssl rand -base64 32)"
-    elif [ -r /dev/urandom ]; then
-        GEN_MASTER_KEY="$(head -c 32 /dev/urandom 2>/dev/null | base64 | tr -d '\r\n' || true)"
-    fi
-    if [ -z "$GEN_MASTER_KEY" ]; then
-        echo "!! 生成随机 Master Key 失败: 系统可靠 CSPRNG 不可用。安装已安全阻断。" >&2
-        exit 1
-    fi
+    GEN_MASTER_KEY="$(generate_master_key)"
 
     install -m 600 -o root -g root /dev/null "$ENV_FILE"
     cat > "$ENV_FILE" <<EOF
@@ -184,7 +189,23 @@ EOF
 else
     echo "==> 保留已有配置文件: $ENV_FILE"
     if [ "$HAS_MASTER_KEY" = false ]; then
-        echo "【警告】已有配置文件 $ENV_FILE 中未检测到 ICLOUD_HME_MASTER_KEY，请确保服务启动前已正确注入该环境变量。"
+        # HAS_DB=false (已有 DB 且缺失 key 场景已在前文红线阻断退出)
+        GEN_MASTER_KEY="$(generate_master_key)"
+        cat >> "$ENV_FILE" <<EOF
+
+# 凭据主密钥 (自动补齐)
+# 【核心机密】Master Key 用于认证加密 Apple Cookies、App 专用密码与通知 Secret。
+# 【安全红线】丢失此密钥将无法解密恢复 V2 加密凭据，请务必安全备份！
+ICLOUD_HME_MASTER_KEY=$GEN_MASTER_KEY
+EOF
+        chmod 600 "$ENV_FILE"
+        echo "--------------------------------------------------------"
+        echo "【重要提示】检测到未初始化数据库且配置文件缺少 Master Key，已自动生成并补齐:"
+        echo "  Master Key: $GEN_MASTER_KEY"
+        echo "  配置文件:   $ENV_FILE"
+        echo "【安全警告】请务必将 Master Key 安全备份！"
+        echo "  Master Key 丢失后将无法解密恢复 V2 数据库内的一切受保护凭据。"
+        echo "--------------------------------------------------------"
     fi
 fi
 

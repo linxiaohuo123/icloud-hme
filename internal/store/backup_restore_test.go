@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -783,6 +784,16 @@ func TestPR09_BackupDoesNotMigrateSourceDatabase(t *testing.T) {
 	}
 	if security.IsEncrypted(rawCookies) || security.IsEncrypted(rawAppPass) {
 		t.Fatalf("断言失败: 源数据库产生了 V2 加密副作用!")
+	}
+
+	// 验证源库只读 DSN 契约: mode=ro 连接硬拒绝任何写操作
+	roDB, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(5000)", filepath.ToSlash(dbPath)))
+	if err != nil {
+		t.Fatalf("打开测试只读连接失败: %v", err)
+	}
+	defer roDB.Close()
+	if _, err := roDB.Exec("INSERT INTO api_tokens (id, name, token, created_at, scopes) VALUES ('tok_ro_fail', 'fail', 'x', 'x', 'x');"); err == nil {
+		t.Fatalf("断言失败: mode=ro 只读连接竟然允许执行写操作!")
 	}
 
 	// 4. 断言 backup DB:

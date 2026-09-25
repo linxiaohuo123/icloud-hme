@@ -164,8 +164,9 @@ func CreateDatabaseBackup(ctx context.Context, dataDir string, destination strin
 		return fmt.Errorf("source database is empty or not a regular file: %s", liveDBPath)
 	}
 
-	// 4. 直接打开 SQLite (严禁调用 NewStore / NewStoreWithCipher / schema migration)
-	db, err := sql.Open("sqlite", fmt.Sprintf("%s?_pragma=busy_timeout(5000)", filepath.ToSlash(liveDBPath)))
+	// 4. 直接以只读模式 (mode=ro) 打开 SQLite 连接，从驱动与连接层面杜绝写源库 (严禁调用 NewStore / NewStoreWithCipher / schema migration)
+	srcDSN := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(5000)", filepath.ToSlash(liveDBPath))
+	db, err := sql.Open("sqlite", srcDSN)
 	if err != nil {
 		return fmt.Errorf("open source database failed: %w", err)
 	}

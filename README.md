@@ -33,13 +33,26 @@
 | macOS Apple Silicon | `icloud-hme_darwin_arm64` |
 | Windows x86_64 | `icloud-hme_windows_amd64.exe` |
 
+推荐通过 `.env` 配置文件持久化环境变量，确保 Master Key 仅生成一次并在后续所有启动中持续复用：
+
 ```bash
-# 示例：Linux 下直接运行（必须设置管理员密码与凭据主密钥）
-export ICLOUD_HME_ADMIN_PASSWORD='change-this-before-running-2026'
-export ICLOUD_HME_MASTER_KEY='$(openssl rand -base64 32)'
+# 1. 复制配置文件模板
+cp .env.example .env
+
+# 2. 单独生成一次 32 字节 Base64 Master Key 并安全记录（严禁每次启动重新生成！）
+openssl rand -base64 32
+
+# 3. 编辑 .env 文件，填入管理员密码与刚才生成的 Master Key
+#    ICLOUD_HME_ADMIN_PASSWORD=your-strong-password
+#    ICLOUD_HME_MASTER_KEY=<刚才生成的 32 字节 Base64 密钥>
+
+# 4. 运行服务（程序自动加载当前目录下的 .env，后续启动继续复用此配置）
 chmod +x icloud-hme_linux_amd64
 ./icloud-hme_linux_amd64
 ```
+
+> ⚠️ **Master Key 生命周期核心契约**：
+> Master Key 用于认证加密 Apple Cookies、App 专用密码与通知 Secret。必须**生成一次 → 安全保存 → 所有后续启动继续使用同一把 Key**。严禁每次启动重新运行 `openssl rand`，否则已有 V2 数据库将无法解密！
 
 #### 方式二：Docker
 
@@ -57,7 +70,7 @@ docker run -d \
   ghcr.io/linxiaohuo123/icloud-hme:latest
 ```
 
-> ⚠️ 上面的密码与密钥仅为示例，**不可照抄**。密码请设为至少 8 字符的强密码，Master Key 必须为严格 32 字节的 Base64 字符串（可通过 `openssl rand -base64 32` 生成）。
+> ⚠️ 上面的密码与密钥仅为示例，**不可照抄**。密码请设为至少 8 字符的强密码，Master Key 必须为严格 32 字节的 Base64 字符串（首次部署前运行 `openssl rand -base64 32` 单独生成并安全保存，严禁每次启动重新生成）。
 
 镜像支持 `linux/amd64` 和 `linux/arm64` 双架构，自动适配。
 
@@ -142,8 +155,9 @@ go build -o icloud-hme .
 ### 4. 启动服务
 
 ```bash
-# 二进制方式（默认 data 目录）
+# 二进制方式（默认 data 目录；若未配置 .env，需显式 export 必填项）
 export ICLOUD_HME_ADMIN_PASSWORD='your-strong-password'
+export ICLOUD_HME_MASTER_KEY='your-32-byte-base64-master-key'
 ./icloud-hme_linux_amd64
 
 # 指定端口和数据目录
@@ -619,13 +633,24 @@ Download the latest binary from [GitHub Releases](https://github.com/linxiaohuo1
 | macOS Apple Silicon | `icloud-hme_darwin_arm64` |
 | Windows x86_64 | `icloud-hme_windows_amd64.exe` |
 
+Recommended setup with a `.env` configuration file to ensure the Master Key is generated once and persisted across restarts:
+
 ```bash
-# Linux example (admin password and master key are REQUIRED)
-export ICLOUD_HME_ADMIN_PASSWORD='change-this-before-running-2026'
-export ICLOUD_HME_MASTER_KEY='$(openssl rand -base64 32)'
+# 1. Copy config template
+cp .env.example .env
+
+# 2. Generate a 32-byte Base64 Master Key once and store it safely (DO NOT regenerate on subsequent runs!)
+openssl rand -base64 32
+
+# 3. Edit .env and set ICLOUD_HME_ADMIN_PASSWORD and the generated ICLOUD_HME_MASTER_KEY
+
+# 4. Run the service (the binary automatically loads .env from current directory)
 chmod +x icloud-hme_linux_amd64
 ./icloud-hme_linux_amd64
 ```
+
+> ⚠️ **Master Key Lifecycle Contract**:
+> The Master Key is used to encrypt Apple Cookies, App Passwords, and notification secrets. It must be **generated once → stored safely → reused across all subsequent runs**. Never regenerate the Master Key on each start, or existing encrypted credentials in the V2 database will become permanently undecryptable!
 
 #### Option 2: Docker
 
@@ -641,7 +666,7 @@ docker run -d \
   ghcr.io/linxiaohuo123/icloud-hme:latest
 ```
 
-> The password and master key above are only examples — do NOT copy them. Use a strong password (min 8 chars) and a 32-byte Base64 master key.
+> The password and master key above are only examples — do NOT copy them. Use a strong password (min 8 chars) and a 32-byte Base64 master key (generate once via `openssl rand -base64 32` and preserve it).
 
 #### Option 3: Build from source (Go 1.26+ and Node.js 22.12+)
 
@@ -663,10 +688,12 @@ go build -o icloud-hme .
 | Env var | Description | Default |
 |---|---|---|
 | `ICLOUD_HME_ADMIN_PASSWORD` | Admin password, **required**, min 8 chars | none (refuses to start) |
+| `ICLOUD_HME_MASTER_KEY` | Root credential key, **required**, 32-byte Base64 | none (refuses to start) |
+| `ICLOUD_HME_MASTER_KEY_FILE` | Master key file path (Docker Secret / systemd credentials) | none |
 | `ICLOUD_HME_SESSION_TTL` | Session TTL | `12h` (range `15m`–`168h`) |
 | `ICLOUD_HME_SECURE_COOKIE` | Set `true` when deployed behind TLS | `false` |
 | `ICLOUD_HME_COOKIE_MONITOR_INTERVAL` | Cookie health monitor interval | `30m` (range `5m`–`24h`) |
 
-> **Breaking change (v0.3+)**: without `ICLOUD_HME_ADMIN_PASSWORD` the server refuses to start; all API endpoints now require login (`401 AUTH_REQUIRED`). Admin sessions are in-memory only and are lost on restart.
+> **Breaking change (v0.3+)**: without `ICLOUD_HME_ADMIN_PASSWORD` or `ICLOUD_HME_MASTER_KEY` the server refuses to start; all API endpoints now require login (`401 AUTH_REQUIRED`). Admin sessions are in-memory only and are lost on restart.
 
 Create `data/accounts.json` (see `accounts.json.template`) and start the server (default port `:8081`). Open `http://localhost:8081` to use the management UI. Full API contract: [API.md](API.md).
