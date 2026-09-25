@@ -489,7 +489,6 @@ export default function InboxTableView({
       params.set('days', String(days))
     }
     params.set('limit', String(limit))
-    params.set('body', 'true')
     if (retryKey > 0) {
       params.set('refresh', 'true')
     }
@@ -519,9 +518,9 @@ export default function InboxTableView({
           })
         }
 
-        // 2. 检查是否仍有缺失正文的邮件（如按特定别名拉取未下发 body 的场景）
-        const targets = initialMessages
-          .slice(0, 50)
+        // 2. 检查当前页可见范围 (至多 limit 封) 仍缺失正文的邮件
+        const visibleSlice = initialMessages.slice(0, Math.min(initialMessages.length, limit > 0 ? limit : 20))
+        const targets = visibleSlice
           .filter((m) => !m.preview && !m.body && Boolean(m.message_ref))
           .map((m) => ({
             message_ref: m.message_ref!,
