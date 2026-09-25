@@ -23,7 +23,7 @@
 
 #### 方式一：下载二进制发布版（推荐）
 
-从 [GitHub Releases](https://github.com/xiaozhou26/icloud-hme/releases) 下载对应平台的二进制文件：
+从 [GitHub Releases](https://github.com/linxiaohuo123/icloud-hme/releases) 下载对应平台的二进制文件：
 
 | 平台 | 文件 |
 |---|---|
@@ -34,8 +34,9 @@
 | Windows x86_64 | `icloud-hme_windows_amd64.exe` |
 
 ```bash
-# 示例：Linux 下直接运行（必须先设置管理员密码）
+# 示例：Linux 下直接运行（必须设置管理员密码与凭据主密钥）
 export ICLOUD_HME_ADMIN_PASSWORD='change-this-before-running-2026'
+export ICLOUD_HME_MASTER_KEY='$(openssl rand -base64 32)'
 chmod +x icloud-hme_linux_amd64
 ./icloud-hme_linux_amd64
 ```
@@ -44,7 +45,7 @@ chmod +x icloud-hme_linux_amd64
 
 ```bash
 # 拉取镜像
-docker pull ghcr.io/xiaozhou26/icloud-hme:latest
+docker pull ghcr.io/linxiaohuo123/icloud-hme:latest
 
 # 运行（将本机 data 目录挂载进去）
 docker run -d \
@@ -52,10 +53,11 @@ docker run -d \
   -p 8081:8081 \
   -v /path/to/data:/app/data \
   -e ICLOUD_HME_ADMIN_PASSWORD='change-this-before-running-2026' \
-  ghcr.io/xiaozhou26/icloud-hme:latest
+  -e ICLOUD_HME_MASTER_KEY='your-32-byte-base64-master-key' \
+  ghcr.io/linxiaohuo123/icloud-hme:latest
 ```
 
-> ⚠️ 上面的密码仅为示例，**不可照抄**，请务必更换为至少 8 字符的强密码。
+> ⚠️ 上面的密码与密钥仅为示例，**不可照抄**。密码请设为至少 8 字符的强密码，Master Key 必须为严格 32 字节的 Base64 字符串（可通过 `openssl rand -base64 32` 生成）。
 
 镜像支持 `linux/amd64` 和 `linux/arm64` 双架构，自动适配。
 
@@ -63,7 +65,7 @@ docker run -d \
 
 ```bash
 # 前置要求: Go 1.26+、Node.js 22.12+
-git clone https://github.com/xiaozhou26/icloud-hme.git
+git clone https://github.com/linxiaohuo123/icloud-hme.git
 cd icloud-hme
 
 # 一键构建（安装前端依赖 → 前端测试 → 前端构建 → Go 测试 → 编译）
@@ -82,6 +84,8 @@ go build -o icloud-hme .
 | 环境变量 | 说明 | 默认 |
 |---|---|---|
 | `ICLOUD_HME_ADMIN_PASSWORD` | 管理员密码，**必填**，至少 8 字符，且不得使用仓库模板里的占位值 | 无（缺失时拒绝启动） |
+| `ICLOUD_HME_MASTER_KEY` | 凭据根密钥，**必填**，严格 32 字节 Base64 编码，用于加密凭据 | 无（缺失时拒绝启动） |
+| `ICLOUD_HME_MASTER_KEY_FILE` | 凭据根密钥文件路径（支持 Docker Secret / systemd credentials） | 无 |
 | `ICLOUD_HME_API_KEY` | 自动化 API Key，**等同管理员权限**，请勿下发给第三方 | 无（不启用） |
 | `ICLOUD_HME_ADDR` | HTTP 监听地址 | `127.0.0.1:8081`（仅本机） |
 | `ICLOUD_HME_SESSION_TTL` | 会话有效期 | `12h`（范围 `15m`–`168h`） |
@@ -93,16 +97,17 @@ go build -o icloud-hme .
 | `ICLOUD_HME_LEASE_RETENTION` | 已用别名流水保留期，支持 `180d` 写法；清理不影响别名路由表 | 永久保留 |
 | `ICLOUD_HME_ALLOW_PRIVATE_WEBHOOK` | 允许通知 Webhook 指向内网地址 | `false`（默认拒绝内网，防盲 SSRF） |
 
-> **Breaking Change（v0.3+）**：升级后未设置 `ICLOUD_HME_ADMIN_PASSWORD` 将拒绝启动；
+> **Breaking Change**：未设置 `ICLOUD_HME_ADMIN_PASSWORD` 或 `ICLOUD_HME_MASTER_KEY` 将拒绝启动；
 > 原有匿名 API 调用将收到 `401 AUTH_REQUIRED`。管理员会话只存内存，进程重启即失效。
 
-> **上线前三条硬性检查**
+> **上线前四条硬性安全检查**
 >
 > 1. **口令必须替换**。`your_strong_password_here`、`admin123456` 等模板占位值会被启动校验直接拒绝。
-> 2. **必须由 TLS 反代暴露**。程序自身不提供 HTTPS；直接以 HTTP 暴露到公网时，管理员口令与会话 Cookie 均为明文传输。
+> 2. **Master Key 必须安全备份**。V2 SQLite 中：Apple Cookies、App Password、Mailbox credentials、Proxy credential、Notify secrets 使用 AES-256-GCM 认证加密存储；API Token 只保存不可逆哈希；Master Key 独立于数据库保存。**Master Key 丢失后将无法恢复任何已加密凭据！**
+> 3. **历史备份安全处置**。pre-V2 / pre-migration 的历史备份文件可能包含明文凭据，必须安全保管，生产升级稳定确认无误后加密归档或安全销毁。
+> 4. **必须由 TLS 反代暴露**。程序自身不提供 HTTPS；直接以 HTTP 暴露到公网时，管理员口令与会话 Cookie 均为明文传输。
 >    建议保持 `ICLOUD_HME_ADDR=127.0.0.1:8081` 并用 Nginx/Caddy 终止 TLS，同时设置 `ICLOUD_HME_SECURE_COOKIE=true`。
-> 3. **数据目录含明文凭据**（Apple 会话 Cookie、App 专用密码、代理密码）。程序会以 `0700` 创建目录、`0600` 收紧
->    SQLite 及其 WAL/SHM 文件；**Windows 部署需自行收紧目录 ACL**（`os.Chmod` 在 Windows 上只映射只读位）。
+>    程序会以 `0700` 创建目录、`0600` 收紧 SQLite 及其 WAL/SHM 文件；**Windows 部署需自行收紧目录 ACL**。
 
 > **对外分发令牌请用作用域**：`GET /api/tokens` 仅回显掩码，`POST /api/tokens` 未指定 `scopes` 时默认只发放
 > `allocate,verify`（出号 + 取码），这类令牌**无法触达账号/令牌/设置等管理面**。详见 `API.md` 的「作用域模型」。
@@ -567,7 +572,7 @@ GOOS=windows GOARCH=amd64 go build -o icloud-hme.exe .
 git tag v0.2.0 && git push origin --tags
 ```
 
-Actions 会自动构建多平台二进制、Docker 镜像（`ghcr.io/xiaozhou26/icloud-hme`）并创建 Release。
+Actions 会自动构建多平台二进制、Docker 镜像（`ghcr.io/linxiaohuo123/icloud-hme`）并创建 Release。
 
 ### 代码规范
 
@@ -598,13 +603,13 @@ A local management tool for Apple iCloud Hide My Email (HME) aliases, supporting
 - Dual authentication: Cookie and App Password
 - Cookie health monitor: periodic session checks mark dead cookies as error so the scheduler skips them automatically
 - Settings panel with push notifications (Feishu / Bark / Telegram) for cookie expiry, recovery and alias quota alerts
-- Security: single-admin session, CSRF checks, login rate limiting, redacted API responses
+- Security: AES-256-GCM encrypted credentials storage, single-admin session, CSRF checks, login rate limiting, redacted API responses
 
 ### Quick Start
 
 #### Option 1: Binary (GitHub Releases)
 
-Download the latest binary from [GitHub Releases](https://github.com/xiaozhou26/icloud-hme/releases):
+Download the latest binary from [GitHub Releases](https://github.com/linxiaohuo123/icloud-hme/releases):
 
 | Platform | File |
 |---|---|
@@ -615,8 +620,9 @@ Download the latest binary from [GitHub Releases](https://github.com/xiaozhou26/
 | Windows x86_64 | `icloud-hme_windows_amd64.exe` |
 
 ```bash
-# Linux example (admin password is REQUIRED, min 8 chars)
+# Linux example (admin password and master key are REQUIRED)
 export ICLOUD_HME_ADMIN_PASSWORD='change-this-before-running-2026'
+export ICLOUD_HME_MASTER_KEY='$(openssl rand -base64 32)'
 chmod +x icloud-hme_linux_amd64
 ./icloud-hme_linux_amd64
 ```
@@ -624,22 +630,23 @@ chmod +x icloud-hme_linux_amd64
 #### Option 2: Docker
 
 ```bash
-docker pull ghcr.io/xiaozhou26/icloud-hme:latest
+docker pull ghcr.io/linxiaohuo123/icloud-hme:latest
 
 docker run -d \
   --name icloud-hme \
   -p 8081:8081 \
   -v /path/to/data:/app/data \
   -e ICLOUD_HME_ADMIN_PASSWORD='change-this-before-running-2026' \
-  ghcr.io/xiaozhou26/icloud-hme:latest
+  -e ICLOUD_HME_MASTER_KEY='your-32-byte-base64-master-key' \
+  ghcr.io/linxiaohuo123/icloud-hme:latest
 ```
 
-> The password above is only an example — do NOT copy it. Use a strong password with at least 8 characters.
+> The password and master key above are only examples — do NOT copy them. Use a strong password (min 8 chars) and a 32-byte Base64 master key.
 
 #### Option 3: Build from source (Go 1.26+ and Node.js 22.12+)
 
 ```bash
-git clone https://github.com/xiaozhou26/icloud-hme.git
+git clone https://github.com/linxiaohuo123/icloud-hme.git
 cd icloud-hme
 
 # One-shot build (frontend deps → frontend test → frontend build → Go test → binary)

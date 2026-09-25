@@ -9,10 +9,13 @@ package main
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"icloud-hme/internal/store"
 	_ "modernc.org/sqlite"
 )
 
@@ -106,6 +109,9 @@ func TestReleaseValidationSnapshot_IncludesUncheckpointedWAL(t *testing.T) {
 // TestReleaseValidation_QueryFailureCannotPass 验证当遇到损坏或缺失必要字段的非法 schema 时，
 // 任何 SQL 报错均必须 fail-closed 判定为 NOT_READY，绝不能误判为 VALIDATION_PASSED。
 func TestReleaseValidation_QueryFailureCannotPass(t *testing.T) {
+	testKey := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	t.Setenv("ICLOUD_HME_MASTER_KEY", testKey)
+
 	tempDir := t.TempDir()
 	corruptDBPath := filepath.Join(tempDir, "corrupt_schema.db")
 
@@ -139,3 +145,76 @@ func TestReleaseValidation_QueryFailureCannotPass(t *testing.T) {
 		t.Fatalf("必须返回 NOT_READY 或 error")
 	}
 }
+
+// TestReleaseValidation_MissingMasterKeyFailsClosed 验证当未配置 Master Key 时，
+// RunValidation 必须立即 fail closed 并返回明确错误。
+func TestReleaseValidation_MissingMasterKeyFailsClosed(t *testing.T) {
+	t.Setenv("ICLOUD_HME_MASTER_KEY", "")
+	t.Setenv("ICLOUD_HME_MASTER_KEY_FILE", "")
+
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "sample.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("创建数据库失败: %v", err)
+	}
+	if _, err := db.Exec("CREATE TABLE sample (id TEXT PRIMARY KEY);"); err != nil {
+		t.Fatalf("初始化表失败: %v", err)
+	}
+	_ = db.Close()
+
+	passed, err := RunValidation(dbPath)
+	if passed || err == nil {
+		t.Fatalf("缺少 Master Key 时 RunValidation 必须失败")
+	}
+}
+
+// TestReleaseValidation_SuccessWithMasterKey 验证具有有效 Master Key 且源数据库经 V1->V2 迁移后，
+// RunValidation 能够完整通过 11 项一致性与架构巡检。
+func TestReleaseValidation_SuccessWithMasterKey(t *testing.T) {
+	testKey := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	t.Setenv("ICLOUD_HME_MASTER_KEY", testKey)
+
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "valid_v1.db")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("创建数据库失败: %v", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("开启事务失败: %v", err)
+	}
+	if err := store.MigrateV0ToV1ForTest(tx); err != nil {
+		t.Fatalf("MigrateV0ToV1ForTest 失败: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("提交 V1 初始化失败: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA user_version = 1;"); err != nil {
+		t.Fatalf("设置 user_version 失败: %v", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := db.Exec(`
+		INSERT INTO accounts (id, name, real_email, cookies, app_password, mailbox, proxy, status, created_at, updated_at)
+		VALUES ('acc_val_ok', 'Val OK', 'val@test.com', '{"sess":"val"}', 'app_pass_val', '', '', 'active', ?, ?);
+	`, now, now); err != nil {
+		t.Fatalf("写入测试账号失败: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO api_tokens (id, name, token, created_at, scopes)
+		VALUES ('tok_val_ok', 'Val Token', 'am_tok_val_secret_9988', ?, 'admin');
+	`, now); err != nil {
+		t.Fatalf("写入测试令牌失败: %v", err)
+	}
+	_ = db.Close()
+
+	passed, err := RunValidation(dbPath)
+	if err != nil || !passed {
+		t.Fatalf("预期 RunValidation 成功，但失败: passed=%v, err=%v", passed, err)
+	}
+}
+

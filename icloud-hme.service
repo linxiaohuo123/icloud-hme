@@ -21,7 +21,8 @@ ExecStart=/opt/icloud-hme/icloud-hme -addr 127.0.0.1:8081 -data /opt/icloud-hme/
 # 凭据放到独立文件，不要内联在单元里(systemctl cat 与 journal 都能看到)。
 #   install -m 600 -o root -g root /dev/null /etc/icloud-hme.env
 #   # 写入内容:
-#   #   ICLOUD_HME_ADMIN_PASSWORD=<强口令>
+#   #   ICLOUD_HME_ADMIN_PASSWORD=<管理员强口令>  (必填)
+#   #   ICLOUD_HME_MASTER_KEY=<32字节Base64根密钥> (必填，丢失无法恢复 V2 加密凭据)
 #   #   ICLOUD_HME_SECURE_COOKIE=true
 #   #   ICLOUD_HME_TRUSTED_PROXIES=127.0.0.1   # 经 Nginx/Caddy 反代时必填，否则限流退化为全局单桶
 #   #   TZ=Asia/Shanghai

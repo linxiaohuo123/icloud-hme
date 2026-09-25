@@ -71,44 +71,49 @@ func main() {
 		log.Fatalf("错误: -backup 与 -restore 参数互斥，不能同时指定")
 	}
 
-	// 离线/一致性备份模式 (不要求管理员密码、不启动 HTTP/Worker/Apple 凭据)
+	absDataDir, err := filepath.Abs(*dataDir)
+	if err != nil {
+		log.Fatalf("数据目录路径错误: %v", err)
+	}
+
+	// 自动从系统配置文件、当前目录或数据目录读取并装入 .env 中所有环境变量 (PR-09: 优先加载以便离线工具读取 Master Key)
+	loadEnvFiles("/etc/icloud-hme.env", ".env", filepath.Join(absDataDir, ".env"))
+
+	// 离线/一致性备份模式 (只读快照: 绝不触发数据库 migration、不要求管理员密码、不启动 HTTP/Worker/Apple 凭据)
 	if *backupFlag != "" {
-		absDataDir, err := filepath.Abs(*dataDir)
-		if err != nil {
-			log.Fatalf("数据目录路径错误: %v", err)
-		}
 		destPath, err := filepath.Abs(*backupFlag)
 		if err != nil {
 			log.Fatalf("备份目标路径错误: %v", err)
 		}
-		st, err := store.NewStore(absDataDir)
-		if err != nil {
-			log.Fatalf("打开数据库存储失败: %v", err)
-		}
-		defer st.Close()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		if err := st.CreateBackup(ctx, destPath); err != nil {
+		if err := store.CreateDatabaseBackup(ctx, absDataDir, destPath); err != nil {
 			log.Fatalf("创建一致性备份失败: %v", err)
 		}
 		fmt.Printf("一致性备份创建成功: %s\n", destPath)
 		return
 	}
 
-	// 离线一致性恢复模式 (不要求管理员密码、不启动 HTTP/Worker/Apple 凭据)
+	// 离线一致性恢复模式 (使用当前 Master Key 执行 cipher-aware 恢复: 不要求管理员密码、不启动 HTTP/Worker/Apple 凭据)
 	if *restoreFlag != "" {
-		absDataDir, err := filepath.Abs(*dataDir)
-		if err != nil {
-			log.Fatalf("数据目录路径错误: %v", err)
-		}
 		srcPath, err := filepath.Abs(*restoreFlag)
 		if err != nil {
 			log.Fatalf("备份源路径错误: %v", err)
 		}
+
+		masterKey, err := security.LoadMasterKey()
+		if err != nil {
+			log.Fatalf("读取 Master Key 失败: %v", err)
+		}
+		cipher, err := security.NewSecretCipher(masterKey)
+		if err != nil {
+			log.Fatalf("Master Key 无效: %v", err)
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		if err := store.RestoreDatabase(ctx, absDataDir, srcPath); err != nil {
+		if err := store.RestoreDatabaseWithCipher(ctx, absDataDir, srcPath, cipher); err != nil {
 			log.Fatalf("恢复数据库失败: %v", err)
 		}
 		fmt.Printf("数据库恢复成功: %s -> %s\n", srcPath, absDataDir)
@@ -117,10 +122,6 @@ func main() {
 
 	// 离线凭据轮换模式 (不启动服务)
 	if *rotateCredentialsFlag {
-		absDataDir, err := filepath.Abs(*dataDir)
-		if err != nil {
-			log.Fatalf("数据目录路径错误: %v", err)
-		}
 		oldKey, err := security.LoadMasterKey()
 		if err != nil {
 			log.Fatalf("读取当前 Master Key 失败: %v", err)
@@ -156,9 +157,6 @@ func main() {
 		fmt.Printf("凭据 Master Key 离线轮换成功！\n请将生产环境变量 ICLOUD_HME_MASTER_KEY / 文件更新为新密钥后重新启动服务。\n")
 		return
 	}
-
-	// 自动从系统配置文件、当前目录或数据目录读取并装入 .env 中所有环境变量
-	loadEnvFiles("/etc/icloud-hme.env", ".env", filepath.Join(*dataDir, ".env"))
 
 	addrSet := false
 	flag.Visit(func(f *flag.Flag) {

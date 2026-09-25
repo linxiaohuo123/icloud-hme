@@ -1,20 +1,23 @@
 /**
- * [INPUT]: 依赖 context, database/sql, os, path/filepath, strings, testing, time, icloud-hme/internal/hme, icloud-hme/internal/store
- * [OUTPUT]: 提供 TestPR06_BackupIncludesCommittedWALData, TestPR06_BackupPreservesCriticalState, TestPR06_RestoreRoundTrip, TestPR06_CorruptBackupCannotReplaceLiveDatabase, TestPR06_FutureBackupRejected
- * [POS]: internal/store 的备份与离线恢复一致性单测套件 (PR-06 Baseline)
+ * [INPUT]: 依赖 bytes, context, database/sql, encoding/json, errors, fmt, os, path/filepath, strings, testing, time, icloud-hme/internal/hme, icloud-hme/internal/security, icloud-hme/internal/store
+ * [OUTPUT]: 提供 TestPR06 与 PR-09 备份不迁移源库、V1 备份恢复至 V2、错误密钥回滚与受保护凭据验证单测
+ * [POS]: internal/store 的备份与离线恢复一致性单测套件 (PR-09)
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"icloud-hme/internal/hme"
 	"icloud-hme/internal/security"
@@ -681,3 +684,518 @@ func TestPR06_PostSwapValidationFailureRestoresExactPreRestoreState(t *testing.T
 		t.Fatalf("未找到 pre-restore-*.db 快照文件")
 	}
 }
+
+// TestPR09_BackupDoesNotMigrateSourceDatabase 验证 offline backup API 绝不修改源数据库，
+// 保持 user_version=1、原始 schema 与明文数据不发生任何迁移变更，且备份文件物理完整。
+func TestPR09_BackupDoesNotMigrateSourceDatabase(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "icloud_hme.db")
+
+	const (
+		sentinelToken   = "PLAINTEXT_LEGACY_TOKEN_PR09_112233"
+		sentinelCookie  = "PLAINTEXT_COOKIE_PR09_445566"
+		sentinelAppPass = "PLAINTEXT_APP_PASSWORD_PR09_778899"
+		sentinelMailbox = "PLAINTEXT_MAILBOX_PR09_AABBCC"
+		sentinelProxy   = "PLAINTEXT_PROXY_PR09_DDEEFF"
+	)
+
+	// 1. 构造真实 V1 DB: user_version = 1
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("打开测试数据库失败: %v", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("开启事务失败: %v", err)
+	}
+	if err := migrateV0ToV1(tx); err != nil {
+		t.Fatalf("migrateV0ToV1 失败: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("提交 V1 初始化失败: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA user_version = 1;"); err != nil {
+		t.Fatalf("设置 user_version 失败: %v", err)
+	}
+
+	// 插入 plaintext legacy API token (包含明文 token 列)
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := db.Exec(`
+		INSERT INTO api_tokens (id, name, token, created_at, scopes)
+		VALUES ('tok_v1_plain', 'v1_token', ?, ?, 'admin');
+	`, sentinelToken, now); err != nil {
+		t.Fatalf("插入明文 token 失败: %v", err)
+	}
+
+	// 插入 plaintext account credential (明文 cookies, app_password, mailbox, proxy)
+	cookiesJSON, _ := json.Marshal(map[string]string{"session": sentinelCookie})
+	if _, err := db.Exec(`
+		INSERT INTO accounts (id, name, real_email, cookies, app_password, mailbox, proxy, status, created_at, updated_at)
+		VALUES ('acc_v1_plain', 'Plain Account', 'plain@example.com', ?, ?, ?, ?, 'active', ?, ?);
+	`, string(cookiesJSON), sentinelAppPass, sentinelMailbox, sentinelProxy, now, now); err != nil {
+		t.Fatalf("插入明文账号失败: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("关闭源数据库失败: %v", err)
+	}
+
+	// 2. 执行新的 offline backup API: CreateDatabaseBackup
+	ctx := context.Background()
+	backupPath := filepath.Join(dir, "v1_offline_backup.db")
+	if err := CreateDatabaseBackup(ctx, dir, backupPath); err != nil {
+		t.Fatalf("CreateDatabaseBackup 失败: %v", err)
+	}
+
+	// 3. 断言 source DB:
+	// - user_version 仍 = 1
+	// - 旧 schema 不变 (api_tokens 仍保留 token 列)
+	// - plaintext 数据不变
+	// - 没有新增 V2 schema migration side effects
+	srcDB, err := sql.Open("sqlite", filepath.ToSlash(dbPath)+"?mode=ro")
+	if err != nil {
+		t.Fatalf("打开源数据库检验失败: %v", err)
+	}
+	defer srcDB.Close()
+
+	var srcVer int
+	if err := srcDB.QueryRow("PRAGMA user_version;").Scan(&srcVer); err != nil || srcVer != 1 {
+		t.Fatalf("断言失败: 源数据库 user_version 预期保持为 1，实际: %d (err: %v)", srcVer, err)
+	}
+
+	hasTokenCol, err := tableHasColumn(srcDB, "api_tokens", "token")
+	if err != nil || !hasTokenCol {
+		t.Fatalf("断言失败: 源数据库 schema 发生漂移，api_tokens 必须仍包含 token 列 (has=%v, err=%v)", hasTokenCol, err)
+	}
+
+	var rawTok string
+	if err := srcDB.QueryRow("SELECT token FROM api_tokens WHERE id = 'tok_v1_plain'").Scan(&rawTok); err != nil || rawTok != sentinelToken {
+		t.Fatalf("断言失败: 源数据库明文 token 被篡改或迁移: %s (err=%v)", rawTok, err)
+	}
+
+	var rawCookies, rawAppPass, rawMailbox, rawProxy string
+	if err := srcDB.QueryRow("SELECT cookies, app_password, mailbox, proxy FROM accounts WHERE id = 'acc_v1_plain'").Scan(&rawCookies, &rawAppPass, &rawMailbox, &rawProxy); err != nil {
+		t.Fatalf("断言失败: 查询源数据库凭据出错: %v", err)
+	}
+	if !strings.Contains(rawCookies, sentinelCookie) || rawAppPass != sentinelAppPass || rawMailbox != sentinelMailbox || rawProxy != sentinelProxy {
+		t.Fatalf("断言失败: 源数据库明文凭据被修改: cookies=%s, pass=%s", rawCookies, rawAppPass)
+	}
+	if security.IsEncrypted(rawCookies) || security.IsEncrypted(rawAppPass) {
+		t.Fatalf("断言失败: 源数据库产生了 V2 加密副作用!")
+	}
+
+	// 4. 断言 backup DB:
+	// - user_version 同样保持为 1
+	// - 数据完整
+	// - quick_check == ok
+	bakDB, err := sql.Open("sqlite", filepath.ToSlash(backupPath)+"?mode=ro")
+	if err != nil {
+		t.Fatalf("打开备份库检验失败: %v", err)
+	}
+	defer bakDB.Close()
+
+	var bakVer int
+	if err := bakDB.QueryRow("PRAGMA user_version;").Scan(&bakVer); err != nil || bakVer != 1 {
+		t.Fatalf("断言失败: 备份库 user_version 预期保持为 1，实际: %d", bakVer)
+	}
+
+	if err := quickCheck(bakDB); err != nil {
+		t.Fatalf("断言失败: 备份库 quick_check 失败: %v", err)
+	}
+
+	var bakTok string
+	if err := bakDB.QueryRow("SELECT token FROM api_tokens WHERE id = 'tok_v1_plain'").Scan(&bakTok); err != nil || bakTok != sentinelToken {
+		t.Fatalf("断言失败: 备份库明文 token 丢失或不符: %s (err=%v)", bakTok, err)
+	}
+
+	var bakCookies, bakAppPass, bakMailbox, bakProxy string
+	if err := bakDB.QueryRow("SELECT cookies, app_password, mailbox, proxy FROM accounts WHERE id = 'acc_v1_plain'").Scan(&bakCookies, &bakAppPass, &bakMailbox, &bakProxy); err != nil {
+		t.Fatalf("断言失败: 查询备份库凭据出错: %v", err)
+	}
+	if !strings.Contains(bakCookies, sentinelCookie) || bakAppPass != sentinelAppPass || bakMailbox != sentinelMailbox || bakProxy != sentinelProxy {
+		t.Fatalf("断言失败: 备份库明文凭据不完整: cookies=%s, pass=%s", bakCookies, bakAppPass)
+	}
+}
+
+// TestPR09_RestoreV1BackupMigratesToV2 验证当前二进制能够正确将 V1 备份恢复到 live 库并自动完成 V1->V2 迁移，
+// 包括 Token 哈希迁移、凭据密文化、物理明文擦除，且 backup 源文件本身不被修改。
+func TestPR09_RestoreV1BackupMigratesToV2(t *testing.T) {
+	tempDir := t.TempDir()
+	liveDir := filepath.Join(tempDir, "live")
+	backupPath := filepath.Join(tempDir, "v1_legacy_backup.db")
+
+	const (
+		sentinelToken   = "am_PLAINTEXT_SECRET_V1_SENTINEL_PR09"
+		sentinelCookie  = "COOKIE_SECRET_V1_SENTINEL_PR09"
+		sentinelAppPass = "APP_PASS_V1_SENTINEL_PR09"
+		sentinelMailbox = "MAILBOX_CONFIG_V1_SENTINEL_PR09"
+		sentinelNotify  = "https://feishu.example.com/hook/V1_SENTINEL_PR09"
+	)
+
+	// 1. 构造 V1 backup
+	bakDB, err := sql.Open("sqlite", backupPath)
+	if err != nil {
+		t.Fatalf("创建备份数据库失败: %v", err)
+	}
+
+	tx, err := bakDB.Begin()
+	if err != nil {
+		t.Fatalf("开启事务失败: %v", err)
+	}
+	if err := migrateV0ToV1(tx); err != nil {
+		t.Fatalf("migrateV0ToV1 失败: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("提交 V1 初始化失败: %v", err)
+	}
+	if _, err := bakDB.Exec("PRAGMA user_version = 1;"); err != nil {
+		t.Fatalf("设置 user_version 失败: %v", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	cookiesJSON, _ := json.Marshal(map[string]string{"session": sentinelCookie})
+	if _, err := bakDB.Exec(`
+		INSERT INTO accounts (id, name, real_email, cookies, app_password, mailbox, proxy, status, created_at, updated_at)
+		VALUES ('acc_v1_mig', 'V1 Account', 'v1@test.com', ?, ?, ?, '', 'active', ?, ?);
+	`, string(cookiesJSON), sentinelAppPass, sentinelMailbox, now, now); err != nil {
+		t.Fatalf("插入 V1 测试账号失败: %v", err)
+	}
+
+	if _, err := bakDB.Exec(`
+		INSERT INTO api_tokens (id, name, token, created_at, scopes)
+		VALUES ('tok_v1_mig', 'V1 Token', ?, ?, 'admin');
+	`, sentinelToken, now); err != nil {
+		t.Fatalf("插入 V1 测试令牌失败: %v", err)
+	}
+
+	notifyJSON, _ := json.Marshal(map[string]interface{}{"feishu_webhook": sentinelNotify})
+	if _, err := bakDB.Exec(`
+		INSERT INTO settings (key, value, updated_at)
+		VALUES ('notify_settings', ?, ?);
+	`, string(notifyJSON), now); err != nil {
+		t.Fatalf("插入 V1 通知配置失败: %v", err)
+	}
+
+	if err := bakDB.Close(); err != nil {
+		t.Fatalf("关闭备份数据库失败: %v", err)
+	}
+
+	// 记录 backup source 文件的初始状态
+	bakFiBefore, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("读取 backup 文件信息失败: %v", err)
+	}
+
+	// 2. 执行 RestoreDatabaseWithCipher(..., keyA)
+	keyA := genTestKey(0x11)
+	cipherA, err := security.NewSecretCipher(keyA)
+	if err != nil {
+		t.Fatalf("创建 cipherA 失败: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := RestoreDatabaseWithCipher(ctx, liveDir, backupPath, cipherA); err != nil {
+		t.Fatalf("RestoreDatabaseWithCipher 失败: %v", err)
+	}
+
+	// 断言 backup source 文件本身不被修改
+	bakFiAfter, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("读取 backup 文件信息失败: %v", err)
+	}
+	if bakFiAfter.ModTime() != bakFiBefore.ModTime() || bakFiAfter.Size() != bakFiBefore.Size() {
+		t.Fatalf("断言失败: backup source 文件在 restore 过程中被意外修改!")
+	}
+
+	// 3. 打开恢复后的 live DB 并断言：
+	// - user_version == 2
+	// - 原 legacy token secret 升级后仍可通过认证
+	// - api_tokens 不再保存 plaintext token column
+	// - protected credentials 为 enc:v1
+	// - 正确 key 可以读取原始 credential
+	st, err := NewStoreWithCipher(liveDir, cipherA)
+	if err != nil {
+		t.Fatalf("使用 cipherA 打开恢复后的数据库失败: %v", err)
+	}
+
+	var liveVer int
+	if err := st.db.QueryRow("PRAGMA user_version;").Scan(&liveVer); err != nil || liveVer != 2 {
+		st.Close()
+		t.Fatalf("断言失败: live DB user_version 预期为 2，实际为: %d (err: %v)", liveVer, err)
+	}
+
+	// api_tokens 不再保存 plaintext token 列
+	hasTokenCol, err := tableHasColumn(st.db, "api_tokens", "token")
+	if err != nil || hasTokenCol {
+		st.Close()
+		t.Fatalf("断言失败: live DB 中 api_tokens 严禁保留明文 token 列 (has=%v, err=%v)", hasTokenCol, err)
+	}
+
+	// 原 legacy token secret 升级后仍可通过认证
+	if !st.ValidateToken(sentinelToken) {
+		st.Close()
+		t.Fatalf("断言失败: 原 legacy token secret (%s) 无法通过认证", sentinelToken)
+	}
+
+	// 检查 raw SQLite 列已为 enc:v1:
+	var rawCookies, rawAppPass, rawMailbox string
+	if err := st.db.QueryRow("SELECT cookies, app_password, mailbox FROM accounts WHERE id = 'acc_v1_mig'").Scan(&rawCookies, &rawAppPass, &rawMailbox); err != nil {
+		st.Close()
+		t.Fatalf("查询恢复后 live DB 失败: %v", err)
+	}
+	if !security.IsEncrypted(rawCookies) || !security.IsEncrypted(rawAppPass) || !security.IsEncrypted(rawMailbox) {
+		st.Close()
+		t.Fatalf("断言失败: protected credentials 必须为 enc:v1 密文 (cookies=%s, pass=%s)", rawCookies, rawAppPass)
+	}
+
+	// 正确 key 可以读取原始 credential
+	rec, err := st.GetAccount("acc_v1_mig")
+	if err != nil || rec == nil {
+		st.Close()
+		t.Fatalf("GetAccount 失败: %v", err)
+	}
+	if !strings.Contains(rec.CookiesJSON, sentinelCookie) || rec.AppPassword != sentinelAppPass || rec.MailboxJSON != sentinelMailbox {
+		st.Close()
+		t.Fatalf("解密出的账号凭据不匹配: cookies=%s, pass=%s, mailbox=%s", rec.CookiesJSON, rec.AppPassword, rec.MailboxJSON)
+	}
+
+	st.Close() // 刷盘关闭以确保物理文件写入
+
+	// 4. 扫描 live: icloud_hme.db, wal, shm (若存在): 不得包含测试 plaintext sentinel
+	sentinels := [][]byte{
+		[]byte(sentinelCookie),
+		[]byte(sentinelAppPass),
+		[]byte(sentinelMailbox),
+		[]byte(sentinelNotify),
+	}
+	checkFiles := []string{
+		filepath.Join(liveDir, "icloud_hme.db"),
+		filepath.Join(liveDir, "icloud_hme.db-wal"),
+		filepath.Join(liveDir, "icloud_hme.db-shm"),
+	}
+	for _, fPath := range checkFiles {
+		data, err := os.ReadFile(fPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			t.Fatalf("读取 live 文件 %s 失败: %v", fPath, err)
+		}
+		for _, s := range sentinels {
+			if bytes.Contains(data, s) {
+				t.Fatalf("安全违规: live 文件 %s 物理存在明文敏感 sentinel: %s", fPath, string(s))
+			}
+		}
+	}
+}
+
+// TestPR09_RestoreWrongKeyLeavesLiveDatabaseUntouched 验证当用错误 Master Key 执行恢复时，
+// 恢复必须 fail closed 拒绝，原 live DB 完好恢复为 restore 前状态，且 pre-restore 快照完好保留。
+func TestPR09_RestoreWrongKeyLeavesLiveDatabaseUntouched(t *testing.T) {
+	tempDir := t.TempDir()
+	liveDir := filepath.Join(tempDir, "live")
+	backupDir := filepath.Join(tempDir, "backup")
+
+	keyA := genTestKey(0xAA)
+	cipherA, err := security.NewSecretCipher(keyA)
+	if err != nil {
+		t.Fatalf("创建 cipherA 失败: %v", err)
+	}
+
+	keyB := genTestKey(0xBB)
+	cipherB, err := security.NewSecretCipher(keyB)
+	if err != nil {
+		t.Fatalf("创建 cipherB 失败: %v", err)
+	}
+
+	const (
+		liveSentinel   = "LIVE_APP_PASSWORD_KEY_A_PR09"
+		backupSentinel = "BACKUP_APP_PASSWORD_KEY_B_PR09"
+	)
+
+	// 1. 初始化 live DB: 使用 key A
+	stLive, err := NewStoreWithCipher(liveDir, cipherA)
+	if err != nil {
+		t.Fatalf("初始化 live Store 失败: %v", err)
+	}
+	if err := stLive.SaveAccount(&AccountRecord{
+		ID:          "acc_live_1",
+		Name:        "Live Account",
+		AppPassword: liveSentinel,
+		Status:      "active",
+	}); err != nil {
+		t.Fatalf("写入 live 账号失败: %v", err)
+	}
+	stLive.Close()
+
+	// 2. 初始化 backup DB: 使用 key B
+	stBak, err := NewStoreWithCipher(backupDir, cipherB)
+	if err != nil {
+		t.Fatalf("初始化 backup Store 失败: %v", err)
+	}
+	if err := stBak.SaveAccount(&AccountRecord{
+		ID:          "acc_bak_1",
+		Name:        "Backup Account",
+		AppPassword: backupSentinel,
+		Status:      "active",
+	}); err != nil {
+		t.Fatalf("写入 backup 账号失败: %v", err)
+	}
+	ctx := context.Background()
+	backupPath := filepath.Join(tempDir, "backup_key_b.db")
+	if err := stBak.CreateBackup(ctx, backupPath); err != nil {
+		t.Fatalf("创建 key B 备份失败: %v", err)
+	}
+	stBak.Close()
+
+	// 3. 当前环境使用 key A 执行 restore: 尝试恢复 key B 的备份
+	err = RestoreDatabaseWithCipher(ctx, liveDir, backupPath, cipherA)
+	// 预期：restore fail closed，不能报告 success
+	if err == nil {
+		t.Fatalf("断言失败: 用错误密钥 (key A) 恢复 key B 备份竟然未报错!")
+	}
+
+	// 4. 验证原 live DB 被恢复为 restore 前状态：
+	// key A 仍可以打开并读取 live credentials
+	stReopened, err := NewStoreWithCipher(liveDir, cipherA)
+	if err != nil {
+		t.Fatalf("断言失败: 回滚后无法用原 key A 打开 live DB: %v", err)
+	}
+	defer stReopened.Close()
+
+	rec, err := stReopened.GetAccount("acc_live_1")
+	if err != nil || rec == nil {
+		t.Fatalf("断言失败: 回滚后未能读取原 live 账号: %v", err)
+	}
+	if rec.AppPassword != liveSentinel {
+		t.Fatalf("断言失败: 回滚后 live 凭据不匹配: 预期 %s, 实际 %s", liveSentinel, rec.AppPassword)
+	}
+
+	// 5. 验证 pre-restore snapshot 保留
+	backupsDir := filepath.Join(liveDir, "backups")
+	entries, err := os.ReadDir(backupsDir)
+	if err != nil {
+		t.Fatalf("读取 backups 目录失败: %v", err)
+	}
+	foundPreRestore := false
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "pre-restore-") && strings.HasSuffix(entry.Name(), ".db") {
+			foundPreRestore = true
+			break
+		}
+	}
+	if !foundPreRestore {
+		t.Fatalf("断言失败: pre-restore 快照未保留!")
+	}
+}
+
+// TestPR09_ValidateProtectedSecrets 针对 Store.ValidateProtectedSecrets 执行纯本地目标单测
+func TestPR09_ValidateProtectedSecrets(t *testing.T) {
+	keyA := genTestKey(0x33)
+	cipherA, _ := security.NewSecretCipher(keyA)
+	keyB := genTestKey(0x44)
+	cipherB, _ := security.NewSecretCipher(keyB)
+
+	t.Run("PassWithCorrectKey", func(t *testing.T) {
+		dir := t.TempDir()
+		st, err := NewStoreWithCipher(dir, cipherA)
+		if err != nil {
+			t.Fatalf("NewStoreWithCipher failed: %v", err)
+		}
+		defer st.Close()
+
+		if err := st.SaveAccount(&AccountRecord{
+			ID:          "acc_val_1",
+			CookiesJSON: `{"token":"foo"}`,
+			AppPassword: "pass",
+			MailboxJSON: `{"host":"imap"}`,
+			Proxy:       "http://proxy",
+		}); err != nil {
+			t.Fatalf("SaveAccount failed: %v", err)
+		}
+		if err := st.SaveEncryptedSetting("notify_settings", `{"webhook":"bar"}`, security.NotifySettingsAAD()); err != nil {
+			t.Fatalf("SaveEncryptedSetting failed: %v", err)
+		}
+
+		if err := st.ValidateProtectedSecrets(); err != nil {
+			t.Fatalf("ValidateProtectedSecrets 应该成功，但报错: %v", err)
+		}
+	})
+
+	t.Run("FailWithWrongKey", func(t *testing.T) {
+		dir := t.TempDir()
+		st, err := NewStoreWithCipher(dir, cipherA)
+		if err != nil {
+			t.Fatalf("NewStoreWithCipher failed: %v", err)
+		}
+		if err := st.SaveAccount(&AccountRecord{
+			ID:          "acc_val_wrong",
+			AppPassword: "secret_pass",
+		}); err != nil {
+			t.Fatalf("SaveAccount failed: %v", err)
+		}
+		st.Close()
+
+		// 用 key B 打开
+		stB, err := newStoreWithLock(dir, nil, cipherB)
+		if err != nil {
+			t.Fatalf("newStoreWithLock failed: %v", err)
+		}
+		defer stB.Close()
+
+		if err := stB.ValidateProtectedSecrets(); err == nil {
+			t.Fatalf("ValidateProtectedSecrets 用错误密钥应该失败，但返回成功")
+		}
+	})
+
+	t.Run("FailWithPlaintextSecret", func(t *testing.T) {
+		dir := t.TempDir()
+		st, err := NewStoreWithCipher(dir, cipherA)
+		if err != nil {
+			t.Fatalf("NewStoreWithCipher failed: %v", err)
+		}
+		defer st.Close()
+
+		// 绕过 SaveAccount 直接往 accounts 表写入未加密明文
+		if _, err := st.db.Exec(`
+			INSERT INTO accounts (id, name, real_email, app_password, status, created_at, updated_at)
+			VALUES ('acc_plain', 'Plain', 'plain@test.com', 'PLAINTEXT_SECRET', 'active', datetime('now'), datetime('now'));
+		`); err != nil {
+			t.Fatalf("插入明文失败: %v", err)
+		}
+
+		if err := st.ValidateProtectedSecrets(); err == nil {
+			t.Fatalf("ValidateProtectedSecrets 遇到明文凭据应该失败，但返回成功")
+		}
+	})
+
+	t.Run("FailWithNilCipherWhenSecretsPresent", func(t *testing.T) {
+		dir := t.TempDir()
+		st, err := NewStoreWithCipher(dir, cipherA)
+		if err != nil {
+			t.Fatalf("NewStoreWithCipher failed: %v", err)
+		}
+		if err := st.SaveAccount(&AccountRecord{
+			ID:          "acc_no_key",
+			AppPassword: "secret_pass",
+		}); err != nil {
+			t.Fatalf("SaveAccount failed: %v", err)
+		}
+		st.Close()
+
+		// 用 nil cipher 打开 (且环境无 key)
+		t.Setenv("ICLOUD_HME_MASTER_KEY", "")
+		t.Setenv("ICLOUD_HME_MASTER_KEY_FILE", "")
+		stNil, err := newStoreWithLock(dir, nil, nil)
+		if err != nil {
+			t.Fatalf("newStoreWithLock failed: %v", err)
+		}
+		defer stNil.Close()
+
+		if err := stNil.ValidateProtectedSecrets(); err == nil {
+			t.Fatalf("ValidateProtectedSecrets 在无 cipher 情况下应该失败，但返回成功")
+		}
+	})
+}
+
