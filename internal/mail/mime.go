@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap"
+	"github.com/emersion/go-imap/utf7"
 	"github.com/emersion/go-message/charset"
 )
 
@@ -163,6 +164,12 @@ func extractStructuralRecipients(toHeader string, header mail.Header) []string {
 		add(header.Get("Delivered-To"))
 		add(header.Get("X-Original-To"))
 		add(header.Get("Envelope-To"))
+		add(header.Get("X-Forwarded-To"))
+		add(header.Get("Resent-To"))
+		add(header.Get("X-Envelope-To"))
+		add(header.Get("Original-Recipient"))
+		add(header.Get("X-Apple-Original-To"))
+		add(header.Get("X-Apple-Recipient"))
 	}
 	return recipients
 }
@@ -221,16 +228,28 @@ func folderRole(name string, attrs []string) string {
 	}
 
 	lower := strings.ToLower(name)
+	decoded, _ := utf7.Encoding.NewDecoder().String(name)
+	lowerDecoded := strings.ToLower(decoded)
+
+	isMatch := func(keywords ...string) bool {
+		for _, kw := range keywords {
+			if strings.Contains(lower, kw) || strings.Contains(lowerDecoded, kw) {
+				return true
+			}
+		}
+		return false
+	}
+
 	switch {
-	case strings.Contains(lower, "junk"), strings.Contains(lower, "spam"), strings.Contains(lower, "bulk"):
+	case isMatch("junk", "spam", "bulk", "垃圾", "广告"):
 		return "junk"
-	case strings.Contains(lower, "sent"):
+	case isMatch("sent", "已发送", "已发"):
 		return "sent"
-	case strings.Contains(lower, "draft"):
+	case isMatch("draft", "草稿"):
 		return "drafts"
-	case strings.Contains(lower, "trash"), strings.Contains(lower, "deleted"):
+	case isMatch("trash", "deleted", "已删除", "废纸篓"):
 		return "trash"
-	case strings.Contains(lower, "archive"):
+	case isMatch("archive", "归档"):
 		return "archive"
 	default:
 		return "custom"

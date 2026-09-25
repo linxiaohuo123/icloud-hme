@@ -174,6 +174,31 @@ describe('AuthProvider + LoginPage', () => {
       expect(screen.getByRole('heading', { name: 'iCloud HME 管理台' })).toBeInTheDocument(),
     )
   })
+
+  it('已认证状态访问 /login 自动重定向到 /schedule', async () => {
+    server.use(
+      http.get('/api/auth/session', () =>
+        HttpResponse.json({
+          success: true,
+          data: {
+            csrf_token: 'csrf-abc',
+            expires_at: '2026-08-05T22:00:00+08:00',
+          },
+        }),
+      ),
+    )
+    render(
+      <MemoryRouter initialEntries={['/login']}>
+        <AuthProvider>
+          <Routes>
+            <Route path="/login" element={<LoginPage />} />
+            <Route path="/schedule" element={<p data-testid="schedule-page">调度大盘页</p>} />
+          </Routes>
+        </AuthProvider>
+      </MemoryRouter>,
+    )
+    expect(await screen.findByTestId('schedule-page')).toBeInTheDocument()
+  })
 })
 
 function LogoutProbe() {

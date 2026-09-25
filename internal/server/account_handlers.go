@@ -235,8 +235,8 @@ type setMailboxReq struct {
 
 func (s *Server) setMailboxHandler(c *gin.Context) {
 	var req setMailboxReq
-	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" || req.IMAPHost == "" || req.IMAPPort < 1 || req.AuthorizationCode == "" {
-		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: 收件邮箱、IMAP 服务器、端口和授权码必填")
+	if err := c.ShouldBindJSON(&req); err != nil || req.Email == "" || req.IMAPHost == "" || req.IMAPPort < 1 {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: 收件邮箱、IMAP 服务器和端口必填")
 		return
 	}
 	accountID := c.Param("id")

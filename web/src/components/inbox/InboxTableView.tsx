@@ -470,6 +470,7 @@ export default function InboxTableView({
       setLoading(false)
       setIsRevalidating(true)
     } else {
+      setResult(null)
       setLoading(true)
       setIsRevalidating(false)
     }
@@ -488,6 +489,7 @@ export default function InboxTableView({
       params.set('days', String(days))
     }
     params.set('limit', String(limit))
+    params.set('body', 'true')
     if (retryKey > 0) {
       params.set('refresh', 'true')
     }
@@ -495,15 +497,14 @@ export default function InboxTableView({
     request<InboxResult>(`/api/inbox?${params.toString()}`, {
       signal: controller.signal,
     })
-      .then((data) => {
+      .then(async (data) => {
         if (isStale()) return
         setError('')
         unsupportedRetryRef.current[accountId] = 0
 
-        // 静默预取前 50 封邮件正文注入内存缓存并响应式合入列表 (基于规范 message_ref / UID)
+        // 1. 先用本地/模块缓存中已有的正文快速回填
         let initialMessages = data?.messages || []
         if (data && Array.isArray(data.messages) && data.messages.length > 0) {
-          // 1. 先用本地/模块缓存中已有的正文快速回填，单次渲染避免视图闪烁
           initialMessages = data.messages.map((m) => {
             const key = buildMailCacheKey(accountId, m)
             const cached = moduleMessageCache.get(key) || messageCacheRef.current.get(key)
@@ -517,106 +518,83 @@ export default function InboxTableView({
             return m
           })
         }
-        const updatedResult = data ? { ...data, messages: initialMessages } : null
-        setResult(updatedResult)
-        if (updatedResult) {
-          setSnapshot(currentQueryKey, updatedResult)
-        }
 
-        if (data && Array.isArray(data.messages) && data.messages.length > 0) {
-          // 2. 正文分阶段小批补全：仅针对当前可见范围 (前 50 封) 缺 preview/body 且具备规范 MessageRef 的邮件，按 CHUNK_SIZE=5 顺序补全
-          const targets = initialMessages
-            .slice(0, 50)
-            .filter((m) => !m.preview && !m.body && Boolean(m.message_ref))
-            .map((m) => ({
-              message_ref: m.message_ref!,
-              folder: m.folder || folder || 'INBOX',
-              uid: m.uid ? String(m.uid) : undefined,
-              id: m.id,
-            }))
+        // 2. 检查是否仍有缺失正文的邮件（如按特定别名拉取未下发 body 的场景）
+        const targets = initialMessages
+          .slice(0, 50)
+          .filter((m) => !m.preview && !m.body && Boolean(m.message_ref))
+          .map((m) => ({
+            message_ref: m.message_ref!,
+            folder: m.folder || folder || 'INBOX',
+            uid: m.uid ? String(m.uid) : undefined,
+            id: m.id,
+          }))
 
-          if (targets.length > 0) {
-            const CHUNK_SIZE = 5
-            const chunks: typeof targets[] = []
-            for (let i = 0; i < targets.length; i += CHUNK_SIZE) {
-              chunks.push(targets.slice(i, i + CHUNK_SIZE))
-            }
+        let finalMessages = initialMessages
 
-            void (async () => {
-              try {
-                for (const chunk of chunks) {
-                  if (isStale() || controller.signal.aborted) {
-                    break
-                  }
-                  try {
-                    const batch = await request<{ messages?: FullMessage[] }>('/api/messages', {
-                      method: 'POST',
-                      body: {
-                        account_id: accountId,
-                        messages: chunk,
-                      },
-                      signal: controller.signal,
-                    })
-                    if (isStale()) return
-                    const list = Array.isArray(batch?.messages) ? batch.messages : []
-                    if (list.length === 0) continue
-
-                    // 严禁 fallback 裸 UID/id，必须严格按完整 canonical MessageRef 匹配回填
-                    const byRef = new Map<string, FullMessage>()
-                    list.forEach((fm) => {
-                      if (!fm || !fm.message_ref) return
-                      const cacheKey = buildMailCacheKey(accountId, fm)
-                      setModuleMessageCache(cacheKey, fm)
-                      messageCacheRef.current.set(cacheKey, fm)
-                      byRef.set(fm.message_ref, fm)
-                    })
-
-                    setResult((prev) => {
-                      if (!prev || !prev.messages) return prev
-                      let changed = false
-                      const updatedMessages = prev.messages.map((m) => {
-                        if (!m.message_ref) return m
-                        const match = byRef.get(m.message_ref)
-                        if (!match) return m
-
-                        const nextPreview = match.preview || match.body || m.preview
-                        const nextBody = match.body || m.body
-                        if (nextPreview !== m.preview || nextBody !== m.body) {
-                          changed = true
-                          return {
-                            ...m,
-                            preview: nextPreview,
-                            body: nextBody,
-                            unread: m.unread ?? match.unread,
-                          }
-                        }
-                        return m
-                      })
-
-                      if (!changed) return prev
-                      const nextRes = { ...prev, messages: updatedMessages }
-                      setSnapshot(currentQueryKey, nextRes)
-                      return nextRes
-                    })
-                  } catch {
-                    // 单小批失败不中断
-                  }
-                }
-              } finally {
-                if (!isStale()) {
-                  isBusyRef.current = false
-                  setIsRevalidating(false)
-                }
-              }
-            })()
-          } else {
-            isBusyRef.current = false
-            setIsRevalidating(false)
+        // 3. 受控分片获取正文与原子提交：
+        // 维持 CHUNK_SIZE = 5 顺序分片以保护 IMAP 连接与网络受控，同时在全部分片获取完成前绝不提交半成品空数据，彻底消灭验证码与正文逐个跳出的问题
+        if (targets.length > 0) {
+          const CHUNK_SIZE = 5
+          const chunks: Array<typeof targets> = []
+          for (let i = 0; i < targets.length; i += CHUNK_SIZE) {
+            chunks.push(targets.slice(i, i + CHUNK_SIZE))
           }
-        } else {
-          isBusyRef.current = false
-          setIsRevalidating(false)
+
+          const byRef = new Map<string, FullMessage>()
+          for (const chunk of chunks) {
+            if (isStale()) return
+            try {
+              const batch = await request<{ messages?: FullMessage[] }>('/api/messages', {
+                method: 'POST',
+                body: {
+                  account_id: accountId,
+                  messages: chunk,
+                },
+                signal: controller.signal,
+              })
+              if (isStale()) return
+              const list = Array.isArray(batch?.messages) ? batch.messages : []
+              list.forEach((fm) => {
+                if (!fm || !fm.message_ref) return
+                const cacheKey = buildMailCacheKey(accountId, fm)
+                setModuleMessageCache(cacheKey, fm)
+                messageCacheRef.current.set(cacheKey, fm)
+                byRef.set(fm.message_ref, fm)
+              })
+            } catch {
+              // 单个 chunk 失败不阻断后续 chunk 尝试与兜底展示
+            }
+          }
+
+          if (isStale()) return
+
+          if (byRef.size > 0) {
+            finalMessages = initialMessages.map((m) => {
+              if (!m.message_ref) return m
+              const match = byRef.get(m.message_ref)
+              if (!match) return m
+              return {
+                ...m,
+                preview: match.preview || match.body || m.preview,
+                body: match.body || m.body,
+                unread: m.unread ?? match.unread,
+              }
+            })
+          }
         }
+
+        if (isStale()) return
+
+        // 4. 一次性原子提交终态数据：主题、正文、发件人及最左侧嗅探提取的验证码胶囊同帧出场
+        const finalResult = data ? { ...data, messages: finalMessages } : null
+        setResult(finalResult)
+        if (finalResult) {
+          setSnapshot(currentQueryKey, finalResult)
+        }
+        setLoading(false)
+        setIsRevalidating(false)
+        isBusyRef.current = false
       })
       .catch((err) => {
         const isAuthError = err instanceof ApiError && (err.status === 401 || err.code === 'AUTH_REQUIRED')
@@ -677,6 +655,7 @@ export default function InboxTableView({
     setAccountId(newAccountId)
     setAlias('')
     setPage(1)
+    setResult(null)
     messageCacheRef.current.clear()
     unsupportedRetryRef.current[newAccountId] = 0
     setSearchParams({ account_id: newAccountId }, { replace: true })
@@ -804,7 +783,7 @@ export default function InboxTableView({
     const known = new Set(['all', 'inbox', 'junk'])
     const extra = folders
       .filter((f) => !known.has(f.name.toLowerCase()) && !known.has(f.role.toLowerCase()))
-      .map((f) => ({ value: f.name, label: `${f.name} (${f.role})` }))
+      .map((f) => ({ value: f.name, label: `${f.display_name || f.name} (${f.role})` }))
     return [...base, ...extra]
   }, [folders])
 

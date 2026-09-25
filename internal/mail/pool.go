@@ -36,6 +36,8 @@ type pooledConn struct {
 	sem         chan struct{} // 单账号并发信号量 (cap=1)，支持真正的无泄露 Context 超时
 	appleID     string
 	appPassword string
+	server      string
+	port        int
 	proxyURL    string
 	client      *Client
 	lastUsed    time.Time
@@ -86,16 +88,26 @@ func (p *Pool) SetMaxConns(max int) {
 }
 
 // DoContext 借出已连接的 Client 执行 fn，支持真实 Context 超时与取消 (Issue 13)。
-// 当 ctx.Done() 触发时，对底层 net.Conn 调用 SetDeadline(time.Now()) 并 forceClose() 真正打断网络 I/O，
-// 且强制将已中断的连接从连接池中丢弃 (pc.client = nil)，严禁放回连接池复用。
 func (p *Pool) DoContext(ctx context.Context, appleID, appPassword, proxyURL string, fn func(*Client) error) error {
+	return p.DoContextWithServer(ctx, appleID, appPassword, IMAPServer, IMAPPort, proxyURL, fn)
+}
+
+// DoContextWithServer 借出指定服务器与端口的已连接 Client 执行 fn，支持真实 Context 超时与取消。
+func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server string, port int, proxyURL string, fn func(*Client) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if appleID == "" || appPassword == "" {
+	if email == "" || password == "" {
 		return fmt.Errorf("IMAP 凭据为空")
 	}
-	pc := p.getOrCreate(appleID)
+	server = strings.TrimSpace(server)
+	if server == "" {
+		server = IMAPServer
+	}
+	if port <= 0 {
+		port = IMAPPort
+	}
+	pc := p.getOrCreateWithServer(email, server, port)
 	if pc == nil {
 		return fmt.Errorf("连接池已关闭")
 	}
@@ -107,14 +119,16 @@ func (p *Pool) DoContext(ctx context.Context, appleID, appPassword, proxyURL str
 	}
 	defer pc.unlock()
 
-	// 密码或代理变更则换新 (仅在单账号自身锁 pc.mu 内执行, 杜绝占死全局池锁 p.mu)
-	if pc.appPassword != appPassword || pc.proxyURL != proxyURL {
+	// 密码、代理或目标服务器变更则换新 (仅在单账号自身锁 pc.mu 内执行, 杜绝占死全局池锁 p.mu)
+	if pc.appPassword != password || pc.proxyURL != proxyURL || pc.server != server || pc.port != port {
 		if pc.client != nil {
 			pc.client.forceClose()
 			pc.client = nil
 		}
-		pc.appleID = appleID
-		pc.appPassword = appPassword
+		pc.appleID = email
+		pc.appPassword = password
+		pc.server = server
+		pc.port = port
 		pc.proxyURL = proxyURL
 	}
 
@@ -195,13 +209,32 @@ func (p *Pool) Close() {
 	p.mu.Unlock()
 }
 
+func poolKey(email, server string, port int) string {
+	lowerEmail := strings.ToLower(strings.TrimSpace(email))
+	if (server == "" || strings.EqualFold(server, IMAPServer)) && (port <= 0 || port == IMAPPort) {
+		return lowerEmail
+	}
+	return fmt.Sprintf("%s|%s:%d", lowerEmail, strings.ToLower(strings.TrimSpace(server)), port)
+}
+
 func (p *Pool) getOrCreate(appleID string) *pooledConn {
+	return p.getOrCreateWithServer(appleID, IMAPServer, IMAPPort)
+}
+
+func (p *Pool) getOrCreateWithServer(email, server string, port int) *pooledConn {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
 		return nil
 	}
-	key := strings.ToLower(strings.TrimSpace(appleID))
+	server = strings.TrimSpace(server)
+	if server == "" {
+		server = IMAPServer
+	}
+	if port <= 0 {
+		port = IMAPPort
+	}
+	key := poolKey(email, server, port)
 	if elem, ok := p.items[key]; ok {
 		p.lruList.MoveToFront(elem)
 		return elem.Value.(*pooledConn)
@@ -211,8 +244,10 @@ func (p *Pool) getOrCreate(appleID string) *pooledConn {
 	p.evictOldestLocked()
 
 	pc := &pooledConn{
-		appleID: appleID,
-		sem:     make(chan struct{}, 1),
+		appleID:  email,
+		server:   server,
+		port:     port,
+		sem:      make(chan struct{}, 1),
 	}
 	elem := p.lruList.PushFront(pc)
 	p.items[key] = elem
@@ -233,7 +268,8 @@ func (p *Pool) evictOldestLocked() {
 			}
 			pc.unlock()
 			p.lruList.Remove(elem)
-			delete(p.items, strings.ToLower(strings.TrimSpace(pc.appleID)))
+			key := poolKey(pc.appleID, pc.server, pc.port)
+			delete(p.items, key)
 		}
 		elem = prev
 	}
@@ -289,11 +325,22 @@ func (pc *pooledConn) ensure(idleClose time.Duration) error {
 		pc.client.forceClose()
 		pc.client = nil
 	}
-	c := NewClientWithProxy(pc.appleID, pc.appPassword, pc.proxyURL)
+	server := pc.server
+	if server == "" {
+		server = IMAPServer
+	}
+	port := pc.port
+	if port <= 0 {
+		port = IMAPPort
+	}
+	c := NewClientWithServer(pc.appleID, pc.appPassword, server, port)
+	if pc.proxyURL != "" {
+		c.SetProxy(pc.proxyURL)
+	}
 	if err := c.Connect(); err != nil {
 		if pc.proxyURL != "" {
 			// 慢代理超时/坏节点时，自动降级为直连尝试，保障 IMAP 取信不断供
-			direct := NewClient(pc.appleID, pc.appPassword)
+			direct := NewClientWithServer(pc.appleID, pc.appPassword, server, port)
 			if directErr := direct.Connect(); directErr == nil {
 				pc.client = direct
 				pc.lastUsed = time.Now()

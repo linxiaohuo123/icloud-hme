@@ -92,6 +92,7 @@ export interface MessageDetailResponse {
 /** 邮箱文件夹定义 */
 export interface MailboxFolder {
   name: string
+  display_name?: string
   role: string
 }
 

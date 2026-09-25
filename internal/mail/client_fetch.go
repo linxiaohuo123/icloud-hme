@@ -245,7 +245,7 @@ func (c *Client) resolveFolders(folder string) ([]string, error) {
 				names = append(names, mbox.Name)
 			}
 		default:
-			if strings.EqualFold(mbox.Name, folder) || strings.EqualFold(mbox.Role, role) {
+			if strings.EqualFold(mbox.Name, folder) || strings.EqualFold(mbox.DisplayName, folder) || strings.EqualFold(mbox.Role, role) {
 				names = append(names, mbox.Name)
 			}
 		}

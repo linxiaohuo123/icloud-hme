@@ -437,8 +437,12 @@ func (m *Manager) SetMailbox(id string, config MailboxConfig) error {
 	config.Provider = strings.TrimSpace(config.Provider)
 	config.Email = strings.TrimSpace(config.Email)
 	config.IMAPHost = strings.TrimSpace(config.IMAPHost)
-	if config.Email == "" || config.IMAPHost == "" || config.Password == "" {
-		return fmt.Errorf("收件邮箱、IMAP 服务器和授权码不能为空")
+	config.Password = strings.ReplaceAll(strings.TrimSpace(config.Password), " ", "")
+	if config.Email == "" || config.IMAPHost == "" {
+		return fmt.Errorf("收件邮箱和 IMAP 服务器不能为空")
+	}
+	if (config.Provider == "qq" || strings.Contains(strings.ToLower(config.IMAPHost), "qq.com")) && !strings.Contains(config.Email, "@") {
+		config.Email = config.Email + "@qq.com"
 	}
 	if strings.Contains(config.IMAPHost, "://") || config.IMAPPort < 1 || config.IMAPPort > 65535 {
 		return fmt.Errorf("IMAP 服务器或端口无效")
@@ -448,10 +452,16 @@ func (m *Manager) SetMailbox(id string, config MailboxConfig) error {
 	var proxyURL string
 	if ok {
 		proxyURL = acc.Proxy
+		if config.Password == "" && acc.Mailbox != nil && acc.Mailbox.Password != "" {
+			config.Password = acc.Mailbox.Password
+		}
 	}
 	m.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
+	}
+	if config.Password == "" {
+		return fmt.Errorf("授权码不能为空")
 	}
 	mc := mail.NewClientWithServer(config.Email, config.Password, config.IMAPHost, config.IMAPPort)
 	useProxy := proxyURL != "" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "true" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "1"
@@ -487,7 +497,7 @@ connectedMailbox:
 // SetAppPassword 设置 iCloud 邮箱和 App 专用密码,并测试 IMAP 连接。
 func (m *Manager) SetAppPassword(id, icloudEmail, appPassword string) error {
 	icloudEmail = strings.TrimSpace(icloudEmail)
-	appPassword = strings.TrimSpace(appPassword)
+	appPassword = strings.ReplaceAll(strings.TrimSpace(appPassword), " ", "")
 	if icloudEmail == "" {
 		return fmt.Errorf("iCloud 邮箱不能为空")
 	}

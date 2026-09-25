@@ -16,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/emersion/go-imap/utf7"
 )
 
 func TestDialHTTPConnectSuccess(t *testing.T) {
@@ -175,3 +177,33 @@ func TestResolveFoldersFallback(t *testing.T) {
 		t.Fatalf("自定义文件夹解析失败: %v, %v", folders, err)
 	}
 }
+
+func TestQQMailboxFolderRole(t *testing.T) {
+	names := map[string]string{
+		"垃圾箱":  "junk",
+		"垃圾邮件": "junk",
+		"广告邮件": "junk",
+		"广告箱":  "junk",
+		"已发送":  "sent",
+		"草稿箱":  "drafts",
+		"已删除":  "trash",
+		"废纸篓":  "trash",
+	}
+
+	for name, expected := range names {
+		encoded, err := utf7.Encoding.NewEncoder().String(name)
+		if err != nil {
+			t.Fatalf("编码失败: %v", err)
+		}
+		roleEncoded := folderRole(encoded, nil)
+		if roleEncoded != expected {
+			t.Fatalf("编码后文件夹 %s (%s) 识别失败: 得到 %s, 期望 %s", encoded, name, roleEncoded, expected)
+		}
+		roleRaw := folderRole(name, nil)
+		if roleRaw != expected {
+			t.Fatalf("原始文件夹 %s 识别失败: 得到 %s, 期望 %s", name, roleRaw, expected)
+		}
+	}
+}
+
+

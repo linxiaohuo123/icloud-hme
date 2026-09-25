@@ -36,6 +36,7 @@ const DEFAULT_DURATION = 4000
 const COPYABLE_DURATION = 6000
 const HOVER_EXIT_DELAY = 1200
 
+// eslint-disable-next-line react-refresh/only-export-components
 export function useToast(): ToastContextValue {
   const ctx = useContext(ToastContext)
   if (!ctx) {

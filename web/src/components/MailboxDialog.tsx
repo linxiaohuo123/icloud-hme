@@ -57,9 +57,11 @@ export default function MailboxDialog({ accountId, current, open, onClose, onSav
     setSubmitting(true)
     setError('')
     try {
+      const cleanEmail = email.trim()
+      const cleanCode = code.replace(/\s+/g, '')
       await request(`/api/accounts/${accountId}/mailbox`, {
         method: 'PUT',
-        body: JSON.stringify({ provider, email, imap_host: host, imap_port: Number(port), authorization_code: code }),
+        body: JSON.stringify({ provider, email: cleanEmail, imap_host: host.trim(), imap_port: Number(port), authorization_code: cleanCode }),
       })
       onSaved()
       if (typeof window !== 'undefined') {
@@ -93,7 +95,20 @@ export default function MailboxDialog({ accountId, current, open, onClose, onSav
       <div className="form-field"><label htmlFor="mailbox-email">收件邮箱</label><input id="mailbox-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></div>
       <div className="form-field"><label htmlFor="mailbox-host">IMAP 服务器</label><input id="mailbox-host" value={host} onChange={(e) => setHost(e.target.value)} /></div>
       <div className="form-field"><label htmlFor="mailbox-port">SSL 端口</label><input id="mailbox-port" type="number" min="1" max="65535" value={port} onChange={(e) => setPort(e.target.value)} /></div>
-      <div className="form-field"><label htmlFor="mailbox-code">邮箱授权码</label><input id="mailbox-code" type="password" autoComplete="off" value={code} onChange={(e) => setCode(e.target.value)} /></div>
+      <div className="form-field">
+        <label htmlFor="mailbox-code">邮箱授权码</label>
+        <input
+          id="mailbox-code"
+          type="password"
+          autoComplete="off"
+          value={code}
+          placeholder={current?.email ? '已配置（如不修改请留空）' : '请输入 16 位授权码'}
+          onChange={(e) => setCode(e.target.value)}
+        />
+        <small style={{ display: 'block', marginTop: 4, color: 'var(--text-secondary, #666)', fontSize: '0.85em' }}>
+          提示：QQ / 163 等邮箱须使用网页设置生成的 IMAP 独立授权码（支持直接粘贴带空格格式）
+        </small>
+      </div>
       <div className="form-actions">
         <button type="button" onClick={onClose}>取消</button>
         <button type="button" className="primary" onClick={() => void handleSubmit()} disabled={submitting}>{submitting ? '验证中…' : '验证并接入'}</button>

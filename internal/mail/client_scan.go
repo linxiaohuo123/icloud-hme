@@ -115,7 +115,7 @@ func (c *Client) ScanMailboxUIDPage(opts ScanPageOptions) (ScanPageResult, error
 		BodyPartName: imap.BodyPartName{
 			Specifier: imap.HeaderSpecifier,
 			Fields: []string{
-				"To", "Cc", "Delivered-To", "X-Original-To", "Envelope-To", "Subject", "From",
+				"To", "Cc", "Delivered-To", "X-Original-To", "Envelope-To", "X-Forwarded-To", "Resent-To", "X-Envelope-To", "Original-Recipient", "X-Apple-Original-To", "X-Apple-Recipient", "Subject", "From",
 			},
 		},
 		Peek: true,

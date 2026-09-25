@@ -41,7 +41,7 @@ export default function MailDetailDialog({
   const isHtml = detail?.content_type?.toLowerCase().includes('html') ?? false
   const sender = detail ? parseSenderInfo(detail.from) : null
   const otpResult = detail
-    ? extractOTP(buildSniffContext(detail.subject, undefined, detail.body))
+    ? extractOTP(buildSniffContext(detail.subject, detail.preview, detail.body))
     : null
   const code = otpResult?.code
   const magicLink = otpResult?.magicLink

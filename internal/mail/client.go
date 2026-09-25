@@ -24,6 +24,7 @@ import (
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
+	"github.com/emersion/go-imap/utf7"
 	"golang.org/x/net/proxy"
 )
 
@@ -60,8 +61,9 @@ type Message struct {
 
 // Folder describes a selectable IMAP mailbox.
 type Folder struct {
-	Name string `json:"name"`
-	Role string `json:"role"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name,omitempty"`
+	Role        string `json:"role"`
 }
 
 // FullMessage 是一封邮件的完整内容(含正文)。
@@ -203,7 +205,17 @@ func (c *Client) Connect() error {
 		_ = cli.Logout()
 		_ = rawConn.Close()
 		if strings.Contains(loginErr.Error(), "Authentication Failed") || strings.Contains(loginErr.Error(), "AUTHENTICATIONFAILED") {
-			return fmt.Errorf("IMAP 登录失败 (Authentication Failed) — 请检查账号与授权码；若密码无误，通常是该 Apple ID 尚未在苹果设备或网页端开通 iCloud 邮件（Mailbox does not exist）: %w", loginErr)
+			lowerServer := strings.ToLower(c.server)
+			if strings.Contains(lowerServer, "qq.com") || strings.Contains(lowerServer, "foxmail.com") {
+				return fmt.Errorf("QQ / Foxmail 邮箱 IMAP 认证失败 (Authentication Failed) — 请确认：1. 已在网页端【设置-账户】开启「POP3/IMAP服务」；2. 必须使用 16 位授权码，不可使用 QQ 登录密码；3. 授权码是否有效或被 QQ 安全中心异地拦截: %w", loginErr)
+			}
+			if strings.Contains(lowerServer, "163.com") || strings.Contains(lowerServer, "126.com") || strings.Contains(lowerServer, "yeah.net") {
+				return fmt.Errorf("网易邮箱 IMAP 认证失败 (Authentication Failed) — 请确认：1. 已在网页端【设置-POP3/SMTP/IMAP】开启「POP3/IMAP服务」；2. 必须使用网易专属授权密码，不可使用网易登录密码: %w", loginErr)
+			}
+			if strings.Contains(lowerServer, "mail.me.com") || strings.Contains(lowerServer, "icloud.com") {
+				return fmt.Errorf("IMAP 登录失败 (Authentication Failed) — 请检查账号与授权码；若密码无误，通常是该 Apple ID 尚未在苹果设备或网页端开通 iCloud 邮件（Mailbox does not exist）: %w", loginErr)
+			}
+			return fmt.Errorf("IMAP 登录失败 (Authentication Failed) — 请检查邮箱账号与授权码/应用专用密码是否正确: %w", loginErr)
 		}
 		return fmt.Errorf("IMAP 登录失败 — 请检查邮箱账号、授权码和服务器地址: %w", loginErr)
 	}
@@ -291,9 +303,14 @@ func (c *Client) ListMailboxes() ([]Folder, error) {
 		if hasAttr(info.Attributes, imap.NoSelectAttr) {
 			continue
 		}
+		displayName, _ := utf7.Encoding.NewDecoder().String(info.Name)
+		if displayName == "" {
+			displayName = info.Name
+		}
 		folders = append(folders, Folder{
-			Name: info.Name,
-			Role: folderRole(info.Name, info.Attributes),
+			Name:        info.Name,
+			DisplayName: displayName,
+			Role:        folderRole(info.Name, info.Attributes),
 		})
 	}
 	if err := <-done; err != nil {
@@ -546,10 +563,16 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 	}
 
 	// 1) 服务端按 Header 检索并 Union 去重
-	// QQ 邮箱服务端不支持 Delivered-To 等非标 Header，强行搜索会导致全箱扫描并返回数千 UID 造成网络浪费与延迟。
-	// 因此对 QQ 邮箱仅搜索标准 To 标头，未命中时秒级穿透至本地快速比对。
+	// QQ/网易等国产邮箱服务端不支持 Delivered-To 等非标 Header，强行搜索会导致全箱扫描并返回数千 UID 造成网络浪费与延迟。
+	// 因此对国产邮箱仅搜索标准 To 标头，未命中时秒级穿透至本地快速比对。
 	headers := []string{"To"}
-	if !strings.Contains(strings.ToLower(c.server), "qq.com") {
+	lowerServer := strings.ToLower(c.server)
+	isDomestic := strings.Contains(lowerServer, "qq.com") ||
+		strings.Contains(lowerServer, "foxmail.com") ||
+		strings.Contains(lowerServer, "163.com") ||
+		strings.Contains(lowerServer, "126.com") ||
+		strings.Contains(lowerServer, "yeah.net")
+	if !isDomestic {
 		headers = append(headers, "Delivered-To", "X-Original-To", "Envelope-To")
 	}
 

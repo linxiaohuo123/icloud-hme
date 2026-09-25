@@ -42,6 +42,8 @@ CLAUDE.md
 .ccg/
 .superpowers/
 /icloud-hme-gemini-execution-plan/
+/icloud-hme-gemini-audit-2026-09-24/
+/dev/
 
 # Temp / scratch files
 /fresh-req.json

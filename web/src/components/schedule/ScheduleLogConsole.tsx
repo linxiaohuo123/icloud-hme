@@ -11,6 +11,7 @@ import { IconRefresh, IconTerminal, IconZap } from '../icons'
 
 export type LogLevel = 'success' | 'error' | 'warn' | 'info'
 
+// eslint-disable-next-line react-refresh/only-export-components
 export function getLogLevel(msg: string): LogLevel {
   if (msg.includes('失败') || msg.includes('ERROR') || msg.includes('401')) {
     return 'error'
@@ -31,6 +32,7 @@ export function getLogLevel(msg: string): LogLevel {
   return 'info'
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
 export const LOG_LEVEL_META: Record<LogLevel, { text: string; className: string }> = {
   error: { text: 'ERROR', className: 'log-badge-error' },
   warn: { text: 'WARN', className: 'log-badge-warn' },

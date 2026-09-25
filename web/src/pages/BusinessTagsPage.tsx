@@ -38,6 +38,7 @@ function tagLabel(t: BusinessTag): string {
   return t.tag || t.name
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
 export function getTokenStatus(tok: APITokenRecord): 'revoked' | 'expired' | 'needs_rotation' | 'active' {
   if (tok.revoked_at && tok.revoked_at.trim() !== '') {
     return 'revoked'

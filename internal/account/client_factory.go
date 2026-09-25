@@ -170,43 +170,10 @@ func (m *Manager) WithMailClientContext(ctx context.Context, id string, fn func(
 	}
 	m.mu.RUnlock()
 	if mailbox != nil && mailbox.Email != "" && mailbox.Password != "" {
-		mc := mail.NewClientWithServer(mailbox.Email, mailbox.Password, mailbox.IMAPHost, mailbox.IMAPPort)
-		useProxy := proxyURL != "" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "true" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "1"
-		if useProxy {
-			mc.SetProxy(proxyURL)
+		if os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "true" || os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "1" {
+			proxyURL = ""
 		}
-		if err := mc.Connect(); err != nil {
-			if useProxy {
-				direct := mail.NewClientWithServer(mailbox.Email, mailbox.Password, mailbox.IMAPHost, mailbox.IMAPPort)
-				if directErr := direct.Connect(); directErr == nil {
-					mc = direct
-					goto connectedCustomMailbox
-				}
-			}
-			return err
-		}
-connectedCustomMailbox:
-		defer mc.Disconnect()
-
-		stopWatch := make(chan struct{})
-		defer close(stopWatch)
-		go func() {
-			select {
-			case <-ctx.Done():
-				mc.SetDeadline(time.Now())
-				mc.ForceClose()
-			case <-stopWatch:
-			}
-		}()
-
-		mc.SetDeadline(time.Now().Add(mail.IMAPCommandTimeout))
-		defer mc.SetDeadline(time.Time{})
-		err := fn(mc)
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			mc.ForceClose()
-			return ctxErr
-		}
-		return err
+		return m.getIMAPPool().DoContextWithServer(ctx, mailbox.Email, mailbox.Password, mailbox.IMAPHost, mailbox.IMAPPort, proxyURL, fn)
 	}
 	imapEmail, appPassword, proxyURL, err := m.imapCreds(id)
 	if err != nil {

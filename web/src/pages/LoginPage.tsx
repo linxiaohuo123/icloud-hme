@@ -6,18 +6,22 @@
  */
 
 import { useState, type FormEvent } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, Navigate } from 'react-router-dom'
 import { useAuth } from '../auth/AuthProvider'
 import { ApiError } from '../api/client'
 import { IconEye, IconEyeOff, IconLock, IconShield } from '../components/icons'
 
 export default function LoginPage() {
-  const { login } = useAuth()
+  const { login, status } = useAuth()
   const navigate = useNavigate()
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+
+  if (status === 'authenticated') {
+    return <Navigate to="/schedule" replace />
+  }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
