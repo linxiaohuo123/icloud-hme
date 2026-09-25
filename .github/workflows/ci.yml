@@ -70,7 +70,9 @@ jobs:
             STATUS=$?
             echo "::error title=Go Test Failed::exit code $STATUS"
             echo "=== FAILED TESTS ==="
-            grep -E "--- FAIL|FAIL:" test.log || true
+            grep -E "--- FAIL|FAIL:" test.log | while IFS= read -r line; do
+              echo "::error title=TestFailure::$line"
+            done || true
             echo "=== PANIC LOGS ==="
             grep -E "panic:" test.log || true
             echo "=== LAST 50 LINES ==="
@@ -93,7 +95,9 @@ jobs:
             STATUS=$?
             echo "::error title=Go Race Test Failed::exit code $STATUS"
             echo "=== FAILED RACE TESTS ==="
-            grep -E "--- FAIL|FAIL:" test_race.log || true
+            grep -E "--- FAIL|FAIL:" test_race.log | while IFS= read -r line; do
+              echo "::error title=RaceTestFailure::$line"
+            done || true
             echo "=== LAST 50 LINES ==="
             tail -n 50 test_race.log
             exit $STATUS

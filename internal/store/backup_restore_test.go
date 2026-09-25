@@ -240,8 +240,7 @@ func TestPR06_BackupPreservesCriticalState(t *testing.T) {
 		t.Fatalf("备份中 Mailbox 必须为 enc:v1 密文，当前为明文: %s", accOut.MailboxJSON)
 	}
 
-	key, _ := security.ParseMasterKey(testMasterKey)
-	testCipher, _ := security.NewSecretCipher(key)
+	testCipher := st.Cipher()
 
 	decCookies, err := testCipher.Decrypt(accOut.CookiesJSON, security.AccountAAD("acc_crit_1", "cookies"))
 	if err != nil || string(decCookies) != accRecord.CookiesJSON {
