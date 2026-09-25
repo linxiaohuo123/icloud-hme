@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 fmt, net/mail, sort, strings, github.com/emersion/go-imap
+ * [INPUT]: 依赖 fmt, net/mail, sort, strings, time, github.com/emersion/go-imap
  * [OUTPUT]: 对外提供 (*Client).GetFull, (*Client).GetFullInFolder, (*Client).GetFullInFolderWithValidity, (*Client).GetFullBatchInFolder, (*Client).GetFullBatchInFolderWithValidity, (*Client).GetMailboxBoundary, (*Client).Delete, (*Client).DeleteInFolder
  * [POS]: internal/mail 的邮件正文提取与邮箱管理逻辑，支持单封/批量完整内容拉取、UIDVALIDITY 严格校验与邮件物理删除
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -12,6 +12,7 @@ import (
 	"net/mail"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/emersion/go-imap"
 )
@@ -31,6 +32,10 @@ func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, 
 	if c.cli == nil {
 		return nil, fmt.Errorf("未连接")
 	}
+	opStart := time.Now()
+	defer func() {
+		LogMailPerf("get_full", "server", c.perfServer(), "folder", folder, "uid", uid, "total_ms", time.Since(opStart).Milliseconds())
+	}()
 	folders, err := c.resolveFolders(folder)
 	if err != nil {
 		return nil, err
@@ -107,6 +112,11 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 	if folder == "" || strings.EqualFold(folder, "all") {
 		folder = "INBOX"
 	}
+	opStart := time.Now()
+	var fetchedCount int
+	defer func() {
+		LogMailPerf("get_full_batch", "server", c.perfServer(), "folder", folder, "requested", len(uids), "fetched", fetchedCount, "total_ms", time.Since(opStart).Milliseconds())
+	}()
 	status, err := c.cli.Select(folder, true)
 	if err != nil {
 		return nil, err
@@ -133,6 +143,7 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 		if msg == nil {
 			continue
 		}
+		fetchedCount++
 		message := toMessage(msg, folder)
 		message.UIDValidity = status.UidValidity
 		message.UID = msg.Uid

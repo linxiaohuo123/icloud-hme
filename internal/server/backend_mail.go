@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/mail, internal/account
  * [OUTPUT]: 对外提供 managerBackend 的邮件收发与邮箱管理方法 (ListInbox, ListMailboxes, GetMessage, GetMessages, DeleteMessage, ScanMailboxUIDPage, GetMailboxBoundaryContext)、parseMessageID 与 InboxQuery, InboxResult, ScanPageQuery, ScanPageResult, MessageRef 类型
- * [POS]: internal/server 的邮件业务门面实现；IMAP folder:uid 与 WebMail ThreadID 分流，批量详情降级尽力返回 WebMail 列表
+ * [POS]: internal/server 的邮件业务门面实现；IMAP folder:uid 与 WebMail ThreadID 分流，批量详情降级尽力返回 WebMail 列表，接入 MailPerf 观测 (inbox_query 脱敏埋点)
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"icloud-hme/internal/mail"
 )
@@ -99,7 +100,24 @@ func webMailIDMatch(messageID, rawID, idPart string) bool {
 }
 
 // ListInboxContext 读取收件箱摘要 (支持 context 上下文超时与真实底层连接中断，支持 SinceUID 增量游标，Issue 13 & 14)。
-func (b *managerBackend) ListInboxContext(ctx context.Context, q InboxQuery) (InboxResult, error) {
+// 接入 MailPerf 观测 (PR-MAIL-00)：记录查询参数、返回条数与总耗时，alias 已脱敏，不记录任何邮件正文。
+func (b *managerBackend) ListInboxContext(ctx context.Context, q InboxQuery) (inboxRes InboxResult, inboxErr error) {
+	opStart := time.Now()
+	defer func() {
+		mail.LogMailPerf("inbox_query",
+			"account", q.AccountID,
+			"alias", mail.MaskEmailForLog(q.Alias),
+			"folder", q.Folder,
+			"limit", q.Limit,
+			"days", q.Days,
+			"since_uid", q.SinceUID,
+			"with_body", q.WithBody,
+			"method", inboxRes.Method,
+			"messages", inboxRes.Count,
+			"total_ms", time.Since(opStart).Milliseconds(),
+			"err", inboxErr != nil,
+		)
+	}()
 	if err := ctx.Err(); err != nil {
 		return InboxResult{}, err
 	}

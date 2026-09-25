@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 fmt, sort, strings, github.com/emersion/go-imap
+ * [INPUT]: 依赖 fmt, sort, strings, time, github.com/emersion/go-imap
  * [OUTPUT]: 对外提供 ScanPageOptions, ScanPageResult, (*Client).ScanMailboxUIDPage
- * [POS]: internal/mail 的增量 UID 分页扫描核心 (PR-04A F07)，支持固定 upper bound、UID 升序检索、最旧 pageSize 切片与 metadata-first 小标头拉取
+ * [POS]: internal/mail 的增量 UID 分页扫描核心 (PR-04A F07)，支持固定 upper bound、UID 升序检索、最旧 pageSize 切片与 metadata-first 小标头拉取，接入 MailPerf 观测
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/emersion/go-imap"
 )
@@ -47,7 +48,29 @@ func (c *Client) ScanMailboxUIDPage(opts ScanPageOptions) (ScanPageResult, error
 		pageSize = 50
 	}
 
+	opStart := time.Now()
+	var selectMS, searchMS, fetchMS int64
+	var returned int
+	folderName := folder
+	defer func() {
+		LogMailPerf("scan_uid_page",
+			"server", c.perfServer(),
+			"folder", folderName,
+			"from_uid", opts.FromUIDInclusive,
+			"to_uid", opts.ToUIDInclusive,
+			"page_size", pageSize,
+			"select_ms", selectMS,
+			"search_ms", searchMS,
+			"fetch_ms", fetchMS,
+			"messages", returned,
+			"body_fetch", 0,
+			"total_ms", time.Since(opStart).Milliseconds(),
+		)
+	}()
+
+	mailboxStart := time.Now()
 	mbox, err := c.cli.Select(folder, true)
+	selectMS = time.Since(mailboxStart).Milliseconds()
 	if err != nil {
 		return ScanPageResult{}, err
 	}
@@ -76,7 +99,9 @@ func (c *Client) ScanMailboxUIDPage(opts ScanPageOptions) (ScanPageResult, error
 	criteria.Uid = new(imap.SeqSet)
 	criteria.Uid.AddRange(opts.FromUIDInclusive, toUID)
 
+	searchStart := time.Now()
 	foundUIDs, searchErr := c.cli.UidSearch(criteria)
+	searchMS = time.Since(searchStart).Milliseconds()
 	if searchErr != nil {
 		return ScanPageResult{}, searchErr
 	}
@@ -131,6 +156,7 @@ func (c *Client) ScanMailboxUIDPage(opts ScanPageOptions) (ScanPageResult, error
 
 	messages := make(chan *imap.Message, len(pageUIDs))
 	done := make(chan error, 1)
+	fetchStart := time.Now()
 	go func() {
 		done <- c.cli.UidFetch(seqset, items, messages)
 	}()
@@ -154,8 +180,11 @@ func (c *Client) ScanMailboxUIDPage(opts ScanPageOptions) (ScanPageResult, error
 		fetched = append(fetched, m)
 	}
 	if err := <-done; err != nil {
+		fetchMS = time.Since(fetchStart).Milliseconds()
 		return ScanPageResult{}, err
 	}
+	fetchMS = time.Since(fetchStart).Milliseconds()
+	returned = len(fetched)
 
 	// 保证按 UID 升序排列
 	sort.Slice(fetched, func(i, j int) bool { return fetched[i].UID < fetched[j].UID })

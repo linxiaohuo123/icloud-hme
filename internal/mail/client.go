@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 github.com/emersion/go-imap, golang.org/x/net/proxy
  * [OUTPUT]: 对外提供 Client、NewClient、NewClientWithServer、Message、FullMessage
- * [POS]: internal/mail 的 IMAP 邮件读取客户端核心，连接建立与列表搜索；内容拉取由 client_fetch.go 承载，增量扫描由 client_scan.go 承载，隧道拨号由 dial.go 承载
+ * [POS]: internal/mail 的 IMAP 邮件读取客户端核心，连接建立与列表搜索；内容拉取由 client_fetch.go 承载，增量扫描由 client_scan.go 承载，隧道拨号由 dial.go 承载，性能观测由 perf.go 承载
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -291,6 +291,7 @@ func (c *Client) ListMailboxes() ([]Folder, error) {
 	if c.cli == nil {
 		return nil, fmt.Errorf("未连接")
 	}
+	listStart := time.Now()
 
 	ch := make(chan *imap.MailboxInfo, 32)
 	done := make(chan error, 1)
@@ -314,8 +315,10 @@ func (c *Client) ListMailboxes() ([]Folder, error) {
 		})
 	}
 	if err := <-done; err != nil {
+		LogMailPerf("list_mailboxes", "server", c.perfServer(), "folders", len(folders), "list_ms", time.Since(listStart).Milliseconds(), "err", true)
 		return nil, err
 	}
+	LogMailPerf("list_mailboxes", "server", c.perfServer(), "folders", len(folders), "list_ms", time.Since(listStart).Milliseconds())
 
 	sort.SliceStable(folders, func(i, j int) bool {
 		return folderSortRank(folders[i]) < folderSortRank(folders[j])
@@ -379,21 +382,28 @@ func (c *Client) listFolder(folder string, limit int, days int, sinceUID uint32,
 }
 
 func (c *Client) listMailbox(folder string, limit int, days int, sinceUID uint32, includeBody bool) ([]Message, error) {
+	mailboxStart := time.Now()
 	mbox, err := c.cli.Select(folder, true)
 	if err != nil {
+		LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", time.Since(mailboxStart).Milliseconds(), "err", true)
 		return nil, err
 	}
+	selectMS := time.Since(mailboxStart).Milliseconds()
 	total := int(mbox.Messages)
 	if total == 0 {
+		LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", selectMS, "messages", 0)
 		return []Message{}, nil
 	}
 
 	seqset := new(imap.SeqSet)
 	isUID := false
+	var searchMS int64
 	if sinceUID > 0 {
 		if mbox.UidNext > 0 && sinceUID >= mbox.UidNext {
+			LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", selectMS, "messages", 0)
 			return []Message{}, nil
 		}
+		searchStart := time.Now()
 		criteria := imap.NewSearchCriteria()
 		criteria.Uid = new(imap.SeqSet)
 		criteria.Uid.AddRange(sinceUID, 0)
@@ -401,7 +411,9 @@ func (c *Client) listMailbox(folder string, limit int, days int, sinceUID uint32
 			criteria.Since = time.Now().AddDate(0, 0, -days)
 		}
 		foundUIDs, searchErr := c.cli.UidSearch(criteria)
+		searchMS = time.Since(searchStart).Milliseconds()
 		if searchErr != nil {
+			LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", selectMS, "search_ms", searchMS, "err", true)
 			return nil, searchErr
 		}
 		if len(foundUIDs) == 0 {
@@ -438,6 +450,7 @@ func (c *Client) listMailbox(folder string, limit int, days int, sinceUID uint32
 
 	messages := make(chan *imap.Message, limit)
 	done := make(chan error, 1)
+	fetchStart := time.Now()
 	go func() {
 		if isUID {
 			done <- c.cli.UidFetch(seqset, items, messages)
@@ -447,7 +460,11 @@ func (c *Client) listMailbox(folder string, limit int, days int, sinceUID uint32
 	}()
 
 	var out []Message
+	var bodyFetchCount int
 	for msg := range messages {
+		if includeBody {
+			bodyFetchCount++
+		}
 		m := parser(msg, folder)
 		if sinceUID > 0 && m.UID < sinceUID {
 			continue
@@ -472,8 +489,10 @@ func (c *Client) listMailbox(folder string, limit int, days int, sinceUID uint32
 		out = append(out, m)
 	}
 	if err := <-done; err != nil {
+		LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", selectMS, "search_ms", searchMS, "fetch_ms", time.Since(fetchStart).Milliseconds(), "err", true)
 		return nil, err
 	}
+	LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", selectMS, "search_ms", searchMS, "fetch_ms", time.Since(fetchStart).Milliseconds(), "messages", len(out), "body_fetch", bodyFetchCount)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Date > out[j].Date })
 	return out, nil
 }
@@ -557,10 +576,36 @@ func (c *Client) ForEachByRecipientInFolderSince(recipient string, folder string
 }
 
 func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, limit int, days int, sinceUID uint32, onMsg func(Message) bool) error {
+	opStart := time.Now()
+	mailboxStart := time.Now()
 	mbox, err := c.cli.Select(folder, true)
 	if err != nil {
+		LogMailPerf("find_by_recipient", "server", c.perfServer(), "folder", folder, "recipient", MaskEmailForLog(recipient), "limit", limit, "since_uid", sinceUID, "select_ms", time.Since(mailboxStart).Milliseconds(), "err", true)
 		return err
 	}
+	selectMS := time.Since(mailboxStart).Milliseconds()
+	var searchMS, fetchMS int64
+	var bodyFetch int
+	var allUIDs []uint32
+	fallback := false
+	matchedCount := 0
+	defer func() {
+		LogMailPerf("find_by_recipient",
+			"server", c.perfServer(),
+			"folder", folder,
+			"recipient", MaskEmailForLog(recipient),
+			"limit", limit,
+			"since_uid", sinceUID,
+			"select_ms", selectMS,
+			"search_ms", searchMS,
+			"fetch_ms", fetchMS,
+			"uids_found", len(allUIDs),
+			"body_fetch", bodyFetch,
+			"fallback", fallback,
+			"matched", matchedCount,
+			"total_ms", time.Since(opStart).Milliseconds(),
+		)
+	}()
 
 	// 1) 服务端按 Header 检索并 Union 去重
 	// QQ/网易等国产邮箱服务端不支持 Delivered-To 等非标 Header，强行搜索会导致全箱扫描并返回数千 UID 造成网络浪费与延迟。
@@ -577,7 +622,7 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 	}
 
 	seen := make(map[uint32]struct{})
-	var allUIDs []uint32
+	searchStart := time.Now()
 	for _, header := range headers {
 		criteria := imap.NewSearchCriteria()
 		criteria.Header.Add(header, recipient)
@@ -609,6 +654,7 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 	}
 	sort.Slice(allUIDs, func(i, j int) bool { return allUIDs[i] < allUIDs[j] })
 	uids := allUIDs
+	searchMS = time.Since(searchStart).Milliseconds()
 
 	if len(uids) > 0 {
 		if sinceUID == 0 {
@@ -622,6 +668,7 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 		items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate, imap.FetchFlags, section.FetchItem()}
 		messages := make(chan *imap.Message, len(uids))
 		done := make(chan error, 1)
+		fetchStart := time.Now()
 		go func() {
 			done <- c.cli.UidFetch(seqset, items, messages)
 		}()
@@ -645,11 +692,13 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 			fetched = append(fetched, m)
 		}
 		if err := <-done; err != nil {
+			fetchMS = time.Since(fetchStart).Milliseconds()
 			return err
 		}
+		fetchMS = time.Since(fetchStart).Milliseconds()
+		bodyFetch = len(fetched)
 		// 按 UID 从大到小 (新到旧) 排序触发回调；严格核验收件人匹配
 		sort.SliceStable(fetched, func(i, j int) bool { return fetched[i].UID > fetched[j].UID })
-		matchedCount := 0
 		for _, m := range fetched {
 			if !m.matches(recipient) {
 				continue
@@ -667,6 +716,7 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 	}
 
 	// 2) fallback: 扫最近 N 封信, 本地全文与 Header 深度比对 (解决 Apple 内部转寄重写 To 导致的漏信)
+	fallback = true
 	return c.forEachRecentMatching(folder, recipient, limit, days, sinceUID, onMsg)
 }
 
@@ -679,11 +729,31 @@ func newestUIDs(uids []uint32, limit int) []uint32 {
 }
 
 // forEachRecentMatching 拉取 folder 最近 scan 封信件, 本地比对 To/Headers/Body/Subject。
+// 注意: 这是候选查找阶段的重路径 —— 每封扫描邮件都会执行完整 BODY[] fetch (PR-MAIL-02 待整改点)。
 func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days int, sinceUID uint32, onMsg func(Message) bool) error {
+	opStart := time.Now()
+	mailboxStart := time.Now()
 	mbox, err := c.cli.Select(folder, true)
 	if err != nil {
+		LogMailPerf("recent_fallback", "server", c.perfServer(), "folder", folder, "recipient", MaskEmailForLog(recipient), "select_ms", time.Since(mailboxStart).Milliseconds(), "err", true)
 		return err
 	}
+	selectMS := time.Since(mailboxStart).Milliseconds()
+	var fetchMS int64
+	var bodyFetch int
+	matched := 0
+	defer func() {
+		LogMailPerf("recent_fallback",
+			"server", c.perfServer(),
+			"folder", folder,
+			"recipient", MaskEmailForLog(recipient),
+			"select_ms", selectMS,
+			"fetch_ms", fetchMS,
+			"body_fetch", bodyFetch,
+			"matched", matched,
+			"total_ms", time.Since(opStart).Milliseconds(),
+		)
+	}()
 	total := int(mbox.Messages)
 	if total == 0 {
 		return nil
@@ -698,6 +768,7 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 	if scan > total {
 		scan = total
 	}
+	bodyFetch = scan
 	from := mbox.Messages - uint32(scan) + 1
 	seqset := new(imap.SeqSet)
 	seqset.AddRange(from, mbox.Messages)
@@ -712,6 +783,7 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 	}
 	messages := make(chan *imap.Message, scan)
 	done := make(chan error, 1)
+	fetchStart := time.Now()
 	go func() {
 		done <- c.cli.Fetch(seqset, items, messages)
 	}()
@@ -737,8 +809,11 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 		}
 	}
 	if err := <-done; err != nil {
+		fetchMS = time.Since(fetchStart).Milliseconds()
 		return err
 	}
+	fetchMS = time.Since(fetchStart).Milliseconds()
+	matched = len(cands)
 	sort.SliceStable(cands, func(i, j int) bool { return cands[i].Date > cands[j].Date })
 	for i, m := range cands {
 		if i >= limit {

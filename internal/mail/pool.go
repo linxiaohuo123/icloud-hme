@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 sync, time, fmt, strings
  * [OUTPUT]: 对外提供 Pool, NewPool 等按账号复用的 IMAP 长连接池管理能力
- * [POS]: internal/mail 的连接复用与生命周期管控层
+ * [POS]: internal/mail 的连接复用与生命周期管控层，接入 MailPerf 观测 (pool_wait/ensure/connect/ping/op 耗时)
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -112,11 +112,13 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 		return fmt.Errorf("连接池已关闭")
 	}
 
+	poolWaitStart := time.Now()
 	select {
 	case pc.sem <- struct{}{}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	poolWaitMS := time.Since(poolWaitStart).Milliseconds()
 	defer pc.unlock()
 
 	// 密码、代理或目标服务器变更则换新 (仅在单账号自身锁 pc.mu 内执行, 杜绝占死全局池锁 p.mu)
@@ -132,8 +134,21 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 		pc.proxyURL = proxyURL
 	}
 
-	if err := pc.ensure(p.idleClose); err != nil {
-		return err
+	ensureStart := time.Now()
+	ensureStats, ensureErr := pc.ensure(p.idleClose)
+	ensureMS := time.Since(ensureStart).Milliseconds()
+	if ensureErr != nil {
+		LogMailPerf("pool_op",
+			"account", MaskEmailForLog(email),
+			"server", server,
+			"pool_wait_ms", poolWaitMS,
+			"ensure_ms", ensureMS,
+			"conn_ms", ensureStats.ConnectMS,
+			"ping_ms", ensureStats.PingMS,
+			"reused", ensureStats.Reused,
+			"ensure_err", true,
+		)
+		return ensureErr
 	}
 
 	cli := pc.client
@@ -162,8 +177,23 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 		cli.SetDeadline(time.Time{})
 	}()
 
+	opStart := time.Now()
 	err := fn(cli)
+	opMS := time.Since(opStart).Milliseconds()
 	pc.lastUsed = time.Now()
+
+	LogMailPerf("pool_op",
+		"account", MaskEmailForLog(email),
+		"server", server,
+		"pool_wait_ms", poolWaitMS,
+		"ensure_ms", ensureMS,
+		"conn_ms", ensureStats.ConnectMS,
+		"ping_ms", ensureStats.PingMS,
+		"reused", ensureStats.Reused,
+		"op_ms", opMS,
+		"err", err != nil,
+		"conn_err", isLikelyConnErr(err),
+	)
 
 	// 若在执行期间 context 已触发取消，连接已被打断，必须从连接池丢弃，严禁复用 (Issue 13)
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -310,7 +340,15 @@ func (p *Pool) reapIdleConns() {
 	p.mu.Unlock()
 }
 
-func (pc *pooledConn) ensure(idleClose time.Duration) error {
+// poolEnsureStats 记录单次 ensure 的连接复用与耗时情况，供 MailPerf 观测 (PR-MAIL-00)。
+type poolEnsureStats struct {
+	Reused    bool  // 复用既有连接 (Ping 通过)
+	PingMS    int64 // 复用路径 NOOP 耗时
+	ConnectMS int64 // 新建连接 (TCP+TLS+Login) 耗时
+}
+
+func (pc *pooledConn) ensure(idleClose time.Duration) (poolEnsureStats, error) {
+	var stats poolEnsureStats
 	if pc.client != nil {
 		// 空闲太久主动重建, 避免服务端静默断连
 		if idleClose > 0 && !pc.lastUsed.IsZero() && time.Since(pc.lastUsed) > idleClose {
@@ -319,8 +357,12 @@ func (pc *pooledConn) ensure(idleClose time.Duration) error {
 		}
 	}
 	if pc.client != nil {
-		if err := pc.client.Ping(); err == nil {
-			return nil
+		pingStart := time.Now()
+		err := pc.client.Ping()
+		stats.PingMS = time.Since(pingStart).Milliseconds()
+		if err == nil {
+			stats.Reused = true
+			return stats, nil
 		}
 		pc.client.forceClose()
 		pc.client = nil
@@ -337,21 +379,24 @@ func (pc *pooledConn) ensure(idleClose time.Duration) error {
 	if pc.proxyURL != "" {
 		c.SetProxy(pc.proxyURL)
 	}
+	connectStart := time.Now()
 	if err := c.Connect(); err != nil {
+		stats.ConnectMS = time.Since(connectStart).Milliseconds()
 		if pc.proxyURL != "" {
 			// 慢代理超时/坏节点时，自动降级为直连尝试，保障 IMAP 取信不断供
 			direct := NewClientWithServer(pc.appleID, pc.appPassword, server, port)
 			if directErr := direct.Connect(); directErr == nil {
 				pc.client = direct
 				pc.lastUsed = time.Now()
-				return nil
+				return stats, nil
 			}
 		}
-		return err
+		return stats, err
 	}
+	stats.ConnectMS = time.Since(connectStart).Milliseconds()
 	pc.client = c
 	pc.lastUsed = time.Now()
-	return nil
+	return stats, nil
 }
 
 func isLikelyConnErr(err error) bool {
