@@ -12,6 +12,8 @@ import (
 	"log"
 	"os"
 	"strings"
+
+	"github.com/emersion/go-imap"
 )
 
 // mailPerfEnabled 由环境变量 ICLOUD_HME_MAIL_PERF_LOG 初始化 (true/1 开启，false/空/其他关闭)。
@@ -63,6 +65,17 @@ func MaskEmailForLog(addr string) string {
 		keep = len(local)
 	}
 	return local[:keep] + "***@" + domain
+}
+
+// msgHasBodySection 判断 FETCH 响应中是否真实携带了 BODY section (FIX-8 received 计数依据)。
+// GetBody 是纯 map 查找 (幂等不消费)，与 toMessageWithBody 的双 section 探测保持一致:
+// 服务端可能以 BODY[] 或 BODY.PEEK[] 任意一种形式返回。
+func msgHasBodySection(msg *imap.Message) bool {
+	if msg == nil {
+		return false
+	}
+	return msg.GetBody(&imap.BodySectionName{Peek: true}) != nil ||
+		msg.GetBody(&imap.BodySectionName{}) != nil
 }
 
 // perfServer 返回用于日志观测的服务器标识；测试注入的 Client 可能未填 server，兜底为标准 iCloud IMAP。

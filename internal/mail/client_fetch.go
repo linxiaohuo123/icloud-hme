@@ -33,9 +33,10 @@ func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, 
 		return nil, fmt.Errorf("未连接")
 	}
 	opStart := time.Now()
+	bodyRequested := 0
 	bodyReceived := 0
 	defer func() {
-		LogMailPerf("get_full", "server", c.perfServer(), "folder", folder, "uid", uid, "body_fetch_requested", 1, "body_fetch_received", bodyReceived, "total_ms", time.Since(opStart).Milliseconds(), "err", retErr != nil)
+		LogMailPerf("get_full", "server", c.perfServer(), "folder", folder, "uid", uid, "body_fetch_requested", bodyRequested, "body_fetch_received", bodyReceived, "total_ms", time.Since(opStart).Milliseconds(), "err", retErr != nil)
 	}()
 	folders, err := c.resolveFolders(folder)
 	if err != nil {
@@ -56,6 +57,8 @@ func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, 
 		items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate, imap.FetchFlags, section.FetchItem()}
 		messages := make(chan *imap.Message, 1)
 		done := make(chan error, 1)
+		// FIX-8: 只统计真正发出 BODY FETCH 的次数 (folder=all 会在多个 folder 依次尝试)
+		bodyRequested++
 		go func() {
 			done <- c.cli.UidFetch(seqset, items, messages)
 		}()
@@ -85,7 +88,7 @@ func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, 
 				Method:       "imap",
 			}
 			if r := msg.GetBody(section); r != nil {
-				bodyReceived = 1
+				bodyReceived++
 				if em, err := mail.ReadMessage(r); err == nil {
 					body, _ := readBody(em)
 					full.Body = strings.TrimSpace(body)
@@ -115,9 +118,10 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 		folder = "INBOX"
 	}
 	opStart := time.Now()
+	bodyRequested := 0
 	bodyReceived := 0
 	defer func() {
-		LogMailPerf("get_full_batch", "server", c.perfServer(), "folder", folder, "requested", len(uids), "body_fetch_requested", len(uids), "body_fetch_received", bodyReceived, "total_ms", time.Since(opStart).Milliseconds(), "err", retErr != nil)
+		LogMailPerf("get_full_batch", "server", c.perfServer(), "folder", folder, "requested", len(uids), "body_fetch_requested", bodyRequested, "body_fetch_received", bodyReceived, "total_ms", time.Since(opStart).Milliseconds(), "err", retErr != nil)
 	}()
 	status, err := c.cli.Select(folder, true)
 	if err != nil {
@@ -136,6 +140,8 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 	items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate, imap.FetchFlags, section.FetchItem()}
 	messages := make(chan *imap.Message, len(uids))
 	done := make(chan error, 1)
+	// FIX-8: SELECT / UIDVALIDITY 校验通过、真正即将执行 UidFetch 时才计入 requested
+	bodyRequested = len(uids)
 	go func() {
 		done <- c.cli.UidFetch(seqset, items, messages)
 	}()
@@ -144,7 +150,9 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 		if msg == nil {
 			continue
 		}
-		bodyReceived++
+		if msgHasBodySection(msg) {
+			bodyReceived++
+		}
 		message := toMessage(msg, folder)
 		message.UIDValidity = status.UidValidity
 		message.UID = msg.Uid

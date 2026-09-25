@@ -157,6 +157,9 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 	if ensureErr != nil {
 		perf.ensureErr = true
 		perf.err = true
+		// FIX-9: 按错误类型判别连接类失败 (超时/reset/refused 等)；
+		// 认证失败等业务错误保持 conn_err=false，严禁把所有 IMAP 错误都算作连接错误
+		perf.connErr = isLikelyConnErr(ensureErr)
 		return ensureErr
 	}
 
@@ -438,6 +441,8 @@ func (pc *pooledConn) ensure(idleClose time.Duration) (poolEnsureStats, error) {
 		return stats, nil
 	}
 	if pc.proxyURL == "" {
+		// FIX-7: 直连失败同样必须记录总建连耗时，禁止 conn_ms=0 + err=true 的错误指标
+		stats.ConnectMS = time.Since(connectStart).Milliseconds()
 		return stats, connectErr
 	}
 	// 慢代理超时/坏节点时，自动降级为直连尝试，保障 IMAP 取信不断供 (仅修统计，不改此业务行为)
@@ -460,10 +465,12 @@ func isLikelyConnErr(err error) bool {
 		return false
 	}
 	s := strings.ToLower(err.Error())
-	// 常见断连/IO 错误关键字
+	// 常见断连/IO/建连失败错误关键字 (FIX-9: 仅显式连接类, 不把认证等业务错误归入 conn_err)
 	for _, k := range []string{
 		"connection reset", "broken pipe", "eof", "i/o timeout",
 		"use of closed", "not connected", "connection refused",
+		"actively refused", "connectex", "no such host",
+		"network is unreachable", "handshake failure", "握手失败",
 		"imap 连接", "wsarecv", "wsasend",
 	} {
 		if strings.Contains(s, k) {

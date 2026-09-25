@@ -470,7 +470,7 @@ func (c *Client) listMailbox(folder string, limit int, days int, sinceUID uint32
 	var out []Message
 	var bodyReceived int
 	for msg := range messages {
-		if includeBody {
+		if includeBody && msgHasBodySection(msg) {
 			bodyReceived++
 		}
 		m := parser(msg, folder)
@@ -689,6 +689,11 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 			if msg == nil {
 				continue
 			}
+			// FIX-8: 在消费 channel 时实时累加，partial FETCH failure 也能保留已收到 BODY 数；
+			// 仅当响应真实携带 BODY section 时计入 received
+			if msgHasBodySection(msg) {
+				bodyFetchReceived++
+			}
 			m := toMessageWithBody(msg, folder)
 			m.UIDValidity = mbox.UidValidity
 			m.UID = msg.Uid
@@ -707,7 +712,6 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 			return err
 		}
 		fetchMS = time.Since(fetchStart).Milliseconds()
-		bodyFetchReceived = len(fetched)
 		// 按 UID 从大到小 (新到旧) 排序触发回调；严格核验收件人匹配
 		sort.SliceStable(fetched, func(i, j int) bool { return fetched[i].UID > fetched[j].UID })
 		for _, m := range fetched {
@@ -806,7 +810,9 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 		if msg == nil {
 			continue
 		}
-		bodyFetchReceived++
+		if msgHasBodySection(msg) {
+			bodyFetchReceived++
+		}
 		m := toMessageWithBody(msg, folder)
 		if days > 0 {
 			if t, err := time.Parse(time.RFC3339, m.Date); err == nil {
