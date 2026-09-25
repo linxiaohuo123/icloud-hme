@@ -252,7 +252,45 @@ describe('Inbox Baseline Performance Measurements', () => {
     view2.unmount()
   })
 
-  it('stages message body requests in sequential chunks of at most 5 items', async () => {
+  it('TEST-1: /api/messages 永不返回时，列表元数据依然先显示 (Fast First Paint)', async () => {
+    let resolveMessages: (() => void) | null = null
+    const messagesDeferred = new Promise<void>((resolve) => {
+      resolveMessages = resolve
+    })
+
+    server.use(
+      http.get('/api/mailboxes', () => {
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_perf', folders: dummyFolders } })
+      }),
+      http.get('/api/inbox', () => {
+        return HttpResponse.json({ success: true, data: dummyInboxResult })
+      }),
+      http.post('/api/messages', async () => {
+        await messagesDeferred
+        return HttpResponse.json({ success: true, data: { messages: [] } })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_perf" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    // 在 /api/messages 挂起未返回的情况下，邮件列表的主题已立即渲染显示
+    await waitFor(() => {
+      expect(screen.getByText('Apple Security Code')).toBeInTheDocument()
+      expect(screen.getByText('Your OTP is 123456')).toBeInTheDocument()
+    })
+
+    // 释放 /api/messages，测试正常收尾
+    resolveMessages!()
+    unmount()
+  })
+
+  it('TEST-4: 当前可见缺失正文目标单次 background batch 请求 (12 封只发 1 次 batch_size=12)', async () => {
     const chunkSizes: number[] = []
     const manyMessages = Array.from({ length: 12 }, (_, i) => ({
       id: `msg_${i + 1}`,
@@ -308,18 +346,14 @@ describe('Inbox Baseline Performance Measurements', () => {
 
     await waitFor(() => {
       expect(screen.getByText('Verification Code #1')).toBeInTheDocument()
-      // 12 items chunked by 5 => chunks of 5, 5, 2
-      expect(chunkSizes.length).toBeGreaterThanOrEqual(1)
+      expect(screen.getByText('Verification Code #12')).toBeInTheDocument()
     })
 
+    // 关键断言：不再分片为 [5, 5, 2]，而是单次请求 12
     await waitFor(() => {
-      expect(chunkSizes).toEqual([5, 5, 2])
+      expect(chunkSizes).toEqual([12])
     })
-
-    // Verify all chunks are capped at CHUNK_SIZE = 5
-    for (const size of chunkSizes) {
-      expect(size).toBeLessThanOrEqual(5)
-    }
+    expect(chunkSizes.length).toBe(1)
 
     unmount()
   })
@@ -479,8 +513,7 @@ describe('Inbox Baseline Performance Measurements', () => {
     unmount()
   })
 
-  it('handles later chunk failure gracefully without losing previously completed chunks', async () => {
-    let chunkCall = 0
+  it('TEST-2: /api/messages 失败(500)时，已渲染的 metadata 列表不消失且不进入整页错误', async () => {
     const tenMessages = Array.from({ length: 10 }, (_, i) => ({
       id: `msg_${i + 1}`,
       message_ref: `imap:acc_perf:INBOX:1:${200 + i}`,
@@ -508,23 +541,7 @@ describe('Inbox Baseline Performance Measurements', () => {
           },
         })
       }),
-      http.post('/api/messages', async ({ request }) => {
-        chunkCall++
-        const body = (await request.json()) as { messages?: Array<{ id: string; message_ref: string }> }
-        if (chunkCall === 1) {
-          // Chunk 1 succeeds with verification code
-          return HttpResponse.json({
-            success: true,
-            data: {
-              messages: (body?.messages || []).map((m: { id: string; message_ref: string }) => ({
-                ...m,
-                body: `Body with OTP: 888123 for ${m.message_ref}`,
-                preview: `OTP: 888123`,
-              })),
-            },
-          })
-        }
-        // Chunk 2 fails with 500
+      http.post('/api/messages', async () => {
         return HttpResponse.json({ success: false, code: 'INTERNAL_ERROR', message: 'IMAP socket timeout' }, { status: 500 })
       }),
     )
@@ -542,15 +559,14 @@ describe('Inbox Baseline Performance Measurements', () => {
       expect(screen.getByText('Batch Item #10')).toBeInTheDocument()
     })
 
-    // Chunk 1 OTP successfully displays
-    await waitFor(() => {
-      expect(screen.getAllByText('888123').length).toBeGreaterThanOrEqual(1)
-    })
-
-    // All 10 items remain listed in the table (view does not break or crash)
+    // 所有 10 封邮件依然完整展示在列表中
     for (let i = 1; i <= 10; i++) {
       expect(screen.getByText(`Batch Item #${i}`)).toBeInTheDocument()
     }
+
+    // 严禁出现整页错误提示或清空列表
+    expect(screen.queryByText('IMAP socket timeout')).toBeNull()
+    expect(screen.queryByText('网络连接失败，请检查服务状态')).toBeNull()
 
     unmount()
   })
@@ -603,20 +619,23 @@ describe('Inbox Baseline Performance Measurements', () => {
     view2.unmount()
   })
 
-  it('demonstrates progressive OTP appearance: first chunk OTP visible before remaining chunks complete', async () => {
-    const tenMessages = Array.from({ length: 10 }, (_, i) => ({
-      id: `prog_${i + 1}`,
-      message_ref: `imap:acc_perf:INBOX:1:${300 + i}`,
-      subject: `Prog Item #${i + 1}`,
+  it('TEST-3: 邮件元数据优先渲染，后台正文返回后渐进提取并显示验证码胶囊 (Progressive OTP Enrichment)', async () => {
+    let resolveMessages: (() => void) | null = null
+    const messagesDeferred = new Promise<void>((resolve) => {
+      resolveMessages = resolve
+    })
+
+    const testMsg = {
+      id: 'otp_msg_1',
+      message_ref: 'imap:acc_perf:INBOX:1:999',
+      subject: 'Security Verification Notification',
       from: 'apple@apple.com',
       to: 'perf@icloud.com',
       date: '2026-09-23 20:00:00',
       folder: 'INBOX',
       preview: '',
       body: '',
-    }))
-
-    let chunkStep = 0
+    }
 
     server.use(
       http.get('/api/mailboxes', () => {
@@ -627,29 +646,24 @@ describe('Inbox Baseline Performance Measurements', () => {
           success: true,
           data: {
             account_id: 'acc_perf',
-            count: 10,
-            messages: tenMessages,
+            count: 1,
+            messages: [testMsg],
             method: 'imap',
           },
         })
       }),
-      http.post('/api/messages', async ({ request }) => {
-        chunkStep++
-        const body = (await request.json()) as { messages?: Array<{ id: string; message_ref: string }> }
-        // Each chunk takes 20ms
-        await new Promise((r) => setTimeout(r, 20))
+      http.post('/api/messages', async () => {
+        await messagesDeferred
         return HttpResponse.json({
           success: true,
           data: {
-            messages: (body?.messages || []).map((m: { id: string; message_ref: string }) => {
-              const num = m.message_ref.split(':').pop() || '0'
-              const code = String(800000 + Number(num))
-              return {
-                ...m,
-                body: `Your verification code is ${code}`,
-                preview: `Your verification code is ${code}`,
-              }
-            }),
+            messages: [
+              {
+                ...testMsg,
+                body: 'Your verification code is 884812. Valid for 10 minutes.',
+                preview: 'Your verification code is 884812.',
+              },
+            ],
           },
         })
       }),
@@ -663,15 +677,18 @@ describe('Inbox Baseline Performance Measurements', () => {
       </MemoryRouter>,
     )
 
-    // First chunk items appear with their OTP badge first
+    // 第一帧：主题已先显示，但此时正文未到，验证码胶囊不存在
     await waitFor(() => {
-      expect(screen.getByText('800300')).toBeInTheDocument()
+      expect(screen.getByText('Security Verification Notification')).toBeInTheDocument()
     })
+    expect(screen.queryByText('884812')).toBeNull()
 
-    // Eventually all items have their OTP badges
+    // 释放后台 /api/messages 请求
+    resolveMessages!()
+
+    // 响应式合并后，验证码胶囊渐进出场
     await waitFor(() => {
-      expect(screen.getByText('800309')).toBeInTheDocument()
-      expect(chunkStep).toBe(2)
+      expect(screen.getByText('884812')).toBeInTheDocument()
     })
 
     unmount()
@@ -840,6 +857,263 @@ describe('Inbox Baseline Performance Measurements', () => {
     // 5. 核心断言：由于会话世代失效与卸载拦截，旧详情绝对不得被回填至模块级缓存！
     const staleCached = getModuleMessageCache('imap:acc_perf:INBOX:1:123')
     expect(staleCached).toBeUndefined()
+  })
+
+  it('TEST-6: 账号切换时旧账户在途 /api/messages enrichment 不污染新账户视图', async () => {
+    let resolveAcc1Messages: (() => void) | null = null
+    const acc1Deferred = new Promise<void>((resolve) => {
+      resolveAcc1Messages = resolve
+    })
+
+    const acc1Msg = {
+      id: 'acc1_msg_1',
+      message_ref: 'imap:acc_1:INBOX:1:101',
+      subject: 'Account 1 Notification',
+      from: 'apple@apple.com',
+      to: 'acc1@icloud.com',
+      date: '2026-09-23 20:00:00',
+      folder: 'INBOX',
+      preview: '',
+      body: '',
+    }
+
+    const acc2Msg = {
+      id: 'acc2_msg_1',
+      message_ref: 'imap:acc_2:INBOX:1:201',
+      subject: 'Account 2 Notification',
+      from: 'google@google.com',
+      to: 'acc2@icloud.com',
+      date: '2026-09-23 20:01:00',
+      folder: 'INBOX',
+      preview: 'Account 2 Preview',
+      body: 'Account 2 Body',
+    }
+
+    server.use(
+      http.get('/api/mailboxes', () => {
+        return HttpResponse.json({ success: true, data: { folders: dummyFolders } })
+      }),
+      http.get('/api/inbox', ({ request }) => {
+        const url = new URL(request.url)
+        const acc = url.searchParams.get('account_id')
+        if (acc === 'acc_1') {
+          return HttpResponse.json({
+            success: true,
+            data: {
+              account_id: 'acc_1',
+              count: 1,
+              messages: [acc1Msg],
+              method: 'imap',
+            },
+          })
+        }
+        return HttpResponse.json({
+          success: true,
+          data: {
+            account_id: 'acc_2',
+            count: 1,
+            messages: [acc2Msg],
+            method: 'imap',
+          },
+        })
+      }),
+      http.post('/api/messages', async ({ request }) => {
+        const body = (await request.json()) as { account_id?: string; messages?: Array<{ id: string; message_ref: string }> }
+        if (body.account_id === 'acc_1') {
+          await acc1Deferred
+          return HttpResponse.json({
+            success: true,
+            data: {
+              messages: [
+                {
+                  ...acc1Msg,
+                  body: 'SECRET_ACC1_VERIFICATION_CODE_777888',
+                  preview: 'SECRET_ACC1_VERIFICATION_CODE_777888',
+                },
+              ],
+            },
+          })
+        }
+        return HttpResponse.json({
+          success: true,
+          data: {
+            messages: [acc2Msg],
+          },
+        })
+      }),
+    )
+
+    const { rerender, unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_1" fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    // acc_1 metadata 渲染
+    await waitFor(() => {
+      expect(screen.getByText('Account 1 Notification')).toBeInTheDocument()
+    })
+
+    // 切换到 acc_2，此时 acc_1 的 /api/messages 仍被阻塞
+    rerender(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_2" fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    // acc_2 显示
+    await waitFor(() => {
+      expect(screen.getByText('Account 2 Notification')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('Account 1 Notification')).toBeNull()
+
+    // 此时释放 acc_1 的 /api/messages
+    resolveAcc1Messages!()
+    await new Promise((r) => setTimeout(r, 60))
+
+    // 核心断言：acc_1 的正文与 OTP 绝对不得出现在 acc_2 的视图中
+    expect(screen.queryByText('SECRET_ACC1_VERIFICATION_CODE_777888')).toBeNull()
+    expect(screen.queryByText('Account 1 Notification')).toBeNull()
+    expect(screen.getByText('Account 2 Notification')).toBeInTheDocument()
+
+    unmount()
+  })
+
+  it('TEST-7: alias 筛选切换时旧 query 在途 /api/messages enrichment 不覆盖新 query 结果', async () => {
+    let resolveAlias1Messages: (() => void) | null = null
+    const alias1Deferred = new Promise<void>((resolve) => {
+      resolveAlias1Messages = resolve
+    })
+
+    const msgAlias1 = {
+      id: 'msg_al_1',
+      message_ref: 'imap:acc_perf:INBOX:1:111',
+      subject: 'Alias 1 Exclusive Message',
+      from: 'apple@apple.com',
+      to: 'alias1@icloud.com',
+      date: '2026-09-23 20:00:00',
+      folder: 'INBOX',
+      preview: '',
+      body: '',
+    }
+
+    const msgAlias2 = {
+      id: 'msg_al_2',
+      message_ref: 'imap:acc_perf:INBOX:1:222',
+      subject: 'Alias 2 Exclusive Message',
+      from: 'banana@apple.com',
+      to: 'alias2@icloud.com',
+      date: '2026-09-23 20:01:00',
+      folder: 'INBOX',
+      preview: 'Alias 2 Preview',
+      body: 'Alias 2 Body',
+    }
+
+    server.use(
+      http.get('/api/mailboxes', () => {
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_perf', folders: dummyFolders } })
+      }),
+      http.get('/api/inbox', ({ request }) => {
+        const url = new URL(request.url)
+        const al = url.searchParams.get('alias')
+        if (al === 'alias1@icloud.com') {
+          return HttpResponse.json({
+            success: true,
+            data: {
+              account_id: 'acc_perf',
+              count: 1,
+              messages: [msgAlias1],
+              method: 'imap',
+            },
+          })
+        }
+        return HttpResponse.json({
+          success: true,
+          data: {
+            account_id: 'acc_perf',
+            count: 1,
+            messages: [msgAlias2],
+            method: 'imap',
+          },
+        })
+      }),
+      http.post('/api/messages', async ({ request }) => {
+        const body = (await request.json()) as { messages?: Array<{ id: string; message_ref: string }> }
+        const isAlias1 = body.messages?.some((m) => m.message_ref === msgAlias1.message_ref)
+        if (isAlias1) {
+          await alias1Deferred
+          return HttpResponse.json({
+            success: true,
+            data: {
+              messages: [
+                {
+                  ...msgAlias1,
+                  body: 'SECRET_ALIAS1_OTP_112233',
+                  preview: 'SECRET_ALIAS1_OTP_112233',
+                },
+              ],
+            },
+          })
+        }
+        return HttpResponse.json({
+          success: true,
+          data: {
+            messages: [msgAlias2],
+          },
+        })
+      }),
+    )
+
+    const { rerender, unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView
+            accountId="acc_perf"
+            accountSummary={dummyAccount}
+            fixedAccount={true}
+            initialAlias="alias1@icloud.com"
+          />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Alias 1 Exclusive Message')).toBeInTheDocument()
+    })
+
+    // 切换 initialAlias 为 alias2@icloud.com，此时 alias1 的 /api/messages 仍在途
+    rerender(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView
+            accountId="acc_perf"
+            accountSummary={dummyAccount}
+            fixedAccount={true}
+            initialAlias="alias2@icloud.com"
+          />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Alias 2 Exclusive Message')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('Alias 1 Exclusive Message')).toBeNull()
+
+    // 释放 alias 1 的在途 enrichment
+    resolveAlias1Messages!()
+    await new Promise((r) => setTimeout(r, 60))
+
+    // 核心断言：alias 1 的旧 enrichment 绝不覆盖或混入 alias 2 的视图
+    expect(screen.queryByText('SECRET_ALIAS1_OTP_112233')).toBeNull()
+    expect(screen.queryByText('Alias 1 Exclusive Message')).toBeNull()
+    expect(screen.getByText('Alias 2 Exclusive Message')).toBeInTheDocument()
+
+    unmount()
   })
 })
 
