@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 api/client (request, ApiError, getMessageDetail), api/types, components (AsyncState, ConfirmDialog, ToastProvider), hooks/useAccounts (fetchAccountsDeduped), utils (clipboard, date, mail, sniffer: buildSniffContext, extractOTPMemoized, parseSenderInfo), ./InboxFilterBar, ./InboxTableRow, ./MailDetailDialog
- * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；支持 externalAliases 直传消灭冗余 I/O、fetchAccountsDeduped 全局缓存共享、数据层一次性嗅探与 O(1) 属性直读、模块级缓存防 Tab 切换重载与自动刷新轮询
+ * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；支持 externalAliases 直传消灭冗余 I/O、fetchAccountsDeduped 全局缓存共享、数据层一次性嗅探与 O(1) 属性直读、模块级缓存防 Tab 切换重载与自动刷新轮询、首屏 Metadata 快速渲染 (Fast First Paint) 与后台单批正文渐进增强
  * [POS]: web/src/components/inbox 的核心视图容器，统一单账号工作台与全局收件箱大盘的数据流与交互
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -518,7 +518,7 @@ export default function InboxTableView({
           })
         }
 
-        // 2. 检查当前页可见范围 (至多 limit 封) 仍缺失正文的邮件
+        // 2. 检查当前页可见范围 (至多 limit 封，且单次至多 20) 仍缺失正文的邮件
         const visibleSlice = initialMessages.slice(0, Math.min(initialMessages.length, limit > 0 ? limit : 20))
         const targets = visibleSlice
           .filter((m) => !m.preview && !m.body && Boolean(m.message_ref))
@@ -529,47 +529,49 @@ export default function InboxTableView({
             id: m.id,
           }))
 
-        let finalMessages = initialMessages
+        // P0: 优先首屏渲染 (Fast First Paint)
+        // metadata 一旦返回，立即提交 baseResult 并结束 loading，使用户能在第一时间看到邮件列表与关键元数据
+        const baseResult = data ? { ...data, messages: initialMessages } : null
+        setResult(baseResult)
+        if (baseResult) {
+          setSnapshot(currentQueryKey, baseResult)
+        }
+        setLoading(false)
 
-        // 3. 受控分片获取正文与原子提交：
-        // 维持 CHUNK_SIZE = 5 顺序分片以保护 IMAP 连接与网络受控，同时在全部分片获取完成前绝不提交半成品空数据，彻底消灭验证码与正文逐个跳出的问题
-        if (targets.length > 0) {
-          const CHUNK_SIZE = 5
-          const chunks: Array<typeof targets> = []
-          for (let i = 0; i < targets.length; i += CHUNK_SIZE) {
-            chunks.push(targets.slice(i, i + CHUNK_SIZE))
-          }
+        if (targets.length === 0) {
+          setIsRevalidating(false)
+          isBusyRef.current = false
+          return
+        }
 
-          const byRef = new Map<string, FullMessage>()
-          for (const chunk of chunks) {
-            if (isStale()) return
-            try {
-              const batch = await request<{ messages?: FullMessage[] }>('/api/messages', {
-                method: 'POST',
-                body: {
-                  account_id: accountId,
-                  messages: chunk,
-                },
-                signal: controller.signal,
-              })
-              if (isStale()) return
-              const list = Array.isArray(batch?.messages) ? batch.messages : []
-              list.forEach((fm) => {
-                if (!fm || !fm.message_ref) return
-                const cacheKey = buildMailCacheKey(accountId, fm)
-                setModuleMessageCache(cacheKey, fm)
-                messageCacheRef.current.set(cacheKey, fm)
-                byRef.set(fm.message_ref, fm)
-              })
-            } catch {
-              // 单个 chunk 失败不阻断后续 chunk 尝试与兜底展示
-            }
-          }
+        // 3. 后台单批次补全正文 (Progressive Enrichment)：
+        // 限制至多 20 封单次 POST /api/messages 请求，正文无论慢或失败绝不阻断首屏列表
+        setIsRevalidating(true)
+        const batchTargets = targets.slice(0, 20)
 
+        try {
+          const batch = await request<{ messages?: FullMessage[] }>('/api/messages', {
+            method: 'POST',
+            body: {
+              account_id: accountId,
+              messages: batchTargets,
+            },
+            signal: controller.signal,
+          })
           if (isStale()) return
 
+          const list = Array.isArray(batch?.messages) ? batch.messages : []
+          const byRef = new Map<string, FullMessage>()
+          list.forEach((fm) => {
+            if (!fm || !fm.message_ref) return
+            const cacheKey = buildMailCacheKey(accountId, fm)
+            setModuleMessageCache(cacheKey, fm)
+            messageCacheRef.current.set(cacheKey, fm)
+            byRef.set(fm.message_ref, fm)
+          })
+
           if (byRef.size > 0) {
-            finalMessages = initialMessages.map((m) => {
+            const enrichedMessages = initialMessages.map((m) => {
               if (!m.message_ref) return m
               const match = byRef.get(m.message_ref)
               if (!match) return m
@@ -580,20 +582,20 @@ export default function InboxTableView({
                 unread: m.unread ?? match.unread,
               }
             })
+            const enrichedResult = data ? { ...data, messages: enrichedMessages } : null
+            setResult(enrichedResult)
+            if (enrichedResult) {
+              setSnapshot(currentQueryKey, enrichedResult)
+            }
+          }
+        } catch {
+          // 后台 enrichment 失败属于渐进增强降级，静默处理，严禁清空 baseResult 或报错覆盖首屏
+        } finally {
+          if (!isStale()) {
+            setIsRevalidating(false)
+            isBusyRef.current = false
           }
         }
-
-        if (isStale()) return
-
-        // 4. 一次性原子提交终态数据：主题、正文、发件人及最左侧嗅探提取的验证码胶囊同帧出场
-        const finalResult = data ? { ...data, messages: finalMessages } : null
-        setResult(finalResult)
-        if (finalResult) {
-          setSnapshot(currentQueryKey, finalResult)
-        }
-        setLoading(false)
-        setIsRevalidating(false)
-        isBusyRef.current = false
       })
       .catch((err) => {
         const isAuthError = err instanceof ApiError && (err.status === 401 || err.code === 'AUTH_REQUIRED')
