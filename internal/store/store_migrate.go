@@ -8,6 +8,7 @@
 package store
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -88,6 +89,15 @@ func (s *Store) insertLegacyTags(tags map[string]*BusinessTag) error {
 	return tx.Commit()
 }
 
+type legacyTokenRecord struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Token      string `json:"token"`
+	CreatedAt  string `json:"created_at"`
+	LastUsedAt string `json:"last_used_at"`
+	Scopes     string `json:"scopes"`
+}
+
 func (s *Store) migrateTokensFile() error {
 	file := filepath.Join(s.dataDir, "tokens.json")
 	data, err := os.ReadFile(file)
@@ -97,7 +107,7 @@ func (s *Store) migrateTokensFile() error {
 		}
 		return fmt.Errorf("read %s failed: %w", file, err)
 	}
-	var tokens map[string]*APIToken
+	var tokens map[string]*legacyTokenRecord
 	if err := json.Unmarshal(data, &tokens); err != nil {
 		s.keepLegacyFile(file, "解析失败", err)
 		return fmt.Errorf("parse %s failed: %w", file, err)
@@ -114,17 +124,29 @@ func (s *Store) migrateTokensFile() error {
 	return nil
 }
 
-func (s *Store) insertLegacyTokens(tokens map[string]*APIToken) error {
+func (s *Store) insertLegacyTokens(tokens map[string]*legacyTokenRecord) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO api_tokens (id, name, token, created_at, last_used_at, scopes) VALUES (?, ?, ?, ?, ?, ?)`)
+
+	hasTokenHash, err := tableHasColumn(tx, "api_tokens", "token_hash")
+	if err != nil {
+		return err
+	}
+
+	var stmt *sql.Stmt
+	if hasTokenHash {
+		stmt, err = tx.Prepare(`INSERT OR IGNORE INTO api_tokens (id, name, token_hash, token_prefix, created_at, last_used_at, scopes, needs_rotation) VALUES (?, ?, ?, ?, ?, ?, ?, 1)`)
+	} else {
+		stmt, err = tx.Prepare(`INSERT OR IGNORE INTO api_tokens (id, name, token, created_at, last_used_at, scopes) VALUES (?, ?, ?, ?, ?, ?)`)
+	}
 	if err != nil {
 		return err
 	}
 	defer func() { _ = stmt.Close() }()
+
 	for _, tok := range tokens {
 		if tok == nil {
 			continue
@@ -134,8 +156,16 @@ func (s *Store) insertLegacyTokens(tokens map[string]*APIToken) error {
 		if scopes == "" {
 			scopes = ScopeAdmin
 		}
-		if _, err := stmt.Exec(tok.ID, tok.Name, tok.Token, tok.CreatedAt, tok.LastUsedAt, scopes); err != nil {
-			return err
+		if hasTokenHash {
+			tokenHash := HashToken(tok.Token)
+			tokenPrefix := SafeTokenPrefix(tok.Token)
+			if _, err := stmt.Exec(tok.ID, tok.Name, tokenHash, tokenPrefix, tok.CreatedAt, tok.LastUsedAt, scopes); err != nil {
+				return err
+			}
+		} else {
+			if _, err := stmt.Exec(tok.ID, tok.Name, tok.Token, tok.CreatedAt, tok.LastUsedAt, scopes); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()

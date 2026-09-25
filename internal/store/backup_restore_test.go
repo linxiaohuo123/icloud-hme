@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"icloud-hme/internal/hme"
+	"icloud-hme/internal/security"
 )
 
 // TestPR06_BackupIncludesCommittedWALData 验证在 WAL 模式下无需手动 checkpoint，CreateBackup 也能捕获最新 committed 事务数据
@@ -72,13 +73,13 @@ func TestPR06_BackupIncludesCommittedWALData(t *testing.T) {
 	}
 
 	// 检查 committed 数据必须存在
-	var tokName, tokSecret, scopes string
-	err = bakDB.QueryRow("SELECT name, token, scopes FROM api_tokens WHERE id='tok_wal_1'").Scan(&tokName, &tokSecret, &scopes)
+	var tokName, tokHash, scopes string
+	err = bakDB.QueryRow("SELECT name, token_hash, scopes FROM api_tokens WHERE id='tok_wal_1'").Scan(&tokName, &tokHash, &scopes)
 	if err != nil {
 		t.Fatalf("未能在备份中找到刚写入的 WAL committed 数据: %v", err)
 	}
-	if tokName != "wal_bot" || tokSecret != "sec_wal_test" || scopes != "allocate" {
-		t.Fatalf("WAL 备份中数据字段不匹配: %s, %s, %s", tokName, tokSecret, scopes)
+	if tokName != "wal_bot" || tokHash != HashToken("sec_wal_test") || scopes != "allocate" {
+		t.Fatalf("WAL 备份中数据字段不匹配: %s, %s, %s", tokName, tokHash, scopes)
 	}
 
 	var settingVal string
@@ -228,23 +229,41 @@ func TestPR06_BackupPreservesCriticalState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("查询备份中 accounts 失败: %v", err)
 	}
-	if accOut.CookiesJSON != accRecord.CookiesJSON {
-		t.Fatalf("Cookie 字段不匹配: 期望 %s, 实际 %s", accRecord.CookiesJSON, accOut.CookiesJSON)
+	// 验证备份库中敏感字段已完成 AES-256-GCM 加密，绝不存在明文泄漏
+	if !security.IsEncrypted(accOut.CookiesJSON) {
+		t.Fatalf("备份中 Cookie 必须为 enc:v1 密文，当前为明文: %s", accOut.CookiesJSON)
 	}
-	if accOut.AppPassword != accRecord.AppPassword {
-		t.Fatalf("AppPassword 字段不匹配: 期望 %s, 实际 %s", accRecord.AppPassword, accOut.AppPassword)
+	if !security.IsEncrypted(accOut.AppPassword) {
+		t.Fatalf("备份中 AppPassword 必须为 enc:v1 密文，当前为明文: %s", accOut.AppPassword)
 	}
-	if accOut.MailboxJSON != accRecord.MailboxJSON {
-		t.Fatalf("Mailbox 字段不匹配: 期望 %s, 实际 %s", accRecord.MailboxJSON, accOut.MailboxJSON)
+	if !security.IsEncrypted(accOut.MailboxJSON) {
+		t.Fatalf("备份中 Mailbox 必须为 enc:v1 密文，当前为明文: %s", accOut.MailboxJSON)
 	}
 
-	// 校验 Token
-	var tokToken, tokScopes string
-	if err := bakDB.QueryRow("SELECT token, scopes FROM api_tokens WHERE id='tok_crit_1'").Scan(&tokToken, &tokScopes); err != nil {
+	testCipher := st.Cipher()
+
+	decCookies, err := testCipher.Decrypt(accOut.CookiesJSON, security.AccountAAD("acc_crit_1", "cookies"))
+	if err != nil || string(decCookies) != accRecord.CookiesJSON {
+		t.Fatalf("解密备份中 Cookie 失败或内容不符: %v", err)
+	}
+
+	decAppPass, err := testCipher.Decrypt(accOut.AppPassword, security.AccountAAD("acc_crit_1", "app_password"))
+	if err != nil || string(decAppPass) != accRecord.AppPassword {
+		t.Fatalf("解密备份中 AppPassword 失败或内容不符: %v", err)
+	}
+
+	decMailbox, err := testCipher.Decrypt(accOut.MailboxJSON, security.AccountAAD("acc_crit_1", "mailbox"))
+	if err != nil || string(decMailbox) != accRecord.MailboxJSON {
+		t.Fatalf("解密备份中 Mailbox 失败或内容不符: %v", err)
+	}
+
+	// 校验 Token: 必须为不可逆 token_hash
+	var tokHash, tokScopes string
+	if err := bakDB.QueryRow("SELECT token_hash, scopes FROM api_tokens WHERE id='tok_crit_1'").Scan(&tokHash, &tokScopes); err != nil {
 		t.Fatalf("查询备份中 api_tokens 失败: %v", err)
 	}
-	if tokToken != "api_token_secret_9999" || tokScopes != "admin,allocate" {
-		t.Fatalf("Token 关键字段不匹配: token=%s, scopes=%s", tokToken, tokScopes)
+	if tokHash != HashToken("api_token_secret_9999") || tokScopes != "admin,allocate" {
+		t.Fatalf("Token 关键字段不匹配: hash=%s, scopes=%s", tokHash, tokScopes)
 	}
 
 	// 校验 Inventory
@@ -354,7 +373,7 @@ func TestPR06_RestoreRoundTrip(t *testing.T) {
 
 	// 7. 验证原状态完全恢复
 	tokens := reopenedStore.ListTokens()
-	if len(tokens) != 1 || tokens[0].ID != "tok_round_1" || tokens[0].Token != "sec_round_123" {
+	if len(tokens) != 1 || tokens[0].ID != "tok_round_1" || !reopenedStore.ValidateToken("sec_round_123") {
 		t.Fatalf("恢复后 Token 状态未正确还原: %+v", tokens)
 	}
 

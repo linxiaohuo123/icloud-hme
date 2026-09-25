@@ -14,12 +14,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"icloud-hme/internal/security"
 	_ "modernc.org/sqlite"
 )
 
@@ -56,6 +58,7 @@ type Store struct {
 	instanceLock   dataDirLock
 	dataDir        string
 	db             *sql.DB
+	cipher         *security.SecretCipher
 	activityCh     chan string
 	stopCh         chan struct{}
 	flusherDone    chan struct{}
@@ -69,8 +72,23 @@ func (s *Store) DB() *sql.DB {
 	return s.db
 }
 
-// NewStore 创建并加载 Store
+// Cipher 返回底层加密机
+func (s *Store) Cipher() *security.SecretCipher {
+	return s.cipher
+}
+
+// SetCipherForTest 测试专用：注入加密机
+func (s *Store) SetCipherForTest(cipher *security.SecretCipher) {
+	s.cipher = cipher
+}
+
+// NewStore 创建并加载 Store (优先从环境变量读取 Master Key, 测试环境下缺省允许空 cipher 运行非凭据流程)
 func NewStore(dataDir string) (*Store, error) {
+	return NewStoreWithCipher(dataDir, nil)
+}
+
+// NewStoreWithCipher 创建并加载 Store，显式注入 SecretCipher 加密机
+func NewStoreWithCipher(dataDir string, cipher *security.SecretCipher) (*Store, error) {
 	if dataDir == "" {
 		dataDir = "data"
 	}
@@ -79,7 +97,7 @@ func NewStore(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("acquire data directory lock failed: %w", err)
 	}
 
-	st, err := newStoreWithLock(dataDir, lock)
+	st, err := newStoreWithLock(dataDir, lock, cipher)
 	if err != nil {
 		_ = lock.Close()
 		return nil, err
@@ -89,15 +107,22 @@ func NewStore(dataDir string) (*Store, error) {
 
 // newStoreWithoutLockForTest 测试专用：创建连接到同一目录但不申请目录排他锁的 Store (用于同进程多连接并发事务测试)
 func newStoreWithoutLockForTest(dataDir string) (*Store, error) {
-	return newStoreWithLock(dataDir, nil)
+	return newStoreWithLock(dataDir, nil, nil)
 }
 
-func newStoreWithLock(dataDir string, lock dataDirLock) (*Store, error) {
+func newStoreWithLock(dataDir string, lock dataDirLock, cipher *security.SecretCipher) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return nil, fmt.Errorf("创建数据目录失败: %w", err)
 	}
 	// 目录可能由旧版本以 0755 创建，这里强制收紧，避免同机其他用户读取凭据库
 	_ = os.Chmod(dataDir, 0700)
+
+	// 如果外部未显式传 cipher，则尝试从环境变量加载
+	if cipher == nil {
+		if k, err := security.LoadMasterKey(); err == nil {
+			cipher, _ = security.NewSecretCipher(k)
+		}
+	}
 
 	dbPath := filepath.Join(dataDir, "icloud_hme.db")
 	dbStat, statErr := os.Stat(dbPath)
@@ -122,6 +147,7 @@ func newStoreWithLock(dataDir string, lock dataDirLock) (*Store, error) {
 		instanceLock: lock,
 		dataDir:      dataDir,
 		db:           db,
+		cipher:       cipher,
 		activityCh:   make(chan string, 256),
 		stopCh:       make(chan struct{}),
 		flusherDone:  make(chan struct{}),
@@ -272,20 +298,30 @@ func (s *Store) initSchema(dbExistedBefore bool) error {
 		if err := createOnlineBackup(context.Background(), s.db, backupPath); err != nil {
 			return fmt.Errorf("pre-migration backup failed: %w", err)
 		}
+		log.Printf("[Security] 存在敏感 rollback backup: %s (包含迁移前明文凭据，上线验证完成后请安全归档或销毁)", backupPath)
 	}
 
-	// 5. Version 0 -> Version 1 事务化迁移
-	if v < CurrentSchemaVersion {
-		tx, err := s.db.Begin()
-		if err != nil {
-			return fmt.Errorf("begin migration tx failed: %w", err)
-		}
-		if err := migrateV0ToV1(tx); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("migrate v0 to v1 failed: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit migration tx failed: %w", err)
+	// 5. 顺序迁移调度器 (Version 0 -> Version 1 -> Version 2 ...)
+	for currentV := v; currentV < CurrentSchemaVersion; currentV++ {
+		switch currentV {
+		case 0:
+			tx, err := s.db.Begin()
+			if err != nil {
+				return fmt.Errorf("begin migration v0 to v1 tx failed: %w", err)
+			}
+			if err := migrateV0ToV1(tx); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migrate v0 to v1 failed: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit migration v0 to v1 tx failed: %w", err)
+			}
+		case 1:
+			if err := s.migrateV1ToV2(); err != nil {
+				return fmt.Errorf("migrate v1 to v2 failed: %w", err)
+			}
+		default:
+			return fmt.Errorf("unsupported migration path from version %d", currentV)
 		}
 	}
 

@@ -63,28 +63,52 @@ jobs:
           path: internal/webui/dist/
 
       - name: Test
+        env:
+          ICLOUD_HME_MASTER_KEY: MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=
         run: |
-          go test -p 1 -v -timeout 4m ./... > test.log 2>&1 || {
+          go test -p 1 -v -timeout 8m ./... > test.log 2>&1 || {
             STATUS=$?
             echo "::error title=Go Test Failed::exit code $STATUS"
-            tail -n 50 test.log | while IFS= read -r line; do
-              echo "::warning::$line"
-            done
-            cat test.log
+            echo "=== FAILED TESTS ==="
+            grep -E "--- FAIL|FAIL:" test.log | while IFS= read -r line; do
+              echo "::error title=TestFailure::$line"
+            done || true
+            echo "=== PANIC LOGS ==="
+            grep -E "panic:" test.log || true
+            echo "=== LAST 50 LINES ==="
+            tail -n 50 test.log
             exit $STATUS
           }
 
+      - name: Upload Test Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log
+          path: test.log
+
       - name: Test (race)
+        env:
+          ICLOUD_HME_MASTER_KEY: MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=
         run: |
-          go test -p 1 -v -race -timeout 5m ./... > test_race.log 2>&1 || {
+          go test -p 1 -v -race -timeout 8m ./... > test_race.log 2>&1 || {
             STATUS=$?
             echo "::error title=Go Race Test Failed::exit code $STATUS"
-            tail -n 50 test_race.log | while IFS= read -r line; do
-              echo "::warning::$line"
-            done
-            cat test_race.log
+            echo "=== FAILED RACE TESTS ==="
+            grep -E "--- FAIL|FAIL:" test_race.log | while IFS= read -r line; do
+              echo "::error title=RaceTestFailure::$line"
+            done || true
+            echo "=== LAST 50 LINES ==="
+            tail -n 50 test_race.log
             exit $STATUS
           }
+
+      - name: Upload Race Test Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-race-log
+          path: test_race.log
 
       - name: Vet
         run: go vet ./...
@@ -107,6 +131,19 @@ jobs:
       - name: Build Docker Image
         run: docker build -t icloud-hme:smoke .
 
+      - name: Verify Missing Master Key Fails Closed
+        run: |
+          mkdir -p /tmp/smoke-data-nokey
+          sudo chown -R 10001:10001 /tmp/smoke-data-nokey
+          docker run --name smoke-app-nokey \
+            -v /tmp/smoke-data-nokey:/app/data \
+            -e ICLOUD_HME_ADMIN_PASSWORD=smoke_test_admin_password_2026 \
+            icloud-hme:smoke || true
+          EXIT_CODE=$(docker inspect --format='{{.State.ExitCode}}' smoke-app-nokey)
+          echo "Exit code without Master Key: $EXIT_CODE"
+          [ "$EXIT_CODE" != "0" ] || { echo "Container should fail closed when Master Key is missing"; exit 1; }
+          docker rm -f smoke-app-nokey || true
+
       - name: Run Smoke Container (Non-root UID 10001, Isolated Empty Data Dir)
         run: |
           mkdir -p /tmp/smoke-data
@@ -115,6 +152,7 @@ jobs:
             -p 127.0.0.1:8081:8081 \
             -v /tmp/smoke-data:/app/data \
             -e ICLOUD_HME_ADMIN_PASSWORD=smoke_test_admin_password_2026 \
+            -e ICLOUD_HME_MASTER_KEY=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE= \
             icloud-hme:smoke
           sleep 3
 

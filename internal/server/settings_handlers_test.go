@@ -72,16 +72,20 @@ func TestNotifySettingsRoundtrip(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &out); err != nil {
 		t.Fatalf("解析回读响应失败: %v", err)
 	}
-	if out.Data.FeishuWebhook != "https://open.feishu.cn/open-apis/bot/v2/hook/xxx" ||
+	if !strings.Contains(out.Data.FeishuWebhook, "********") || strings.Contains(out.Data.FeishuWebhook, "xxx") ||
 		out.Data.QuotaThreshold != 700 || out.Data.TelegramChat != "42" {
-		t.Fatalf("回读配置不符: %+v", out.Data)
+		t.Fatalf("回读配置不符(应返回脱敏值): %+v", out.Data)
 	}
 	if out.Data.EventKinds["cookie_recovered"] {
 		t.Fatal("cookie_recovered 应为关闭")
 	}
 
 	// 重启后配置仍在(从 store 加载)
-	if got := s.loadNotifySettings().FeishuWebhook; got != "https://open.feishu.cn/open-apis/bot/v2/hook/xxx" {
+	loaded, err := s.loadNotifySettings()
+	if err != nil {
+		t.Fatalf("loadNotifySettings 失败: %v", err)
+	}
+	if got := loaded.FeishuWebhook; got != "https://open.feishu.cn/open-apis/bot/v2/hook/xxx" {
 		t.Fatalf("store 持久化配置不符: %q", got)
 	}
 }

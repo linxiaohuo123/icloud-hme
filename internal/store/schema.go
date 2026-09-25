@@ -15,8 +15,8 @@ import (
 	"time"
 )
 
-// CurrentSchemaVersion 数据库正式版本基线 (PR-06 起始版本为 1)
-const CurrentSchemaVersion = 1
+// CurrentSchemaVersion 数据库正式版本基线 (PR-07 版本为 2)
+const CurrentSchemaVersion = 2
 
 type schemaExecutor interface {
 	Exec(query string, args ...any) (sql.Result, error)
@@ -34,6 +34,11 @@ func SetBeforeMigrationStepHookForTest(hook func(step string) error) {
 	migrationHookMu.Lock()
 	defer migrationHookMu.Unlock()
 	beforeMigrationStepHookForTest = hook
+}
+
+// MigrateV0ToV1ForTest 仅供测试使用: 构造标准完整的 V1 数据库
+func MigrateV0ToV1ForTest(tx *sql.Tx) error {
+	return migrateV0ToV1(tx)
 }
 
 func callMigrationStepHook(step string) error {
@@ -664,8 +669,13 @@ func validateSchema(db *sql.DB) error {
 		{"accounts", "app_password"},
 		{"accounts", "mailbox"},
 		{"accounts", "status"},
-		{"api_tokens", "token"},
+		{"api_tokens", "token_hash"},
+		{"api_tokens", "token_prefix"},
 		{"api_tokens", "scopes"},
+		{"api_tokens", "expires_at"},
+		{"api_tokens", "revoked_at"},
+		{"api_tokens", "rotated_at"},
+		{"api_tokens", "needs_rotation"},
 		{"lease_records", "token_name"},
 		{"schedules", "alias_label"},
 		{"schedules", "mode"},
@@ -689,6 +699,15 @@ func validateSchema(db *sql.DB) error {
 		}
 	}
 
+	// 3.1 安全隔离硬约束: api_tokens 表严禁存在 token 明文列 (PR-07)
+	hasPlaintextTokenCol, err := tableHasColumn(db, "api_tokens", "token")
+	if err != nil {
+		return fmt.Errorf("schema validation failed: check api_tokens.token error: %w", err)
+	}
+	if hasPlaintextTokenCol {
+		return fmt.Errorf("schema validation failed: api_tokens 表严禁保留明文 token 列")
+	}
+
 	// 4. 检查关键索引
 	requiredIndexes := []string{
 		"idx_leases_allocated_at",
@@ -708,6 +727,7 @@ func validateSchema(db *sql.DB) error {
 		"idx_vreq_lease",
 		"idx_vreq_email",
 		"idx_hme_intents_unresolved",
+		"idx_api_tokens_hash",
 	}
 	for _, idx := range requiredIndexes {
 		var count int
@@ -723,7 +743,7 @@ func validateSchema(db *sql.DB) error {
 		columns []string
 	}{
 		{"business_tags", []string{"tag"}},
-		{"api_tokens", []string{"token"}},
+		{"api_tokens", []string{"token_hash"}},
 		{"alias_allocations", []string{"alias_email"}},
 		{"operations", []string{"principal_kind", "principal_id", "operation_kind", "idempotency_key"}},
 		{"alias_inventory", []string{"email"}},

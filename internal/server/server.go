@@ -104,7 +104,7 @@ func New(mgr *account.Manager, st *store.Store, cfg Config) (*Server, error) {
 			return nil, err
 		}
 	}
-	return newWithBackendAndStore(&managerBackend{mgr: mgr, store: st}, cfg, st), nil
+	return newWithBackendAndStoreWithError(&managerBackend{mgr: mgr, store: st}, cfg, st)
 }
 
 // newWithBackend 创建 Server 并注入 Backend(测试使用内存 fake)。
@@ -119,6 +119,11 @@ func newWithBackend(be Backend, cfg Config) *Server {
 }
 
 func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
+	srv, _ := newWithBackendAndStoreWithError(be, cfg, st)
+	return srv
+}
+
+func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*Server, error) {
 	if !cfg.Debug {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -178,7 +183,12 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 		return res, err
 	}, be.ListAccounts)
 	if st != nil {
-		notifier.UpdateSettings(s.loadNotifySettings())
+		notifySt, err := s.loadNotifySettings()
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("加载通知配置失败 (Fail Closed): %w", err)
+		}
+		notifier.UpdateSettings(notifySt)
 		if n, err := st.ReconcileAvailableInventory(); err == nil && n > 0 {
 			log.Printf("[Server] 存量库存安全对齐完成: 已隔离/收敛 %d 个受保护或异常别名", n)
 		}
@@ -215,7 +225,7 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 	// 显式配置 TrustedProxies 时才采信来自这些地址的 X-Forwarded-For。
 	_ = s.r.SetTrustedProxies(cfg.TrustedProxies)
 	s.register()
-	return s
+	return s, nil
 }
 
 // 优雅停机默认超时预算 (PR-05 F10)。统一约束 HTTP Shutdown 与后台各 Worker 收敛。
@@ -577,9 +587,10 @@ func (s *Server) register() {
 				adm.PATCH("/tags/:id", csrfCheck(s.auth), s.updateTagHandler)
 				adm.DELETE("/tags/:id", csrfCheck(s.auth), s.deleteTagHandler)
 
-				// ===== 中台扩展: 外部令牌 (令牌本体只回显掩码, 杜绝令牌互相收割) =====
+				// ===== 中台扩展: 外部令牌 (不可逆哈希存储, 仅在创建/轮换时一次性可见) =====
 				adm.GET("/tokens", s.listTokensHandler)
 				adm.POST("/tokens", csrfCheck(s.auth), s.createTokenHandler)
+				adm.POST("/tokens/:id/rotate", csrfCheck(s.auth), s.rotateTokenHandler)
 				adm.DELETE("/tokens/:id", csrfCheck(s.auth), s.deleteTokenHandler)
 
 				// ===== 中台扩展: 已用别名流水 =====
@@ -596,6 +607,7 @@ func (s *Server) register() {
 				// ===== 系统设置: 通知 =====
 				adm.GET("/settings/notify", s.getNotifySettingsHandler)
 				adm.PUT("/settings/notify", csrfCheck(s.auth), s.updateNotifySettingsHandler)
+				adm.PATCH("/settings/notify", csrfCheck(s.auth), s.updateNotifySettingsHandler)
 				adm.POST("/settings/notify/test", csrfCheck(s.auth), s.testNotifyHandler)
 
 				// ===== 系统 =====

@@ -122,7 +122,7 @@ func TestMIG08_FailedMigrationRollsBackCompletely(t *testing.T) {
 	if err != nil || len(backups) == 0 {
 		t.Fatalf("MIG08 失败: 迁移前备份文件未生成: %v", err)
 	}
-	if !strings.HasPrefix(backups[0].Name(), "pre-migrate-v0-to-v1-") {
+	if !strings.HasPrefix(backups[0].Name(), fmt.Sprintf("pre-migrate-v0-to-v%d-", CurrentSchemaVersion)) {
 		t.Fatalf("MIG08 失败: 备份文件名不符合规范: %s", backups[0].Name())
 	}
 	_ = checkDB.Close()
@@ -136,8 +136,8 @@ func TestMIG08_FailedMigrationRollsBackCompletely(t *testing.T) {
 	defer stRetry.Close()
 
 	var finalVer int
-	if err := stRetry.db.QueryRow("PRAGMA user_version").Scan(&finalVer); err != nil || finalVer != 1 {
-		t.Fatalf("MIG08 失败: 恢复后版本号期望 1, 实际: %d (err=%v)", finalVer, err)
+	if err := stRetry.db.QueryRow("PRAGMA user_version").Scan(&finalVer); err != nil || finalVer != CurrentSchemaVersion {
+		t.Fatalf("MIG08 失败: 恢复后版本号期望 %d, 实际: %d (err=%v)", CurrentSchemaVersion, finalVer, err)
 	}
 }
 
@@ -180,8 +180,8 @@ func TestMIG09_LegacyUnversionedToV1(t *testing.T) {
 	defer st.Close()
 
 	var ver int
-	if err := st.db.QueryRow("PRAGMA user_version").Scan(&ver); err != nil || ver != 1 {
-		t.Fatalf("MIG09 失败: user_version 期望为 1, 实际: %d", ver)
+	if err := st.db.QueryRow("PRAGMA user_version").Scan(&ver); err != nil || ver != CurrentSchemaVersion {
+		t.Fatalf("MIG09 失败: user_version 期望为 %d, 实际: %d", CurrentSchemaVersion, ver)
 	}
 
 	// 验证回填与安全隔离:
@@ -524,10 +524,10 @@ func TestMIG12_CriticalUniqueConstraintsEnforced(t *testing.T) {
 	}
 	defer st.Close()
 
-	// 1. 验证 user_version 升为 1
+	// 1. 验证 user_version 升为当前版本
 	var v int
-	if err := st.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 1 {
-		t.Fatalf("MIG12 失败: user_version 未升至 1: %d (%v)", v, err)
+	if err := st.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != CurrentSchemaVersion {
+		t.Fatalf("MIG12 失败: user_version 未升至 %d: %d (%v)", CurrentSchemaVersion, v, err)
 	}
 
 	// 2. 验证 UNIQUE 存在

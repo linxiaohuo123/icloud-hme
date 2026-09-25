@@ -328,7 +328,7 @@ func RestoreDatabase(ctx context.Context, dataDir string, backupPath string) err
 	}
 	if validationErr == nil {
 		// 校验恢复库完整性与架构兼容性 (因当前函数已持有独占锁，newStoreWithLock 传 nil lock 避免重复申请)
-		st, err := newStoreWithLock(dataDir, nil)
+		st, err := newStoreWithLock(dataDir, nil, nil)
 		if err != nil {
 			validationErr = err
 		} else {
