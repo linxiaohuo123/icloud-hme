@@ -66,13 +66,13 @@ jobs:
         env:
           ICLOUD_HME_MASTER_KEY: MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=
         run: |
-          go test -p 1 -v -timeout 4m ./... > test.log 2>&1 || {
+          set -o pipefail
+          go test -p 1 -v -timeout 8m ./... 2>&1 | tee test.log || {
             STATUS=$?
             echo "::error title=Go Test Failed::exit code $STATUS"
-            tail -n 50 test.log | while IFS= read -r line; do
-              echo "::warning::$line"
+            grep -E "--- FAIL|FAIL:|panic:" test.log | head -n 30 | while IFS= read -r line; do
+              echo "::error title=Failure Detail::$line"
             done
-            cat test.log
             exit $STATUS
           }
 
@@ -80,13 +80,13 @@ jobs:
         env:
           ICLOUD_HME_MASTER_KEY: MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=
         run: |
-          go test -p 1 -v -race -timeout 5m ./... > test_race.log 2>&1 || {
+          set -o pipefail
+          go test -p 1 -v -race -timeout 8m ./... 2>&1 | tee test_race.log || {
             STATUS=$?
             echo "::error title=Go Race Test Failed::exit code $STATUS"
-            tail -n 50 test_race.log | while IFS= read -r line; do
-              echo "::warning::$line"
+            grep -E "--- FAIL|FAIL:|panic:" test_race.log | head -n 30 | while IFS= read -r line; do
+              echo "::error title=Race Failure Detail::$line"
             done
-            cat test_race.log
             exit $STATUS
           }
 
