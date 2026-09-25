@@ -66,29 +66,45 @@ jobs:
         env:
           ICLOUD_HME_MASTER_KEY: MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=
         run: |
-          set -o pipefail
-          go test -p 1 -v -timeout 8m ./... 2>&1 | tee test.log || {
+          go test -p 1 -v -timeout 8m ./... > test.log 2>&1 || {
             STATUS=$?
             echo "::error title=Go Test Failed::exit code $STATUS"
-            grep -E "--- FAIL|FAIL:|panic:" test.log | head -n 30 | while IFS= read -r line; do
-              echo "::error title=Failure Detail::$line"
-            done
+            echo "=== FAILED TESTS ==="
+            grep -E "--- FAIL|FAIL:" test.log || true
+            echo "=== PANIC LOGS ==="
+            grep -E "panic:" test.log || true
+            echo "=== LAST 50 LINES ==="
+            tail -n 50 test.log
             exit $STATUS
           }
+
+      - name: Upload Test Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log
+          path: test.log
 
       - name: Test (race)
         env:
           ICLOUD_HME_MASTER_KEY: MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=
         run: |
-          set -o pipefail
-          go test -p 1 -v -race -timeout 8m ./... 2>&1 | tee test_race.log || {
+          go test -p 1 -v -race -timeout 8m ./... > test_race.log 2>&1 || {
             STATUS=$?
             echo "::error title=Go Race Test Failed::exit code $STATUS"
-            grep -E "--- FAIL|FAIL:|panic:" test_race.log | head -n 30 | while IFS= read -r line; do
-              echo "::error title=Race Failure Detail::$line"
-            done
+            echo "=== FAILED RACE TESTS ==="
+            grep -E "--- FAIL|FAIL:" test_race.log || true
+            echo "=== LAST 50 LINES ==="
+            tail -n 50 test_race.log
             exit $STATUS
           }
+
+      - name: Upload Race Test Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-race-log
+          path: test_race.log
 
       - name: Vet
         run: go vet ./...
