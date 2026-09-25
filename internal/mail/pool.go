@@ -119,7 +119,18 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 		return ctx.Err()
 	}
 	poolWaitMS := time.Since(poolWaitStart).Milliseconds()
-	defer pc.unlock()
+
+	// perfRecord 只收集纯数据；最终 defer 在释放 pc.sem 之后才输出日志 (FIX-1)。
+	// 标准库 log.Print 是同步输出，若在持有单账号 IMAP slot 期间执行会人为延长 slot 占用并污染 pool_wait_ms 观测。
+	// 本 defer 注册最早 → LIFO 最后执行，天然保证时序:
+	//   连接状态收尾 (函数体内) → deadline 清理 → stopWatch 关闭 → pc.unlock → LogMailPerf
+	var perf *poolPerfRecord
+	defer func() {
+		pc.unlock()
+		if perf != nil {
+			logPoolPerfRecord(perf)
+		}
+	}()
 
 	// 密码、代理或目标服务器变更则换新 (仅在单账号自身锁 pc.mu 内执行, 杜绝占死全局池锁 p.mu)
 	if pc.appPassword != password || pc.proxyURL != proxyURL || pc.server != server || pc.port != port {
@@ -134,25 +145,24 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 		pc.proxyURL = proxyURL
 	}
 
+	perf = &poolPerfRecord{
+		account:    MaskEmailForLog(email),
+		server:     server,
+		poolWaitMS: poolWaitMS,
+	}
 	ensureStart := time.Now()
 	ensureStats, ensureErr := pc.ensure(p.idleClose)
-	ensureMS := time.Since(ensureStart).Milliseconds()
+	perf.ensureMS = time.Since(ensureStart).Milliseconds()
+	perf.stats = ensureStats
 	if ensureErr != nil {
-		LogMailPerf("pool_op",
-			"account", MaskEmailForLog(email),
-			"server", server,
-			"pool_wait_ms", poolWaitMS,
-			"ensure_ms", ensureMS,
-			"conn_ms", ensureStats.ConnectMS,
-			"ping_ms", ensureStats.PingMS,
-			"reused", ensureStats.Reused,
-			"ensure_err", true,
-		)
+		perf.ensureErr = true
+		perf.err = true
 		return ensureErr
 	}
 
 	cli := pc.client
 	if cli == nil {
+		perf.err = true
 		return fmt.Errorf("IMAP 客户端未就绪")
 	}
 
@@ -179,26 +189,14 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 
 	opStart := time.Now()
 	err := fn(cli)
-	opMS := time.Since(opStart).Milliseconds()
+	perf.opMS = time.Since(opStart).Milliseconds()
 	pc.lastUsed = time.Now()
-
-	LogMailPerf("pool_op",
-		"account", MaskEmailForLog(email),
-		"server", server,
-		"pool_wait_ms", poolWaitMS,
-		"ensure_ms", ensureMS,
-		"conn_ms", ensureStats.ConnectMS,
-		"ping_ms", ensureStats.PingMS,
-		"reused", ensureStats.Reused,
-		"op_ms", opMS,
-		"err", err != nil,
-		"conn_err", isLikelyConnErr(err),
-	)
 
 	// 若在执行期间 context 已触发取消，连接已被打断，必须从连接池丢弃，严禁复用 (Issue 13)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		cli.forceClose()
 		pc.client = nil
+		perf.err = true
 		return ctxErr
 	}
 
@@ -207,6 +205,8 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 		cli.forceClose()
 		pc.client = nil
 	}
+	perf.err = err != nil
+	perf.connErr = isLikelyConnErr(err)
 	return err
 }
 
@@ -340,11 +340,56 @@ func (p *Pool) reapIdleConns() {
 	p.mu.Unlock()
 }
 
-// poolEnsureStats 记录单次 ensure 的连接复用与耗时情况，供 MailPerf 观测 (PR-MAIL-00)。
+// poolEnsureStats 记录单次 ensure 的连接复用与耗时情况，供 MailPerf 观测 (PR-MAIL-00 / FIX-2)。
+// ConnectMS 恒为"从首次 Connect 开始到最终连接成功/失败"的总耗时 (含 proxy→direct fallback 全程)，
+// 保证任何路径下 conn_ms 都反映真实的建连成本，不低估。
 type poolEnsureStats struct {
-	Reused    bool  // 复用既有连接 (Ping 通过)
-	PingMS    int64 // 复用路径 NOOP 耗时
-	ConnectMS int64 // 新建连接 (TCP+TLS+Login) 耗时
+	Reused          bool  // 复用既有连接 (Ping 通过)
+	PingMS          int64 // 复用路径 NOOP 耗时
+	ConnectMS       int64 // 首次 Connect 起点到最终结果的总耗时 (含 fallback)
+	ProxyFallback   bool  // 是否发生 proxy 连接失败 → direct 直连降级
+	ProxyConnectMS  int64 // 走 proxy 的尝试耗时 (未走 proxy 时为 0)
+	DirectConnectMS int64 // 直连尝试耗时 (无 proxy 或 fallback direct 时)
+}
+
+// 四种建连路径的指标语义 (FIX-2):
+//   无 proxy 直连成功:            ProxyFallback=false, ProxyConnectMS=0,      DirectConnectMS=T,   ConnectMS=T
+//   proxy 成功:                   ProxyFallback=false, ProxyConnectMS=T,      DirectConnectMS=0,   ConnectMS=T
+//   proxy 失败 → direct 成功:      ProxyFallback=true,  ProxyConnectMS=T1,     DirectConnectMS=T2,  ConnectMS=T1+T2
+//   proxy 失败 → direct 失败:      ProxyFallback=true,  ProxyConnectMS=T1,     DirectConnectMS=T2,  ConnectMS=T1+T2, err=true
+
+// poolPerfRecord 是 pool_op 的纯数据观测记录 (FIX-1)。
+// 在持有 pc.sem 期间只填充字段，释放 semaphore 后由 logPoolPerfRecord 输出，
+// 保证同步日志输出不延长单账号 IMAP slot 占用时间。
+type poolPerfRecord struct {
+	account    string
+	server     string
+	poolWaitMS int64
+	ensureMS   int64
+	opMS       int64
+	stats      poolEnsureStats
+	ensureErr  bool
+	err        bool
+	connErr    bool
+}
+
+func logPoolPerfRecord(r *poolPerfRecord) {
+	LogMailPerf("pool_op",
+		"account", r.account,
+		"server", r.server,
+		"pool_wait_ms", r.poolWaitMS,
+		"ensure_ms", r.ensureMS,
+		"conn_ms", r.stats.ConnectMS,
+		"proxy_connect_ms", r.stats.ProxyConnectMS,
+		"direct_connect_ms", r.stats.DirectConnectMS,
+		"proxy_fallback", r.stats.ProxyFallback,
+		"ping_ms", r.stats.PingMS,
+		"reused", r.stats.Reused,
+		"op_ms", r.opMS,
+		"ensure_err", r.ensureErr,
+		"err", r.err,
+		"conn_err", r.connErr,
+	)
 }
 
 func (pc *pooledConn) ensure(idleClose time.Duration) (poolEnsureStats, error) {
@@ -380,21 +425,32 @@ func (pc *pooledConn) ensure(idleClose time.Duration) (poolEnsureStats, error) {
 		c.SetProxy(pc.proxyURL)
 	}
 	connectStart := time.Now()
-	if err := c.Connect(); err != nil {
-		stats.ConnectMS = time.Since(connectStart).Milliseconds()
-		if pc.proxyURL != "" {
-			// 慢代理超时/坏节点时，自动降级为直连尝试，保障 IMAP 取信不断供
-			direct := NewClientWithServer(pc.appleID, pc.appPassword, server, port)
-			if directErr := direct.Connect(); directErr == nil {
-				pc.client = direct
-				pc.lastUsed = time.Now()
-				return stats, nil
-			}
-		}
-		return stats, err
+	connectErr := c.Connect()
+	if pc.proxyURL != "" {
+		stats.ProxyConnectMS = time.Since(connectStart).Milliseconds()
+	} else {
+		stats.DirectConnectMS = time.Since(connectStart).Milliseconds()
 	}
+	if connectErr == nil {
+		stats.ConnectMS = time.Since(connectStart).Milliseconds()
+		pc.client = c
+		pc.lastUsed = time.Now()
+		return stats, nil
+	}
+	if pc.proxyURL == "" {
+		return stats, connectErr
+	}
+	// 慢代理超时/坏节点时，自动降级为直连尝试，保障 IMAP 取信不断供 (仅修统计，不改此业务行为)
+	stats.ProxyFallback = true
+	direct := NewClientWithServer(pc.appleID, pc.appPassword, server, port)
+	directStart := time.Now()
+	directErr := direct.Connect()
+	stats.DirectConnectMS = time.Since(directStart).Milliseconds()
 	stats.ConnectMS = time.Since(connectStart).Milliseconds()
-	pc.client = c
+	if directErr != nil {
+		return stats, connectErr
+	}
+	pc.client = direct
 	pc.lastUsed = time.Now()
 	return stats, nil
 }

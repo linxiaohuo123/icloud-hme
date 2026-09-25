@@ -318,7 +318,7 @@ func (c *Client) ListMailboxes() ([]Folder, error) {
 		LogMailPerf("list_mailboxes", "server", c.perfServer(), "folders", len(folders), "list_ms", time.Since(listStart).Milliseconds(), "err", true)
 		return nil, err
 	}
-	LogMailPerf("list_mailboxes", "server", c.perfServer(), "folders", len(folders), "list_ms", time.Since(listStart).Milliseconds())
+	LogMailPerf("list_mailboxes", "server", c.perfServer(), "folders", len(folders), "list_ms", time.Since(listStart).Milliseconds(), "err", false)
 
 	sort.SliceStable(folders, func(i, j int) bool {
 		return folderSortRank(folders[i]) < folderSortRank(folders[j])
@@ -391,16 +391,17 @@ func (c *Client) listMailbox(folder string, limit int, days int, sinceUID uint32
 	selectMS := time.Since(mailboxStart).Milliseconds()
 	total := int(mbox.Messages)
 	if total == 0 {
-		LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", selectMS, "messages", 0)
+		LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", selectMS, "messages", 0, "err", false)
 		return []Message{}, nil
 	}
 
 	seqset := new(imap.SeqSet)
 	isUID := false
 	var searchMS int64
+	bodyRequested := 0
 	if sinceUID > 0 {
 		if mbox.UidNext > 0 && sinceUID >= mbox.UidNext {
-			LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", selectMS, "messages", 0)
+			LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", selectMS, "messages", 0, "err", false)
 			return []Message{}, nil
 		}
 		searchStart := time.Now()
@@ -417,6 +418,7 @@ func (c *Client) listMailbox(folder string, limit int, days int, sinceUID uint32
 			return nil, searchErr
 		}
 		if len(foundUIDs) == 0 {
+			LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", selectMS, "search_ms", searchMS, "messages", 0, "err", false)
 			return []Message{}, nil
 		}
 		sort.Slice(foundUIDs, func(i, j int) bool { return foundUIDs[i] < foundUIDs[j] })
@@ -426,6 +428,9 @@ func (c *Client) listMailbox(folder string, limit int, days int, sinceUID uint32
 		for _, u := range foundUIDs {
 			seqset.AddNum(u)
 		}
+		if includeBody {
+			bodyRequested = len(foundUIDs)
+		}
 		isUID = true
 	} else {
 		from := uint32(1)
@@ -433,6 +438,9 @@ func (c *Client) listMailbox(folder string, limit int, days int, sinceUID uint32
 			from = mbox.Messages - uint32(limit) + 1
 		}
 		seqset.AddRange(from, mbox.Messages)
+		if includeBody {
+			bodyRequested = int(mbox.Messages - from + 1)
+		}
 	}
 
 	items := []imap.FetchItem{
@@ -460,10 +468,10 @@ func (c *Client) listMailbox(folder string, limit int, days int, sinceUID uint32
 	}()
 
 	var out []Message
-	var bodyFetchCount int
+	var bodyReceived int
 	for msg := range messages {
 		if includeBody {
-			bodyFetchCount++
+			bodyReceived++
 		}
 		m := parser(msg, folder)
 		if sinceUID > 0 && m.UID < sinceUID {
@@ -489,10 +497,10 @@ func (c *Client) listMailbox(folder string, limit int, days int, sinceUID uint32
 		out = append(out, m)
 	}
 	if err := <-done; err != nil {
-		LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", selectMS, "search_ms", searchMS, "fetch_ms", time.Since(fetchStart).Milliseconds(), "err", true)
+		LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", selectMS, "search_ms", searchMS, "fetch_ms", time.Since(fetchStart).Milliseconds(), "body_fetch_requested", bodyRequested, "body_fetch_received", bodyReceived, "err", true)
 		return nil, err
 	}
-	LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", selectMS, "search_ms", searchMS, "fetch_ms", time.Since(fetchStart).Milliseconds(), "messages", len(out), "body_fetch", bodyFetchCount)
+	LogMailPerf("list_folder", "server", c.perfServer(), "folder", folder, "limit", limit, "since_uid", sinceUID, "with_body", includeBody, "select_ms", selectMS, "search_ms", searchMS, "fetch_ms", time.Since(fetchStart).Milliseconds(), "messages", len(out), "body_fetch_requested", bodyRequested, "body_fetch_received", bodyReceived, "err", false)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Date > out[j].Date })
 	return out, nil
 }
@@ -575,7 +583,7 @@ func (c *Client) ForEachByRecipientInFolderSince(recipient string, folder string
 	return nil
 }
 
-func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, limit int, days int, sinceUID uint32, onMsg func(Message) bool) error {
+func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, limit int, days int, sinceUID uint32, onMsg func(Message) bool) (retErr error) {
 	opStart := time.Now()
 	mailboxStart := time.Now()
 	mbox, err := c.cli.Select(folder, true)
@@ -585,7 +593,7 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 	}
 	selectMS := time.Since(mailboxStart).Milliseconds()
 	var searchMS, fetchMS int64
-	var bodyFetch int
+	var bodyFetchRequested, bodyFetchReceived int
 	var allUIDs []uint32
 	fallback := false
 	matchedCount := 0
@@ -600,10 +608,12 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 			"search_ms", searchMS,
 			"fetch_ms", fetchMS,
 			"uids_found", len(allUIDs),
-			"body_fetch", bodyFetch,
+			"body_fetch_requested", bodyFetchRequested,
+			"body_fetch_received", bodyFetchReceived,
 			"fallback", fallback,
 			"matched", matchedCount,
 			"total_ms", time.Since(opStart).Milliseconds(),
+			"err", retErr != nil,
 		)
 	}()
 
@@ -660,6 +670,7 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 		if sinceUID == 0 {
 			uids = newestUIDs(uids, limit)
 		}
+		bodyFetchRequested = len(uids)
 		seqset := new(imap.SeqSet)
 		for _, u := range uids {
 			seqset.AddNum(u)
@@ -696,7 +707,7 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 			return err
 		}
 		fetchMS = time.Since(fetchStart).Milliseconds()
-		bodyFetch = len(fetched)
+		bodyFetchReceived = len(fetched)
 		// 按 UID 从大到小 (新到旧) 排序触发回调；严格核验收件人匹配
 		sort.SliceStable(fetched, func(i, j int) bool { return fetched[i].UID > fetched[j].UID })
 		for _, m := range fetched {
@@ -730,7 +741,7 @@ func newestUIDs(uids []uint32, limit int) []uint32 {
 
 // forEachRecentMatching 拉取 folder 最近 scan 封信件, 本地比对 To/Headers/Body/Subject。
 // 注意: 这是候选查找阶段的重路径 —— 每封扫描邮件都会执行完整 BODY[] fetch (PR-MAIL-02 待整改点)。
-func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days int, sinceUID uint32, onMsg func(Message) bool) error {
+func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days int, sinceUID uint32, onMsg func(Message) bool) (retErr error) {
 	opStart := time.Now()
 	mailboxStart := time.Now()
 	mbox, err := c.cli.Select(folder, true)
@@ -740,7 +751,7 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 	}
 	selectMS := time.Since(mailboxStart).Milliseconds()
 	var fetchMS int64
-	var bodyFetch int
+	var bodyFetchRequested, bodyFetchReceived int
 	matched := 0
 	defer func() {
 		LogMailPerf("recent_fallback",
@@ -749,9 +760,11 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 			"recipient", MaskEmailForLog(recipient),
 			"select_ms", selectMS,
 			"fetch_ms", fetchMS,
-			"body_fetch", bodyFetch,
+			"body_fetch_requested", bodyFetchRequested,
+			"body_fetch_received", bodyFetchReceived,
 			"matched", matched,
 			"total_ms", time.Since(opStart).Milliseconds(),
+			"err", retErr != nil,
 		)
 	}()
 	total := int(mbox.Messages)
@@ -768,7 +781,7 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 	if scan > total {
 		scan = total
 	}
-	bodyFetch = scan
+	bodyFetchRequested = scan
 	from := mbox.Messages - uint32(scan) + 1
 	seqset := new(imap.SeqSet)
 	seqset.AddRange(from, mbox.Messages)
@@ -793,6 +806,7 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 		if msg == nil {
 			continue
 		}
+		bodyFetchReceived++
 		m := toMessageWithBody(msg, folder)
 		if days > 0 {
 			if t, err := time.Parse(time.RFC3339, m.Date); err == nil {

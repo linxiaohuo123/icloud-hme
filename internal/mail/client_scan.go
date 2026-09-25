@@ -35,7 +35,7 @@ type ScanPageResult struct {
 // ScanMailboxUIDPage 增量顺序扫描指定邮箱指定 UID 范围内的单页邮件元数据 (PR-04A F07)。
 // 严格按 UID 升序推进，只取最旧的 PageSize 封邮件，第一阶段仅拉取 Envelope 与结构化收件人 Header，
 // 绝不截断丢弃早期未处理 UID，绝不全量拉取邮件正文。
-func (c *Client) ScanMailboxUIDPage(opts ScanPageOptions) (ScanPageResult, error) {
+func (c *Client) ScanMailboxUIDPage(opts ScanPageOptions) (res ScanPageResult, retErr error) {
 	if c.cli == nil {
 		return ScanPageResult{}, fmt.Errorf("未连接")
 	}
@@ -50,7 +50,7 @@ func (c *Client) ScanMailboxUIDPage(opts ScanPageOptions) (ScanPageResult, error
 
 	opStart := time.Now()
 	var selectMS, searchMS, fetchMS int64
-	var returned int
+	returned := 0
 	folderName := folder
 	defer func() {
 		LogMailPerf("scan_uid_page",
@@ -63,8 +63,8 @@ func (c *Client) ScanMailboxUIDPage(opts ScanPageOptions) (ScanPageResult, error
 			"search_ms", searchMS,
 			"fetch_ms", fetchMS,
 			"messages", returned,
-			"body_fetch", 0,
 			"total_ms", time.Since(opStart).Milliseconds(),
+			"err", retErr != nil,
 		)
 	}()
 

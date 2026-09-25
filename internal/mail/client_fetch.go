@@ -28,13 +28,14 @@ func (c *Client) GetFullInFolder(folder string, uid uint32) (*FullMessage, error
 }
 
 // GetFullInFolderWithValidity 获取指定文件夹中单封邮件的完整内容，支持严格校验 UIDVALIDITY。
-func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, uid uint32) (*FullMessage, error) {
+func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, uid uint32) (full *FullMessage, retErr error) {
 	if c.cli == nil {
 		return nil, fmt.Errorf("未连接")
 	}
 	opStart := time.Now()
+	bodyReceived := 0
 	defer func() {
-		LogMailPerf("get_full", "server", c.perfServer(), "folder", folder, "uid", uid, "total_ms", time.Since(opStart).Milliseconds())
+		LogMailPerf("get_full", "server", c.perfServer(), "folder", folder, "uid", uid, "body_fetch_requested", 1, "body_fetch_received", bodyReceived, "total_ms", time.Since(opStart).Milliseconds(), "err", retErr != nil)
 	}()
 	folders, err := c.resolveFolders(folder)
 	if err != nil {
@@ -77,13 +78,14 @@ func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, 
 			}
 			msgModel.MessageRef = ref.Encode()
 
-			full := &FullMessage{
+			full = &FullMessage{
 				Message:      msgModel,
 				BodyComplete: true,
 				Provider:     "imap",
 				Method:       "imap",
 			}
 			if r := msg.GetBody(section); r != nil {
+				bodyReceived = 1
 				if em, err := mail.ReadMessage(r); err == nil {
 					body, _ := readBody(em)
 					full.Body = strings.TrimSpace(body)
@@ -102,7 +104,7 @@ func (c *Client) GetFullBatchInFolder(folder string, uids []uint32) ([]*FullMess
 }
 
 // GetFullBatchInFolderWithValidity 批量获取指定文件夹中的完整邮件内容，并校验 UIDVALIDITY。
-func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uint32, uids []uint32) ([]*FullMessage, error) {
+func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uint32, uids []uint32) (out []*FullMessage, retErr error) {
 	if c.cli == nil {
 		return nil, fmt.Errorf("未连接")
 	}
@@ -113,9 +115,9 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 		folder = "INBOX"
 	}
 	opStart := time.Now()
-	var fetchedCount int
+	bodyReceived := 0
 	defer func() {
-		LogMailPerf("get_full_batch", "server", c.perfServer(), "folder", folder, "requested", len(uids), "fetched", fetchedCount, "total_ms", time.Since(opStart).Milliseconds())
+		LogMailPerf("get_full_batch", "server", c.perfServer(), "folder", folder, "requested", len(uids), "body_fetch_requested", len(uids), "body_fetch_received", bodyReceived, "total_ms", time.Since(opStart).Milliseconds(), "err", retErr != nil)
 	}()
 	status, err := c.cli.Select(folder, true)
 	if err != nil {
@@ -138,12 +140,11 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 		done <- c.cli.UidFetch(seqset, items, messages)
 	}()
 
-	var out []*FullMessage
 	for msg := range messages {
 		if msg == nil {
 			continue
 		}
-		fetchedCount++
+		bodyReceived++
 		message := toMessage(msg, folder)
 		message.UIDValidity = status.UidValidity
 		message.UID = msg.Uid
