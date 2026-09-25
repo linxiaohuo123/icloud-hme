@@ -7,7 +7,18 @@ import AliasesPage from './AliasesPage'
 import { server } from '../test/server'
 import { setCSRFToken } from '../api/client'
 import { ToastProvider } from '../components/ToastProvider'
+import { clearAccountsCache } from '../hooks/useAccounts'
 import type { AccountSummary, Alias } from '../api/types'
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
 
 const accounts: AccountSummary[] = [
   {
@@ -78,6 +89,7 @@ function renderPage(initialPath = '/aliases') {
 
 describe('AliasesPage', () => {
   beforeEach(() => {
+    clearAccountsCache()
     setCSRFToken('csrf-test')
     server.resetHandlers()
   })
@@ -337,5 +349,77 @@ describe('AliasesPage', () => {
     // 切换到 50 条后，45 条在第 1 页内全部展示，共 1 页
     expect(screen.getByText(/共/)).toHaveTextContent('共 45 个别名，当前第 1 / 1 页')
     expect(localStorage.getItem('icloud_hme_alias_page_size')).toBe('50')
+  })
+
+  it('TestAliasesPage_StaleRefreshCannotOverwriteNewAccountSelection: 账号 A 刷新慢请求返回绝不覆盖已切换的账号 B', async () => {
+    const user = userEvent.setup()
+    const deferredRefreshA = createDeferred<{ account_id: string; count: number; aliases: Alias[] }>()
+
+    const aliasA: Alias = {
+      email: 'a-refresh@icloud.com',
+      anonymousId: 'anon_a_refresh',
+      label: 'A专属别名',
+      active: true,
+      account_id: 'acc_1',
+    }
+
+    const aliasB: Alias = {
+      email: 'b-alias@icloud.com',
+      anonymousId: 'anon_b',
+      label: 'B专属别名',
+      active: true,
+      account_id: 'acc_2',
+    }
+
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.get('/api/aliases', async ({ request }) => {
+        const url = new URL(request.url)
+        const id = url.searchParams.get('account_id')
+        const refresh = url.searchParams.get('refresh') === 'true'
+
+        // 当 acc_1 手动点击刷新时，挂起该请求
+        if (id === 'acc_1' && refresh) {
+          const data = await deferredRefreshA.promise
+          return HttpResponse.json({ success: true, data })
+        }
+        if (id === 'acc_2') {
+          return HttpResponse.json({
+            success: true,
+            data: { account_id: 'acc_2', count: 1, aliases: [aliasB] },
+          })
+        }
+        return HttpResponse.json({
+          success: true,
+          data: { account_id: 'acc_1', count: 1, aliases: [aliases[0]] },
+        })
+      }),
+    )
+
+    // 1. 打开页面，默认定位到 acc_1
+    renderPage('/aliases?account_id=acc_1')
+    expect(await screen.findByText('alpha@icloud.com')).toBeInTheDocument()
+
+    // 2. 点击 "刷新号池" (触发 acc_1 的慢刷新)
+    const refreshBtn = screen.getByRole('button', { name: /刷新号池/i })
+    await user.click(refreshBtn)
+
+    // 3. 用户在下拉框快速切换到 acc_2
+    await user.selectOptions(screen.getByLabelText(/所属账号/), 'acc_2')
+
+    // 4. 等待 acc_2 的数据展示出来
+    expect(await screen.findByText('b-alias@icloud.com')).toBeInTheDocument()
+
+    // 5. 放行 acc_1 的慢刷新响应
+    deferredRefreshA.resolve({
+      account_id: 'acc_1',
+      count: 1,
+      aliases: [aliasA],
+    })
+
+    // 6. 验证: 页面必须继续保持 acc_2 的别名，acc_1 的晚返回结果被丢弃
+    await new Promise((r) => setTimeout(r, 50))
+    expect(screen.getByText('b-alias@icloud.com')).toBeInTheDocument()
+    expect(screen.queryByText('a-refresh@icloud.com')).toBeNull()
   })
 })

@@ -1,13 +1,46 @@
 import { http, HttpResponse } from 'msw'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter, Route, Routes } from 'react-router-dom'
+import { useNavigate, MemoryRouter, Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it } from 'vitest'
 import AccountWorkspace from './AccountWorkspace'
 import { server } from '../test/server'
 import { setCSRFToken } from '../api/client'
 import { ToastProvider } from '../components/ToastProvider'
 import type { AccountSummary, Alias, InboxResult } from '../api/types'
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+function WorkspaceNavHelper() {
+  const navigate = useNavigate()
+  return (
+    <div>
+      <button onClick={() => navigate('/workspace/acc_a')}>Go Acc A</button>
+      <button onClick={() => navigate('/workspace/acc_b')}>Go Acc B</button>
+    </div>
+  )
+}
+
+function renderWorkspaceWithNav(initialUrl = '/workspace/acc_a') {
+  return render(
+    <ToastProvider>
+      <MemoryRouter initialEntries={[initialUrl]}>
+        <WorkspaceNavHelper />
+        <Routes>
+          <Route path="/workspace/:accountId" element={<AccountWorkspace />} />
+        </Routes>
+      </MemoryRouter>
+    </ToastProvider>,
+  )
+}
 
 const testAccount: AccountSummary = {
   id: 'acc_test',
@@ -159,5 +192,158 @@ describe('AccountWorkspace', () => {
 
     expect(screen.getByText('work-1@icloud.com')).toBeInTheDocument()
     expect(screen.queryByText('shop-2@icloud.com')).not.toBeInTheDocument()
+  })
+
+  it('TestAccountWorkspace_SlowAccountACannotOverwriteAccountB: 账号 A 请求挂起切到 B，A 慢返回绝不可覆盖 B', async () => {
+    const user = userEvent.setup()
+    const deferredAccountA = createDeferred<AccountSummary>()
+
+    const accountA: AccountSummary = {
+      ...testAccount,
+      id: 'acc_a',
+      name: '账号-Alpha',
+      real_email: 'alpha@example.com',
+      icloud_email: 'alpha@icloud.com',
+    }
+
+    const accountB: AccountSummary = {
+      ...testAccount,
+      id: 'acc_b',
+      name: '账号-Beta',
+      real_email: 'beta@example.com',
+      icloud_email: 'beta@icloud.com',
+    }
+
+    server.use(
+      http.get('/api/accounts/acc_a', async () => {
+        const data = await deferredAccountA.promise
+        return HttpResponse.json({ success: true, data })
+      }),
+      http.get('/api/accounts/acc_b', () => {
+        return HttpResponse.json({ success: true, data: accountB })
+      }),
+      http.get('/api/aliases', ({ request }) => {
+        const url = new URL(request.url)
+        const accId = url.searchParams.get('account_id')
+        if (accId === 'acc_b') {
+          return HttpResponse.json({
+            success: true,
+            data: {
+              aliases: [
+                {
+                  email: 'beta-alias@icloud.com',
+                  anonymousId: 'anon_b',
+                  label: 'Beta别名',
+                  active: true,
+                },
+              ],
+            },
+          })
+        }
+        return HttpResponse.json({ success: true, data: { aliases: [] } })
+      }),
+    )
+
+    // 1. 渲染 Workspace，初始路由为 /workspace/acc_a (Account A 请求挂起)
+    renderWorkspaceWithNav('/workspace/acc_a')
+
+    // 2. 路由快速切换到 /workspace/acc_b
+    await user.click(screen.getByText('Go Acc B'))
+
+    // 3. 等待 Account B 渲染成功
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: '账号-Beta' })).toBeInTheDocument()
+      expect(screen.getByText('beta@icloud.com')).toBeInTheDocument()
+      expect(screen.getByText('beta-alias@icloud.com')).toBeInTheDocument()
+    })
+
+    // 4. 放行 Account A 的慢响应
+    deferredAccountA.resolve(accountA)
+
+    // 5. 验证: 页面必须继续保持账号 B，绝不可被 A 覆盖
+    await new Promise((r) => setTimeout(r, 50))
+    expect(screen.getByRole('heading', { name: '账号-Beta' })).toBeInTheDocument()
+    expect(screen.getByText('beta@icloud.com')).toBeInTheDocument()
+    expect(screen.queryByText('账号-Alpha')).not.toBeInTheDocument()
+    expect(screen.queryByText('alpha@icloud.com')).not.toBeInTheDocument()
+  })
+
+  it('TestAccountWorkspace_SlowAliasACannotOverwriteAliasesB: 账号 A 别名慢请求返回绝不覆盖账号 B 别名', async () => {
+    const user = userEvent.setup()
+    const deferredAliasA = createDeferred<Alias[]>()
+
+    const accountA: AccountSummary = {
+      ...testAccount,
+      id: 'acc_a',
+      name: '账号-Alpha',
+    }
+
+    const accountB: AccountSummary = {
+      ...testAccount,
+      id: 'acc_b',
+      name: '账号-Beta',
+    }
+
+    server.use(
+      http.get('/api/accounts/acc_a', () => {
+        return HttpResponse.json({ success: true, data: accountA })
+      }),
+      http.get('/api/accounts/acc_b', () => {
+        return HttpResponse.json({ success: true, data: accountB })
+      }),
+      http.get('/api/aliases', async ({ request }) => {
+        const url = new URL(request.url)
+        const accId = url.searchParams.get('account_id')
+        if (accId === 'acc_a') {
+          const list = await deferredAliasA.promise
+          return HttpResponse.json({ success: true, data: { aliases: list } })
+        }
+        if (accId === 'acc_b') {
+          return HttpResponse.json({
+            success: true,
+            data: {
+              aliases: [
+                {
+                  email: 'b-unique@icloud.com',
+                  anonymousId: 'anon_b_unique',
+                  label: 'B专属',
+                  active: true,
+                },
+              ],
+            },
+          })
+        }
+        return HttpResponse.json({ success: true, data: { aliases: [] } })
+      }),
+    )
+
+    // 1. 渲染 /workspace/acc_a，账号 A 别名请求挂起
+    renderWorkspaceWithNav('/workspace/acc_a')
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: '账号-Alpha' })).toBeInTheDocument()
+    })
+
+    // 2. 切换到 /workspace/acc_b
+    await user.click(screen.getByText('Go Acc B'))
+
+    // 3. 等待 B 的别名展示
+    await waitFor(() => {
+      expect(screen.getByText('b-unique@icloud.com')).toBeInTheDocument()
+    })
+
+    // 4. 放行 A 的慢别名数据
+    deferredAliasA.resolve([
+      {
+        email: 'a-stale@icloud.com',
+        anonymousId: 'anon_a_stale',
+        label: 'A过期别名',
+        active: true,
+      },
+    ])
+
+    // 5. 验证: 页面必须继续只有 B 的别名，A 绝不写入
+    await new Promise((r) => setTimeout(r, 50))
+    expect(screen.getByText('b-unique@icloud.com')).toBeInTheDocument()
+    expect(screen.queryByText('a-stale@icloud.com')).not.toBeInTheDocument()
   })
 })

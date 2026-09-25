@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { ApiError, request } from '../api/client'
-import type { APIToken, BusinessTag } from '../api/types'
+import type { APIToken, APITokenRecord, BusinessTag, CreatedAPIToken } from '../api/types'
 import AsyncState from '../components/AsyncState'
 import ConfirmDialog from '../components/ConfirmDialog'
 import Dialog from '../components/Dialog'
@@ -23,6 +23,7 @@ import {
   IconFileText,
   IconKey,
   IconPlus,
+  IconRefresh,
   IconTag,
   IconTrash,
 } from '../components/icons'
@@ -35,6 +36,22 @@ const ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000
 
 function tagLabel(t: BusinessTag): string {
   return t.tag || t.name
+}
+
+export function getTokenStatus(tok: APITokenRecord): 'revoked' | 'expired' | 'needs_rotation' | 'active' {
+  if (tok.revoked_at && tok.revoked_at.trim() !== '') {
+    return 'revoked'
+  }
+  if (tok.expires_at && tok.expires_at.trim() !== '') {
+    const expTime = new Date(tok.expires_at).getTime()
+    if (!isNaN(expTime) && expTime <= Date.now()) {
+      return 'expired'
+    }
+  }
+  if (tok.needs_rotation) {
+    return 'needs_rotation'
+  }
+  return 'active'
 }
 
 export default function BusinessTagsPage() {
@@ -222,12 +239,14 @@ export default function BusinessTagsPage() {
     }
   }
 
+  const [rotatingTokenId, setRotatingTokenId] = useState<string | null>(null)
+
   async function handleCreateToken(e: React.FormEvent) {
     e.preventDefault()
     if (!newTokenName.trim()) return
     setSavingToken(true)
     try {
-      const created = await request<APIToken>('/api/tokens', {
+      const created = await request<CreatedAPIToken>('/api/tokens', {
         method: 'POST',
         body: { name: newTokenName.trim() },
       })
@@ -241,6 +260,25 @@ export default function BusinessTagsPage() {
       show(err instanceof ApiError ? err.message : '生成令牌失败')
     } finally {
       setSavingToken(false)
+    }
+  }
+
+  async function handleRotateToken(tok: APITokenRecord) {
+    if (rotatingTokenId) return
+    setRotatingTokenId(tok.id)
+    try {
+      const res = await request<CreatedAPIToken>(`/api/tokens/${encodeURIComponent(tok.id)}/rotate`, {
+        method: 'POST',
+      })
+      if (res.token) {
+        setCreatedTokenVal(res.token)
+      }
+      show(`令牌 [${tok.name}] 已轮换，新令牌已生成`)
+      await loadTokens()
+    } catch (err) {
+      show(err instanceof ApiError ? err.message : '轮换令牌失败')
+    } finally {
+      setRotatingTokenId(null)
     }
   }
 
@@ -507,34 +545,81 @@ export default function BusinessTagsPage() {
                 <thead>
                   <tr>
                     <th>令牌标识</th>
+                    <th>权限范围</th>
+                    <th>状态</th>
                     <th>最后调用时间</th>
                     <th>操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {tokens.map((tok) => (
-                    <tr key={tok.id}>
-                      <td>
-                        <div style={{ fontWeight: 600, color: 'var(--color-text)' }}>{tok.name}</div>
-                        <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', fontFamily: 'var(--font-mono)' }}>{tok.id}</div>
-                      </td>
-                      <td style={{ fontSize: '12px', color: 'var(--color-text-secondary)' }} title={formatFullDate(tok.last_used_at, '从未调用')}>
-                        {formatDate(tok.last_used_at, '从未调用')}
-                      </td>
-                      <td>
-                        <div className="row-actions">
-                          <button
-                            type="button"
-                            className="danger"
-                            onClick={() => setDeleteTokenTarget(tok)}
-                            title="作废令牌"
-                          >
-                            <IconTrash size={14} /> 作废
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
+                  {tokens.map((tok) => {
+                    const status = getTokenStatus(tok)
+                    return (
+                      <tr key={tok.id}>
+                        <td>
+                          <div style={{ fontWeight: 600, color: 'var(--color-text)' }}>{tok.name}</div>
+                          <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', fontFamily: 'var(--font-mono)' }}>
+                            {tok.token_prefix ? `${tok.token_prefix}****` : tok.id}
+                          </div>
+                        </td>
+                        <td>
+                          <span style={{ fontSize: '12px', color: 'var(--color-text-secondary)' }}>
+                            {tok.scopes || 'allocate,verify'}
+                          </span>
+                        </td>
+                        <td>
+                          {status === 'revoked' && (
+                            <span className="badge badge-error">已作废</span>
+                          )}
+                          {status === 'expired' && (
+                            <span className="badge badge-error">已过期</span>
+                          )}
+                          {status === 'needs_rotation' && (
+                            <span className="badge badge-warning" title="历史遗留高危令牌，建议立即轮换">
+                              待轮换
+                            </span>
+                          )}
+                          {status === 'active' && (
+                            <span className="badge badge-active">正常</span>
+                          )}
+                        </td>
+                        <td style={{ fontSize: '12px', color: 'var(--color-text-secondary)' }} title={formatFullDate(tok.last_used_at, '从未调用')}>
+                          {formatDate(tok.last_used_at, '从未调用')}
+                        </td>
+                        <td>
+                          <div className="row-actions">
+                            {status !== 'revoked' && status !== 'expired' && (
+                              <>
+                                <button
+                                  type="button"
+                                  className="btn btn-xs btn-secondary"
+                                  onClick={() => void handleRotateToken(tok)}
+                                  disabled={rotatingTokenId === tok.id}
+                                  title="轮换令牌"
+                                >
+                                  <IconRefresh size={12} /> {rotatingTokenId === tok.id ? '轮换中…' : '轮换'}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="danger"
+                                  onClick={() => setDeleteTokenTarget(tok)}
+                                  title="作废令牌"
+                                >
+                                  <IconTrash size={14} /> 作废
+                                </button>
+                              </>
+                            )}
+                            {status === 'revoked' && (
+                              <span style={{ fontSize: '12px', color: 'var(--color-text-tertiary)' }}>已作废</span>
+                            )}
+                            {status === 'expired' && (
+                              <span style={{ fontSize: '12px', color: 'var(--color-text-tertiary)' }}>已过期</span>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>

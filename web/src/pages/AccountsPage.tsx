@@ -5,11 +5,12 @@
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Link } from 'react-router-dom'
 import { request, ApiError } from '../api/client'
 import type { AccountSummary } from '../api/types'
+import { useAccounts, invalidateAccounts } from '../hooks/useAccounts'
 import AsyncState from '../components/AsyncState'
 import AccountFormDialog from '../components/AccountFormDialog'
 import CookieDialog from '../components/CookieDialog'
@@ -235,10 +236,7 @@ function AccountActions({
 }
 
 export default function AccountsPage() {
-  const [accounts, setAccounts] = useState<AccountSummary[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
-  const [retryKey, setRetryKey] = useState(0)
+  const { accounts, loading, error, refresh } = useAccounts()
 
   // dialog 状态
   const [formOpen, setFormOpen] = useState(false)
@@ -253,37 +251,19 @@ export default function AccountsPage() {
 
   const { show } = useToast()
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const data = await request<AccountSummary[]>('/api/accounts')
-      setAccounts(data)
-      setError('')
-      window.dispatchEvent(new CustomEvent('account-updated'))
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    void load()
-  }, [load, retryKey])
-
   function handleRetry() {
-    setLoading(true)
-    setRetryKey((k) => k + 1)
+    void refresh(true)
   }
 
   async function handleDelete() {
     if (!deleteFor) return
+    const targetId = deleteFor.id
     setDeleting(true)
     try {
-      await request(`/api/accounts/${deleteFor.id}`, { method: 'DELETE' })
+      await request(`/api/accounts/${targetId}`, { method: 'DELETE' })
       setDeleteFor(null)
       show('账号已删除')
-      void load()
+      invalidateAccounts(targetId)
     } catch (err) {
       show(err instanceof ApiError ? err.message : '删除失败')
     } finally {
@@ -375,7 +355,7 @@ export default function AccountsPage() {
         </div>
         <AsyncState
           loading={loading}
-          error={error}
+          error={error || ''}
           empty={accounts.length === 0}
           emptyText="暂无账号，点击“添加账号”开始"
           onRetry={handleRetry}
@@ -450,9 +430,10 @@ export default function AccountsPage() {
           open={formOpen}
           onClose={() => setFormOpen(false)}
           onSaved={() => {
+            const targetId = editing?.id
             setFormOpen(false)
             show('账号已保存')
-            void load()
+            invalidateAccounts(targetId)
           }}
           editing={editing ? { id: editing.id, name: editing.name, icloudEmail: editing.icloud_email, host: editing.host } : null}
         />
@@ -463,9 +444,10 @@ export default function AccountsPage() {
           open
           onClose={() => setCookieFor(null)}
           onSaved={() => {
+            const targetId = cookieFor.id
             setCookieFor(null)
             show('Cookie 已更新')
-            void load()
+            invalidateAccounts(targetId)
           }}
         />
       )}
@@ -477,9 +459,10 @@ export default function AccountsPage() {
           open
           onClose={() => setLoginFor(null)}
           onSaved={() => {
+            const targetId = loginFor.id
             setLoginFor(null)
             show('登录成功')
-            void load()
+            invalidateAccounts(targetId)
           }}
         />
       )}
@@ -490,9 +473,10 @@ export default function AccountsPage() {
           open
           onClose={() => setAppPwdFor(null)}
           onSaved={() => {
+            const targetId = appPwdFor.id
             setAppPwdFor(null)
             show('App 专用密码已设置')
-            void load()
+            invalidateAccounts(targetId)
           }}
         />
       )}
@@ -502,9 +486,10 @@ export default function AccountsPage() {
           open
           onClose={() => setProxyFor(null)}
           onSaved={() => {
+            const targetId = proxyFor.id
             setProxyFor(null)
             show('代理已更新')
-            void load()
+            invalidateAccounts(targetId)
           }}
         />
       )}
@@ -514,7 +499,12 @@ export default function AccountsPage() {
           current={mailboxFor.mailbox}
           open
           onClose={() => setMailboxFor(null)}
-          onSaved={() => { setMailboxFor(null); show('收件邮箱已接入'); void load() }}
+          onSaved={() => {
+            const targetId = mailboxFor.id
+            setMailboxFor(null)
+            show('收件邮箱已接入')
+            invalidateAccounts(targetId)
+          }}
         />
       )}
       {deleteFor && (

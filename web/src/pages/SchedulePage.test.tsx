@@ -1,12 +1,23 @@
 import { http, HttpResponse } from 'msw'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import SchedulePage from './SchedulePage'
 import { server } from '../test/server'
 import { setCSRFToken } from '../api/client'
 import { ToastProvider } from '../components/ToastProvider'
+import { clearAccountsCache } from '../hooks/useAccounts'
 import type { AccountSummary, ScheduleConfig, ScheduleLog } from '../api/types'
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
 
 const accounts: AccountSummary[] = [
   {
@@ -74,6 +85,7 @@ function renderPage() {
 
 describe('SchedulePage', () => {
   beforeEach(() => {
+    clearAccountsCache()
     setCSRFToken('csrf-test')
     server.resetHandlers()
     mockApi()
@@ -193,5 +205,66 @@ describe('SchedulePage', () => {
     const selectElements = screen.getAllByLabelText('调度模式')
     await user.selectOptions(selectElements[0]!, 'daily_window')
     await waitFor(() => expect(putBody?.mode).toBe('daily_window'))
+  })
+
+  it('TestSchedulePage_StalePollCannotOverwriteSuccessfulMutation: 旧 poll 在途时发生 mutation，旧 poll 返回绝不可覆盖 mutation', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    try {
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime.bind(vi) })
+      const deferredOldConfigs = createDeferred<ScheduleConfig[]>()
+
+      let configsCallCount = 0
+      server.use(
+        http.get('/api/schedule/configs', async () => {
+          configsCallCount++
+          if (configsCallCount === 1) {
+            return HttpResponse.json({ success: true, data: configs })
+          }
+          if (configsCallCount === 2) {
+            // 慢 poll: 挂起并稍后返回未启用的旧数据
+            const data = await deferredOldConfigs.promise
+            return HttpResponse.json({ success: true, data })
+          }
+          // 权威 revalidate: 返回更新后的配置
+          return HttpResponse.json({
+            success: true,
+            data: [
+              ...configs,
+              { account_id: 'acc_off', enabled: true, hourly_quota: 5, current_hour_count: 0 },
+            ],
+          })
+        }),
+        http.put('/api/schedule/configs/acc_off', async () => {
+          return HttpResponse.json({ success: true, data: null })
+        }),
+      )
+
+      // 1. 初始渲染，acc_off 尚未开启
+      renderPage()
+      await screen.findByText('未启用号')
+      const toggleCheckbox = screen.getByLabelText('账号 未启用号 自动补货开关')
+      expect(toggleCheckbox).not.toBeChecked()
+
+      // 2. 推进时间 3000ms 触发第 2 轮 poll，使 configsCallCount 达到 2 并挂起
+      await vi.advanceTimersByTimeAsync(3000)
+      await waitFor(() => expect(configsCallCount).toBe(2))
+
+      // 3. 此时发生 mutation (点击开关)，使在途 poll 失效
+      await user.click(toggleCheckbox)
+
+      // 4. local commit 立即生效，开关变为选中状态
+      await waitFor(() => {
+        expect(toggleCheckbox).toBeChecked()
+      })
+
+      // 5. 随后放行旧 poll 的响应 (返回未开启的旧配置)
+      deferredOldConfigs.resolve([])
+
+      // 6. 验证: 页面必须继续保持开启状态，旧 poll 绝不能覆盖 mutation
+      await new Promise((r) => setTimeout(r, 50))
+      expect(toggleCheckbox).toBeChecked()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
