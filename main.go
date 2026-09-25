@@ -43,6 +43,7 @@ import (
 	"time"
 
 	"icloud-hme/internal/account"
+	"icloud-hme/internal/security"
 	"icloud-hme/internal/server"
 	"icloud-hme/internal/store"
 )
@@ -63,6 +64,7 @@ func main() {
 	apiTokenFlag := flag.String("api-token", "", "兼容参考项目的 API Token 参数 (也可通过 ICLOUD_PRIME_API_TOKEN 设置)")
 	backupFlag := flag.String("backup", "", "一致性备份目标文件路径")
 	restoreFlag := flag.String("restore", "", "一致性恢复源备份文件路径")
+	rotateCredentialsFlag := flag.Bool("rotate-credentials", false, "执行 Master Key 离线凭据轮换 (不启动服务)")
 	flag.Parse()
 
 	if *backupFlag != "" && *restoreFlag != "" {
@@ -110,6 +112,48 @@ func main() {
 			log.Fatalf("恢复数据库失败: %v", err)
 		}
 		fmt.Printf("数据库恢复成功: %s -> %s\n", srcPath, absDataDir)
+		return
+	}
+
+	// 离线凭据轮换模式 (不启动服务)
+	if *rotateCredentialsFlag {
+		absDataDir, err := filepath.Abs(*dataDir)
+		if err != nil {
+			log.Fatalf("数据目录路径错误: %v", err)
+		}
+		oldKey, err := security.LoadMasterKey()
+		if err != nil {
+			log.Fatalf("读取当前 Master Key 失败: %v", err)
+		}
+		oldCipher, err := security.NewSecretCipher(oldKey)
+		if err != nil {
+			log.Fatalf("当前 Master Key 无效: %v", err)
+		}
+
+		newKeyRaw := strings.TrimSpace(os.Getenv("ICLOUD_HME_NEW_MASTER_KEY"))
+		if newKeyFile := strings.TrimSpace(os.Getenv("ICLOUD_HME_NEW_MASTER_KEY_FILE")); newKeyFile != "" {
+			data, readErr := os.ReadFile(newKeyFile)
+			if readErr != nil {
+				log.Fatalf("读取新 Master Key 文件失败 (%s): %v", newKeyFile, readErr)
+			}
+			newKeyRaw = string(data)
+		}
+		if newKeyRaw == "" {
+			log.Fatalf("缺少新 Master Key 配置: 请设置环境变量 ICLOUD_HME_NEW_MASTER_KEY 或 ICLOUD_HME_NEW_MASTER_KEY_FILE")
+		}
+		newKey, err := security.ParseMasterKey(newKeyRaw)
+		if err != nil {
+			log.Fatalf("解析新 Master Key 失败: %v", err)
+		}
+		newCipher, err := security.NewSecretCipher(newKey)
+		if err != nil {
+			log.Fatalf("新 Master Key 无效: %v", err)
+		}
+
+		if err := store.RotateCredentials(absDataDir, oldCipher, newCipher); err != nil {
+			log.Fatalf("凭据轮换失败: %v", err)
+		}
+		fmt.Printf("凭据 Master Key 离线轮换成功！\n请将生产环境变量 ICLOUD_HME_MASTER_KEY / 文件更新为新密钥后重新启动服务。\n")
 		return
 	}
 
@@ -165,7 +209,16 @@ func main() {
 		log.Fatalf("数据目录路径错误: %v", err)
 	}
 
-	st, err := store.NewStore(abs)
+	masterKey, err := security.LoadMasterKey()
+	if err != nil {
+		log.Fatalf("Master Key 配置错误 (Fail Closed): %v", err)
+	}
+	cipher, err := security.NewSecretCipher(masterKey)
+	if err != nil {
+		log.Fatalf("初始化 Master Key 加密机失败: %v", err)
+	}
+
+	st, err := store.NewStoreWithCipher(abs, cipher)
 	if err != nil {
 		log.Fatalf("初始化数据库存储失败: %v", err)
 	}

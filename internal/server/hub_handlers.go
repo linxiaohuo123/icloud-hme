@@ -8,8 +8,6 @@
 package server
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"net/http"
@@ -144,45 +142,78 @@ func (s *Server) deleteTagHandler(c *gin.Context) {
 
 // --- 外部令牌 Tokens ---
 
+// --- 外部令牌 Tokens ---
+
 func (s *Server) listTokensHandler(c *gin.Context) {
-	// 只回显掩码: 令牌本体仅在创建响应中出现一次，避免管理台被读取后批量收割
-	ok(c, s.store.ListTokensMasked())
+	// 只回显安全前缀: 令牌本体仅在创建/轮换响应中出现一次，杜绝令牌泄露或互相收割
+	ok(c, s.store.ListTokens())
+}
+
+type createTokenRequest struct {
+	Name          string `json:"name"`
+	Token         string `json:"token"`
+	Scopes        string `json:"scopes"`
+	ExpiresAt     string `json:"expires_at"`
+	ExpiresInDays int    `json:"expires_in_days"`
 }
 
 func (s *Server) createTokenHandler(c *gin.Context) {
-	var req store.APIToken
+	var req createTokenRequest
 	_ = c.ShouldBindJSON(&req)
+
+	// 【安全红线】禁止继续接受管理员自定义 Token (防止 123456 / test 等弱口令)
+	if strings.TrimSpace(req.Token) != "" {
+		failCode(c, http.StatusBadRequest, "CUSTOM_TOKEN_NOT_ALLOWED", "不允许自定义令牌，系统将自动生成高熵令牌")
+		return
+	}
+
 	req.Name = strings.TrimSpace(req.Name)
 	if req.Name == "" {
 		req.Name = "外部接入令牌"
 	}
-	if strings.TrimSpace(req.Token) == "" {
-		b := make([]byte, 16)
-		_, _ = rand.Read(b)
-		req.Token = "am_" + hex.EncodeToString(b)
-	}
-	if req.ID == "" {
-		req.ID = store.NewAPITokenID()
-	}
-	if req.CreatedAt == "" {
-		req.CreatedAt = time.Now().Format(time.RFC3339)
-	}
+
 	// 缺省按最小权限发放: 对外令牌默认只能出号与取码，无法触达管理面
 	scopes, err := normalizeScopes(req.Scopes)
 	if err != nil {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
 		return
 	}
-	req.Scopes = scopes
-	if err := s.store.SaveToken(req); err != nil {
-		if isUniqueViolation(err) {
-			failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "该令牌值已存在，请勿重复使用同一个令牌")
+
+	expiresAt := strings.TrimSpace(req.ExpiresAt)
+	if req.ExpiresInDays > 0 && expiresAt == "" {
+		expiresAt = time.Now().UTC().AddDate(0, 0, req.ExpiresInDays).Format(time.RFC3339)
+	}
+	if expiresAt != "" {
+		if _, err := time.Parse(time.RFC3339, expiresAt); err != nil {
+			failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "过期时间格式必须为 RFC3339")
+			return
+		}
+	}
+
+	created, err := s.store.CreateToken(req.Name, scopes, expiresAt)
+	if err != nil {
+		backendFail(c, err)
+		return
+	}
+	ok(c, created)
+}
+
+func (s *Server) rotateTokenHandler(c *gin.Context) {
+	id := c.Param("id")
+	created, err := s.store.RotateToken(id)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			failCode(c, http.StatusNotFound, "NOT_FOUND", "令牌不存在")
+			return
+		}
+		if strings.Contains(err.Error(), "revoked") {
+			failCode(c, http.StatusBadRequest, "TOKEN_REVOKED", "已注销令牌无法轮换")
 			return
 		}
 		backendFail(c, err)
 		return
 	}
-	ok(c, req)
+	ok(c, created)
 }
 
 // isUniqueViolation 判断是否命中 SQLite 唯一约束，用于把重复值映射成可读的 400，
@@ -226,7 +257,7 @@ func normalizeScopes(raw string) (string, error) {
 
 func (s *Server) deleteTokenHandler(c *gin.Context) {
 	id := c.Param("id")
-	// 【BUG-13 修复】区分"成功删除"和"本就不存在"
+	// 软注销 (Soft Revoke): 保持 token identity 与历史审计记录，同时立即使认证失效
 	affected, err := s.store.DeleteToken(id)
 	if err != nil {
 		backendFail(c, err)

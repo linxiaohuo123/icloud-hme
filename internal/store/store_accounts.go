@@ -12,6 +12,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"icloud-hme/internal/security"
 )
 
 // ────────────────────────────────────────────────────────────────
@@ -45,12 +47,37 @@ type AccountRecord struct {
 // 写操作
 // ────────────────────────────────────────────────────────────────
 
-// SaveAccount 插入或全量替换一个账号记录 (UPSERT)。
+// SaveAccount 插入或全量替换一个账号记录 (UPSERT)。写库前对敏感凭据字段执行 AES-256-GCM + AAD 认证加密。
 func (s *Store) SaveAccount(rec *AccountRecord) error {
 	now := time.Now().Format(time.RFC3339)
 	if rec.UpdatedAt == "" {
 		rec.UpdatedAt = now
 	}
+
+	cookies := rec.CookiesJSON
+	appPassword := rec.AppPassword
+	mailbox := rec.MailboxJSON
+	proxy := rec.Proxy
+
+	if cookies != "" || appPassword != "" || mailbox != "" || proxy != "" {
+		if s.cipher == nil {
+			return fmt.Errorf("master key is required to encrypt account credentials")
+		}
+		var err error
+		if cookies, err = s.ensureFieldEncrypted(cookies, security.AccountAAD(rec.ID, "cookies")); err != nil {
+			return fmt.Errorf("encrypt account cookies failed: %w", err)
+		}
+		if appPassword, err = s.ensureFieldEncrypted(appPassword, security.AccountAAD(rec.ID, "app_password")); err != nil {
+			return fmt.Errorf("encrypt account app_password failed: %w", err)
+		}
+		if mailbox, err = s.ensureFieldEncrypted(mailbox, security.AccountAAD(rec.ID, "mailbox")); err != nil {
+			return fmt.Errorf("encrypt account mailbox failed: %w", err)
+		}
+		if proxy, err = s.ensureFieldEncrypted(proxy, security.AccountAAD(rec.ID, "proxy")); err != nil {
+			return fmt.Errorf("encrypt account proxy failed: %w", err)
+		}
+	}
+
 	query := `
 	INSERT INTO accounts (id, name, real_email, icloud_email, cookies, host, service_url,
 		proxy, app_password, mailbox, status, alias_total, alias_active,
@@ -65,8 +92,8 @@ func (s *Store) SaveAccount(rec *AccountRecord) error {
 		tags=excluded.tags, updated_at=excluded.updated_at;
 	`
 	_, err := s.db.Exec(query,
-		rec.ID, rec.Name, rec.RealEmail, rec.ICloudEmail, rec.CookiesJSON,
-		rec.Host, rec.ServiceURL, rec.Proxy, rec.AppPassword, rec.MailboxJSON,
+		rec.ID, rec.Name, rec.RealEmail, rec.ICloudEmail, cookies,
+		rec.Host, rec.ServiceURL, proxy, appPassword, mailbox,
 		rec.Status, rec.AliasTotal, rec.AliasActive,
 		rec.LastValidated, rec.LastError, rec.CreatedAt, rec.TagsJSON, rec.UpdatedAt,
 	)
@@ -82,13 +109,30 @@ var validAccountColumns = map[string]bool{
 }
 
 // UpdateAccountFields 原子更新指定账号的一组字段（细粒度写，避免全量 UPSERT）。
-// fields 的 key 必须是 accounts 表的合法列名。
+// fields 的 key 必须是 accounts 表的合法列名。如果包含敏感凭据，自动加密。
 func (s *Store) UpdateAccountFields(id string, fields map[string]interface{}) error {
 	if len(fields) == 0 {
 		return nil
 	}
 	// 自动追加 updated_at
 	fields["updated_at"] = time.Now().Format(time.RFC3339)
+
+	sensitiveCols := []string{"cookies", "app_password", "mailbox", "proxy"}
+	for _, col := range sensitiveCols {
+		if rawVal, ok := fields[col]; ok {
+			strVal, isStr := rawVal.(string)
+			if isStr && strVal != "" {
+				if s.cipher == nil {
+					return fmt.Errorf("master key is required to encrypt account %s", col)
+				}
+				encVal, err := s.ensureFieldEncrypted(strVal, security.AccountAAD(id, col))
+				if err != nil {
+					return fmt.Errorf("encrypt account field %s failed: %w", col, err)
+				}
+				fields[col] = encVal
+			}
+		}
+	}
 
 	setClauses := make([]string, 0, len(fields))
 	args := make([]interface{}, 0, len(fields)+1)
@@ -147,9 +191,33 @@ func (s *Store) SaveAccountsBatch(recs []*AccountRecord) error {
 		if r == nil {
 			continue
 		}
+		cookies := r.CookiesJSON
+		appPassword := r.AppPassword
+		mailbox := r.MailboxJSON
+		proxy := r.Proxy
+
+		if cookies != "" || appPassword != "" || mailbox != "" || proxy != "" {
+			if s.cipher == nil {
+				return fmt.Errorf("master key is required to encrypt account credentials")
+			}
+			var encErr error
+			if cookies, encErr = s.ensureFieldEncrypted(cookies, security.AccountAAD(r.ID, "cookies")); encErr != nil {
+				return fmt.Errorf("encrypt account cookies failed: %w", encErr)
+			}
+			if appPassword, encErr = s.ensureFieldEncrypted(appPassword, security.AccountAAD(r.ID, "app_password")); encErr != nil {
+				return fmt.Errorf("encrypt account app_password failed: %w", encErr)
+			}
+			if mailbox, encErr = s.ensureFieldEncrypted(mailbox, security.AccountAAD(r.ID, "mailbox")); encErr != nil {
+				return fmt.Errorf("encrypt account mailbox failed: %w", encErr)
+			}
+			if proxy, encErr = s.ensureFieldEncrypted(proxy, security.AccountAAD(r.ID, "proxy")); encErr != nil {
+				return fmt.Errorf("encrypt account proxy failed: %w", encErr)
+			}
+		}
+
 		if _, err := stmt.Exec(
-			r.ID, r.Name, r.RealEmail, r.ICloudEmail, r.CookiesJSON,
-			r.Host, r.ServiceURL, r.Proxy, r.AppPassword, r.MailboxJSON,
+			r.ID, r.Name, r.RealEmail, r.ICloudEmail, cookies,
+			r.Host, r.ServiceURL, proxy, appPassword, mailbox,
 			r.Status, r.AliasTotal, r.AliasActive,
 			r.LastValidated, r.LastError, r.CreatedAt, r.TagsJSON, r.UpdatedAt,
 		); err != nil {
@@ -177,6 +245,9 @@ func (s *Store) GetAccount(id string) (*AccountRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := s.decryptAccountRecord(rec); err != nil {
+		return nil, err
+	}
 	return rec, nil
 }
 
@@ -190,7 +261,7 @@ func (s *Store) ListAllAccounts() ([]*AccountRecord, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanAccountRows(rows)
+	return s.scanAccountRows(rows)
 }
 
 // ListAccountsPaged 分页查询账号列表，返回 (记录, 总数, 错误)。
@@ -207,7 +278,7 @@ func (s *Store) ListAccountsPaged(offset, limit int) ([]*AccountRecord, int, err
 		return nil, 0, err
 	}
 	defer rows.Close()
-	recs, err := scanAccountRows(rows)
+	recs, err := s.scanAccountRows(rows)
 	return recs, total, err
 }
 
@@ -219,7 +290,7 @@ func (s *Store) AccountCount() (int, error) {
 }
 
 // ────────────────────────────────────────────────────────────────
-// 内部扫描辅助
+// 内部扫描与安全解密辅助
 // ────────────────────────────────────────────────────────────────
 
 type rowScanner interface {
@@ -235,16 +306,87 @@ func scanAccountRow(row rowScanner, rec *AccountRecord) error {
 	)
 }
 
-func scanAccountRows(rows *sql.Rows) ([]*AccountRecord, error) {
+func (s *Store) scanAccountRows(rows *sql.Rows) ([]*AccountRecord, error) {
 	var result []*AccountRecord
 	for rows.Next() {
 		rec := &AccountRecord{}
 		if err := scanAccountRow(rows, rec); err != nil {
 			return nil, err
 		}
+		if err := s.decryptAccountRecord(rec); err != nil {
+			return nil, err
+		}
 		result = append(result, rec)
 	}
 	return result, rows.Err()
+}
+
+// decryptAccountRecord 使用绑定 AAD 解密敏感凭据字段。解密失败或未加密明文均 fail closed。
+func (s *Store) decryptAccountRecord(rec *AccountRecord) error {
+	if rec == nil {
+		return nil
+	}
+	fields := []struct {
+		name string
+		val  *string
+	}{
+		{"cookies", &rec.CookiesJSON},
+		{"app_password", &rec.AppPassword},
+		{"mailbox", &rec.MailboxJSON},
+		{"proxy", &rec.Proxy},
+	}
+
+	for _, f := range fields {
+		if *f.val == "" {
+			continue
+		}
+		if !security.IsEncrypted(*f.val) {
+			return fmt.Errorf("account %s field %s is not encrypted", rec.ID, f.name)
+		}
+		if s.cipher == nil {
+			return fmt.Errorf("master key is required to decrypt account %s field %s", rec.ID, f.name)
+		}
+		dec, err := s.cipher.Decrypt(*f.val, security.AccountAAD(rec.ID, f.name))
+		if err != nil {
+			return fmt.Errorf("decrypt account %s field %s failed: %w", rec.ID, f.name, err)
+		}
+		*f.val = string(dec)
+	}
+	return nil
+}
+
+// GetEncryptedSetting 解密并读取设置项。若未加密或解密失败则 fail closed。
+func (s *Store) GetEncryptedSetting(key string, aad []byte) (string, error) {
+	raw := s.GetSetting(key)
+	if raw == "" {
+		return "", nil
+	}
+	if !security.IsEncrypted(raw) {
+		return "", fmt.Errorf("setting %s is not encrypted", key)
+	}
+	if s.cipher == nil {
+		return "", fmt.Errorf("master key is required to decrypt setting %s", key)
+	}
+	dec, err := s.cipher.Decrypt(raw, aad)
+	if err != nil {
+		return "", fmt.Errorf("decrypt setting %s failed: %w", key, err)
+	}
+	return string(dec), nil
+}
+
+// SaveEncryptedSetting 认证加密并持久化设置项。
+func (s *Store) SaveEncryptedSetting(key, plaintext string, aad []byte) error {
+	if plaintext == "" {
+		return s.SaveSetting(key, "")
+	}
+	if s.cipher == nil {
+		return fmt.Errorf("master key is required to encrypt setting %s", key)
+	}
+	enc, err := s.cipher.Encrypt([]byte(plaintext), aad)
+	if err != nil {
+		return fmt.Errorf("encrypt setting %s failed: %w", key, err)
+	}
+	return s.SaveSetting(key, enc)
 }
 
 // joinStrings 简单拼接，避免引入 strings 包的额外依赖（store.go 已有 strings 导入）。

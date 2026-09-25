@@ -16,6 +16,14 @@ import (
 	"time"
 )
 
+const testMasterKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
+func init() {
+	if os.Getenv("ICLOUD_HME_MASTER_KEY") == "" && os.Getenv("ICLOUD_HME_MASTER_KEY_FILE") == "" {
+		_ = os.Setenv("ICLOUD_HME_MASTER_KEY", testMasterKey)
+	}
+}
+
 // 并发创建业务标识/令牌不得互相覆盖。
 //
 // 回归防线:主键曾用 time.Now().UnixNano() 生成，Windows 时钟粒度约 15ms，
@@ -408,7 +416,7 @@ func TestStoreMigration(t *testing.T) {
 	}
 
 	tokens := s.ListTokens()
-	if len(tokens) != 1 || tokens[0].Token != "legacy_tok" {
+	if len(tokens) != 1 || !tokens[0].NeedsRotation || !s.ValidateToken("legacy_tok") {
 		t.Fatalf("Migrated tokens mismatch: %+v", tokens)
 	}
 
