@@ -660,6 +660,11 @@ export default function InboxTableView({
     const primaryKey = buildMailCacheKey(accountId, message)
     const cached = moduleMessageCache.get(primaryKey) || messageCacheRef.current.get(primaryKey)
     if (cached) {
+      // 边界 1：切换到已缓存邮件时，立即使任何在途未完成详情请求失效并重置状态，防止旧请求晚到覆盖当前视图
+      detailAbortRef.current?.abort()
+      detailAbortRef.current = null
+      detailInFlightRef.current = null
+      setDetailLoading(false)
       setDetail(cached)
       return
     }
@@ -672,6 +677,7 @@ export default function InboxTableView({
       return
     }
 
+    // 边界 2：切换到另一封未缓存邮件，中止前一请求并建立当前 controller 所有权
     detailAbortRef.current?.abort()
     const controller = new AbortController()
     detailAbortRef.current = controller
@@ -683,6 +689,7 @@ export default function InboxTableView({
       if (
         sessionGen !== moduleSessionGen ||
         currentGen !== accountGenRef.current ||
+        detailAbortRef.current !== controller ||
         controller.signal.aborted
       ) {
         return
@@ -702,16 +709,19 @@ export default function InboxTableView({
       if (
         sessionGen === moduleSessionGen &&
         currentGen === accountGenRef.current &&
+        detailAbortRef.current === controller &&
         !(err instanceof ApiError && err.code === 'ABORTED')
       ) {
         show(err instanceof ApiError ? err.message : '读取邮件详情失败')
       }
     } finally {
-      if (detailInFlightRef.current === targetRefOrId) {
+      // 只有拥有当前所有权的 controller 才能清理当前 loading 与 inFlight 状态，严禁旧请求清理新请求
+      if (detailAbortRef.current === controller) {
+        detailAbortRef.current = null
         detailInFlightRef.current = null
-      }
-      if (sessionGen === moduleSessionGen && currentGen === accountGenRef.current) {
-        setDetailLoading(false)
+        if (sessionGen === moduleSessionGen && currentGen === accountGenRef.current) {
+          setDetailLoading(false)
+        }
       }
     }
   }, [accountId, show])

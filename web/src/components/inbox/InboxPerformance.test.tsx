@@ -1705,6 +1705,7 @@ describe('PR-MAIL-04: Body-on-demand & Single-message reading', () => {
         })
       }),
       http.get('/api/inbox/imap%3Aacc_mail04%3AINBOX%3A1%3A102', async () => {
+        await new Promise((r) => setTimeout(r, 60))
         return HttpResponse.json({
           success: true,
           data: {
@@ -1742,13 +1743,113 @@ describe('PR-MAIL-04: Body-on-demand & Single-message reading', () => {
     // 此时切换点击邮件 2
     fireEvent.click(screen.getByRole('button', { name: 'Second Mail Subject' }))
 
+    // A 被 abort
     await waitFor(() => {
       expect(abortedMsg1).toBe(true)
     })
 
+    // 核心断言：A 的 abort / finally 绝不得提前关闭邮件 2 的 loading 状态
+    expect(screen.getByText('读取邮件正文中…')).toBeInTheDocument()
+
+    // 邮件 2 最终正常呈现
     await waitFor(() => {
       expect(screen.getByText('Body for msg 2')).toBeInTheDocument()
     })
+
+    unmount()
+  })
+
+  // TEST 2.1: A 未缓存 detail pending 时切换点击已缓存的 B，A 必须被 abort，且即使 A 返回也不得覆盖 B
+  it('TEST 2.1: aborts pending uncached A when switching to cached B, and late A never overwrites B', async () => {
+    let startedMsg1 = false
+    let abortedMsg1 = false
+    let resolveMsg1: (() => void) | null = null
+    const msg1Deferred = new Promise<void>((resolve) => {
+      resolveMsg1 = resolve
+    })
+
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: [dummyAccount] })),
+      http.get('/api/mailboxes', () => HttpResponse.json({ success: true, data: { account_id: 'acc_mail04', folders: [] } })),
+      http.get('/api/inbox', () => HttpResponse.json({ success: true, data: dummyMessages })),
+      http.get('/api/inbox/imap%3Aacc_mail04%3AINBOX%3A1%3A102', () => {
+        return HttpResponse.json({
+          success: true,
+          data: {
+            message: {
+              ...dummyMessages.messages[1],
+              body: 'CACHED_BODY_FOR_B',
+              preview: 'CACHED_BODY_FOR_B',
+              content_type: 'text/plain',
+              body_complete: true,
+            },
+          },
+        })
+      }),
+      http.get('/api/inbox/imap%3Aacc_mail04%3AINBOX%3A1%3A101', async ({ request }) => {
+        startedMsg1 = true
+        request.signal.addEventListener('abort', () => {
+          abortedMsg1 = true
+        })
+        await msg1Deferred
+        return HttpResponse.json({
+          success: true,
+          data: {
+            message: {
+              ...dummyMessages.messages[0],
+              body: 'LATE_ARRIVING_BODY_A',
+              preview: 'LATE_ARRIVING_BODY_A',
+              content_type: 'text/plain',
+              body_complete: true,
+            },
+          },
+        })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_mail04" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('First Mail Subject')).toBeInTheDocument()
+      expect(screen.getByText('Second Mail Subject')).toBeInTheDocument()
+    })
+
+    // 0. 先打开并关闭 B，使 B 存入缓存
+    fireEvent.click(screen.getByRole('button', { name: 'Second Mail Subject' }))
+    await waitFor(() => {
+      expect(screen.getByText('CACHED_BODY_FOR_B')).toBeInTheDocument()
+    })
+    const dialog = screen.getByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: '关闭' }))
+
+    // 1. 点击未缓存的邮件 A (并等待其请求发出处于挂起状态)
+    fireEvent.click(screen.getByRole('button', { name: 'First Mail Subject' }))
+    await waitFor(() => {
+      expect(startedMsg1).toBe(true)
+    })
+
+    // 2. 切换点击已缓存的邮件 B
+    fireEvent.click(screen.getByRole('button', { name: 'Second Mail Subject' }))
+
+    // 3. 断言 A 被立即 abort，且弹窗立即展示 B 的正文
+    await waitFor(() => {
+      expect(abortedMsg1).toBe(true)
+      expect(screen.getByText('CACHED_BODY_FOR_B')).toBeInTheDocument()
+    })
+
+    // 4. 释放延迟的 A 响应，模拟晚到的 A 返回
+    resolveMsg1!()
+    await new Promise((r) => setTimeout(r, 60))
+
+    // 核心断言：晚到的 A 绝对不得覆盖当前已展示的 B
+    expect(screen.getByText('CACHED_BODY_FOR_B')).toBeInTheDocument()
+    expect(screen.queryByText('LATE_ARRIVING_BODY_A')).toBeNull()
 
     unmount()
   })
