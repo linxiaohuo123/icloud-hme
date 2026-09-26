@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 github.com/emersion/go-imap, golang.org/x/net/proxy
  * [OUTPUT]: 对外提供 Client、NewClient、NewClientWithServer、Message、FullMessage
- * [POS]: internal/mail 的 IMAP 邮件读取客户端核心，连接建立与列表搜索；内容拉取由 client_fetch.go 承载，增量扫描由 client_scan.go 承载，隧道拨号由 dial.go 承载，性能观测由 perf.go 承载
+ * [POS]: internal/mail 的 IMAP 邮件读取客户端核心，连接建立与列表搜索 (PR-MAIL-02 支持两阶段 metadata-first 别名发现与候选批量正文拉取)；内容拉取由 client_fetch.go 承载，增量扫描由 client_scan.go 承载，隧道拨号由 dial.go 承载，性能观测由 perf.go 承载
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -593,6 +593,8 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 	}
 	selectMS := time.Since(mailboxStart).Milliseconds()
 	var searchMS, fetchMS int64
+	var metadataFetchRequested, metadataFetchReceived int
+	var candidateCount int
 	var bodyFetchRequested, bodyFetchReceived int
 	var allUIDs []uint32
 	fallback := false
@@ -608,6 +610,9 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 			"search_ms", searchMS,
 			"fetch_ms", fetchMS,
 			"uids_found", len(allUIDs),
+			"metadata_fetch_requested", metadataFetchRequested,
+			"metadata_fetch_received", metadataFetchReceived,
+			"candidate_count", candidateCount,
 			"body_fetch_requested", bodyFetchRequested,
 			"body_fetch_received", bodyFetchReceived,
 			"fallback", fallback,
@@ -667,16 +672,19 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 	searchMS = time.Since(searchStart).Milliseconds()
 
 	if len(uids) > 0 {
-		if sinceUID == 0 {
-			uids = newestUIDs(uids, limit)
-		}
-		bodyFetchRequested = len(uids)
+		metadataFetchRequested = len(uids)
 		seqset := new(imap.SeqSet)
 		for _, u := range uids {
 			seqset.AddNum(u)
 		}
-		section := &imap.BodySectionName{Peek: true}
-		items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate, imap.FetchFlags, section.FetchItem()}
+		section := metadataRecipientHeaderSection()
+		items := []imap.FetchItem{
+			imap.FetchUid,
+			imap.FetchEnvelope,
+			imap.FetchInternalDate,
+			imap.FetchFlags,
+			section.FetchItem(),
+		}
 		messages := make(chan *imap.Message, len(uids))
 		done := make(chan error, 1)
 		fetchStart := time.Now()
@@ -684,49 +692,85 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 			done <- c.cli.UidFetch(seqset, items, messages)
 		}()
 
-		var fetched []Message
+		var matchedCandidates []Message
 		for msg := range messages {
 			if msg == nil {
 				continue
 			}
-			// FIX-8: 在消费 channel 时实时累加，partial FETCH failure 也能保留已收到 BODY 数；
-			// 仅当响应真实携带 BODY section 时计入 received
-			if msgHasBodySection(msg) {
-				bodyFetchReceived++
-			}
-			m := toMessageWithBody(msg, folder)
-			m.UIDValidity = mbox.UidValidity
-			m.UID = msg.Uid
-			m.Provider = "imap"
-			ref := MessageRef{
-				Provider:    "imap",
-				Mailbox:     folder,
-				UIDValidity: mbox.UidValidity,
-				UID:         m.UID,
-			}
-			m.MessageRef = ref.Encode()
-			fetched = append(fetched, m)
-		}
-		if err := <-done; err != nil {
-			fetchMS = time.Since(fetchStart).Milliseconds()
-			return err
-		}
-		fetchMS = time.Since(fetchStart).Milliseconds()
-		// 按 UID 从大到小 (新到旧) 排序触发回调；严格核验收件人匹配
-		sort.SliceStable(fetched, func(i, j int) bool { return fetched[i].UID > fetched[j].UID })
-		for _, m := range fetched {
-			if !m.matches(recipient) {
+			metadataFetchReceived++
+			m := toMessageWithHeaderOnly(msg, section, folder)
+			if sinceUID > 0 && m.UID < sinceUID {
 				continue
 			}
-			matchedCount++
-			if !onMsg(m) {
-				return nil
+			if days > 0 {
+				if t, err := time.Parse(time.RFC3339, m.Date); err == nil {
+					if time.Since(t) > time.Duration(days)*24*time.Hour {
+						continue
+					}
+				}
+			}
+			if m.matches(recipient) {
+				m.UIDValidity = mbox.UidValidity
+				m.UID = msg.Uid
+				m.Provider = "imap"
+				ref := MessageRef{
+					Provider:    "imap",
+					Mailbox:     folder,
+					UIDValidity: mbox.UidValidity,
+					UID:         m.UID,
+				}
+				m.MessageRef = ref.Encode()
+				matchedCandidates = append(matchedCandidates, m)
 			}
 		}
-		// 只有当至少命中一封真正匹配目标别名的邮件时才提前结束；
-		// 若因非标 IMAP 返回了无关历史邮件导致 matchedCount == 0，必须穿透执行 fallback 深度比对
-		if matchedCount > 0 {
-			return nil
+		if err := <-done; err != nil {
+			fetchMS += time.Since(fetchStart).Milliseconds()
+			return err
+		}
+		fetchMS += time.Since(fetchStart).Milliseconds()
+		candidateCount = len(matchedCandidates)
+
+		// 只有在元数据阶段结构化收件人确认匹配后，才进入第二阶段拉取完整正文 (PR-MAIL-02)
+		if candidateCount > 0 {
+			// 按新到旧排序 (newest first: UID 降序)
+			sort.SliceStable(matchedCandidates, func(i, j int) bool {
+				return matchedCandidates[i].UID > matchedCandidates[j].UID
+			})
+			if limit > 0 && len(matchedCandidates) > limit {
+				matchedCandidates = matchedCandidates[:limit]
+			}
+
+			targetUIDs := make([]uint32, 0, len(matchedCandidates))
+			for _, c := range matchedCandidates {
+				targetUIDs = append(targetUIDs, c.UID)
+			}
+
+			bodyFetchRequested = len(targetUIDs)
+			bodyStart := time.Now()
+			fullMsgs, bodyRecv, err := c.fetchCandidatesBody(folder, mbox.UidValidity, targetUIDs)
+			fetchMS += time.Since(bodyStart).Milliseconds()
+			bodyFetchReceived = bodyRecv
+			if err != nil {
+				return err
+			}
+
+			// 保持 newest first 排序
+			sort.SliceStable(fullMsgs, func(i, j int) bool {
+				return fullMsgs[i].UID > fullMsgs[j].UID
+			})
+
+			for _, m := range fullMsgs {
+				if sinceUID > 0 && m.UID < sinceUID {
+					continue
+				}
+				matchedCount++
+				if !onMsg(m) {
+					return nil
+				}
+			}
+			if matchedCount > 0 {
+				return nil
+			}
 		}
 	}
 
@@ -743,8 +787,7 @@ func newestUIDs(uids []uint32, limit int) []uint32 {
 	return uids[len(uids)-limit:]
 }
 
-// forEachRecentMatching 拉取 folder 最近 scan 封信件, 本地比对 To/Headers/Body/Subject。
-// 注意: 这是候选查找阶段的重路径 —— 每封扫描邮件都会执行完整 BODY[] fetch (PR-MAIL-02 待整改点)。
+// forEachRecentMatching 扫 folder 最近 scan 封信件元数据 (PR-MAIL-02 metadata-first)，仅在确认目标 alias 匹配后单次批量拉取候选正文。
 func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days int, sinceUID uint32, onMsg func(Message) bool) (retErr error) {
 	opStart := time.Now()
 	mailboxStart := time.Now()
@@ -755,6 +798,8 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 	}
 	selectMS := time.Since(mailboxStart).Milliseconds()
 	var fetchMS int64
+	var metadataFetchRequested, metadataFetchReceived int
+	var candidateCount int
 	var bodyFetchRequested, bodyFetchReceived int
 	matched := 0
 	defer func() {
@@ -764,6 +809,9 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 			"recipient", MaskEmailForLog(recipient),
 			"select_ms", selectMS,
 			"fetch_ms", fetchMS,
+			"metadata_fetch_requested", metadataFetchRequested,
+			"metadata_fetch_received", metadataFetchReceived,
+			"candidate_count", candidateCount,
 			"body_fetch_requested", bodyFetchRequested,
 			"body_fetch_received", bodyFetchReceived,
 			"matched", matched,
@@ -785,12 +833,13 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 	if scan > total {
 		scan = total
 	}
-	bodyFetchRequested = scan
+	metadataFetchRequested = scan
 	from := mbox.Messages - uint32(scan) + 1
 	seqset := new(imap.SeqSet)
 	seqset.AddRange(from, mbox.Messages)
 
-	section := &imap.BodySectionName{Peek: true}
+	// Stage 1: Candidate Discovery — 仅拉取元数据与结构化收件人 Header (PR-MAIL-02)
+	section := metadataRecipientHeaderSection()
 	items := []imap.FetchItem{
 		imap.FetchUid,
 		imap.FetchEnvelope,
@@ -810,10 +859,19 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 		if msg == nil {
 			continue
 		}
-		if msgHasBodySection(msg) {
-			bodyFetchReceived++
+		metadataFetchReceived++
+		m := toMessageWithHeaderOnly(msg, section, folder)
+		m.UIDValidity = mbox.UidValidity
+		m.UID = msg.Uid
+		m.Provider = "imap"
+		ref := MessageRef{
+			Provider:    "imap",
+			Mailbox:     folder,
+			UIDValidity: mbox.UidValidity,
+			UID:         m.UID,
 		}
-		m := toMessageWithBody(msg, folder)
+		m.MessageRef = ref.Encode()
+
 		if days > 0 {
 			if t, err := time.Parse(time.RFC3339, m.Date); err == nil {
 				if time.Since(t) > time.Duration(days)*24*time.Hour {
@@ -829,21 +887,110 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 		}
 	}
 	if err := <-done; err != nil {
-		fetchMS = time.Since(fetchStart).Milliseconds()
+		fetchMS += time.Since(fetchStart).Milliseconds()
 		return err
 	}
-	fetchMS = time.Since(fetchStart).Milliseconds()
-	matched = len(cands)
-	sort.SliceStable(cands, func(i, j int) bool { return cands[i].Date > cands[j].Date })
-	for i, m := range cands {
-		if i >= limit {
-			break
+	fetchMS += time.Since(fetchStart).Milliseconds()
+	candidateCount = len(cands)
+
+	if candidateCount == 0 {
+		return nil
+	}
+
+	// 新邮件在前 (newest first)
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].Date != cands[j].Date {
+			return cands[i].Date > cands[j].Date
 		}
+		return cands[i].UID > cands[j].UID
+	})
+	if limit > 0 && len(cands) > limit {
+		cands = cands[:limit]
+	}
+
+	targetUIDs := make([]uint32, 0, len(cands))
+	for _, cand := range cands {
+		targetUIDs = append(targetUIDs, cand.UID)
+	}
+
+	// Stage 2: Candidate Body Fetch — 批量获取已匹配候选的完整正文 (PR-MAIL-02)
+	bodyFetchRequested = len(targetUIDs)
+	bodyStart := time.Now()
+	bodyMsgs, bodyRecv, err := c.fetchCandidatesBody(folder, mbox.UidValidity, targetUIDs)
+	fetchMS += time.Since(bodyStart).Milliseconds()
+	bodyFetchReceived = bodyRecv
+	if err != nil {
+		return err
+	}
+
+	sort.SliceStable(bodyMsgs, func(i, j int) bool {
+		if bodyMsgs[i].Date != bodyMsgs[j].Date {
+			return bodyMsgs[i].Date > bodyMsgs[j].Date
+		}
+		return bodyMsgs[i].UID > bodyMsgs[j].UID
+	})
+
+	for _, m := range bodyMsgs {
+		if sinceUID > 0 && m.UID < sinceUID {
+			continue
+		}
+		matched++
 		if !onMsg(m) {
 			return nil
 		}
 	}
 	return nil
+}
+
+// fetchCandidatesBody 单次 IMAP UID FETCH 批量拉取一组已匹配候选邮件的完整正文 (PR-MAIL-02)。
+func (c *Client) fetchCandidatesBody(folder string, uidValidity uint32, uids []uint32) ([]Message, int, error) {
+	if len(uids) == 0 {
+		return nil, 0, nil
+	}
+	seqset := new(imap.SeqSet)
+	for _, u := range uids {
+		seqset.AddNum(u)
+	}
+	section := &imap.BodySectionName{Peek: true}
+	items := []imap.FetchItem{
+		imap.FetchUid,
+		imap.FetchEnvelope,
+		imap.FetchInternalDate,
+		imap.FetchFlags,
+		section.FetchItem(),
+	}
+	messages := make(chan *imap.Message, len(uids))
+	done := make(chan error, 1)
+	go func() {
+		done <- c.cli.UidFetch(seqset, items, messages)
+	}()
+
+	var fetched []Message
+	bodyReceived := 0
+	for msg := range messages {
+		if msg == nil {
+			continue
+		}
+		if msgHasBodySection(msg) {
+			bodyReceived++
+		}
+		m := toMessageWithBody(msg, folder)
+		m.UIDValidity = uidValidity
+		m.UID = msg.Uid
+		m.Provider = "imap"
+		ref := MessageRef{
+			Provider:    "imap",
+			Mailbox:     folder,
+			UIDValidity: uidValidity,
+			UID:         m.UID,
+		}
+		m.MessageRef = ref.Encode()
+		fetched = append(fetched, m)
+	}
+	if err := <-done; err != nil {
+		return nil, bodyReceived, err
+	}
+	return fetched, bodyReceived, nil
 }
 
 // fetchOneUID 拉取单封邮件(含 body preview), 使用 BODY.PEEK 不标已读。
