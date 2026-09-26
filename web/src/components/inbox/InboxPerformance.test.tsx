@@ -1287,8 +1287,8 @@ describe('PR-MAIL-03: INBOX First & Mailbox Lazy Load', () => {
 
   // TEST 4｜Inbox pending 时点击 folder: 必须等 first paint 完成后才允许发送 /api/mailboxes
   it('TEST 4: defers /api/mailboxes when folder is clicked while /api/inbox is pending until metadata first paint finishes', async () => {
-    let resolveInbox: (value: HttpResponse) => void
-    const inboxPromise = new Promise<HttpResponse>((resolve) => {
+    let resolveInbox: () => void
+    const inboxDeferred = new Promise<void>((resolve) => {
       resolveInbox = resolve
     })
 
@@ -1298,8 +1298,9 @@ describe('PR-MAIL-03: INBOX First & Mailbox Lazy Load', () => {
       http.get('/api/accounts', () => {
         return HttpResponse.json({ success: true, data: [dummyAccount] })
       }),
-      http.get('/api/inbox', () => {
-        return inboxPromise
+      http.get('/api/inbox', async () => {
+        await inboxDeferred
+        return HttpResponse.json({ success: true, data: dummyInboxResult })
       }),
       http.get('/api/mailboxes', () => {
         mailboxesCallCount++
@@ -1326,7 +1327,7 @@ describe('PR-MAIL-03: INBOX First & Mailbox Lazy Load', () => {
     expect(mailboxesCallCount).toBe(0)
 
     // 释放 /api/inbox，完成 metadata first paint
-    resolveInbox!(HttpResponse.json({ success: true, data: dummyInboxResult }))
+    resolveInbox!()
 
     // 首屏可见
     await waitFor(() => {
@@ -1389,8 +1390,8 @@ describe('PR-MAIL-03: INBOX First & Mailbox Lazy Load', () => {
 
   // EXTRA 1: Account switch 防污染
   it('EXTRA: account switch discards stale in-flight /api/mailboxes response and resets folder to INBOX', async () => {
-    let resolveAcc1Mailboxes: (value: HttpResponse) => void
-    const acc1MailboxesPromise = new Promise<HttpResponse>((resolve) => {
+    let resolveAcc1Mailboxes: () => void
+    const acc1Deferred = new Promise<void>((resolve) => {
       resolveAcc1Mailboxes = resolve
     })
 
@@ -1423,11 +1424,18 @@ describe('PR-MAIL-03: INBOX First & Mailbox Lazy Load', () => {
           },
         })
       }),
-      http.get('/api/mailboxes', ({ request }) => {
+      http.get('/api/mailboxes', async ({ request }) => {
         const url = new URL(request.url)
         const accId = url.searchParams.get('account_id')
         if (accId === 'acc_mail03') {
-          return acc1MailboxesPromise
+          await acc1Deferred
+          return HttpResponse.json({
+            success: true,
+            data: {
+              account_id: 'acc_mail03',
+              folders: dummyCustomFolders, // 包含 "Work"
+            },
+          })
         }
         return HttpResponse.json({
           success: true,
@@ -1469,15 +1477,7 @@ describe('PR-MAIL-03: INBOX First & Mailbox Lazy Load', () => {
     })
 
     // 释放账号 A 的延迟响应，返回属于账号 A 的工作文件夹
-    resolveAcc1Mailboxes!(
-      HttpResponse.json({
-        success: true,
-        data: {
-          account_id: 'acc_mail03',
-          folders: dummyCustomFolders, // 包含 "Work"
-        },
-      }),
-    )
+    resolveAcc1Mailboxes!()
 
     // 等待微任务完成
     await new Promise((r) => setTimeout(r, 60))
