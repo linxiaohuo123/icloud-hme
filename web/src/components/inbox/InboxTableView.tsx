@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 api/client (request, ApiError, getMessageDetail), api/types, components (AsyncState, ConfirmDialog, ToastProvider), hooks/useAccounts (fetchAccountsDeduped), utils (clipboard, date, mail, sniffer: buildSniffContext, extractOTPMemoized, parseSenderInfo), ./InboxFilterBar, ./InboxTableRow, ./MailDetailDialog
- * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；支持 externalAliases 直传消灭冗余 I/O、fetchAccountsDeduped 全局缓存共享、INBOX First 首屏优先加载、/api/mailboxes 交互式按需懒加载 (带 pending 队列与 IMAP 避让)、模块级缓存防 Tab 切换重载、首屏 Metadata 快速渲染 (Fast First Paint) 与后台单批正文渐进增强
+ * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；支持 externalAliases 直传消灭冗余 I/O、fetchAccountsDeduped 全局缓存共享、INBOX First 首屏优先加载、/api/mailboxes 交互式按需懒加载 (带 pending 队列与 IMAP 避让)、模块级缓存防 Tab 切换重载、Body-on-demand 按需加载单封正文 (零首屏批量正文 I/O)
  * [POS]: web/src/components/inbox 的核心视图容器，统一单账号工作台与全局收件箱大盘的数据流与交互
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -232,6 +232,7 @@ export default function InboxTableView({
 
   const abortRef = useRef<AbortController | null>(null)
   const detailAbortRef = useRef<AbortController | null>(null)
+  const detailInFlightRef = useRef<string | null>(null)
   const folderAbortRef = useRef<AbortController | null>(null)
   const folderLoadingAccountRef = useRef<string | null>(null)
   const pendingFolderLoadRef = useRef(false)
@@ -244,6 +245,7 @@ export default function InboxTableView({
   useEffect(() => {
     return () => {
       detailAbortRef.current?.abort()
+      detailInFlightRef.current = null
       abortRef.current?.abort()
       folderAbortRef.current?.abort()
       folderLoadingAccountRef.current = null
@@ -260,6 +262,7 @@ export default function InboxTableView({
     if (propAccountId && propAccountId !== accountId) {
       accountGenRef.current += 1
       detailAbortRef.current?.abort()
+      detailInFlightRef.current = null
       abortRef.current?.abort()
       folderAbortRef.current?.abort()
       folderLoadingAccountRef.current = null
@@ -289,6 +292,7 @@ export default function InboxTableView({
     const handleLogout = () => {
       accountGenRef.current += 1
       detailAbortRef.current?.abort()
+      detailInFlightRef.current = null
       abortRef.current?.abort()
       folderAbortRef.current?.abort()
       folderLoadingAccountRef.current = null
@@ -308,6 +312,7 @@ export default function InboxTableView({
       if (!targetId || targetId === accountId) {
         accountGenRef.current += 1
         detailAbortRef.current?.abort()
+        detailInFlightRef.current = null
         abortRef.current?.abort()
         folderAbortRef.current?.abort()
         folderLoadingAccountRef.current = null
@@ -545,12 +550,12 @@ export default function InboxTableView({
     request<InboxResult>(`/api/inbox?${params.toString()}`, {
       signal: controller.signal,
     })
-      .then(async (data) => {
+      .then((data) => {
         if (isStale()) return
         setError('')
         unsupportedRetryRef.current[accountId] = 0
 
-        // 1. 先用本地/模块缓存中已有的正文快速回填
+        // 1. 先用本地/模块缓存中已有的正文快速回填 (零网络成本复用已有缓存)
         let initialMessages = data?.messages || []
         if (data && Array.isArray(data.messages) && data.messages.length > 0) {
           initialMessages = data.messages.map((m) => {
@@ -567,84 +572,16 @@ export default function InboxTableView({
           })
         }
 
-        // 2. 检查当前页可见范围 (至多 limit 封，且单次至多 20) 仍缺失正文的邮件
-        const visibleSlice = initialMessages.slice(0, Math.min(initialMessages.length, limit > 0 ? limit : 20))
-        const targets = visibleSlice
-          .filter((m) => !m.preview && !m.body && Boolean(m.message_ref))
-          .map((m) => ({
-            message_ref: m.message_ref!,
-            folder: m.folder || folder || 'INBOX',
-            uid: m.uid ? String(m.uid) : undefined,
-            id: m.id,
-          }))
-
-        // P0: 优先首屏渲染 (Fast First Paint)
-        // metadata 一旦返回，立即提交 baseResult 并结束 loading，使用户能在第一时间看到邮件列表与关键元数据
+        // PR-MAIL-04: Body-on-demand
+        // /api/inbox 返回 metadata 后直接渲染，不再自动 POST /api/messages，完整正文按需单封读取
         const baseResult = data ? { ...data, messages: initialMessages } : null
         setResult(baseResult)
         if (baseResult) {
           setSnapshot(currentQueryKey, baseResult)
         }
         setLoading(false)
-
-        if (targets.length === 0) {
-          setIsRevalidating(false)
-          isBusyRef.current = false
-          return
-        }
-
-        // 3. 后台单批次补全正文 (Progressive Enrichment)：
-        // 限制至多 20 封单次 POST /api/messages 请求，正文无论慢或失败绝不阻断首屏列表
-        setIsRevalidating(true)
-        const batchTargets = targets.slice(0, 20)
-
-        try {
-          const batch = await request<{ messages?: FullMessage[] }>('/api/messages', {
-            method: 'POST',
-            body: {
-              account_id: accountId,
-              messages: batchTargets,
-            },
-            signal: controller.signal,
-          })
-          if (isStale()) return
-
-          const list = Array.isArray(batch?.messages) ? batch.messages : []
-          const byRef = new Map<string, FullMessage>()
-          list.forEach((fm) => {
-            if (!fm || !fm.message_ref) return
-            const cacheKey = buildMailCacheKey(accountId, fm)
-            setModuleMessageCache(cacheKey, fm)
-            messageCacheRef.current.set(cacheKey, fm)
-            byRef.set(fm.message_ref, fm)
-          })
-
-          if (byRef.size > 0) {
-            const enrichedMessages = initialMessages.map((m) => {
-              if (!m.message_ref) return m
-              const match = byRef.get(m.message_ref)
-              if (!match) return m
-              return {
-                ...m,
-                preview: match.preview || match.body || m.preview,
-                body: match.body || m.body,
-                unread: m.unread ?? match.unread,
-              }
-            })
-            const enrichedResult = data ? { ...data, messages: enrichedMessages } : null
-            setResult(enrichedResult)
-            if (enrichedResult) {
-              setSnapshot(currentQueryKey, enrichedResult)
-            }
-          }
-        } catch {
-          // 后台 enrichment 失败属于渐进增强降级，静默处理，严禁清空 baseResult 或报错覆盖首屏
-        } finally {
-          if (!isStale()) {
-            setIsRevalidating(false)
-            isBusyRef.current = false
-          }
-        }
+        setIsRevalidating(false)
+        isBusyRef.current = false
       })
       .catch((err) => {
         const isAuthError = err instanceof ApiError && (err.status === 401 || err.code === 'AUTH_REQUIRED')
@@ -701,6 +638,7 @@ export default function InboxTableView({
   function handleAccountChange(newAccountId: string) {
     accountGenRef.current += 1
     detailAbortRef.current?.abort()
+    detailInFlightRef.current = null
     abortRef.current?.abort()
     folderAbortRef.current?.abort()
     folderLoadingAccountRef.current = null
@@ -726,12 +664,20 @@ export default function InboxTableView({
       return
     }
 
+    const targetRefOrId = message.message_ref || message.id
+    if (!targetRefOrId) return
+
+    // 连续点击同一封邮件时防止重复请求 (PR-MAIL-04)
+    if (detailInFlightRef.current === targetRefOrId) {
+      return
+    }
+
     detailAbortRef.current?.abort()
     const controller = new AbortController()
     detailAbortRef.current = controller
+    detailInFlightRef.current = targetRefOrId
 
     setDetailLoading(true)
-    const targetRefOrId = message.message_ref || message.id
     try {
       const resp = await getMessageDetail(accountId, targetRefOrId, controller.signal)
       if (
@@ -761,6 +707,9 @@ export default function InboxTableView({
         show(err instanceof ApiError ? err.message : '读取邮件详情失败')
       }
     } finally {
+      if (detailInFlightRef.current === targetRefOrId) {
+        detailInFlightRef.current = null
+      }
       if (sessionGen === moduleSessionGen && currentGen === accountGenRef.current) {
         setDetailLoading(false)
       }
