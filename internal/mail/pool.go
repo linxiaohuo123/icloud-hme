@@ -20,6 +20,10 @@ import (
 // DefaultMaxConns 默认最大同时持有的 IMAP 长连接数。
 const DefaultMaxConns = 50
 
+// pooledConnHealthCheckInterval 最近活跃连接免 Ping 快速复用窗口 (PR-MAIL-05)。
+// 在此窗口期内最近使用过的长连接直接复用，消除多余的 NOOP 网络 RTT。
+const pooledConnHealthCheckInterval = 30 * time.Second
+
 // Pool 管理按账号复用的 IMAP 长连接。同一账号串行使用(go-imap 非并发安全)。
 // 支持 LRU 驱逐与后台空闲连接主动回收，杜绝千号场景下的 socket 泄漏。
 type Pool struct {
@@ -405,6 +409,12 @@ func (pc *pooledConn) ensure(idleClose time.Duration) (poolEnsureStats, error) {
 		}
 	}
 	if pc.client != nil {
+		// 最近活跃连接免 Ping 直接复用，消除每次请求的 NOOP 网络 RTT (PR-MAIL-05)
+		if !pc.lastUsed.IsZero() && time.Since(pc.lastUsed) <= pooledConnHealthCheckInterval {
+			stats.Reused = true
+			return stats, nil
+		}
+
 		pingStart := time.Now()
 		err := pc.client.Ping()
 		stats.PingMS = time.Since(pingStart).Milliseconds()
@@ -509,4 +519,10 @@ func (p *Pool) TryLockForTesting(appleID string) bool {
 func (p *Pool) UnlockForTesting(appleID string) {
 	pc := p.getOrCreate(appleID)
 	pc.unlock()
+}
+
+// SetLastUsedForTesting 供测试调整连接最后使用时间
+func (p *Pool) SetLastUsedForTesting(appleID string, t time.Time) {
+	pc := p.getOrCreate(appleID)
+	pc.lastUsed = t
 }
