@@ -242,6 +242,18 @@ export default function InboxTableView({
   const messageCacheRef = useRef<Map<string, FullMessage>>(new Map())
   const hasAccountsLoadedRef = useRef(Boolean(accountSummary))
 
+  // 统一详情生命周期管理 (FIX-1)：在切账号、登出、关闭或换邮件时彻底取消在途请求并重置状态
+  const resetDetailState = useCallback((clearDetail = true) => {
+    detailAbortRef.current?.abort()
+    detailAbortRef.current = null
+    detailInFlightRef.current = null
+    setDetailLoading(false)
+
+    if (clearDetail) {
+      setDetail(null)
+    }
+  }, [])
+
   useEffect(() => {
     return () => {
       detailAbortRef.current?.abort()
@@ -261,8 +273,7 @@ export default function InboxTableView({
   useEffect(() => {
     if (propAccountId && propAccountId !== accountId) {
       accountGenRef.current += 1
-      detailAbortRef.current?.abort()
-      detailInFlightRef.current = null
+      resetDetailState()
       abortRef.current?.abort()
       folderAbortRef.current?.abort()
       folderLoadingAccountRef.current = null
@@ -273,7 +284,7 @@ export default function InboxTableView({
       setFolder('INBOX')
       setFolders(getCachedFolders(propAccountId) || [])
     }
-  }, [propAccountId, accountId])
+  }, [propAccountId, accountId, resetDetailState])
 
   // 监听外部 initialAlias 变更（工作台别名联动）
   useEffect(() => {
@@ -291,8 +302,7 @@ export default function InboxTableView({
   useEffect(() => {
     const handleLogout = () => {
       accountGenRef.current += 1
-      detailAbortRef.current?.abort()
-      detailInFlightRef.current = null
+      resetDetailState()
       abortRef.current?.abort()
       folderAbortRef.current?.abort()
       folderLoadingAccountRef.current = null
@@ -303,7 +313,6 @@ export default function InboxTableView({
       setLoading(false)
       setResult(null)
       setFolders([])
-      setDetail(null)
     }
 
     const handleAccountUpdated = (e: Event) => {
@@ -311,8 +320,7 @@ export default function InboxTableView({
       const targetId = customEvent.detail?.accountId
       if (!targetId || targetId === accountId) {
         accountGenRef.current += 1
-        detailAbortRef.current?.abort()
-        detailInFlightRef.current = null
+        resetDetailState()
         abortRef.current?.abort()
         folderAbortRef.current?.abort()
         folderLoadingAccountRef.current = null
@@ -332,7 +340,7 @@ export default function InboxTableView({
       window.removeEventListener('auth-logout', handleLogout)
       window.removeEventListener('account-updated', handleAccountUpdated)
     }
-  }, [accountId])
+  }, [accountId, resetDetailState])
 
   const prevAccountConfigRef = useRef('')
   useEffect(() => {
@@ -340,6 +348,7 @@ export default function InboxTableView({
     const configSig = `${accountSummary.id}:${accountSummary.has_app_password}:${accountSummary.mailbox?.email || ''}:${accountSummary.mailbox?.imap_host || ''}:${accountSummary.has_proxy}:${accountSummary.status}:${accountSummary.last_validated}`
     if (prevAccountConfigRef.current && prevAccountConfigRef.current !== configSig) {
       accountGenRef.current += 1
+      resetDetailState()
       abortRef.current?.abort()
       isBusyRef.current = false
       messageCacheRef.current.clear()
@@ -347,7 +356,7 @@ export default function InboxTableView({
       setRetryKey((k) => k + 1)
     }
     prevAccountConfigRef.current = configSig
-  }, [accountSummary])
+  }, [accountSummary, resetDetailState])
 
   // 自动刷新轮询定时器：页面在后台时暂停，在途请求未完成（包括后台 revalidate 与正文补全）时跳过打断
   useEffect(() => {
@@ -637,8 +646,7 @@ export default function InboxTableView({
 
   function handleAccountChange(newAccountId: string) {
     accountGenRef.current += 1
-    detailAbortRef.current?.abort()
-    detailInFlightRef.current = null
+    resetDetailState()
     abortRef.current?.abort()
     folderAbortRef.current?.abort()
     folderLoadingAccountRef.current = null
@@ -661,10 +669,7 @@ export default function InboxTableView({
     const cached = moduleMessageCache.get(primaryKey) || messageCacheRef.current.get(primaryKey)
     if (cached) {
       // 边界 1：切换到已缓存邮件时，立即使任何在途未完成详情请求失效并重置状态，防止旧请求晚到覆盖当前视图
-      detailAbortRef.current?.abort()
-      detailAbortRef.current = null
-      detailInFlightRef.current = null
-      setDetailLoading(false)
+      resetDetailState(false)
       setDetail(cached)
       return
     }
@@ -683,6 +688,7 @@ export default function InboxTableView({
     detailAbortRef.current = controller
     detailInFlightRef.current = targetRefOrId
 
+    setDetail(null)
     setDetailLoading(true)
     try {
       const resp = await getMessageDetail(accountId, targetRefOrId, controller.signal)
@@ -724,7 +730,7 @@ export default function InboxTableView({
         }
       }
     }
-  }, [accountId, show])
+  }, [accountId, show, resetDetailState])
 
   const deleteMessage = useCallback(async () => {
     if (!deleteFor) return
@@ -739,7 +745,7 @@ export default function InboxTableView({
       moduleMessageCache.delete(key)
       messageCacheRef.current.delete(key)
       setDeleteFor(null)
-      setDetail(null)
+      resetDetailState()
       show('邮件已删除')
       setRetryKey((k) => k + 1)
     } catch (err) {
@@ -747,7 +753,7 @@ export default function InboxTableView({
     } finally {
       setDeleting(false)
     }
-  }, [deleteFor, accountId, show])
+  }, [deleteFor, accountId, show, resetDetailState])
 
   const handleCopyCode = useCallback(async (code: string) => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current)
@@ -1039,7 +1045,7 @@ export default function InboxTableView({
       <MailDetailDialog
         detail={detail}
         loading={detailLoading}
-        onClose={() => setDetail(null)}
+        onClose={() => resetDetailState()}
         onCopySuccess={(msg) => {
           show(msg)
           onCopySuccess?.(msg)

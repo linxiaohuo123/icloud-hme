@@ -22,14 +22,15 @@ import (
 )
 
 type mockMailItem struct {
-	SeqNum      uint32
-	UID         uint32
-	DateStr     string // "26-Sep-2026 00:00:00 +0000"
-	Subject     string
-	FromAddr    string
-	ToAddr      string
-	DeliveredTo string
-	Body        string
+	SeqNum           uint32
+	UID              uint32
+	DateStr          string // "26-Sep-2026 00:00:00 +0000"
+	Subject          string
+	FromAddr         string
+	ToAddr           string
+	DeliveredTo      string
+	XAppleOriginalTo string
+	Body             string
 }
 
 func (m mockMailItem) headerLiteral() string {
@@ -39,6 +40,9 @@ func (m mockMailItem) headerLiteral() string {
 	}
 	if m.DeliveredTo != "" {
 		b.WriteString(fmt.Sprintf("Delivered-To: %s\r\n", m.DeliveredTo))
+	}
+	if m.XAppleOriginalTo != "" {
+		b.WriteString(fmt.Sprintf("X-Apple-Original-To: %s\r\n", m.XAppleOriginalTo))
 	}
 	if m.FromAddr != "" {
 		b.WriteString(fmt.Sprintf("From: %s\r\n", m.FromAddr))
@@ -101,6 +105,9 @@ type mockServerOption func(*mockServerSettings)
 type mockServerSettings struct {
 	failUIDMetadataAfterN   int
 	failFetchMetadataAfterN int
+	searchHeaderUIDs        map[string][]uint32
+	folderMails             map[string]map[uint32]mockMailItem
+	folderSearchUIDs        map[string][]uint32
 }
 
 func withFailUIDMetadataAfter(n int) mockServerOption {
@@ -109,6 +116,17 @@ func withFailUIDMetadataAfter(n int) mockServerOption {
 
 func withFailFetchMetadataAfter(n int) mockServerOption {
 	return func(s *mockServerSettings) { s.failFetchMetadataAfterN = n }
+}
+
+func withSearchHeaderUIDs(m map[string][]uint32) mockServerOption {
+	return func(s *mockServerSettings) { s.searchHeaderUIDs = m }
+}
+
+func withFolderMails(fm map[string]map[uint32]mockMailItem, fs map[string][]uint32) mockServerOption {
+	return func(s *mockServerSettings) {
+		s.folderMails = fm
+		s.folderSearchUIDs = fs
+	}
 }
 
 func spinMockMailServer(t *testing.T, totalMessages int, searchUIDs []uint32, mails map[uint32]mockMailItem, opts ...mockServerOption) (port int, getCommands func() []string, stop func()) {
@@ -148,6 +166,36 @@ func spinMockMailServer(t *testing.T, totalMessages int, searchUIDs []uint32, ma
 		}
 
 		reader := bufio.NewReader(conn)
+		currentFolder := "INBOX"
+
+		getActiveSortedMails := func() []mockMailItem {
+			if settings.folderMails != nil && settings.folderMails[currentFolder] != nil {
+				var list []mockMailItem
+				for _, m := range settings.folderMails[currentFolder] {
+					list = append(list, m)
+				}
+				sort.Slice(list, func(i, j int) bool { return list[i].SeqNum < list[j].SeqNum })
+				return list
+			}
+			return sortedMails
+		}
+
+		getActiveSearchUIDs := func(trimmedLine string) []uint32 {
+			if settings.folderSearchUIDs != nil && settings.folderSearchUIDs[currentFolder] != nil {
+				return settings.folderSearchUIDs[currentFolder]
+			}
+			if len(settings.searchHeaderUIDs) > 0 {
+				upperLine := strings.ToUpper(trimmedLine)
+				for h, uids := range settings.searchHeaderUIDs {
+					if strings.Contains(upperLine, "HEADER "+strings.ToUpper(h)) {
+						return uids
+					}
+				}
+				return nil
+			}
+			return searchUIDs
+		}
+
 		for {
 			line, rerr := reader.ReadString('\n')
 			if rerr != nil {
@@ -172,13 +220,23 @@ func spinMockMailServer(t *testing.T, totalMessages int, searchUIDs []uint32, ma
 				return
 			case "LOGIN":
 				_, _ = conn.Write([]byte(tag + " OK Logged in\r\n"))
+			case "LIST":
+				_, _ = conn.Write([]byte("* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\HasNoChildren \\Junk) \"/\" \"Junk\"\r\n" + tag + " OK LIST completed\r\n"))
 			case "SELECT", "EXAMINE":
-				resp := fmt.Sprintf("* %d EXISTS\r\n* OK [UIDVALIDITY 1000] UIDs valid\r\n* OK [UIDNEXT 9999] Predicted next UID\r\n%s OK [READ-ONLY] %s completed\r\n", totalMessages, tag, cmd)
+				if len(fields) >= 3 {
+					currentFolder = strings.Trim(fields[2], "\"")
+				}
+				folderCount := totalMessages
+				if settings.folderMails != nil && settings.folderMails[currentFolder] != nil {
+					folderCount = len(settings.folderMails[currentFolder])
+				}
+				resp := fmt.Sprintf("* %d EXISTS\r\n* OK [UIDVALIDITY 1000] UIDs valid\r\n* OK [UIDNEXT 9999] Predicted next UID\r\n%s OK [READ-ONLY] %s completed\r\n", folderCount, tag, cmd)
 				_, _ = conn.Write([]byte(resp))
 			case "UID":
 				if len(fields) >= 3 && strings.ToUpper(fields[2]) == "SEARCH" {
+					uids := getActiveSearchUIDs(trimmed)
 					var uidStrs []string
-					for _, u := range searchUIDs {
+					for _, u := range uids {
 						uidStrs = append(uidStrs, strconv.Itoa(int(u)))
 					}
 					resp := "* SEARCH"
@@ -193,7 +251,7 @@ func spinMockMailServer(t *testing.T, totalMessages int, searchUIDs []uint32, ma
 					var resps []string
 					metadataSent := 0
 					failed := false
-					for _, mail := range sortedMails {
+					for _, mail := range getActiveSortedMails() {
 						if seqsetContainsUID(fields[3], mail.UID) {
 							fUser, fHost := parseAddrParts(mail.FromAddr)
 							tUser, tHost := parseAddrParts(mail.ToAddr)
@@ -228,7 +286,7 @@ func spinMockMailServer(t *testing.T, totalMessages int, searchUIDs []uint32, ma
 				var resps []string
 				metadataSent := 0
 				failed := false
-				for _, mail := range sortedMails {
+				for _, mail := range getActiveSortedMails() {
 					if seqsetContainsUID(fields[2], mail.SeqNum) {
 						fUser, fHost := parseAddrParts(mail.FromAddr)
 						tUser, tHost := parseAddrParts(mail.ToAddr)
@@ -1020,6 +1078,321 @@ func TestRecentFallback_PartialMetadataFetchFailure_PreservesCandidateCount(t *t
 	for k, want := range assertKV {
 		if got, _ := findKV(perfKV, k); got != want {
 			t.Errorf("MailPerf %s = %q, want %q", k, got, want)
+		}
+	}
+}
+
+// TestAliasSearch_MultiHeaderUnionAndNewestFirst (FIX-2) 验证 Alias 搜索遍历全部计划 Header 且不提前 break：
+// limit=2
+// To SEARCH 命中 UID 10, 20
+// Delivered-To SEARCH 命中 UID 30 (最新邮件)
+// 必须完成所有 Header SEARCH，Union 并按 newest-first 排序后返回 UID 30, 20，绝不因 To 搜满 limit 漏掉 30。
+func TestAliasSearch_MultiHeaderUnionAndNewestFirst(t *testing.T) {
+	mails := map[uint32]mockMailItem{
+		10: {SeqNum: 1, UID: 10, DateStr: "26-Sep-2026 01:00:00 +0000", Subject: "旧邮件10", ToAddr: "alias@icloud.com", Body: "正文10"},
+		20: {SeqNum: 2, UID: 20, DateStr: "26-Sep-2026 02:00:00 +0000", Subject: "较新邮件20", ToAddr: "alias@icloud.com", Body: "正文20"},
+		30: {SeqNum: 3, UID: 30, DateStr: "26-Sep-2026 03:00:00 +0000", Subject: "最新邮件30", DeliveredTo: "alias@icloud.com", Body: "正文30"},
+	}
+
+	headerUIDs := map[string][]uint32{
+		"To":           {10, 20},
+		"Delivered-To": {30},
+	}
+
+	port, _, stop := spinMockMailServer(t, 3, nil, mails, withSearchHeaderUIDs(headerUIDs))
+	defer stop()
+
+	c := createTestClient(t, port)
+	defer c.Disconnect()
+
+	msgs, err := c.FindByRecipientInFolder("alias@icloud.com", "INBOX", 2, 7)
+	if err != nil {
+		t.Fatalf("FindByRecipientInFolder failed: %v", err)
+	}
+
+	if len(msgs) != 2 {
+		t.Fatalf("期望返回 2 封邮件, 实际返回 %d", len(msgs))
+	}
+
+	if msgs[0].UID != 30 {
+		t.Errorf("第一封期望是最新邮件 UID 30, 实际得到 UID %d", msgs[0].UID)
+	}
+	if msgs[1].UID != 20 {
+		t.Errorf("第二封期望是 UID 20, 实际得到 UID %d", msgs[1].UID)
+	}
+}
+
+// TestFolderAll_GlobalNewestFirst (FIX-4) 验证 folder=all 多文件夹聚合按全局 newest-first 排序：
+// INBOX 包含旧邮件 (UID 10, 01:00:00)
+// Junk 包含更新的邮件 (UID 20, 02:00:00)
+// limit=1 时，必须检索全部文件夹候选并全局排序，返回 Junk 中的更新邮件 UID 20，绝不因 INBOX 已达 limit 截断。
+func TestFolderAll_GlobalNewestFirst(t *testing.T) {
+	inboxMails := map[uint32]mockMailItem{
+		10: {SeqNum: 1, UID: 10, DateStr: "26-Sep-2026 01:00:00 +0000", Subject: "旧邮件INBOX", ToAddr: "alias@icloud.com", Body: "正文旧"},
+	}
+	junkMails := map[uint32]mockMailItem{
+		20: {SeqNum: 1, UID: 20, DateStr: "26-Sep-2026 02:00:00 +0000", Subject: "新邮件Junk", ToAddr: "alias@icloud.com", Body: "正文新"},
+	}
+
+	folderMails := map[string]map[uint32]mockMailItem{
+		"INBOX": inboxMails,
+		"Junk":  junkMails,
+	}
+	folderSearchUIDs := map[string][]uint32{
+		"INBOX": {10},
+		"Junk":  {20},
+	}
+
+	port, _, stop := spinMockMailServer(t, 1, nil, nil,
+		withFolderMails(folderMails, folderSearchUIDs),
+	)
+	defer stop()
+
+	c := createTestClient(t, port)
+	defer c.Disconnect()
+
+	msgs, err := c.FindByRecipientInFolder("alias@icloud.com", "all", 1, 7)
+	if err != nil {
+		t.Fatalf("FindByRecipientInFolder failed: %v", err)
+	}
+
+	if len(msgs) != 1 {
+		t.Fatalf("期望返回 1 封邮件, 实际返回 %d", len(msgs))
+	}
+
+	if msgs[0].UID != 20 {
+		t.Errorf("期望返回 Junk 中更新的邮件 UID 20, 实际得到 UID %d", msgs[0].UID)
+	}
+	if msgs[0].Subject != "新邮件Junk" {
+		t.Errorf("期望返回主题「新邮件Junk」, 实际得到 %s", msgs[0].Subject)
+	}
+}
+
+// TestAliasSearch_PartialDirectSearchFallback (PR-21 Final Bugfix) 验证 Direct SEARCH 结果少于 limit 时的补齐与排序：
+// limit = 2
+// UID 10: 旧邮件 (01:00:00), To: alias@icloud.com (Direct SEARCH 命中)
+// UID 30: 最新邮件 (02:00:00), To: rewritten@example.com, X-Apple-Original-To: alias@icloud.com (Direct SEARCH 无法命中, Recent Fallback 命中)
+// 验证点：
+// 1. 最终返回 2 封邮件
+// 2. 顺序必须是 30 -> 10 (newest-first)
+// 3. UID 10 不发生重复 BODY FETCH
+func TestAliasSearch_PartialDirectSearchFallback(t *testing.T) {
+	mails := map[uint32]mockMailItem{
+		10: {
+			SeqNum:   1,
+			UID:      10,
+			DateStr:  "26-Sep-2026 01:00:00 +0000",
+			Subject:  "旧邮件Direct",
+			ToAddr:   "alias@icloud.com",
+			Body:     "正文10",
+		},
+		30: {
+			SeqNum:           2,
+			UID:              30,
+			DateStr:          "26-Sep-2026 02:00:00 +0000",
+			Subject:          "新邮件Fallback",
+			ToAddr:           "rewritten@example.com",
+			XAppleOriginalTo: "alias@icloud.com",
+			Body:             "正文30",
+		},
+	}
+	// Direct SEARCH 只能搜到 UID 10
+	searchUIDs := []uint32{10}
+
+	port, getCommands, stop := spinMockMailServer(t, 2, searchUIDs, mails)
+	defer stop()
+
+	c := createTestClient(t, port)
+	defer c.Disconnect()
+
+	msgs, err := c.FindByRecipientInFolder("alias@icloud.com", "INBOX", 2, 7)
+	if err != nil {
+		t.Fatalf("FindByRecipientInFolder failed: %v", err)
+	}
+
+	if len(msgs) != 2 {
+		t.Fatalf("期望返回 2 封邮件, 实际返回 %d", len(msgs))
+	}
+
+	if msgs[0].UID != 30 {
+		t.Errorf("第一封期望是最新邮件 UID 30, 实际得到 UID %d", msgs[0].UID)
+	}
+	if msgs[1].UID != 10 {
+		t.Errorf("第二封期望是旧邮件 UID 10, 实际得到 UID %d", msgs[1].UID)
+	}
+
+	// 验证未发生重复 BODY FETCH：检查发给服务端的命令
+	cmds := getCommands()
+	bodyFetch10Count := 0
+	for _, cmd := range cmds {
+		upper := strings.ToUpper(cmd)
+		if strings.Contains(upper, "FETCH") && (strings.Contains(upper, "BODY[]") || strings.Contains(upper, "BODY.PEEK[]")) {
+			if strings.Contains(cmd, " 10 ") || strings.HasSuffix(cmd, " 10") || strings.Contains(cmd, "10:10") || strings.Contains(cmd, " 10 (") {
+				bodyFetch10Count++
+			}
+		}
+	}
+	if bodyFetch10Count > 1 {
+		t.Errorf("UID 10 的 BODY FETCH 执行了 %d 次，存在重复抓取正文", bodyFetch10Count)
+	}
+}
+
+// TestCase1_PartialDirectDisplacedByNewerFallback 验证 partial direct (UID 10) 被多个 fallback 新邮件 (UID 40, 30) 挤掉：
+// limit = 2
+// Direct: UID 10 (01:00:00)
+// Fallback-only: UID 30 (02:00:00), UID 40 (03:00:00)
+// 最终结果必须为 40, 30 (UID 10 被淘汰出 Top 2)，且 UID 10 绝不能先拉正文。
+func TestCase1_PartialDirectDisplacedByNewerFallback(t *testing.T) {
+	mails := map[uint32]mockMailItem{
+		10: {
+			SeqNum:   1,
+			UID:      10,
+			DateStr:  "26-Sep-2026 01:00:00 +0000",
+			Subject:  "旧邮件Direct10",
+			ToAddr:   "alias@icloud.com",
+			Body:     "正文10",
+		},
+		30: {
+			SeqNum:           2,
+			UID:              30,
+			DateStr:          "26-Sep-2026 02:00:00 +0000",
+			Subject:          "新邮件Fallback30",
+			ToAddr:           "rewritten@example.com",
+			XAppleOriginalTo: "alias@icloud.com",
+			Body:             "正文30",
+		},
+		40: {
+			SeqNum:           3,
+			UID:              40,
+			DateStr:          "26-Sep-2026 03:00:00 +0000",
+			Subject:          "最新邮件Fallback40",
+			ToAddr:           "rewritten@example.com",
+			XAppleOriginalTo: "alias@icloud.com",
+			Body:             "正文40",
+		},
+	}
+	// Direct SEARCH 只能搜到 UID 10
+	searchUIDs := []uint32{10}
+
+	port, getCommands, stop := spinMockMailServer(t, 3, searchUIDs, mails)
+	defer stop()
+
+	c := createTestClient(t, port)
+	defer c.Disconnect()
+
+	msgs, err := c.FindByRecipientInFolder("alias@icloud.com", "INBOX", 2, 7)
+	if err != nil {
+		t.Fatalf("FindByRecipientInFolder failed: %v", err)
+	}
+
+	if len(msgs) != 2 {
+		t.Fatalf("期望返回 2 封邮件, 实际返回 %d", len(msgs))
+	}
+
+	if msgs[0].UID != 40 {
+		t.Errorf("第一封期望是最新邮件 UID 40, 实际得到 UID %d", msgs[0].UID)
+	}
+	if msgs[1].UID != 30 {
+		t.Errorf("第二封期望是 UID 30, 实际得到 UID %d", msgs[1].UID)
+	}
+
+	// 证明 UID 10 不应该进入最终结果
+	for _, m := range msgs {
+		if m.UID == 10 {
+			t.Errorf("UID 10 不应当进入最终结果")
+		}
+	}
+
+	// 证明 BODY FETCH 必须只拉 UID 30, 40，绝不能拉 UID 10
+	cmds := getCommands()
+	for _, cmd := range cmds {
+		upper := strings.ToUpper(cmd)
+		if strings.Contains(upper, "FETCH") && (strings.Contains(upper, "BODY[]") || strings.Contains(upper, "BODY.PEEK[]")) {
+			if strings.Contains(cmd, " 10 ") || strings.HasSuffix(cmd, " 10") || strings.Contains(cmd, "10:10") || strings.Contains(cmd, " 10 (") {
+				t.Fatalf("UID 10 被淘汰出 Top 2，绝不能执行 BODY FETCH，实际执行了命令: %s", cmd)
+			}
+		}
+	}
+}
+
+// TestCase2_FullDirectDisplacedByNewerFallback 验证 direct 已满 limit (UID 10, 20) 仍不能提前返回，必须被 fallback 最新邮件 (UID 40, 30) 替代：
+// limit = 2
+// Direct: UID 10 (01:00:00), UID 20 (02:00:00)
+// Fallback-only: UID 30 (03:00:00), UID 40 (04:00:00)
+// 最终结果必须为 40, 30 (而不是 20, 10)，且最终只拉取 40, 30 的 BODY。
+func TestCase2_FullDirectDisplacedByNewerFallback(t *testing.T) {
+	mails := map[uint32]mockMailItem{
+		10: {
+			SeqNum:   1,
+			UID:      10,
+			DateStr:  "26-Sep-2026 01:00:00 +0000",
+			Subject:  "旧邮件Direct10",
+			ToAddr:   "alias@icloud.com",
+			Body:     "正文10",
+		},
+		20: {
+			SeqNum:   2,
+			UID:      20,
+			DateStr:  "26-Sep-2026 02:00:00 +0000",
+			Subject:  "旧邮件Direct20",
+			ToAddr:   "alias@icloud.com",
+			Body:     "正文20",
+		},
+		30: {
+			SeqNum:           3,
+			UID:              30,
+			DateStr:          "26-Sep-2026 03:00:00 +0000",
+			Subject:          "新邮件Fallback30",
+			ToAddr:           "rewritten@example.com",
+			XAppleOriginalTo: "alias@icloud.com",
+			Body:             "正文30",
+		},
+		40: {
+			SeqNum:           4,
+			UID:              40,
+			DateStr:          "26-Sep-2026 04:00:00 +0000",
+			Subject:          "最新邮件Fallback40",
+			ToAddr:           "rewritten@example.com",
+			XAppleOriginalTo: "alias@icloud.com",
+			Body:             "正文40",
+		},
+	}
+	// Direct SEARCH 搜出 UID 10, 20 (满 2 条)
+	searchUIDs := []uint32{10, 20}
+
+	port, getCommands, stop := spinMockMailServer(t, 4, searchUIDs, mails)
+	defer stop()
+
+	c := createTestClient(t, port)
+	defer c.Disconnect()
+
+	msgs, err := c.FindByRecipientInFolder("alias@icloud.com", "INBOX", 2, 7)
+	if err != nil {
+		t.Fatalf("FindByRecipientInFolder failed: %v", err)
+	}
+
+	if len(msgs) != 2 {
+		t.Fatalf("期望返回 2 封邮件, 实际返回 %d", len(msgs))
+	}
+
+	if msgs[0].UID != 40 {
+		t.Errorf("第一封期望是最新邮件 UID 40, 实际得到 UID %d", msgs[0].UID)
+	}
+	if msgs[1].UID != 30 {
+		t.Errorf("第二封期望是 UID 30, 实际得到 UID %d", msgs[1].UID)
+	}
+
+	// 证明 BODY FETCH 绝不能拉取已淘汰的 UID 10, 20
+	cmds := getCommands()
+	for _, cmd := range cmds {
+		upper := strings.ToUpper(cmd)
+		if strings.Contains(upper, "FETCH") && (strings.Contains(upper, "BODY[]") || strings.Contains(upper, "BODY.PEEK[]")) {
+			if strings.Contains(cmd, " 10 ") || strings.HasSuffix(cmd, " 10") || strings.Contains(cmd, "10:10") || strings.Contains(cmd, " 10 (") {
+				t.Fatalf("UID 10 被淘汰，绝不能拉取 BODY，实际命令: %s", cmd)
+			}
+			if strings.Contains(cmd, " 20 ") || strings.HasSuffix(cmd, " 20") || strings.Contains(cmd, "20:20") || strings.Contains(cmd, " 20 (") {
+				t.Fatalf("UID 20 被淘汰，绝不能拉取 BODY，实际命令: %s", cmd)
+			}
 		}
 	}
 }

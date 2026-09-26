@@ -404,3 +404,28 @@ func TestPoolEnsure_StaleConnectionPings(t *testing.T) {
 		t.Fatalf("超时未收到 NOOP Ping")
 	}
 }
+
+func TestPoolDoContext_DeadConnectionDiscarded(t *testing.T) {
+	p := NewPool()
+	defer p.Close()
+
+	account := "deadconn@icloud.com"
+	pass := "dummy_pass"
+	mockClient := &Client{}
+	p.SetClientForTesting(account, pass, mockClient)
+
+	err := p.DoContext(context.Background(), account, pass, "", func(c *Client) error {
+		return errors.New("imap: connection closed")
+	})
+	if err == nil {
+		t.Fatalf("DoContext 应当返回错误")
+	}
+	if !strings.Contains(err.Error(), "connection closed") {
+		t.Fatalf("期望得到 connection closed 错误，实际为: %v", err)
+	}
+
+	// 断言：该 client 已被从池中清掉
+	if cli := p.ClientForTesting(account); cli != nil {
+		t.Fatalf("连接发生 dead connection 错误后应当从池中清掉，但依然存在: %v", cli)
+	}
+}

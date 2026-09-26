@@ -557,28 +557,63 @@ func (c *Client) ForEachByRecipientInFolderSince(recipient string, folder string
 		return err
 	}
 
+	if len(folders) <= 1 {
+		folderName := "INBOX"
+		if len(folders) == 1 {
+			folderName = folders[0]
+		}
+		return c.forEachByRecipientInMailbox(recipient, folderName, limit, days, sinceUID, onMsg)
+	}
+
+	// 多文件夹聚合模式 (例如 folder=all 对应 INBOX + Junk，FIX-4)：
+	// 每一个文件夹各自检索其有限候选 (不超过 limit)，最后全局聚合、去重并按 newest-first 排序截断，
+	// 杜绝因 INBOX 满足 limit 就过早放弃扫描包含更新邮件的 Junk 文件夹
+	var allMsgs []Message
+	seenRefs := make(map[string]struct{})
 	var folderErrors []string
 	successFolders := 0
-	stop := false
-	wrappedOnMsg := func(m Message) bool {
-		cont := onMsg(m)
-		if !cont {
-			stop = true
-		}
-		return cont
-	}
+
 	for _, name := range folders {
-		if stop {
-			break
-		}
-		if err := c.forEachByRecipientInMailbox(recipient, name, limit, days, sinceUID, wrappedOnMsg); err != nil {
+		var folderMsgs []Message
+		err := c.forEachByRecipientInMailbox(recipient, name, limit, days, sinceUID, func(m Message) bool {
+			folderMsgs = append(folderMsgs, m)
+			return len(folderMsgs) < limit
+		})
+		if err != nil {
 			folderErrors = append(folderErrors, fmt.Sprintf("%s: %v", name, err))
 			continue
 		}
 		successFolders++
+		for _, m := range folderMsgs {
+			key := m.MessageRef
+			if key == "" {
+				key = fmt.Sprintf("%s:%d:%d", m.Folder, m.UIDValidity, m.UID)
+			}
+			if _, ok := seenRefs[key]; !ok {
+				seenRefs[key] = struct{}{}
+				allMsgs = append(allMsgs, m)
+			}
+		}
 	}
 	if len(folders) > 0 && successFolders == 0 {
 		return fmt.Errorf("所有文件夹检索均失败: %s", strings.Join(folderErrors, "; "))
+	}
+
+	// 全局 newest-first 排序 (优先按 Date RFC3339 降序，Date 相同时按 UID 降序)
+	sort.SliceStable(allMsgs, func(i, j int) bool {
+		if allMsgs[i].Date != allMsgs[j].Date {
+			return allMsgs[i].Date > allMsgs[j].Date
+		}
+		return allMsgs[i].UID > allMsgs[j].UID
+	})
+	if limit > 0 && len(allMsgs) > limit {
+		allMsgs = allMsgs[:limit]
+	}
+
+	for _, m := range allMsgs {
+		if !onMsg(m) {
+			break
+		}
 	}
 	return nil
 }
@@ -599,6 +634,14 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 	var allUIDs []uint32
 	fallback := false
 	matchedCount := 0
+
+	var fallbackBodyRequested, fallbackBodyReceived int
+	var fbMetadataReq, fbMetadataRecv int
+	var fbFetchMS int64
+	var fbCandsCount int
+	var fbErr error
+	var fbOpStart time.Time
+
 	defer func() {
 		LogMailPerf("find_by_recipient",
 			"server", c.perfServer(),
@@ -620,6 +663,26 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 			"total_ms", time.Since(opStart).Milliseconds(),
 			"err", retErr != nil,
 		)
+	}()
+
+	defer func() {
+		if fallback {
+			LogMailPerf("recent_fallback",
+				"server", c.perfServer(),
+				"folder", folder,
+				"recipient", MaskEmailForLog(recipient),
+				"select_ms", selectMS,
+				"fetch_ms", fbFetchMS,
+				"metadata_fetch_requested", fbMetadataReq,
+				"metadata_fetch_received", fbMetadataRecv,
+				"candidate_count", fbCandsCount,
+				"body_fetch_requested", fallbackBodyRequested,
+				"body_fetch_received", fallbackBodyReceived,
+				"matched", fallbackBodyReceived,
+				"total_ms", time.Since(fbOpStart).Milliseconds(),
+				"err", fbErr != nil,
+			)
+		}
 	}()
 
 	// 1) 服务端按 Header 检索并 Union 去重
@@ -662,17 +725,29 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 				}
 			}
 		}
-		// 性能关键优化：如果当前已搜出足够数量的 UID（>= limit），立即短路返回
-		if len(allUIDs) >= limit {
-			break
-		}
 	}
+	// 避免 UID 数量无限放大 (FIX-2)：必须完成所有计划 Header SEARCH 并 Union 去重后，
+	// 优先按 UID newest-first 方向截断保留有限候选 (max(limit*3, 30) 且封顶 100)，再送入 metadata FETCH 与结构化收件人核验
+	sort.Slice(allUIDs, func(i, j int) bool { return allUIDs[i] > allUIDs[j] })
+	maxCandidates := limit * 3
+	if maxCandidates < 30 {
+		maxCandidates = 30
+	}
+	if maxCandidates > 100 {
+		maxCandidates = 100
+	}
+	if limit > 0 && len(allUIDs) > maxCandidates {
+		allUIDs = allUIDs[:maxCandidates]
+	}
+	// 恢复 UID 升序用于 SeqSet 构建
 	sort.Slice(allUIDs, func(i, j int) bool { return allUIDs[i] < allUIDs[j] })
 	uids := allUIDs
 	searchMS = time.Since(searchStart).Milliseconds()
 
+	// Stage 1: Direct SEARCH 阶段，仅检索并拉取元数据候选 (不获取正文，在最终 Top N 确定前严禁拉取正文)
+	var directCandidates []Message
 	if len(uids) > 0 {
-		metadataFetchRequested = len(uids)
+		metadataFetchRequested += len(uids)
 		seqset := new(imap.SeqSet)
 		for _, u := range uids {
 			seqset.AddNum(u)
@@ -692,7 +767,6 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 			done <- c.cli.UidFetch(seqset, items, messages)
 		}()
 
-		var matchedCandidates []Message
 		for msg := range messages {
 			if msg == nil {
 				continue
@@ -710,7 +784,6 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 				}
 			}
 			if m.matches(recipient) {
-				candidateCount++
 				m.UIDValidity = mbox.UidValidity
 				m.UID = msg.Uid
 				m.Provider = "imap"
@@ -721,7 +794,8 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 					UID:         m.UID,
 				}
 				m.MessageRef = ref.Encode()
-				matchedCandidates = append(matchedCandidates, m)
+				directCandidates = append(directCandidates, m)
+				candidateCount = len(directCandidates)
 			}
 		}
 		if err := <-done; err != nil {
@@ -729,54 +803,103 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 			return err
 		}
 		fetchMS += time.Since(fetchStart).Milliseconds()
+	}
 
-		// 只有在元数据阶段结构化收件人确认匹配后，才进入第二阶段拉取完整正文 (PR-MAIL-02)
-		if candidateCount > 0 {
-			// 按新到旧排序 (newest first: UID 降序)
-			sort.SliceStable(matchedCandidates, func(i, j int) bool {
-				return matchedCandidates[i].UID > matchedCandidates[j].UID
-			})
-			if limit > 0 && len(matchedCandidates) > limit {
-				matchedCandidates = matchedCandidates[:limit]
+	// Stage 2: Recent fallback scan 阶段，仅发现最近信件中的元数据候选 (解决 Apple 转发/重写导致的漏信，亦不获取正文)
+	// 若 Direct SEARCH 已经全量涵盖邮箱所有邮件且已找到候选，则无需重复扫最近信件；否则必须执行 fallback 确保不漏最新信
+	var fallbackCandidates []Message
+	needFallback := int(mbox.Messages) > 0 && (len(directCandidates) == 0 || len(allUIDs) < int(mbox.Messages))
+	if needFallback {
+		fallback = true
+		fbOpStart = time.Now()
+		scanLimit := limit
+		if scanLimit <= 0 {
+			scanLimit = 10
+		}
+		fbCands, reqCount, recvCount, fbMS, err := c.findRecentMatchingCandidates(folder, recipient, scanLimit, days, sinceUID)
+		fbFetchMS = fbMS
+		fetchMS += fbMS
+		fbMetadataReq = reqCount
+		fbMetadataRecv = recvCount
+		fbCandsCount = len(fbCands)
+		metadataFetchRequested += reqCount
+		metadataFetchReceived += recvCount
+		if err != nil {
+			fbErr = err
+			return err
+		}
+		fallbackCandidates = fbCands
+	}
+
+	// Stage 3: 合并 metadata candidates、去重、按 newest-first 排序并截断为最终候选 (Top limit)
+	seenUIDs := make(map[uint32]struct{})
+	var candidates []Message
+	for _, m := range append(directCandidates, fallbackCandidates...) {
+		if _, ok := seenUIDs[m.UID]; !ok {
+			seenUIDs[m.UID] = struct{}{}
+			candidates = append(candidates, m)
+		}
+	}
+	candidateCount = len(candidates)
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].Date != candidates[j].Date {
+			return candidates[i].Date > candidates[j].Date
+		}
+		return candidates[i].UID > candidates[j].UID
+	})
+
+	if limit > 0 && len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+
+	// Stage 4: 仅针对最终确认的 Top N 候选邮件执行单次批量 UID FETCH BODY
+	if len(candidates) > 0 {
+		targetUIDs := make([]uint32, 0, len(candidates))
+		for _, c := range candidates {
+			targetUIDs = append(targetUIDs, c.UID)
+		}
+
+		bodyFetchRequested = len(targetUIDs)
+		bodyStart := time.Now()
+		fullMsgs, bodyRecv, err := c.fetchCandidatesBody(folder, mbox.UidValidity, targetUIDs)
+		fetchMS += time.Since(bodyStart).Milliseconds()
+		bodyFetchReceived = bodyRecv
+		if err != nil {
+			return err
+		}
+
+		// 统计来源于 fallback 的候选邮件最终被拉取正文的数量
+		fallbackUIDSet := make(map[uint32]struct{}, len(fallbackCandidates))
+		for _, fc := range fallbackCandidates {
+			fallbackUIDSet[fc.UID] = struct{}{}
+		}
+		for _, u := range targetUIDs {
+			if _, ok := fallbackUIDSet[u]; ok {
+				fallbackBodyRequested++
 			}
-
-			targetUIDs := make([]uint32, 0, len(matchedCandidates))
-			for _, c := range matchedCandidates {
-				targetUIDs = append(targetUIDs, c.UID)
+		}
+		for _, m := range fullMsgs {
+			if _, ok := fallbackUIDSet[m.UID]; ok {
+				fallbackBodyReceived++
 			}
+		}
 
-			bodyFetchRequested = len(targetUIDs)
-			bodyStart := time.Now()
-			fullMsgs, bodyRecv, err := c.fetchCandidatesBody(folder, mbox.UidValidity, targetUIDs)
-			fetchMS += time.Since(bodyStart).Milliseconds()
-			bodyFetchReceived = bodyRecv
-			if err != nil {
-				return err
-			}
+		msgByUID := make(map[uint32]Message, len(fullMsgs))
+		for _, m := range fullMsgs {
+			msgByUID[m.UID] = m
+		}
 
-			// 保持 newest first 排序
-			sort.SliceStable(fullMsgs, func(i, j int) bool {
-				return fullMsgs[i].UID > fullMsgs[j].UID
-			})
-
-			for _, m := range fullMsgs {
-				if sinceUID > 0 && m.UID < sinceUID {
-					continue
-				}
+		for _, cand := range candidates {
+			if m, ok := msgByUID[cand.UID]; ok {
 				matchedCount++
 				if !onMsg(m) {
 					return nil
 				}
 			}
-			if matchedCount > 0 {
-				return nil
-			}
 		}
 	}
-
-	// 2) fallback: 扫最近 N 封信, 本地全文与 Header 深度比对 (解决 Apple 内部转寄重写 To 导致的漏信)
-	fallback = true
-	return c.forEachRecentMatching(folder, recipient, limit, days, sinceUID, onMsg)
+	return nil
 }
 
 // newestUIDs 保留 UID 列表中最新的 limit 个(假定 UID 升序)。
@@ -787,41 +910,15 @@ func newestUIDs(uids []uint32, limit int) []uint32 {
 	return uids[len(uids)-limit:]
 }
 
-// forEachRecentMatching 扫 folder 最近 scan 封信件元数据 (PR-MAIL-02 metadata-first)，仅在确认目标 alias 匹配后单次批量拉取候选正文。
-func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days int, sinceUID uint32, onMsg func(Message) bool) (retErr error) {
-	opStart := time.Now()
-	mailboxStart := time.Now()
+// findRecentMatchingCandidates 扫 folder 最近 scan 封信件元数据 (PR-MAIL-02 metadata-first)，仅做结构化收件人核验返回候选元数据，不拉取正文。
+func (c *Client) findRecentMatchingCandidates(folder, recipient string, limit int, days int, sinceUID uint32) (cands []Message, reqCount, recvCount int, fetchMS int64, retErr error) {
 	mbox, err := c.cli.Select(folder, true)
 	if err != nil {
-		LogMailPerf("recent_fallback", "server", c.perfServer(), "folder", folder, "recipient", MaskEmailForLog(recipient), "select_ms", time.Since(mailboxStart).Milliseconds(), "err", true)
-		return err
+		return nil, 0, 0, 0, err
 	}
-	selectMS := time.Since(mailboxStart).Milliseconds()
-	var fetchMS int64
-	var metadataFetchRequested, metadataFetchReceived int
-	var candidateCount int
-	var bodyFetchRequested, bodyFetchReceived int
-	matched := 0
-	defer func() {
-		LogMailPerf("recent_fallback",
-			"server", c.perfServer(),
-			"folder", folder,
-			"recipient", MaskEmailForLog(recipient),
-			"select_ms", selectMS,
-			"fetch_ms", fetchMS,
-			"metadata_fetch_requested", metadataFetchRequested,
-			"metadata_fetch_received", metadataFetchReceived,
-			"candidate_count", candidateCount,
-			"body_fetch_requested", bodyFetchRequested,
-			"body_fetch_received", bodyFetchReceived,
-			"matched", matched,
-			"total_ms", time.Since(opStart).Milliseconds(),
-			"err", retErr != nil,
-		)
-	}()
 	total := int(mbox.Messages)
 	if total == 0 {
-		return nil
+		return nil, 0, 0, 0, nil
 	}
 	scan := limit * 3
 	if scan < 10 {
@@ -833,7 +930,7 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 	if scan > total {
 		scan = total
 	}
-	metadataFetchRequested = scan
+	reqCount = scan
 	from := mbox.Messages - uint32(scan) + 1
 	seqset := new(imap.SeqSet)
 	seqset.AddRange(from, mbox.Messages)
@@ -854,12 +951,11 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 		done <- c.cli.Fetch(seqset, items, messages)
 	}()
 
-	var cands []Message
 	for msg := range messages {
 		if msg == nil {
 			continue
 		}
-		metadataFetchReceived++
+		recvCount++
 		m := toMessageWithHeaderOnly(msg, section, folder)
 		m.UIDValidity = mbox.UidValidity
 		m.UID = msg.Uid
@@ -883,63 +979,15 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 			continue
 		}
 		if m.matches(recipient) {
-			candidateCount++
 			cands = append(cands, m)
 		}
 	}
 	if err := <-done; err != nil {
-		fetchMS += time.Since(fetchStart).Milliseconds()
-		return err
+		fetchMS = time.Since(fetchStart).Milliseconds()
+		return cands, reqCount, recvCount, fetchMS, err
 	}
-	fetchMS += time.Since(fetchStart).Milliseconds()
-
-	if candidateCount == 0 {
-		return nil
-	}
-
-	// 新邮件在前 (newest first)
-	sort.SliceStable(cands, func(i, j int) bool {
-		if cands[i].Date != cands[j].Date {
-			return cands[i].Date > cands[j].Date
-		}
-		return cands[i].UID > cands[j].UID
-	})
-	if limit > 0 && len(cands) > limit {
-		cands = cands[:limit]
-	}
-
-	targetUIDs := make([]uint32, 0, len(cands))
-	for _, cand := range cands {
-		targetUIDs = append(targetUIDs, cand.UID)
-	}
-
-	// Stage 2: Candidate Body Fetch — 批量获取已匹配候选的完整正文 (PR-MAIL-02)
-	bodyFetchRequested = len(targetUIDs)
-	bodyStart := time.Now()
-	bodyMsgs, bodyRecv, err := c.fetchCandidatesBody(folder, mbox.UidValidity, targetUIDs)
-	fetchMS += time.Since(bodyStart).Milliseconds()
-	bodyFetchReceived = bodyRecv
-	if err != nil {
-		return err
-	}
-
-	sort.SliceStable(bodyMsgs, func(i, j int) bool {
-		if bodyMsgs[i].Date != bodyMsgs[j].Date {
-			return bodyMsgs[i].Date > bodyMsgs[j].Date
-		}
-		return bodyMsgs[i].UID > bodyMsgs[j].UID
-	})
-
-	for _, m := range bodyMsgs {
-		if sinceUID > 0 && m.UID < sinceUID {
-			continue
-		}
-		matched++
-		if !onMsg(m) {
-			return nil
-		}
-	}
-	return nil
+	fetchMS = time.Since(fetchStart).Milliseconds()
+	return cands, reqCount, recvCount, fetchMS, nil
 }
 
 // fetchCandidatesBody 单次 IMAP UID FETCH 批量拉取一组已匹配候选邮件的完整正文 (PR-MAIL-02)。

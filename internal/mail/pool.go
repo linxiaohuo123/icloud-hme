@@ -197,23 +197,26 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 	opStart := time.Now()
 	err := fn(cli)
 	perf.opMS = time.Since(opStart).Milliseconds()
-	pc.lastUsed = time.Now()
 
 	// 若在执行期间 context 已触发取消，连接已被打断，必须从连接池丢弃，严禁复用 (Issue 13)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		cli.forceClose()
 		pc.client = nil
 		perf.err = true
+		perf.connErr = false
 		return ctxErr
 	}
 
-	if err != nil && isLikelyConnErr(err) {
-		// 连接坏了, 丢掉, 下次重建
+	connErr := isLikelyConnErr(err)
+	if connErr {
+		// 连接坏了, 丢掉, 下次重建且不刷新 lastUsed (FIX-3)
 		cli.forceClose()
 		pc.client = nil
+	} else {
+		pc.lastUsed = time.Now()
 	}
 	perf.err = err != nil
-	perf.connErr = isLikelyConnErr(err)
+	perf.connErr = connErr
 	return err
 }
 
@@ -475,9 +478,10 @@ func isLikelyConnErr(err error) bool {
 		return false
 	}
 	s := strings.ToLower(err.Error())
-	// 常见断连/IO/建连失败错误关键字 (FIX-9: 仅显式连接类, 不把认证等业务错误归入 conn_err)
+	// 常见断连/IO/建连失败错误关键字 (FIX-9 / FIX-3: 仅显式连接类, 补充 connection closed / unexpected eof 等, 不把认证等业务错误归入 conn_err)
 	for _, k := range []string{
-		"connection reset", "broken pipe", "eof", "i/o timeout",
+		"connection reset", "connection closed", "closed by remote host",
+		"broken pipe", "eof", "unexpected eof", "i/o timeout",
 		"use of closed", "not connected", "connection refused",
 		"actively refused", "connectex", "no such host",
 		"network is unreachable", "handshake failure", "握手失败",
