@@ -583,7 +583,7 @@ func (s *Store) PromoteUnknownToAvailable(accountID string, limit int) (int64, e
 	selectQuery := `
 		SELECT email, account_id
 		FROM alias_inventory
-		WHERE allocation_state = 'unknown'
+		WHERE allocation_state IN ('unknown', 'quarantined')
 		  AND remote_state NOT IN ('deleted', 'inactive')
 		  AND (? = '' OR account_id = ?)
 		  AND account_id IN (
@@ -646,7 +646,7 @@ func (s *Store) PromoteUnknownToAvailable(accountID string, limit int) (int64, e
 		UPDATE alias_inventory
 		SET allocation_state = 'available',
 		    remote_state = CASE WHEN remote_state = 'unknown' THEN 'active' ELSE remote_state END
-		WHERE email = ? AND allocation_state = 'unknown'
+		WHERE email = ? AND allocation_state IN ('unknown', 'quarantined')
 	`)
 	if err != nil {
 		return 0, fmt.Errorf("prepare update statement failed: %w", err)
@@ -688,7 +688,7 @@ func (s *Store) PromoteUnknownToAvailable(accountID string, limit int) (int64, e
 	return promotedCount, nil
 }
 
-// CountDormantPoolAliases 统计当前处于沉睡状态 (unknown 且未分配、属于非保护账号) 的存量别名数
+// CountDormantPoolAliases 统计当前处于沉睡/隔离状态 (unknown 或 quarantined 且未分配、属于非保护账号) 的存量别名数
 func (s *Store) CountDormantPoolAliases() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -696,7 +696,7 @@ func (s *Store) CountDormantPoolAliases() int {
 	_ = s.db.QueryRow(`
 		SELECT COUNT(*)
 		FROM alias_inventory
-		WHERE allocation_state = 'unknown'
+		WHERE allocation_state IN ('unknown', 'quarantined')
 		  AND remote_state NOT IN ('deleted', 'inactive')
 		  AND LOWER(email) NOT IN (SELECT LOWER(alias_email) FROM alias_allocations)
 		  AND account_id IN (
