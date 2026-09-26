@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 api/client (request, ApiError, getMessageDetail), api/types, components (AsyncState, ConfirmDialog, ToastProvider), hooks/useAccounts (fetchAccountsDeduped), utils (clipboard, date, mail, sniffer: buildSniffContext, extractOTPMemoized, parseSenderInfo), ./InboxFilterBar, ./InboxTableRow, ./MailDetailDialog
- * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；支持 externalAliases 直传消灭冗余 I/O、fetchAccountsDeduped 全局缓存共享、数据层一次性嗅探与 O(1) 属性直读、模块级缓存防 Tab 切换重载与自动刷新轮询、首屏 Metadata 快速渲染 (Fast First Paint) 与后台单批正文渐进增强
+ * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；支持 externalAliases 直传消灭冗余 I/O、fetchAccountsDeduped 全局缓存共享、INBOX First 首屏优先加载、/api/mailboxes 交互式按需懒加载 (带 pending 队列与 IMAP 避让)、模块级缓存防 Tab 切换重载、首屏 Metadata 快速渲染 (Fast First Paint) 与后台单批正文渐进增强
  * [POS]: web/src/components/inbox 的核心视图容器，统一单账号工作台与全局收件箱大盘的数据流与交互
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -57,7 +57,7 @@ const moduleInboxSnapshotCache = new Map<string, InboxSnapshotEntry>()
 const MAX_SNAPSHOT_CACHE = 50
 
 function buildSnapshotKey(accId: string, al: string, fld: string, lmt: number, dys: number, isWebMail: boolean) {
-  const trimmed = (fld || 'all').trim()
+  const trimmed = (fld || 'INBOX').trim()
   const normFolder = isWebMail
     ? 'INBOX'
     : (trimmed.toLowerCase() === 'all'
@@ -169,7 +169,7 @@ export default function InboxTableView({
   const initialAccountId = propAccountId || accountSummary?.id || ''
   const initialIsWebMail = Boolean(accountSummary && !accountSummary.has_app_password && !accountSummary.mailbox?.email)
   const initialSnapshotKey = useMemo(() => {
-    return initialAccountId ? buildSnapshotKey(initialAccountId, initialAlias, 'all', 20, 7, initialIsWebMail) : ''
+    return initialAccountId ? buildSnapshotKey(initialAccountId, initialAlias, 'INBOX', 20, 7, initialIsWebMail) : ''
   }, [initialAccountId, initialAlias, initialIsWebMail])
 
   const initialSnapshot = useMemo(() => {
@@ -185,7 +185,7 @@ export default function InboxTableView({
   })
 
   const [alias, setAlias] = useState(initialAlias)
-  const [folder, setFolder] = useState('all')
+  const [folder, setFolder] = useState('INBOX')
   const [limit, setLimit] = useState(20)
   const [days, setDays] = useState(7)
   const [autoRefreshInterval, setAutoRefreshInterval] = useState<number>(0)
@@ -232,6 +232,9 @@ export default function InboxTableView({
 
   const abortRef = useRef<AbortController | null>(null)
   const detailAbortRef = useRef<AbortController | null>(null)
+  const folderAbortRef = useRef<AbortController | null>(null)
+  const folderLoadingAccountRef = useRef<string | null>(null)
+  const pendingFolderLoadRef = useRef(false)
   const accountGenRef = useRef(0)
   const queryGenRef = useRef(0)
   const isBusyRef = useRef(false)
@@ -242,6 +245,9 @@ export default function InboxTableView({
     return () => {
       detailAbortRef.current?.abort()
       abortRef.current?.abort()
+      folderAbortRef.current?.abort()
+      folderLoadingAccountRef.current = null
+      pendingFolderLoadRef.current = false
       accountGenRef.current += 1
       isBusyRef.current = false
       if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current)
@@ -255,9 +261,14 @@ export default function InboxTableView({
       accountGenRef.current += 1
       detailAbortRef.current?.abort()
       abortRef.current?.abort()
+      folderAbortRef.current?.abort()
+      folderLoadingAccountRef.current = null
+      pendingFolderLoadRef.current = false
       messageCacheRef.current.clear()
       unsupportedRetryRef.current[propAccountId] = 0
       setAccountId(propAccountId)
+      setFolder('INBOX')
+      setFolders(getCachedFolders(propAccountId) || [])
     }
   }, [propAccountId, accountId])
 
@@ -279,6 +290,9 @@ export default function InboxTableView({
       accountGenRef.current += 1
       detailAbortRef.current?.abort()
       abortRef.current?.abort()
+      folderAbortRef.current?.abort()
+      folderLoadingAccountRef.current = null
+      pendingFolderLoadRef.current = false
       isBusyRef.current = false
       messageCacheRef.current.clear()
       clearInboxSnapshotCache()
@@ -295,6 +309,9 @@ export default function InboxTableView({
         accountGenRef.current += 1
         detailAbortRef.current?.abort()
         abortRef.current?.abort()
+        folderAbortRef.current?.abort()
+        folderLoadingAccountRef.current = null
+        pendingFolderLoadRef.current = false
         isBusyRef.current = false
         messageCacheRef.current.clear()
         if (accountId) {
@@ -425,33 +442,65 @@ export default function InboxTableView({
     }
   }, [accountId, externalAliases])
 
-  // 3. 账号变化或目录过期时拉取文件夹列表 (带 5 分钟 TTL 模块级缓存，普通邮件刷新严禁携带 refresh=true)
-  useEffect(() => {
+  // 3. 惰性拉取文件夹列表 (Mailboxes Lazy Load - PR-MAIL-03)：
+  // 仅在用户实际交互文件夹下拉且首屏 Inbox metadata 完成后加载；
+  // 带 5 分钟 TTL 模块级缓存、代际保护与 in-flight 并发防护，WebMail 模式严格不发
+  const ensureFoldersLoaded = useCallback(() => {
     if (!accountId) return
+    if (isWebMailOnly) return
+
     const cached = getCachedFolders(accountId)
     if (cached) {
       setFolders(cached)
       return
     }
+
+    if (folderLoadingAccountRef.current === accountId) {
+      return
+    }
+
+    if (loadingRef.current) {
+      pendingFolderLoadRef.current = true
+      return
+    }
+
     const currentAccountGen = accountGenRef.current
-    let cancelled = false
+    const requestAccountId = accountId
+
+    folderAbortRef.current?.abort()
+    const controller = new AbortController()
+    folderAbortRef.current = controller
+    folderLoadingAccountRef.current = requestAccountId
+
     request<{ account_id: string; folders: MailboxFolder[] }>(
-      `/api/mailboxes?account_id=${encodeURIComponent(accountId)}`,
+      `/api/mailboxes?account_id=${encodeURIComponent(requestAccountId)}`,
+      { signal: controller.signal },
     )
       .then((data) => {
-        if (cancelled || currentAccountGen !== accountGenRef.current) return
+        if (currentAccountGen !== accountGenRef.current) return
         const f = data.folders ?? []
-        moduleFolderCache.set(accountId, { folders: f, cachedAt: Date.now() })
+        moduleFolderCache.set(requestAccountId, { folders: f, cachedAt: Date.now() })
         setFolders(f)
       })
-      .catch(() => {
-        if (cancelled || currentAccountGen !== accountGenRef.current) return
+      .catch((err) => {
+        if (currentAccountGen !== accountGenRef.current) return
+        if (err instanceof ApiError && err.code === 'ABORTED') return
         setFolders([])
       })
-    return () => {
-      cancelled = true
+      .finally(() => {
+        if (folderLoadingAccountRef.current === requestAccountId) {
+          folderLoadingAccountRef.current = null
+        }
+      })
+  }, [accountId, isWebMailOnly])
+
+  // 当首屏 Inbox 渲染完成 (loading 从 true 变为 false) 时，如若用户在此期间已点击文件夹，按序补发 /api/mailboxes
+  useEffect(() => {
+    if (!loading && pendingFolderLoadRef.current) {
+      pendingFolderLoadRef.current = false
+      ensureFoldersLoaded()
     }
-  }, [accountId])
+  }, [loading, ensureFoldersLoaded])
 
   // 4. 查询收件箱邮件 (带代际保护 accountGenRef、快照秒级恢复与分阶段小批正文补全)
   useEffect(() => {
@@ -485,7 +534,7 @@ export default function InboxTableView({
     const params = new URLSearchParams({ account_id: accountId })
     if (alias) params.set('alias', alias)
     if (!isWebMailOnly) {
-      if (folder && folder !== 'all') params.set('folder', folder)
+      params.set('folder', folder || 'INBOX')
       params.set('days', String(days))
     }
     params.set('limit', String(limit))
@@ -640,7 +689,7 @@ export default function InboxTableView({
       const next: Record<string, string> = { account_id: accountId }
       if (alias) next.alias = alias
       if (!isWebMailOnly) {
-        if (folder && folder !== 'all') next.folder = folder
+        if (folder) next.folder = folder
         next.days = String(days)
       }
       next.limit = String(limit)
@@ -653,7 +702,12 @@ export default function InboxTableView({
     accountGenRef.current += 1
     detailAbortRef.current?.abort()
     abortRef.current?.abort()
+    folderAbortRef.current?.abort()
+    folderLoadingAccountRef.current = null
+    pendingFolderLoadRef.current = false
     setAccountId(newAccountId)
+    setFolder('INBOX')
+    setFolders(newAccountId ? getCachedFolders(newAccountId) || [] : [])
     setAlias('')
     setPage(1)
     setResult(null)
@@ -940,7 +994,11 @@ export default function InboxTableView({
           onAliasChange={(val) => setAlias(val)}
           folder={folder}
           folderOptions={folderOptions}
-          onFolderChange={(val) => setFolder(val)}
+          onFolderChange={(val) => {
+            setFolder(val)
+            ensureFoldersLoaded()
+          }}
+          onFolderInteract={ensureFoldersLoaded}
           isWebMailOnly={isWebMailOnly}
           limit={limit}
           onLimitChange={(val) => setLimit(val)}

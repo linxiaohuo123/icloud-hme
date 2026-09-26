@@ -122,8 +122,8 @@ describe('Inbox Baseline Performance Measurements', () => {
     // In baseline mount (without accountSummary):
     // 1. /api/accounts was requested because accountSummary was not provided
     expect(requestCalls.some((c) => c.includes('/api/accounts'))).toBe(true)
-    // 2. /api/mailboxes was requested on mount
-    expect(requestCalls.some((c) => c.includes('/api/mailboxes'))).toBe(true)
+    // 2. /api/mailboxes is lazy-loaded and NOT requested on mount (PR-MAIL-03)
+    expect(requestCalls.some((c) => c.includes('/api/mailboxes'))).toBe(false)
     // 3. /api/inbox was requested
     expect(requestCalls.some((c) => c.includes('/api/inbox'))).toBe(true)
     // 4. /api/messages was requested with chunked batch size <= 5
@@ -720,7 +720,15 @@ describe('Inbox Baseline Performance Measurements', () => {
     await waitFor(() => {
       expect(screen.getByText('Apple Security Code')).toBeInTheDocument()
     })
-    expect(mailboxRequests.length).toBe(1)
+    // PR-MAIL-03: mailboxes is NOT requested on initial mount without interaction
+    expect(mailboxRequests.length).toBe(0)
+
+    // Trigger folder interaction to lazy-load mailboxes
+    const folderSelect = screen.getByLabelText('文件夹')
+    fireEvent.pointerDown(folderSelect)
+    await waitFor(() => {
+      expect(mailboxRequests.length).toBe(1)
+    })
     expect(mailboxRequests[0]).not.toContain('refresh=true')
 
     // Click 查询 (Search button) to trigger a normal mail refresh
@@ -1116,4 +1124,425 @@ describe('Inbox Baseline Performance Measurements', () => {
     unmount()
   })
 })
+
+describe('PR-MAIL-03: INBOX First & Mailbox Lazy Load', () => {
+  const dummyAccount: AccountSummary = {
+    id: 'acc_mail03',
+    name: 'Mail03 Account',
+    real_email: 'mail03@icloud.com',
+    icloud_email: 'mail03@icloud.com',
+    host: 'p123-setup.icloud.com',
+    has_app_password: true,
+    has_cookies: true,
+    has_proxy: false,
+    status: 'active',
+    alias_total: 5,
+    alias_active: 5,
+    last_validated: '2026-09-24 10:00:00',
+    created_at: '2026-09-24 10:00:00',
+  }
+
+  const dummyInboxResult: InboxResult = {
+    account_id: 'acc_mail03',
+    count: 1,
+    messages: [
+      {
+        id: '101',
+        message_ref: 'imap:acc_mail03:INBOX:1:101',
+        subject: 'Welcome to MAIL-03',
+        from: 'service@apple.com',
+        to: 'mail03@icloud.com',
+        date: '2026-09-24 10:00:00',
+        folder: 'INBOX',
+        preview: 'PR-MAIL-03 preview',
+        body: 'PR-MAIL-03 body',
+      },
+    ],
+    method: 'imap',
+  }
+
+  const dummyCustomFolders: MailboxFolder[] = [
+    { name: 'INBOX', role: 'inbox', display_name: '收件箱' },
+    { name: 'Junk', role: 'junk', display_name: '垃圾箱' },
+    { name: 'Archive', role: 'archive', display_name: '归档' },
+    { name: 'Work', role: 'custom', display_name: '工作' },
+  ]
+
+  beforeEach(() => {
+    server.resetHandlers()
+    clearInboxSnapshotCache()
+  })
+
+  // TEST 1｜默认 INBOX: 首次打开 /api/inbox 必须携带 folder=INBOX，不得默认 folder=all
+  it('TEST 1: defaults to folder=INBOX on initial query, never defaults to all', async () => {
+    let requestedFolder: string | null = null
+
+    server.use(
+      http.get('/api/accounts', () => {
+        return HttpResponse.json({ success: true, data: [dummyAccount] })
+      }),
+      http.get('/api/inbox', ({ request }) => {
+        const url = new URL(request.url)
+        requestedFolder = url.searchParams.get('folder')
+        return HttpResponse.json({ success: true, data: dummyInboxResult })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_mail03" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Welcome to MAIL-03')).toBeInTheDocument()
+    })
+
+    expect(requestedFolder).toBe('INBOX')
+    unmount()
+  })
+
+  // TEST 2｜首屏不得 eager mailboxes: 组件启动后在无文件夹操作情况下 /api/mailboxes call count = 0
+  it('TEST 2: initial mount does not eager-fetch /api/mailboxes (call count = 0)', async () => {
+    let mailboxesCallCount = 0
+
+    server.use(
+      http.get('/api/accounts', () => {
+        return HttpResponse.json({ success: true, data: [dummyAccount] })
+      }),
+      http.get('/api/mailboxes', () => {
+        mailboxesCallCount++
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_mail03', folders: dummyCustomFolders } })
+      }),
+      http.get('/api/inbox', () => {
+        return HttpResponse.json({ success: true, data: dummyInboxResult })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_mail03" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Welcome to MAIL-03')).toBeInTheDocument()
+    })
+
+    expect(mailboxesCallCount).toBe(0)
+    unmount()
+  })
+
+  // TEST 3｜用户打开文件夹后 lazy load & 重复操作防重
+  it('TEST 3: lazy-loads /api/mailboxes only on user folder interaction and deduplicates repeated interactions', async () => {
+    let mailboxesCallCount = 0
+
+    server.use(
+      http.get('/api/accounts', () => {
+        return HttpResponse.json({ success: true, data: [dummyAccount] })
+      }),
+      http.get('/api/mailboxes', () => {
+        mailboxesCallCount++
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_mail03', folders: dummyCustomFolders } })
+      }),
+      http.get('/api/inbox', () => {
+        return HttpResponse.json({ success: true, data: dummyInboxResult })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_mail03" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Welcome to MAIL-03')).toBeInTheDocument()
+    })
+    expect(mailboxesCallCount).toBe(0)
+
+    // 用户交互文件夹下拉
+    const folderSelect = screen.getByLabelText('文件夹')
+    fireEvent.pointerDown(folderSelect)
+
+    await waitFor(() => {
+      expect(mailboxesCallCount).toBe(1)
+    })
+
+    // 重复点击 5 次
+    for (let i = 0; i < 5; i++) {
+      fireEvent.pointerDown(folderSelect)
+    }
+
+    // 依然严格等于 1
+    expect(mailboxesCallCount).toBe(1)
+    unmount()
+  })
+
+  // TEST 4｜Inbox pending 时点击 folder: 必须等 first paint 完成后才允许发送 /api/mailboxes
+  it('TEST 4: defers /api/mailboxes when folder is clicked while /api/inbox is pending until metadata first paint finishes', async () => {
+    let resolveInbox: (value: HttpResponse) => void
+    const inboxPromise = new Promise<HttpResponse>((resolve) => {
+      resolveInbox = resolve
+    })
+
+    let mailboxesCallCount = 0
+
+    server.use(
+      http.get('/api/accounts', () => {
+        return HttpResponse.json({ success: true, data: [dummyAccount] })
+      }),
+      http.get('/api/inbox', () => {
+        return inboxPromise
+      }),
+      http.get('/api/mailboxes', () => {
+        mailboxesCallCount++
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_mail03', folders: dummyCustomFolders } })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_mail03" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    // Inbox 当前仍在 pending 加载中
+    expect(screen.queryByText('Welcome to MAIL-03')).toBeNull()
+
+    // 此时用户立即点击文件夹 selector
+    const folderSelect = screen.getByLabelText('文件夹')
+    fireEvent.pointerDown(folderSelect)
+
+    // 核心时序断言：由于 Inbox 尚未完成，禁止发送 /api/mailboxes
+    expect(mailboxesCallCount).toBe(0)
+
+    // 释放 /api/inbox，完成 metadata first paint
+    resolveInbox!(HttpResponse.json({ success: true, data: dummyInboxResult }))
+
+    // 首屏可见
+    await waitFor(() => {
+      expect(screen.getByText('Welcome to MAIL-03')).toBeInTheDocument()
+    })
+
+    // 首屏完成之后，pending 的 /api/mailboxes 被触发
+    await waitFor(() => {
+      expect(mailboxesCallCount).toBe(1)
+    })
+
+    unmount()
+  })
+
+  // TEST 5｜显式 all 保持: 用户选择“全部”，URL 与查询参数必须保留 folder=all，重新挂载恢复 all
+  it('TEST 5: preserves explicit folder=all in query parameters and across search/remount', async () => {
+    const inboxQueries: string[] = []
+
+    server.use(
+      http.get('/api/accounts', () => {
+        return HttpResponse.json({ success: true, data: [dummyAccount] })
+      }),
+      http.get('/api/mailboxes', () => {
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_mail03', folders: dummyCustomFolders } })
+      }),
+      http.get('/api/inbox', ({ request }) => {
+        const url = new URL(request.url)
+        inboxQueries.push(url.searchParams.get('folder') || '')
+        return HttpResponse.json({ success: true, data: dummyInboxResult })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter initialEntries={['/?account_id=acc_mail03&folder=all']}>
+        <ToastProvider>
+          <InboxTableView accountId="acc_mail03" fixedAccount={false} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Welcome to MAIL-03')).toBeInTheDocument()
+    })
+
+    // 从 ?folder=all 初始化时，首屏查询必须带 folder=all
+    expect(inboxQueries[0]).toBe('all')
+
+    // 再次点击查询
+    const searchBtn = screen.getByRole('button', { name: '查询' })
+    fireEvent.click(searchBtn)
+
+    await waitFor(() => {
+      expect(inboxQueries.length).toBeGreaterThanOrEqual(2)
+    })
+    // 显式 all 绝不能被删掉或静默变回 INBOX
+    expect(inboxQueries[inboxQueries.length - 1]).toBe('all')
+
+    unmount()
+  })
+
+  // EXTRA 1: Account switch 防污染
+  it('EXTRA: account switch discards stale in-flight /api/mailboxes response and resets folder to INBOX', async () => {
+    let resolveAcc1Mailboxes: (value: HttpResponse) => void
+    const acc1MailboxesPromise = new Promise<HttpResponse>((resolve) => {
+      resolveAcc1Mailboxes = resolve
+    })
+
+    const acc2: AccountSummary = {
+      ...dummyAccount,
+      id: 'acc_mail03_b',
+      name: 'Account B',
+      real_email: 'acc_b@icloud.com',
+    }
+
+    server.use(
+      http.get('/api/accounts', () => {
+        return HttpResponse.json({ success: true, data: [dummyAccount, acc2] })
+      }),
+      http.get('/api/inbox', ({ request }) => {
+        const url = new URL(request.url)
+        const accId = url.searchParams.get('account_id')
+        return HttpResponse.json({
+          success: true,
+          data: {
+            ...dummyInboxResult,
+            account_id: accId || '',
+            messages: [
+              {
+                ...dummyInboxResult.messages[0],
+                id: accId === 'acc_mail03' ? '101' : '202',
+                subject: accId === 'acc_mail03' ? 'Account A Mail' : 'Account B Mail',
+              },
+            ],
+          },
+        })
+      }),
+      http.get('/api/mailboxes', ({ request }) => {
+        const url = new URL(request.url)
+        const accId = url.searchParams.get('account_id')
+        if (accId === 'acc_mail03') {
+          return acc1MailboxesPromise
+        }
+        return HttpResponse.json({
+          success: true,
+          data: {
+            account_id: 'acc_mail03_b',
+            folders: [{ name: 'INBOX', role: 'inbox' }, { name: 'AccountBExclusive', role: 'custom' }],
+          },
+        })
+      }),
+    )
+
+    const { rerender, unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_mail03" fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Account A Mail')).toBeInTheDocument()
+    })
+
+    // 触发账号 A 的 mailboxes 请求 (处于 pending 慢速中)
+    const folderSelect = screen.getByLabelText('文件夹')
+    fireEvent.pointerDown(folderSelect)
+
+    // 立即切换到账号 B
+    rerender(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_mail03_b" fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Account B Mail')).toBeInTheDocument()
+    })
+
+    // 释放账号 A 的延迟响应，返回属于账号 A 的工作文件夹
+    resolveAcc1Mailboxes!(
+      HttpResponse.json({
+        success: true,
+        data: {
+          account_id: 'acc_mail03',
+          folders: dummyCustomFolders, // 包含 "Work"
+        },
+      }),
+    )
+
+    // 等待微任务完成
+    await new Promise((r) => setTimeout(r, 60))
+
+    // 核心断言：账号 A 的自定义文件夹 "Work" 绝未污染账号 B 的视图
+    expect(screen.queryByText(/Work \(custom\)/)).toBeNull()
+
+    unmount()
+  })
+
+  // EXTRA 2: WebMail-only 不发 /api/mailboxes
+  it('EXTRA: WebMail-only mode never fetches /api/mailboxes even upon folder interaction', async () => {
+    let mailboxesCallCount = 0
+
+    const webmailAccount: AccountSummary = {
+      ...dummyAccount,
+      id: 'acc_webmail',
+      has_app_password: false,
+      mailbox: undefined,
+    }
+
+    server.use(
+      http.get('/api/accounts', () => {
+        return HttpResponse.json({ success: true, data: [webmailAccount] })
+      }),
+      http.get('/api/mailboxes', () => {
+        mailboxesCallCount++
+        return HttpResponse.json({ success: true, data: { account_id: 'acc_webmail', folders: dummyCustomFolders } })
+      }),
+      http.get('/api/inbox', () => {
+        return HttpResponse.json({
+          success: true,
+          data: {
+            ...dummyInboxResult,
+            account_id: 'acc_webmail',
+            method: 'web_api',
+          },
+        })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_webmail" accountSummary={webmailAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Welcome to MAIL-03')).toBeInTheDocument()
+    })
+
+    const folderSelect = screen.getByLabelText('文件夹')
+    expect(folderSelect).toBeDisabled()
+
+    // 用户即便产生事件
+    fireEvent.pointerDown(folderSelect)
+    fireEvent.click(folderSelect)
+
+    // 依然 0 次
+    expect(mailboxesCallCount).toBe(0)
+
+    unmount()
+  })
+})
+
 

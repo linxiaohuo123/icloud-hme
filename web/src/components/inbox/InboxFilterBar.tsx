@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 components/Select, api/types (AccountSummary, Alias)
- * [OUTPUT]: 对外提供 InboxFilterBar 组件，封装收件箱筛选栏 (账号、别名、文件夹、每页、时间范围、自动刷新)
+ * [OUTPUT]: 对外提供 InboxFilterBar 组件，封装收件箱筛选栏 (账号、别名、文件夹、每页、时间范围、自动刷新) 及 onFolderInteract 懒加载交互支持
  * [POS]: web/src/components/inbox 的筛选器组件，为 InboxTableView 提供独立的筛选交互与控制
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -19,6 +19,7 @@ export interface InboxFilterBarProps {
   folder: string
   folderOptions: { value: string; label: string }[]
   onFolderChange: (val: string) => void
+  onFolderInteract?: () => void
   isWebMailOnly: boolean
   limit: number
   onLimitChange: (val: number) => void
@@ -41,6 +42,7 @@ export default function InboxFilterBar({
   folder,
   folderOptions,
   onFolderChange,
+  onFolderInteract,
   isWebMailOnly,
   limit,
   onLimitChange,
@@ -89,7 +91,13 @@ export default function InboxFilterBar({
         />
       </div>
 
-      <div className="inbox-filter-item">
+      <div
+        className="inbox-filter-item"
+        onPointerDownCapture={onFolderInteract}
+        onFocusCapture={onFolderInteract}
+        onClickCapture={onFolderInteract}
+        onKeyDownCapture={onFolderInteract}
+      >
         <label htmlFor="inbox-folder" className="inbox-filter-label">
           文件夹 {isWebMailOnly && <span style={{ opacity: 0.6, fontSize: '0.85em' }}>(WebMail固定)</span>}
         </label>
