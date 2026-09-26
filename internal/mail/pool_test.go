@@ -181,6 +181,8 @@ func TestPoolDoContext_CancellationDuringExecution(t *testing.T) {
 	defer p.Close()
 
 	p.SetClientForTesting("cancel_run@icloud.com", "dummy_pass", mockClient)
+	// 将 lastUsed 调旧至免 Ping 窗口外，确保 ensure 仍发送 initial NOOP 供测试验证前置状态
+	p.SetLastUsedForTesting("cancel_run@icloud.com", time.Now().Add(-1*time.Minute))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -267,4 +269,138 @@ func TestPoolDoContext_CancellationDuringExecution(t *testing.T) {
 		t.Fatalf("取消后单账号槽位信号量未释放，槽位发生泄漏死锁")
 	}
 	p.UnlockForTesting("cancel_run@icloud.com")
+}
+
+func TestPoolEnsure_HotConnectionSkipsPing(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	serverReceivedCmds := make(chan string, 10)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = conn.Write([]byte("* OK [CAPABILITY IMAP4rev1] Mock IMAP Server Ready\r\n"))
+		reader := bufio.NewReader(conn)
+		for {
+			line, rerr := reader.ReadString('\n')
+			if rerr != nil {
+				return
+			}
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				serverReceivedCmds <- strings.ToUpper(fields[1])
+				_, _ = conn.Write([]byte(fields[0] + " OK " + strings.ToUpper(fields[1]) + " completed\r\n"))
+			}
+		}
+	}()
+
+	clientConn, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	imapCli, err := client.New(clientConn)
+	if err != nil {
+		t.Fatalf("imap client.New failed: %v", err)
+	}
+	mockClient := NewClientForTesting("hot@icloud.com", "dummy", clientConn, imapCli)
+
+	p := NewPool()
+	defer p.Close()
+
+	p.SetClientForTesting("hot@icloud.com", "dummy", mockClient)
+	// lastUsed 默认为 time.Now() (<= 30s)，处于免 Ping 窗口期
+
+	callbackEntered := false
+	err = p.DoContext(context.Background(), "hot@icloud.com", "dummy", "", func(c *Client) error {
+		callbackEntered = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("DoContext failed: %v", err)
+	}
+	if !callbackEntered {
+		t.Fatalf("业务回调应当被执行")
+	}
+
+	// 验证未发送 NOOP Ping
+	select {
+	case cmd := <-serverReceivedCmds:
+		t.Fatalf("热连接不应发送 Ping/NOOP，收到命令: %s", cmd)
+	default:
+	}
+}
+
+func TestPoolEnsure_StaleConnectionPings(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	serverReceivedCmds := make(chan string, 10)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = conn.Write([]byte("* OK [CAPABILITY IMAP4rev1] Mock IMAP Server Ready\r\n"))
+		reader := bufio.NewReader(conn)
+		for {
+			line, rerr := reader.ReadString('\n')
+			if rerr != nil {
+				return
+			}
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				serverReceivedCmds <- strings.ToUpper(fields[1])
+				_, _ = conn.Write([]byte(fields[0] + " OK " + strings.ToUpper(fields[1]) + " completed\r\n"))
+			}
+		}
+	}()
+
+	clientConn, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	imapCli, err := client.New(clientConn)
+	if err != nil {
+		t.Fatalf("imap client.New failed: %v", err)
+	}
+	mockClient := NewClientForTesting("stale@icloud.com", "dummy", clientConn, imapCli)
+
+	p := NewPool()
+	defer p.Close()
+
+	p.SetClientForTesting("stale@icloud.com", "dummy", mockClient)
+	// 将 lastUsed 调旧至健康检查窗口外 (例如 1 分钟前)，但小于 10 分钟 idleClose
+	p.SetLastUsedForTesting("stale@icloud.com", time.Now().Add(-1*time.Minute))
+
+	callbackEntered := false
+	err = p.DoContext(context.Background(), "stale@icloud.com", "dummy", "", func(c *Client) error {
+		callbackEntered = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("DoContext failed: %v", err)
+	}
+	if !callbackEntered {
+		t.Fatalf("业务回调应当被执行")
+	}
+
+	// 验证超期连接仍执行 NOOP Ping
+	select {
+	case cmd := <-serverReceivedCmds:
+		if cmd != "NOOP" {
+			t.Fatalf("期望收到 NOOP，实际收到: %s", cmd)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("超时未收到 NOOP Ping")
+	}
 }
