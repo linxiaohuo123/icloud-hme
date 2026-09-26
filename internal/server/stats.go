@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 os, path/filepath, runtime, time, gin
+ * [INPUT]: 依赖 os, path/filepath, runtime, time, gin, icloud-hme/internal/account
  * [OUTPUT]: 对外提供 (Server).systemStatsHandler 与 (CookieMonitor).Interval
  * [POS]: internal/server 的运行时可观测性端点，暴露进程/存储/后台引擎/别名池(alias_pool)资产关键水位供运维与自动化注册集群调度
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"icloud-hme/internal/account"
 )
 
 // systemStatsHandler 处理 GET /api/system/stats（仅 admin 作用域）。
@@ -47,19 +49,29 @@ func (s *Server) systemStatsHandler(c *gin.Context) {
 
 		// 号池资产水位 (实时透出可用别名存量，供外部注册机/集群调度器秒级感知是否需要补仓)
 		totalActiveAliases := 0
+		appleQuotaRemaining := 0
 		if s.be != nil {
 			for _, acc := range s.be.ListAccounts() {
 				if acc.Status == "active" {
 					totalActiveAliases += acc.AliasActive
+					if !account.IsProtectedAccount(acc.Name, acc.Tags) {
+						rem := account.MaxAliasesPerAccount - acc.AliasActive
+						if rem > 0 {
+							appleQuotaRemaining += rem
+						}
+					}
 				}
 			}
 		}
 		consumedAliases := s.store.CountConsumedPoolAliases()
 		availableAliases := s.store.CountAuthoritativeAvailableAliases()
+		dormantAliases := s.store.CountDormantPoolAliases()
 		stats["alias_pool"] = gin.H{
-			"total_active_aliases": totalActiveAliases,
-			"consumed_aliases":     consumedAliases,
-			"available_aliases":    availableAliases,
+			"total_active_aliases":  totalActiveAliases,
+			"consumed_aliases":      consumedAliases,
+			"available_aliases":     availableAliases,
+			"dormant_aliases":       dormantAliases,
+			"apple_quota_remaining": appleQuotaRemaining,
 		}
 	}
 

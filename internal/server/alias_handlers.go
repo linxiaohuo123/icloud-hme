@@ -1,6 +1,6 @@
 /**
- * [INPUT]: 依赖 gin, net/http, strings, encoding/csv, time, fmt, icloud-hme/internal/hme
- * [OUTPUT]: 对外提供 createAliasHandler, createAliasBatchHandler, listAliasesHandler, updateAliasHandler, batchUpdateAliasHandler, deactivateAliasHandler, reactivateAliasHandler, deleteAliasHandler, exportAliasesHandler 等 HTTP 端点
+ * [INPUT]: 依赖 errors, io, gin, net/http, strings, encoding/csv, time, fmt, icloud-hme/internal/hme
+ * [OUTPUT]: 对外提供 createAliasHandler, createAliasBatchHandler, listAliasesHandler, updateAliasHandler, batchUpdateAliasHandler, deactivateAliasHandler, reactivateAliasHandler, deleteAliasHandler, exportAliasesHandler, promoteAliasesToPoolHandler 等 HTTP 端点
  * [POS]: internal/server 的别名生命周期与号池管理路由处理器
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -9,7 +9,9 @@ package server
 
 import (
 	"encoding/csv"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -454,4 +456,39 @@ func csvSafe(v string) string {
 		return "'" + v
 	}
 	return v
+}
+
+type promoteAliasesToPoolReq struct {
+	AccountID string `json:"account_id"`
+	Limit     int    `json:"limit"`
+}
+
+// promoteAliasesToPoolHandler 处理 POST /api/aliases/promote-to-pool（管理员作用域）
+// 将未被消费过的存量别名受控批量激活为可用号池库存，并刷新水位
+func (s *Server) promoteAliasesToPoolHandler(c *gin.Context) {
+	if s.store == nil {
+		failCode(c, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "存储层未就绪")
+		return
+	}
+
+	var req promoteAliasesToPoolReq
+	if err := c.ShouldBindJSON(&req); err != nil && err.Error() != "EOF" && !errors.Is(err, io.EOF) {
+		failCode(c, http.StatusBadRequest, "INVALID_JSON", "请求体 JSON 格式错误: "+err.Error())
+		return
+	}
+
+	promoted, err := s.store.PromoteUnknownToAvailable(req.AccountID, req.Limit)
+	if err != nil {
+		failCode(c, http.StatusBadRequest, "PROMOTION_FAILED", err.Error())
+		return
+	}
+
+	available := s.store.CountAuthoritativeAvailableAliases()
+	dormant := s.store.CountDormantPoolAliases()
+
+	ok(c, gin.H{
+		"promoted_count":    promoted,
+		"available_aliases": available,
+		"dormant_aliases":   dormant,
+	})
 }

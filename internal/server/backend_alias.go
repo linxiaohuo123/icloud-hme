@@ -481,6 +481,10 @@ func (b *managerBackend) RefreshAliasesContext(ctx context.Context, accountID st
 	if b.onAliasesFetched != nil {
 		b.onAliasesFetched(accountID, res)
 	}
+	// 将远端真实状态 (active/inactive) 与 provider_alias_id 同步持久化至库存表 (PR-09)
+	if b.store != nil {
+		_ = b.store.SyncAliasInventory(accountID, res)
+	}
 	return res, nil
 }
 

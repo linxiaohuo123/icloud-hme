@@ -580,6 +580,7 @@ func (s *Server) register() {
 				adm.POST("/aliases/:id/deactivate", csrfCheck(s.auth), s.deactivateAliasHandler)
 				adm.POST("/aliases/:id/reactivate", csrfCheck(s.auth), s.reactivateAliasHandler)
 				adm.DELETE("/aliases/:id", csrfCheck(s.auth), s.deleteAliasHandler)
+				adm.POST("/aliases/promote-to-pool", csrfCheck(s.auth), s.promoteAliasesToPoolHandler)
 
 				// ===== 中台扩展: 业务标识 =====
 				adm.GET("/tags", s.listTagsHandler)

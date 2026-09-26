@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 database/sql, fmt, errors, strings, time, icloud-hme/internal/hme
- * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation 模型及 migrateInventory, AddInventoryAlias, GetInventoryAlias, SyncAliasInventory, CountAuthoritativeAvailableAliases, UpdateAliasRemoteState
+ * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation 模型及 migrateInventory, AddInventoryAlias, GetInventoryAlias, SyncAliasInventory, CountAuthoritativeAvailableAliases, UpdateAliasRemoteState, PromoteUnknownToAvailable, CountDormantPoolAliases
  * [POS]: internal/store 的别名库存实体与迁移定义层，维护 alias_inventory, alias_allocations, operations 表结构与元数据
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -283,6 +283,9 @@ func (s *Store) GetInventoryAlias(email string) (*AliasInventory, error) {
 // SyncAliasInventory 同步远端别名快照；严禁将 allocated 覆盖为 available
 func (s *Store) SyncAliasInventory(accountID string, aliases []hme.Alias) error {
 	now := time.Now().UTC().Format(time.RFC3339)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -295,7 +298,8 @@ func (s *Store) SyncAliasInventory(accountID string, aliases []hme.Alias) error 
 		) VALUES (?, ?, ?, ?, 'unknown', 'synced', ?, 1)
 		ON CONFLICT(email) DO UPDATE SET
 			remote_state = excluded.remote_state,
-			provider_alias_id = excluded.provider_alias_id,
+			provider_alias_id = CASE WHEN excluded.provider_alias_id != '' THEN excluded.provider_alias_id ELSE alias_inventory.provider_alias_id END,
+			account_id = CASE WHEN excluded.account_id != '' THEN excluded.account_id ELSE alias_inventory.account_id END,
 			last_verified_at = excluded.last_verified_at
 	`)
 	if err != nil {
@@ -533,3 +537,189 @@ func (s *Store) UpdateAliasRemoteState(accountID, providerAliasID, email string,
 	return tx.Commit()
 }
 
+// PromoteUnknownToAvailable 将未被消费过的存量别名受控批量激活为可用库存 (PR-09)
+// 约束：
+// 1. 严格排除受保护账号（名称含大号或包含 personal/private/protected 标签）；若显式指定受保护账号直接报错拒绝；
+// 2. 严格排除已在 alias_allocations 中被认领的别名；
+// 3. 严格排除已被停用(inactive)或删除(deleted)的别名；
+// 4. 将符合条件的别名 allocation_state 推进为 available，并将 remote_state 由 unknown 确认为 active；
+// 5. 自动确保激活别名在 alias_routes 中登记就绪，保障后续 IMAP/邮件取码路由无缝直达；
+// 6. 支持 limit 批次上限 (<=0 表示全部)。
+func (s *Store) PromoteUnknownToAvailable(accountID string, limit int) (int64, error) {
+	accountID = strings.TrimSpace(accountID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 1. 若指定账号，检查该账号是否存在且是否受保护
+	if accountID != "" {
+		var accName, accTags, status string
+		err := s.db.QueryRow(`SELECT COALESCE(name, ''), COALESCE(tags, '[]'), COALESCE(status, '') FROM accounts WHERE id = ?`, accountID).Scan(&accName, &accTags, &status)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return 0, fmt.Errorf("account not found: %s", accountID)
+			}
+			return 0, fmt.Errorf("query account failed: %w", err)
+		}
+		if status != "active" {
+			return 0, fmt.Errorf("cannot promote aliases for inactive account: %s", accountID)
+		}
+		if strings.Contains(accName, "大号") ||
+			strings.Contains(strings.ToLower(accTags), "personal") ||
+			strings.Contains(strings.ToLower(accTags), "private") ||
+			strings.Contains(strings.ToLower(accTags), "protected") {
+			return 0, errors.New("cannot promote aliases for protected account")
+		}
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	// 2. 查出待激活别名列表并执行原子状态更新
+	// 使用子查询以保证 100% SQLite 驱动兼容性 (避免某些驱动不支持 UPDATE ... LIMIT 方言)
+	selectQuery := `
+		SELECT email, account_id
+		FROM alias_inventory
+		WHERE allocation_state = 'unknown'
+		  AND remote_state NOT IN ('deleted', 'inactive')
+		  AND (? = '' OR account_id = ?)
+		  AND account_id IN (
+		      SELECT id FROM accounts
+		      WHERE status = 'active'
+		        AND name NOT LIKE '%大号%'
+		        AND (
+		            CASE 
+		                WHEN json_valid(COALESCE(tags, '[]')) THEN NOT EXISTS (
+		                    SELECT 1 FROM json_each(COALESCE(tags, '[]')) 
+		                    WHERE LOWER(TRIM(value)) IN ('personal', 'private', 'protected')
+		                )
+		                ELSE (
+		                    COALESCE(tags, '') NOT LIKE '%"personal"%' COLLATE NOCASE AND
+		                    COALESCE(tags, '') NOT LIKE '%"private"%' COLLATE NOCASE AND
+		                    COALESCE(tags, '') NOT LIKE '%"protected"%' COLLATE NOCASE AND
+		                    COALESCE(tags, '') NOT LIKE '%personal%' COLLATE NOCASE AND
+		                    COALESCE(tags, '') NOT LIKE '%private%' COLLATE NOCASE AND
+		                    COALESCE(tags, '') NOT LIKE '%protected%' COLLATE NOCASE
+		                )
+		            END
+		        )
+		  )
+		  AND LOWER(email) NOT IN (SELECT LOWER(alias_email) FROM alias_allocations)
+		ORDER BY ROWID ASC
+	`
+	var rows *sql.Rows
+	if limit > 0 {
+		selectQuery += " LIMIT ?"
+		rows, err = tx.Query(selectQuery, accountID, accountID, limit)
+	} else {
+		rows, err = tx.Query(selectQuery, accountID, accountID)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("query candidates for promotion failed: %w", err)
+	}
+	defer rows.Close()
+
+	var targets []struct {
+		email     string
+		accountID string
+	}
+	for rows.Next() {
+		var item struct {
+			email     string
+			accountID string
+		}
+		if err := rows.Scan(&item.email, &item.accountID); err != nil {
+			return 0, err
+		}
+		targets = append(targets, item)
+	}
+	_ = rows.Close()
+
+	if len(targets) == 0 {
+		return 0, nil
+	}
+
+	updateStmt, err := tx.Prepare(`
+		UPDATE alias_inventory
+		SET allocation_state = 'available',
+		    remote_state = CASE WHEN remote_state = 'unknown' THEN 'active' ELSE remote_state END
+		WHERE email = ? AND allocation_state = 'unknown'
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("prepare update statement failed: %w", err)
+	}
+	defer updateStmt.Close()
+
+	routeStmt, err := tx.Prepare(`
+		INSERT INTO alias_routes (email, account_id, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(email) DO UPDATE SET
+			account_id = excluded.account_id,
+			updated_at = excluded.updated_at
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("prepare route statement failed: %w", err)
+	}
+	defer routeStmt.Close()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	var promotedCount int64
+	for _, target := range targets {
+		res, err := updateStmt.Exec(target.email)
+		if err != nil {
+			return 0, fmt.Errorf("execute promote update failed on %s: %w", target.email, err)
+		}
+		n, _ := res.RowsAffected()
+		if n > 0 {
+			promotedCount += n
+			if _, rErr := routeStmt.Exec(target.email, target.accountID, now); rErr != nil {
+				return 0, fmt.Errorf("upsert alias route failed on %s: %w", target.email, rErr)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit promotion tx failed: %w", err)
+	}
+
+	return promotedCount, nil
+}
+
+// CountDormantPoolAliases 统计当前处于沉睡状态 (unknown 且未分配、属于非保护账号) 的存量别名数
+func (s *Store) CountDormantPoolAliases() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var count int
+	_ = s.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM alias_inventory
+		WHERE allocation_state = 'unknown'
+		  AND remote_state NOT IN ('deleted', 'inactive')
+		  AND LOWER(email) NOT IN (SELECT LOWER(alias_email) FROM alias_allocations)
+		  AND account_id IN (
+		      SELECT id FROM accounts
+		      WHERE status = 'active'
+		        AND name NOT LIKE '%大号%'
+		        AND (
+		            CASE 
+		                WHEN json_valid(COALESCE(tags, '[]')) THEN NOT EXISTS (
+		                    SELECT 1 FROM json_each(COALESCE(tags, '[]')) 
+		                    WHERE LOWER(TRIM(value)) IN ('personal', 'private', 'protected')
+		                )
+		                ELSE (
+		                    COALESCE(tags, '') NOT LIKE '%"personal"%' COLLATE NOCASE AND
+		                    COALESCE(tags, '') NOT LIKE '%"private"%' COLLATE NOCASE AND
+		                    COALESCE(tags, '') NOT LIKE '%"protected"%' COLLATE NOCASE AND
+		                    COALESCE(tags, '') NOT LIKE '%personal%' COLLATE NOCASE AND
+		                    COALESCE(tags, '') NOT LIKE '%private%' COLLATE NOCASE AND
+		                    COALESCE(tags, '') NOT LIKE '%protected%' COLLATE NOCASE
+		                )
+		            END
+		        )
+		  )
+	`).Scan(&count)
+	return count
+}

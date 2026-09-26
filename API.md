@@ -872,6 +872,33 @@ Content-Type: application/json
 }
 ```
 
+### 29.1 存量别名受控激活入池 (Promote to Pool)
+
+将未被消费过的存量别名（处于 unknown 沉睡状态）受控激活为可用号池库存（available）。严格排除私人大号与受保护账号。
+
+```http
+POST /api/aliases/promote-to-pool
+Authorization: Bearer <API_KEY>
+Content-Type: application/json
+
+{
+  "account_id": "acc_1",  // 可选：指定激活账号；为空表示所有非保护活跃账号
+  "limit": 500            // 可选：批次上限；0 或负数表示全部
+}
+```
+
+**成功响应 (200 OK)**:
+```json
+{
+  "success": true,
+  "data": {
+    "promoted_count": 242,
+    "available_aliases": 496,
+    "dormant_aliases": 0
+  }
+}
+```
+
 ---
 
 ## 网络诊断与代理端点
@@ -1010,6 +1037,7 @@ POST /api/reload
 Authorization: Bearer <API_KEY>
 ```
 - 重新解析加载磁盘上的 `data/accounts.json`。
+- 自动重置 IMAP 连接池与别名内存缓存，支持外部脚本修改 JSON 文件后零停机生效。
 
 ### 39. 运行时可观测性水位 (System Stats)
 
@@ -1038,6 +1066,13 @@ Authorization: Bearer <API_KEY>
       "leases": 1850000,
       "db_size_bytes": 268435456
     },
+    "alias_pool": {
+      "total_active_aliases": 535,
+      "consumed_aliases": 34,
+      "available_aliases": 254,
+      "dormant_aliases": 242,
+      "apple_quota_remaining": 215
+    },
     "message_cache_entries": 137,
     "engines": {
       "mail_subscribers": false,
@@ -1053,12 +1088,16 @@ Authorization: Bearer <API_KEY>
 
 | 指标 | 水位含义 |
 | --- | --- |
+| `alias_pool.available_aliases` | **核心号池就绪水位**：外部注册机当前可立即领取的空闲别名总数 |
+| `alias_pool.dormant_aliases` | **沉睡资产数**：处于 unknown 且干净未消费的别名数，可随时调 `promote-to-pool` 激活入池 |
+| `alias_pool.total_active_aliases` | 所有活跃账号在 Apple 远端处于激活状态的别名总数 |
+| `alias_pool.consumed_aliases` | 历史已被外部注册机或业务领用消费的别名总数 |
+| `alias_pool.apple_quota_remaining` | 距离 Apple 单母号 750 物理上限剩余可现场新建额度（已自动排除私人大号） |
 | `goroutines` | 数千为正常；持续数万说明有泄漏（派生 goroutine 未退出） |
 | `heap_alloc_bytes` | 主要来自别名缓存（账号数 × 别名数）。2000×200 约 150–200 MB |
 | `store.leases` | 未配置 `ICLOUD_HME_LEASE_RETENTION` 时会无限增长 |
 | `store.alias_routes` | 应接近别名总量；明显偏低说明路由自愈尚未覆盖全部账号 |
 | `message_cache_entries` | 上限 1000，接近上限说明详情缓存正在被填满 |
-- 自动重置 IMAP 连接池与别名内存缓存，支持外部脚本修改 JSON 文件后零停机生效。
 
 ---
 

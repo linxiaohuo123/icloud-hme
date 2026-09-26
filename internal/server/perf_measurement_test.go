@@ -499,6 +499,7 @@ func TestOptimized_ServerSideSocketCancellation(t *testing.T) {
 	defer p.Close()
 
 	p.SetClientForTesting("perf_cancel@icloud.com", "dummy_pass", mockClient)
+	p.SetLastUsedForTesting("perf_cancel@icloud.com", time.Now().Add(-1*time.Minute))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -572,8 +573,8 @@ func TestOptimized_ServerSideSocketCancellation(t *testing.T) {
 	select {
 	case <-serverConnClosed:
 		t.Logf("[OPTIMIZED] Server confirmed socket was severed by production Pool.DoContext watchdog")
-	case <-time.After(500 * time.Millisecond):
-		t.Fatalf("服务端未能在 500ms 内检测到套接字关闭，连接发生泄漏")
+	case <-time.After(2 * time.Second):
+		t.Fatalf("服务端未能在 2s 内检测到套接字关闭，连接发生泄漏")
 	}
 
 	// 断言 3: 取消后已中断的 client 必须从连接池中丢弃

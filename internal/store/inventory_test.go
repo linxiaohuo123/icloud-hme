@@ -812,5 +812,110 @@ func TestUpdateAliasRemoteState_IdentityValidationAndRollback(t *testing.T) {
 	}
 }
 
+func TestPromoteUnknownToAvailable(t *testing.T) {
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	// 1. 准备测试账号: 一个正常业务账号，一个保护大号，一个 tags 为 NULL 的账号
+	_, _ = st.db.Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) VALUES ('acc_normal', 'Normal Account', 'norm@test.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+	_, _ = st.db.Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) VALUES ('acc_protected', '私人大号', 'big@test.com', 'active', '["personal"]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+	_, _ = st.db.Exec(`INSERT INTO accounts (id, name, real_email, status, tags, created_at, updated_at) VALUES ('acc_nulltags', 'Null Tags Account', 'null@test.com', 'active', NULL, '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`)
+
+	// 2. 注入各类存量别名
+	// 正常未分配存量 (3 个来自 acc_normal, 1 个来自 acc_nulltags)
+	_, _ = st.db.Exec(`INSERT INTO alias_inventory (email, account_id, provider_alias_id, remote_state, allocation_state, source_type, last_verified_at) VALUES ('clean1@example.com', 'acc_normal', '', 'unknown', 'unknown', 'legacy_unknown', '')`)
+	_, _ = st.db.Exec(`INSERT INTO alias_inventory (email, account_id, provider_alias_id, remote_state, allocation_state, source_type, last_verified_at) VALUES ('clean2@example.com', 'acc_normal', '', 'unknown', 'unknown', 'legacy_unknown', '')`)
+	_, _ = st.db.Exec(`INSERT INTO alias_inventory (email, account_id, provider_alias_id, remote_state, allocation_state, source_type, last_verified_at) VALUES ('clean3@example.com', 'acc_normal', '', 'unknown', 'unknown', 'legacy_unknown', '')`)
+	_, _ = st.db.Exec(`INSERT INTO alias_inventory (email, account_id, provider_alias_id, remote_state, allocation_state, source_type, last_verified_at) VALUES ('clean_null@example.com', 'acc_nulltags', '', 'unknown', 'unknown', 'legacy_unknown', '')`)
+	// 正常但已被停用/删除的别名 (不应激活)
+	_, _ = st.db.Exec(`INSERT INTO alias_inventory (email, account_id, provider_alias_id, remote_state, allocation_state, source_type, last_verified_at) VALUES ('inactive@example.com', 'acc_normal', '', 'inactive', 'unknown', 'legacy_unknown', '')`)
+	// 正常但已消费过的别名 (不应激活)
+	_, _ = st.db.Exec(`INSERT INTO alias_inventory (email, account_id, provider_alias_id, remote_state, allocation_state, source_type, last_verified_at) VALUES ('used@example.com', 'acc_normal', '', 'unknown', 'unknown', 'legacy_unknown', '')`)
+	_, _ = st.db.Exec(`INSERT INTO alias_allocations (allocation_id, alias_email, account_id, owner_kind, owner_id, allocated_at, status) VALUES ('alloc_1', 'used@example.com', 'acc_normal', 'token', 'tok_1', '2026-09-20T00:00:00Z', 'allocated')`)
+	// 受保护大号下的别名 (严禁激活)
+	_, _ = st.db.Exec(`INSERT INTO alias_inventory (email, account_id, provider_alias_id, remote_state, allocation_state, source_type, last_verified_at) VALUES ('protected@example.com', 'acc_protected', '', 'unknown', 'unknown', 'legacy_unknown', '')`)
+
+	// 验证沉睡存量统计: clean1, clean2, clean3, clean_null 共 4 个符合条件 (包含 NULL tags 账号)
+	dormant := st.CountDormantPoolAliases()
+	if dormant != 4 {
+		t.Fatalf("expected 4 dormant aliases, got %d", dormant)
+	}
+
+	// 3. 显式指定受保护账号进行激活，必须直接报错拒绝
+	_, errProt := st.PromoteUnknownToAvailable("acc_protected", 0)
+	if errProt == nil {
+		t.Fatal("expected error when promoting protected account, got nil")
+	}
+
+	// 3.1 显式指定 NULL tags 账号进行激活，验证 Scan 不报错且成功激活
+	nNull, errNull := st.PromoteUnknownToAvailable("acc_nulltags", 0)
+	if errNull != nil {
+		t.Fatalf("promote acc_nulltags failed: %v", errNull)
+	}
+	if nNull != 1 {
+		t.Fatalf("expected 1 promoted from acc_nulltags, got %d", nNull)
+	}
+
+	// 4. 按 limit=2 部分激活
+	n1, err := st.PromoteUnknownToAvailable("acc_normal", 2)
+	if err != nil {
+		t.Fatalf("promote limit=2 failed: %v", err)
+	}
+	if n1 != 2 {
+		t.Fatalf("expected 2 promoted, got %d", n1)
+	}
+	if avail := st.CountAuthoritativeAvailableAliases(); avail != 3 {
+		t.Fatalf("expected 3 available aliases, got %d", avail)
+	}
+	if rem := st.CountDormantPoolAliases(); rem != 1 {
+		t.Fatalf("expected 1 remaining dormant alias, got %d", rem)
+	}
+
+	// 5. 再次无限制激活剩余别名
+	n2, err := st.PromoteUnknownToAvailable("", 0)
+	if err != nil {
+		t.Fatalf("promote remaining failed: %v", err)
+	}
+	if n2 != 1 {
+		t.Fatalf("expected 1 promoted in second pass, got %d", n2)
+	}
+	if avail := st.CountAuthoritativeAvailableAliases(); avail != 4 {
+		t.Fatalf("expected 4 available aliases, got %d", avail)
+	}
+	if rem := st.CountDormantPoolAliases(); rem != 0 {
+		t.Fatalf("expected 0 dormant aliases, got %d", rem)
+	}
+
+	// 6. 核验保护大号与已消费资产未受破坏
+	invProt, _ := st.GetInventoryAlias("protected@example.com")
+	if invProt.AllocationState == AllocationAvailable {
+		t.Fatal("protected asset was erroneously promoted to available")
+	}
+	invUsed, _ := st.GetInventoryAlias("used@example.com")
+	if invUsed.AllocationState == AllocationAvailable {
+		t.Fatal("used asset was erroneously promoted to available")
+	}
+
+	// 7. 核验激活的别名自动在 alias_routes 注册就绪
+	if rAcc, ok := st.FindAliasRoute("clean1@example.com"); !ok || rAcc != "acc_normal" {
+		t.Fatalf("expected clean1@example.com routed to acc_normal, got %s (ok=%v)", rAcc, ok)
+	}
+
+	// 8. 验证激活后的别名可被原子正常认领
+	alloc, _, err := st.ClaimInventoryAlias(ctx, "token", "tok_test", "allocate", "idemp_promoted", "hash_p", "", []string{"acc_normal"})
+	if err != nil || alloc == nil {
+		t.Fatalf("failed to claim promoted alias: %v", err)
+	}
+	if alloc.AliasEmail != "clean1@example.com" && alloc.AliasEmail != "clean2@example.com" && alloc.AliasEmail != "clean3@example.com" {
+		t.Fatalf("unexpected claimed alias: %s", alloc.AliasEmail)
+	}
+}
+
+
 
 
