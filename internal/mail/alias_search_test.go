@@ -22,14 +22,15 @@ import (
 )
 
 type mockMailItem struct {
-	SeqNum      uint32
-	UID         uint32
-	DateStr     string // "26-Sep-2026 00:00:00 +0000"
-	Subject     string
-	FromAddr    string
-	ToAddr      string
-	DeliveredTo string
-	Body        string
+	SeqNum           uint32
+	UID              uint32
+	DateStr          string // "26-Sep-2026 00:00:00 +0000"
+	Subject          string
+	FromAddr         string
+	ToAddr           string
+	DeliveredTo      string
+	XAppleOriginalTo string
+	Body             string
 }
 
 func (m mockMailItem) headerLiteral() string {
@@ -39,6 +40,9 @@ func (m mockMailItem) headerLiteral() string {
 	}
 	if m.DeliveredTo != "" {
 		b.WriteString(fmt.Sprintf("Delivered-To: %s\r\n", m.DeliveredTo))
+	}
+	if m.XAppleOriginalTo != "" {
+		b.WriteString(fmt.Sprintf("X-Apple-Original-To: %s\r\n", m.XAppleOriginalTo))
 	}
 	if m.FromAddr != "" {
 		b.WriteString(fmt.Sprintf("From: %s\r\n", m.FromAddr))
@@ -393,7 +397,7 @@ func TestDirectSearch_MetadataFirst_CandidateOnlyBody(t *testing.T) {
 		mailPerfSink = oldSink
 	}()
 
-	receivedMsgs, err := c.FindByRecipientInFolder("alias@icloud.com", "INBOX", 10, 0)
+	receivedMsgs, err := c.FindByRecipientInFolder("alias@icloud.com", "INBOX", 1, 0)
 	if err != nil {
 		t.Fatalf("FindByRecipientInFolder failed: %v", err)
 	}
@@ -1161,5 +1165,74 @@ func TestFolderAll_GlobalNewestFirst(t *testing.T) {
 	}
 	if msgs[0].Subject != "新邮件Junk" {
 		t.Errorf("期望返回主题「新邮件Junk」, 实际得到 %s", msgs[0].Subject)
+	}
+}
+
+// TestAliasSearch_PartialDirectSearchFallback (PR-21 Final Bugfix) 验证 Direct SEARCH 结果少于 limit 时的补齐与排序：
+// limit = 2
+// UID 10: 旧邮件 (01:00:00), To: alias@icloud.com (Direct SEARCH 命中)
+// UID 30: 最新邮件 (02:00:00), To: rewritten@example.com, X-Apple-Original-To: alias@icloud.com (Direct SEARCH 无法命中, Recent Fallback 命中)
+// 验证点：
+// 1. 最终返回 2 封邮件
+// 2. 顺序必须是 30 -> 10 (newest-first)
+// 3. UID 10 不发生重复 BODY FETCH
+func TestAliasSearch_PartialDirectSearchFallback(t *testing.T) {
+	mails := map[uint32]mockMailItem{
+		10: {
+			SeqNum:   1,
+			UID:      10,
+			DateStr:  "26-Sep-2026 01:00:00 +0000",
+			Subject:  "旧邮件Direct",
+			ToAddr:   "alias@icloud.com",
+			Body:     "正文10",
+		},
+		30: {
+			SeqNum:           2,
+			UID:              30,
+			DateStr:          "26-Sep-2026 02:00:00 +0000",
+			Subject:          "新邮件Fallback",
+			ToAddr:           "rewritten@example.com",
+			XAppleOriginalTo: "alias@icloud.com",
+			Body:             "正文30",
+		},
+	}
+	// Direct SEARCH 只能搜到 UID 10
+	searchUIDs := []uint32{10}
+
+	port, getCommands, stop := spinMockMailServer(t, 2, searchUIDs, mails)
+	defer stop()
+
+	c := createTestClient(t, port)
+	defer c.Disconnect()
+
+	msgs, err := c.FindByRecipientInFolder("alias@icloud.com", "INBOX", 2, 7)
+	if err != nil {
+		t.Fatalf("FindByRecipientInFolder failed: %v", err)
+	}
+
+	if len(msgs) != 2 {
+		t.Fatalf("期望返回 2 封邮件, 实际返回 %d", len(msgs))
+	}
+
+	if msgs[0].UID != 30 {
+		t.Errorf("第一封期望是最新邮件 UID 30, 实际得到 UID %d", msgs[0].UID)
+	}
+	if msgs[1].UID != 10 {
+		t.Errorf("第二封期望是旧邮件 UID 10, 实际得到 UID %d", msgs[1].UID)
+	}
+
+	// 验证未发生重复 BODY FETCH：检查发给服务端的命令
+	cmds := getCommands()
+	bodyFetch10Count := 0
+	for _, cmd := range cmds {
+		upper := strings.ToUpper(cmd)
+		if strings.Contains(upper, "FETCH") && (strings.Contains(upper, "BODY[]") || strings.Contains(upper, "BODY.PEEK[]")) {
+			if strings.Contains(cmd, " 10 ") || strings.HasSuffix(cmd, " 10") || strings.Contains(cmd, "10:10") || strings.Contains(cmd, " 10 (") {
+				bodyFetch10Count++
+			}
+		}
+	}
+	if bodyFetch10Count > 1 {
+		t.Errorf("UID 10 的 BODY FETCH 执行了 %d 次，存在重复抓取正文", bodyFetch10Count)
 	}
 }

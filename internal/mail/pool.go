@@ -203,7 +203,7 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 		cli.forceClose()
 		pc.client = nil
 		perf.err = true
-		perf.connErr = true
+		perf.connErr = false
 		return ctxErr
 	}
 
