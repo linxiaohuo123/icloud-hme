@@ -557,28 +557,63 @@ func (c *Client) ForEachByRecipientInFolderSince(recipient string, folder string
 		return err
 	}
 
+	if len(folders) <= 1 {
+		folderName := "INBOX"
+		if len(folders) == 1 {
+			folderName = folders[0]
+		}
+		return c.forEachByRecipientInMailbox(recipient, folderName, limit, days, sinceUID, onMsg)
+	}
+
+	// 多文件夹聚合模式 (例如 folder=all 对应 INBOX + Junk，FIX-4)：
+	// 每一个文件夹各自检索其有限候选 (不超过 limit)，最后全局聚合、去重并按 newest-first 排序截断，
+	// 杜绝因 INBOX 满足 limit 就过早放弃扫描包含更新邮件的 Junk 文件夹
+	var allMsgs []Message
+	seenRefs := make(map[string]struct{})
 	var folderErrors []string
 	successFolders := 0
-	stop := false
-	wrappedOnMsg := func(m Message) bool {
-		cont := onMsg(m)
-		if !cont {
-			stop = true
-		}
-		return cont
-	}
+
 	for _, name := range folders {
-		if stop {
-			break
-		}
-		if err := c.forEachByRecipientInMailbox(recipient, name, limit, days, sinceUID, wrappedOnMsg); err != nil {
+		var folderMsgs []Message
+		err := c.forEachByRecipientInMailbox(recipient, name, limit, days, sinceUID, func(m Message) bool {
+			folderMsgs = append(folderMsgs, m)
+			return len(folderMsgs) < limit
+		})
+		if err != nil {
 			folderErrors = append(folderErrors, fmt.Sprintf("%s: %v", name, err))
 			continue
 		}
 		successFolders++
+		for _, m := range folderMsgs {
+			key := m.MessageRef
+			if key == "" {
+				key = fmt.Sprintf("%s:%d:%d", m.Folder, m.UIDValidity, m.UID)
+			}
+			if _, ok := seenRefs[key]; !ok {
+				seenRefs[key] = struct{}{}
+				allMsgs = append(allMsgs, m)
+			}
+		}
 	}
 	if len(folders) > 0 && successFolders == 0 {
 		return fmt.Errorf("所有文件夹检索均失败: %s", strings.Join(folderErrors, "; "))
+	}
+
+	// 全局 newest-first 排序 (优先按 Date RFC3339 降序，Date 相同时按 UID 降序)
+	sort.SliceStable(allMsgs, func(i, j int) bool {
+		if allMsgs[i].Date != allMsgs[j].Date {
+			return allMsgs[i].Date > allMsgs[j].Date
+		}
+		return allMsgs[i].UID > allMsgs[j].UID
+	})
+	if limit > 0 && len(allMsgs) > limit {
+		allMsgs = allMsgs[:limit]
+	}
+
+	for _, m := range allMsgs {
+		if !onMsg(m) {
+			break
+		}
 	}
 	return nil
 }
@@ -662,11 +697,21 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 				}
 			}
 		}
-		// 性能关键优化：如果当前已搜出足够数量的 UID（>= limit），立即短路返回
-		if len(allUIDs) >= limit {
-			break
-		}
 	}
+	// 避免 UID 数量无限放大 (FIX-2)：必须完成所有计划 Header SEARCH 并 Union 去重后，
+	// 优先按 UID newest-first 方向截断保留有限候选 (max(limit*3, 30) 且封顶 100)，再送入 metadata FETCH 与结构化收件人核验
+	sort.Slice(allUIDs, func(i, j int) bool { return allUIDs[i] > allUIDs[j] })
+	maxCandidates := limit * 3
+	if maxCandidates < 30 {
+		maxCandidates = 30
+	}
+	if maxCandidates > 100 {
+		maxCandidates = 100
+	}
+	if limit > 0 && len(allUIDs) > maxCandidates {
+		allUIDs = allUIDs[:maxCandidates]
+	}
+	// 恢复 UID 升序用于 SeqSet 构建
 	sort.Slice(allUIDs, func(i, j int) bool { return allUIDs[i] < allUIDs[j] })
 	uids := allUIDs
 	searchMS = time.Since(searchStart).Milliseconds()

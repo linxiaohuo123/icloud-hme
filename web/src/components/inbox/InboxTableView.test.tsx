@@ -480,3 +480,303 @@ describe('InboxTableView WebMail 首屏 Capability 防竞争与退避重试 (PR-
   })
 })
 
+describe('InboxTableView 详情生命周期彻底收口 (FIX-1)', () => {
+  it('Case A: A detail pending → close dialog → request abort, loading=false, dialog disappears, late response 不得重新打开', async () => {
+    let detailResolve: (() => void) | null = null
+    server.use(
+      http.get('/api/inbox', () => {
+        return HttpResponse.json({
+          success: true,
+          data: {
+            account_id: 'acc_1',
+            count: 1,
+            method: 'imap',
+            messages: [
+              {
+                id: '101',
+                message_ref: 'ref_101',
+                from: 'Sender <sender@example.com>',
+                to: 'to@icloud.com',
+                subject: '慢速邮件A',
+                date: '2026-09-20T10:00:00Z',
+                preview: '预览A',
+              },
+            ],
+          },
+        })
+      }),
+      http.get('/api/inbox/:ref', async () => {
+        await new Promise<void>((resolve) => {
+          detailResolve = resolve
+        })
+        return HttpResponse.json({
+          success: true,
+          data: {
+            message: {
+              id: '101',
+              message_ref: 'ref_101',
+              from: 'Sender <sender@example.com>',
+              to: 'to@icloud.com',
+              subject: '慢速邮件A',
+              date: '2026-09-20T10:00:00Z',
+              preview: '预览A',
+              body: '<p>正文内容A</p>',
+              content_type: 'text/html',
+              body_complete: true,
+            },
+          },
+        })
+      }),
+    )
+
+    render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_1" fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('慢速邮件A')).toBeInTheDocument()
+    })
+
+    // 1. 点击邮件触发 loading
+    fireEvent.click(screen.getByRole('button', { name: '慢速邮件A' }))
+
+    await waitFor(() => {
+      expect(screen.getByText('读取邮件正文中…')).toBeInTheDocument()
+    })
+
+    // 2. 在 pending 状态下直接关闭弹窗 (点击遮罩层或触发关闭)
+    const backdrop = document.querySelector('.dialog-backdrop')
+    expect(backdrop).not.toBeNull()
+    fireEvent.click(backdrop!)
+
+    // 3. 弹窗应当立即消失
+    expect(screen.queryByRole('dialog')).toBeNull()
+
+    // 4. 模拟慢速响应晚到返回
+    await act(async () => {
+      detailResolve?.()
+      await delay(50)
+    })
+
+    // 5. late response 严禁重新打开弹窗
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByText('正文内容A')).toBeNull()
+  })
+
+  it('Case B: A detail 已显示 → click uncached B → A 内容立即消失，只显示 loading', async () => {
+    let resolveB!: () => void
+    const promiseB = new Promise<void>((resolve) => {
+      resolveB = resolve
+    })
+    server.use(
+      http.get('/api/inbox', () => {
+        return HttpResponse.json({
+          success: true,
+          data: {
+            account_id: 'acc_1',
+            count: 2,
+            method: 'imap',
+            messages: [
+              {
+                id: '201',
+                message_ref: 'ref_201',
+                from: 'Sender A <senderA@example.com>',
+                to: 'to@icloud.com',
+                subject: '已缓存邮件A',
+                date: '2026-09-20T10:00:00Z',
+                preview: '预览A',
+              },
+              {
+                id: '202',
+                message_ref: 'ref_202',
+                from: 'Sender B <senderB@example.com>',
+                to: 'to@icloud.com',
+                subject: '未缓存邮件B',
+                date: '2026-09-20T11:00:00Z',
+                preview: '预览B',
+              },
+            ],
+          },
+        })
+      }),
+      http.get('/api/inbox/:ref', async ({ params }) => {
+        if (params.ref === 'ref_201') {
+          return HttpResponse.json({
+            success: true,
+            data: {
+              message: {
+                id: '201',
+                message_ref: 'ref_201',
+                from: 'Sender A <senderA@example.com>',
+                to: 'to@icloud.com',
+                subject: '已缓存邮件A',
+                date: '2026-09-20T10:00:00Z',
+                preview: '预览A',
+                body: '<p>我是邮件A的完整正文</p>',
+                content_type: 'text/html',
+                body_complete: true,
+              },
+            },
+          })
+        }
+        await promiseB
+        return HttpResponse.json({
+          success: true,
+          data: {
+            message: {
+              id: '202',
+              message_ref: 'ref_202',
+              from: 'Sender B <senderB@example.com>',
+              to: 'to@icloud.com',
+              subject: '未缓存邮件B',
+              date: '2026-09-20T11:00:00Z',
+              preview: '预览B',
+              body: '<p>我是邮件B的完整正文</p>',
+              content_type: 'text/html',
+              body_complete: true,
+            },
+          },
+        })
+      }),
+    )
+
+    render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_1" fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('已缓存邮件A')).toBeInTheDocument()
+      expect(screen.getByText('未缓存邮件B')).toBeInTheDocument()
+    })
+
+    // 1. 点击邮件 A 并等待其正文显示
+    fireEvent.click(screen.getByRole('button', { name: '已缓存邮件A' }))
+    await waitFor(() => {
+      expect(screen.getByText('我是邮件A的完整正文')).toBeInTheDocument()
+    })
+
+    // 2. 点击邮件 B (此时 B 在途 pending)
+    fireEvent.click(screen.getByRole('button', { name: '未缓存邮件B' }))
+
+    // 3. 邮件 A 的正文必须立即消失，只显示 loading
+    expect(screen.queryByText('我是邮件A的完整正文')).toBeNull()
+    expect(screen.getByText('读取邮件正文中…')).toBeInTheDocument()
+
+    // 4. 释放邮件 B 响应
+    await act(async () => {
+      resolveB?.()
+      await delay(50)
+    })
+
+    // 5. 显示邮件 B 正文
+    await waitFor(() => {
+      expect(screen.getByText('我是邮件B的完整正文')).toBeInTheDocument()
+    })
+  })
+
+  it('Case C: detail pending → switch account → detail=null, loading=false, old account response 不得污染', async () => {
+    let resolveDetail: (() => void) | null = null
+    server.use(
+      http.get('/api/accounts', () => {
+        return HttpResponse.json({ success: true, data: mockAccounts })
+      }),
+      http.get('/api/inbox', ({ request }) => {
+        const url = new URL(request.url)
+        const accId = url.searchParams.get('account_id')
+        return HttpResponse.json({
+          success: true,
+          data: {
+            account_id: accId || '',
+            count: 1,
+            method: 'imap',
+            messages: [
+              {
+                id: accId === 'acc_1' ? '101' : '202',
+                message_ref: accId === 'acc_1' ? 'ref_101' : 'ref_202',
+                from: `${accId}@example.com`,
+                to: 'to@icloud.com',
+                subject: accId === 'acc_1' ? '账户1邮件' : '账户2邮件',
+                date: '2026-09-20T10:00:00Z',
+                preview: '预览',
+              },
+            ],
+          },
+        })
+      }),
+      http.get('/api/inbox/:ref', async () => {
+        await new Promise<void>((resolve) => {
+          resolveDetail = resolve
+        })
+        return HttpResponse.json({
+          success: true,
+          data: {
+            message: {
+              id: '101',
+              message_ref: 'ref_101',
+              from: 'acc_1@example.com',
+              to: 'to@icloud.com',
+              subject: '账户1邮件',
+              date: '2026-09-20T10:00:00Z',
+              preview: '预览',
+              body: '<p>账户1正文</p>',
+              content_type: 'text/html',
+              body_complete: true,
+            },
+          },
+        })
+      }),
+    )
+
+    const { rerender } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_1" fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('账户1邮件')).toBeInTheDocument()
+    })
+
+    // 1. 点击账户1邮件进入 pending
+    fireEvent.click(screen.getByRole('button', { name: '账户1邮件' }))
+    await waitFor(() => {
+      expect(screen.getByText('读取邮件正文中…')).toBeInTheDocument()
+    })
+
+    // 2. 外部切换账户为 acc_2
+    rerender(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_2" fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    // 3. 弹窗立即关闭，loading 归零
+    await waitFor(() => {
+      expect(screen.getByText('账户2邮件')).toBeInTheDocument()
+    })
+    expect(screen.queryByRole('dialog')).toBeNull()
+
+    // 4. 旧账户请求完成返回
+    await act(async () => {
+      resolveDetail?.()
+      await delay(50)
+    })
+
+    // 5. 严禁旧请求回写并污染当前视图
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByText('账户1正文')).toBeNull()
+  })
+})
+
