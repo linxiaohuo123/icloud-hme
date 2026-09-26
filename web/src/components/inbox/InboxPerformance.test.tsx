@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { http, HttpResponse } from 'msw'
 import { server } from '../../test/server'
@@ -126,8 +126,8 @@ describe('Inbox Baseline Performance Measurements', () => {
     expect(requestCalls.some((c) => c.includes('/api/mailboxes'))).toBe(false)
     // 3. /api/inbox was requested
     expect(requestCalls.some((c) => c.includes('/api/inbox'))).toBe(true)
-    // 4. /api/messages was requested with chunked batch size <= 5
-    expect(requestCalls.some((c) => c.includes('/api/messages (batch size: 2)'))).toBe(true)
+    // 4. PR-MAIL-04: Body-on-demand: no automatic /api/messages requested on mount (zero body requests)
+    expect(requestCalls.some((c) => c.includes('/api/messages'))).toBe(false)
 
     unmount()
   })
@@ -290,7 +290,7 @@ describe('Inbox Baseline Performance Measurements', () => {
     unmount()
   })
 
-  it('TEST-4: 当前可见缺失正文目标单次 background batch 请求 (12 封只发 1 次 batch_size=12)', async () => {
+  it('TEST-4 (PR-MAIL-04): 即使有 12 封邮件缺失正文，打开收件箱也绝不自动发起 /api/messages (正文请求 = 0)', async () => {
     const chunkSizes: number[] = []
     const manyMessages = Array.from({ length: 12 }, (_, i) => ({
       id: `msg_${i + 1}`,
@@ -325,13 +325,7 @@ describe('Inbox Baseline Performance Measurements', () => {
         chunkSizes.push(len)
         return HttpResponse.json({
           success: true,
-          data: {
-            messages: (body?.messages || []).map((m: { id: string; message_ref: string }) => ({
-              ...m,
-              body: `Body for ${m.message_ref}`,
-              preview: `Preview for ${m.message_ref}`,
-            })),
-          },
+          data: { messages: [] },
         })
       }),
     )
@@ -349,11 +343,8 @@ describe('Inbox Baseline Performance Measurements', () => {
       expect(screen.getByText('Verification Code #12')).toBeInTheDocument()
     })
 
-    // 关键断言：不再分片为 [5, 5, 2]，而是单次请求 12
-    await waitFor(() => {
-      expect(chunkSizes).toEqual([12])
-    })
-    expect(chunkSizes.length).toBe(1)
+    // 关键断言：PR-MAIL-04 用户不点击邮件时，自动正文批量请求恒等于 0
+    expect(chunkSizes.length).toBe(0)
 
     unmount()
   })
@@ -399,22 +390,22 @@ describe('Inbox Baseline Performance Measurements', () => {
       http.get('/api/inbox', () => {
         return HttpResponse.json({ success: true, data: testMessages })
       }),
-      http.post('/api/messages', async () => {
-        // Return body ONLY for the Junk message
+      http.get('/api/inbox/:ref', () => {
+        // Return detail ONLY for the Junk message
         return HttpResponse.json({
           success: true,
           data: {
-            messages: [
-              {
-                id: '100',
-                uid: 100,
-                folder: 'Junk',
-                message_ref: 'imap:acc_perf:Junk:1:100',
-                subject: 'Junk Spam Warning',
-                body: 'Malicious spam content',
-                preview: 'Malicious spam content',
-              },
-            ],
+            message: {
+              id: '100',
+              uid: 100,
+              folder: 'Junk',
+              message_ref: 'imap:acc_perf:Junk:1:100',
+              subject: 'Junk Spam Warning',
+              body: 'Malicious spam content',
+              preview: 'Malicious spam content',
+              content_type: 'text/plain',
+              body_complete: true,
+            },
           },
         })
       }),
@@ -433,7 +424,10 @@ describe('Inbox Baseline Performance Measurements', () => {
       expect(screen.getByText('Junk Spam Warning')).toBeInTheDocument()
     })
 
-    // Verify Junk received its body
+    // 点击 Junk 邮件拉取单封正文
+    fireEvent.click(screen.getByRole('button', { name: 'Junk Spam Warning' }))
+
+    // 详情弹窗中展示 Junk 正文
     await waitFor(() => {
       expect(screen.getByText('Malicious spam content')).toBeInTheDocument()
     })
@@ -619,11 +613,9 @@ describe('Inbox Baseline Performance Measurements', () => {
     view2.unmount()
   })
 
-  it('TEST-3: 邮件元数据优先渲染，后台正文返回后渐进提取并显示验证码胶囊 (Progressive OTP Enrichment)', async () => {
-    let resolveMessages: (() => void) | null = null
-    const messagesDeferred = new Promise<void>((resolve) => {
-      resolveMessages = resolve
-    })
+  it('TEST-3 (PR-MAIL-04): 邮件元数据优先渲染且无自动正文拉取，点击单封邮件按需获取正文并提取验证码', async () => {
+    let detailFetched = 0
+    let batchFetched = 0
 
     const testMsg = {
       id: 'otp_msg_1',
@@ -653,17 +645,21 @@ describe('Inbox Baseline Performance Measurements', () => {
         })
       }),
       http.post('/api/messages', async () => {
-        await messagesDeferred
+        batchFetched++
+        return HttpResponse.json({ success: true, data: { messages: [] } })
+      }),
+      http.get('/api/inbox/imap%3Aacc_perf%3AINBOX%3A1%3A999', async () => {
+        detailFetched++
         return HttpResponse.json({
           success: true,
           data: {
-            messages: [
-              {
-                ...testMsg,
-                body: 'Your verification code is 884812. Valid for 10 minutes.',
-                preview: 'Your verification code is 884812.',
-              },
-            ],
+            message: {
+              ...testMsg,
+              body: 'Your verification code is 884812. Valid for 10 minutes.',
+              preview: 'Your verification code is 884812.',
+              content_type: 'text/plain',
+              body_complete: true,
+            },
           },
         })
       }),
@@ -677,19 +673,30 @@ describe('Inbox Baseline Performance Measurements', () => {
       </MemoryRouter>,
     )
 
-    // 第一帧：主题已先显示，但此时正文未到，验证码胶囊不存在
+    // 第一帧：主题已先显示，但此时未点击邮件，验证码胶囊不存在且不调用 /api/messages
     await waitFor(() => {
       expect(screen.getByText('Security Verification Notification')).toBeInTheDocument()
     })
     expect(screen.queryByText('884812')).toBeNull()
+    expect(batchFetched).toBe(0)
+    expect(detailFetched).toBe(0)
 
-    // 释放后台 /api/messages 请求
-    resolveMessages!()
+    // 用户点击邮件触发 body-on-demand
+    fireEvent.click(screen.getByRole('button', { name: 'Security Verification Notification' }))
 
-    // 响应式合并后，验证码胶囊渐进出场
+    // 详情弹窗中展示提取的验证码 884812
     await waitFor(() => {
       expect(screen.getByText('884812')).toBeInTheDocument()
     })
+    expect(detailFetched).toBe(1)
+
+    // 再次点击：从缓存打开，detailFetched 仍为 1
+    const dialog = screen.getByRole('dialog')
+    const closeBtn = within(dialog).getByRole('button', { name: '关闭' })
+    fireEvent.click(closeBtn)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Security Verification Notification' }))
+    expect(detailFetched).toBe(1)
 
     unmount()
   })
@@ -1540,6 +1547,418 @@ describe('PR-MAIL-03: INBOX First & Mailbox Lazy Load', () => {
 
     // 依然 0 次
     expect(mailboxesCallCount).toBe(0)
+
+    unmount()
+  })
+})
+
+describe('PR-MAIL-04: Body-on-demand & Single-message reading', () => {
+  const dummyAccount: AccountSummary = {
+    id: 'acc_mail04',
+    name: 'Mail04 Account',
+    real_email: 'mail04@icloud.com',
+    icloud_email: 'mail04@icloud.com',
+    host: 'p123-setup.icloud.com',
+    has_app_password: true,
+    has_cookies: true,
+    has_proxy: false,
+    status: 'active',
+    alias_total: 5,
+    alias_active: 5,
+    last_validated: '2026-09-25 10:00:00',
+    created_at: '2026-09-25 10:00:00',
+  }
+
+  const dummyMessages: InboxResult = {
+    account_id: 'acc_mail04',
+    count: 2,
+    messages: [
+      {
+        id: 'msg_1',
+        message_ref: 'imap:acc_mail04:INBOX:1:101',
+        subject: 'First Mail Subject',
+        from: 'Alice <alice@test.com>',
+        to: 'alias1@icloud.com',
+        date: '2026-09-25 10:00:00',
+        folder: 'INBOX',
+        unread: true,
+        preview: '',
+        body: '',
+      },
+      {
+        id: 'msg_2',
+        message_ref: 'imap:acc_mail04:INBOX:1:102',
+        subject: 'Second Mail Subject',
+        from: 'Bob <bob@test.com>',
+        to: 'alias2@icloud.com',
+        date: '2026-09-25 10:05:00',
+        folder: 'INBOX',
+        unread: false,
+        preview: '',
+        body: '',
+      },
+    ],
+    method: 'imap',
+  }
+
+  beforeEach(() => {
+    server.resetHandlers()
+    clearInboxSnapshotCache()
+  })
+
+  // TEST 1: 连续点击同一封正在拉取的邮件时防重复请求 (请求次数严格为 1)
+  it('TEST 1: dedupes rapid clicks on the same message without issuing duplicate requests', async () => {
+    let detailCalls = 0
+    let resolveDetail: (() => void) | null = null
+    const detailDeferred = new Promise<void>((resolve) => {
+      resolveDetail = resolve
+    })
+
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: [dummyAccount] })),
+      http.get('/api/mailboxes', () => HttpResponse.json({ success: true, data: { account_id: 'acc_mail04', folders: [] } })),
+      http.get('/api/inbox', () => HttpResponse.json({ success: true, data: dummyMessages })),
+      http.get('/api/inbox/imap%3Aacc_mail04%3AINBOX%3A1%3A101', async () => {
+        detailCalls++
+        await detailDeferred
+        return HttpResponse.json({
+          success: true,
+          data: {
+            message: {
+              ...dummyMessages.messages[0],
+              body: 'Full body of first mail',
+              preview: 'Full body of first mail',
+              content_type: 'text/plain',
+              body_complete: true,
+            },
+          },
+        })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_mail04" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('First Mail Subject')).toBeInTheDocument()
+    })
+
+    // 首次点击发起单封正文请求
+    const btn = screen.getByRole('button', { name: 'First Mail Subject' })
+    fireEvent.click(btn)
+
+    await waitFor(() => {
+      expect(detailCalls).toBe(1)
+    })
+
+    // 请求仍处于在途挂起期间，连续点击该邮件 4 次
+    fireEvent.click(btn)
+    fireEvent.click(btn)
+    fireEvent.click(btn)
+    fireEvent.click(btn)
+
+    // 核心断言：因 detailInFlightRef 防重，并没有额外发出重复请求，依然严格为 1 次！
+    expect(detailCalls).toBe(1)
+
+    // 释放请求
+    resolveDetail!()
+
+    await waitFor(() => {
+      expect(screen.getByText('Full body of first mail')).toBeInTheDocument()
+    })
+
+    unmount()
+  })
+
+  // TEST 2: 用户快速切换点击另一封邮件时中止上一在途请求，绝不产生并行正文请求
+  it('TEST 2: aborts previous in-flight request when user clicks a different message', async () => {
+    let startedMsg1 = false
+    let abortedMsg1 = false
+
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: [dummyAccount] })),
+      http.get('/api/mailboxes', () => HttpResponse.json({ success: true, data: { account_id: 'acc_mail04', folders: [] } })),
+      http.get('/api/inbox', () => HttpResponse.json({ success: true, data: dummyMessages })),
+      http.get('/api/inbox/imap%3Aacc_mail04%3AINBOX%3A1%3A101', async ({ request }) => {
+        startedMsg1 = true
+        request.signal.addEventListener('abort', () => {
+          abortedMsg1 = true
+        })
+        // 模拟慢响应
+        await new Promise((r) => setTimeout(r, 150))
+        return HttpResponse.json({
+          success: true,
+          data: {
+            message: {
+              ...dummyMessages.messages[0],
+              body: 'Body for msg 1',
+              preview: 'Body for msg 1',
+              content_type: 'text/plain',
+              body_complete: true,
+            },
+          },
+        })
+      }),
+      http.get('/api/inbox/imap%3Aacc_mail04%3AINBOX%3A1%3A102', async () => {
+        await new Promise((r) => setTimeout(r, 60))
+        return HttpResponse.json({
+          success: true,
+          data: {
+            message: {
+              ...dummyMessages.messages[1],
+              body: 'Body for msg 2',
+              preview: 'Body for msg 2',
+              content_type: 'text/plain',
+              body_complete: true,
+            },
+          },
+        })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_mail04" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('First Mail Subject')).toBeInTheDocument()
+      expect(screen.getByText('Second Mail Subject')).toBeInTheDocument()
+    })
+
+    // 先点击邮件 1，并确认已进入在途请求
+    fireEvent.click(screen.getByRole('button', { name: 'First Mail Subject' }))
+    await waitFor(() => {
+      expect(startedMsg1).toBe(true)
+    })
+
+    // 此时切换点击邮件 2
+    fireEvent.click(screen.getByRole('button', { name: 'Second Mail Subject' }))
+
+    // A 被 abort
+    await waitFor(() => {
+      expect(abortedMsg1).toBe(true)
+    })
+
+    // 核心断言：A 的 abort / finally 绝不得提前关闭邮件 2 的 loading 状态
+    expect(screen.getByText('读取邮件正文中…')).toBeInTheDocument()
+
+    // 邮件 2 最终正常呈现
+    await waitFor(() => {
+      expect(screen.getByText('Body for msg 2')).toBeInTheDocument()
+    })
+
+    unmount()
+  })
+
+  // TEST 2.1: A 未缓存 detail pending 时切换点击已缓存的 B，A 必须被 abort，且即使 A 返回也不得覆盖 B
+  it('TEST 2.1: aborts pending uncached A when switching to cached B, and late A never overwrites B', async () => {
+    let startedMsg1 = false
+    let abortedMsg1 = false
+    let resolveMsg1: (() => void) | null = null
+    const msg1Deferred = new Promise<void>((resolve) => {
+      resolveMsg1 = resolve
+    })
+
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: [dummyAccount] })),
+      http.get('/api/mailboxes', () => HttpResponse.json({ success: true, data: { account_id: 'acc_mail04', folders: [] } })),
+      http.get('/api/inbox', () => HttpResponse.json({ success: true, data: dummyMessages })),
+      http.get('/api/inbox/imap%3Aacc_mail04%3AINBOX%3A1%3A102', () => {
+        return HttpResponse.json({
+          success: true,
+          data: {
+            message: {
+              ...dummyMessages.messages[1],
+              body: 'CACHED_BODY_FOR_B',
+              preview: 'CACHED_BODY_FOR_B',
+              content_type: 'text/plain',
+              body_complete: true,
+            },
+          },
+        })
+      }),
+      http.get('/api/inbox/imap%3Aacc_mail04%3AINBOX%3A1%3A101', async ({ request }) => {
+        startedMsg1 = true
+        request.signal.addEventListener('abort', () => {
+          abortedMsg1 = true
+        })
+        await msg1Deferred
+        return HttpResponse.json({
+          success: true,
+          data: {
+            message: {
+              ...dummyMessages.messages[0],
+              body: 'LATE_ARRIVING_BODY_A',
+              preview: 'LATE_ARRIVING_BODY_A',
+              content_type: 'text/plain',
+              body_complete: true,
+            },
+          },
+        })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_mail04" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('First Mail Subject')).toBeInTheDocument()
+      expect(screen.getByText('Second Mail Subject')).toBeInTheDocument()
+    })
+
+    // 0. 先打开并关闭 B，使 B 存入缓存
+    fireEvent.click(screen.getByRole('button', { name: 'Second Mail Subject' }))
+    await waitFor(() => {
+      expect(screen.getByText('CACHED_BODY_FOR_B')).toBeInTheDocument()
+    })
+    const dialog = screen.getByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: '关闭' }))
+
+    // 1. 点击未缓存的邮件 A (并等待其请求发出处于挂起状态)
+    fireEvent.click(screen.getByRole('button', { name: 'First Mail Subject' }))
+    await waitFor(() => {
+      expect(startedMsg1).toBe(true)
+    })
+
+    // 2. 切换点击已缓存的邮件 B
+    fireEvent.click(screen.getByRole('button', { name: 'Second Mail Subject' }))
+
+    // 3. 断言 A 被立即 abort，且弹窗立即展示 B 的正文
+    await waitFor(() => {
+      expect(abortedMsg1).toBe(true)
+      expect(screen.getByText('CACHED_BODY_FOR_B')).toBeInTheDocument()
+    })
+
+    // 4. 释放延迟的 A 响应，模拟晚到的 A 返回
+    resolveMsg1!()
+    await new Promise((r) => setTimeout(r, 60))
+
+    // 核心断言：晚到的 A 绝对不得覆盖当前已展示的 B
+    expect(screen.getByText('CACHED_BODY_FOR_B')).toBeInTheDocument()
+    expect(screen.queryByText('LATE_ARRIVING_BODY_A')).toBeNull()
+
+    unmount()
+  })
+
+  // TEST 3: 邮件 preview 与 body 为空时，列表完整渲染 subject/from/to/date/folder/unread 且不报错
+  it('TEST 3: renders all metadata fields safely without error when preview and body are empty', async () => {
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: [dummyAccount] })),
+      http.get('/api/mailboxes', () => HttpResponse.json({ success: true, data: { account_id: 'acc_mail04', folders: [] } })),
+      http.get('/api/inbox', () => HttpResponse.json({ success: true, data: dummyMessages })),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_mail04" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('First Mail Subject')).toBeInTheDocument()
+    })
+
+    // 检查 metadata 字段全量可见
+    expect(screen.getByText('First Mail Subject')).toBeInTheDocument()
+    expect(screen.getByText('Alice')).toBeInTheDocument()
+    expect(screen.getByText('alias1@icloud.com')).toBeInTheDocument()
+    expect(screen.getByText('未读')).toBeInTheDocument()
+
+    expect(screen.getByText('Second Mail Subject')).toBeInTheDocument()
+    expect(screen.getByText('Bob')).toBeInTheDocument()
+    expect(screen.getByText('alias2@icloud.com')).toBeInTheDocument()
+
+    // 验证码列显示破折号兜底，无错误提示
+    const noCodeSpans = screen.getAllByText('—')
+    expect(noCodeSpans.length).toBeGreaterThan(0)
+    expect(screen.queryByText(/错误|失败/)).toBeNull()
+
+    unmount()
+  })
+
+  // TEST 4: 刷新邮件列表后，已打开过的邮件继续使用已有 moduleMessageCache 零网络成本回填 preview/body
+  it('TEST 4: backfills body from moduleMessageCache upon list reload with zero extra network requests', async () => {
+    let inboxCalls = 0
+    let detailCalls = 0
+
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: [dummyAccount] })),
+      http.get('/api/mailboxes', () => HttpResponse.json({ success: true, data: { account_id: 'acc_mail04', folders: [] } })),
+      http.get('/api/inbox', () => {
+        inboxCalls++
+        return HttpResponse.json({ success: true, data: dummyMessages })
+      }),
+      http.get('/api/inbox/imap%3Aacc_mail04%3AINBOX%3A1%3A101', () => {
+        detailCalls++
+        return HttpResponse.json({
+          success: true,
+          data: {
+            message: {
+              ...dummyMessages.messages[0],
+              body: 'CACHED_BODY_PREVIEW_SECRET_9988',
+              preview: 'CACHED_BODY_PREVIEW_SECRET_9988',
+              content_type: 'text/plain',
+              body_complete: true,
+            },
+          },
+        })
+      }),
+    )
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <ToastProvider>
+          <InboxTableView accountId="acc_mail04" accountSummary={dummyAccount} fixedAccount={true} />
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('First Mail Subject')).toBeInTheDocument()
+    })
+
+    // 用户点击邮件 1，拉取正文并写入 moduleMessageCache
+    fireEvent.click(screen.getByRole('button', { name: 'First Mail Subject' }))
+
+    await waitFor(() => {
+      expect(detailCalls).toBe(1)
+      expect(screen.getByText('CACHED_BODY_PREVIEW_SECRET_9988')).toBeInTheDocument()
+    })
+
+    // 关闭详情
+    const dialog = screen.getByRole('dialog')
+    const closeBtn = within(dialog).getByRole('button', { name: '关闭' })
+    fireEvent.click(closeBtn)
+
+    // 用户点击查询按钮刷新收件箱列表 (触发重新 GET /api/inbox)
+    const searchBtn = screen.getByRole('button', { name: '查询' })
+    fireEvent.click(searchBtn)
+
+    await waitFor(() => {
+      expect(inboxCalls).toBeGreaterThanOrEqual(2)
+    })
+
+    // 核心断言：未再发送任何详情或正文请求 (detailCalls 依然严格为 1)
+    expect(detailCalls).toBe(1)
+
+    // 且列表利用缓存直接回填了 preview
+    expect(screen.getByText(/CACHED_BODY_PREVIEW_SECRET_9988/)).toBeInTheDocument()
 
     unmount()
   })

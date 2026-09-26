@@ -6,7 +6,7 @@
  */
 
 import { http, HttpResponse, delay } from 'msw'
-import { render, screen, waitFor, fireEvent, act } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, act, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it } from 'vitest'
 import InboxTableView from './InboxTableView'
@@ -388,7 +388,10 @@ describe('InboxTableView WebMail 首屏 Capability 防竞争与退避重试 (PR-
     expect(callCount).toBe(2)
   })
 
-  it('后台批量拉取正文完成后，响应式合并进邮件列表并提取展示验证码', async () => {
+  it('PR-MAIL-04: 打开收件箱不自动拉取正文；点击邮件按需拉取单封正文并缓存，再次点击命中缓存', async () => {
+    let detailRequestCount = 0
+    let batchMessagesCount = 0
+
     server.use(
       http.get('/api/accounts', () => HttpResponse.json({ success: true, data: mockAccounts })),
       http.get('/api/aliases', () => HttpResponse.json({ success: true, data: [] })),
@@ -417,25 +420,28 @@ describe('InboxTableView WebMail 首屏 Capability 防竞争与退避重试 (PR-
         })
       }),
       http.post('/api/messages', () => {
+        batchMessagesCount++
+        return HttpResponse.json({ success: true, data: { messages: [] } })
+      }),
+      http.get('/api/inbox/:ref', () => {
+        detailRequestCount++
         return HttpResponse.json({
           success: true,
           data: {
-            account_id: 'acc_1',
-            count: 1,
-            messages: [
-              {
-                id: '99',
-                message_ref: 'ref_v1_test_99',
-                folder: 'INBOX',
-                uid: 99,
-                from: 'OpenAI <noreply@tm.openai.com>',
-                to: 'alias@icloud.com',
-                subject: 'ChatGPT 临时登录验证',
-                date: '2026-09-20T10:00:00Z',
-                preview: '다음 임시 인증 코드를 입력해 계속하세요: 576932',
-                body: '<p>다음 임시 인증 코드를 입력해 계속하세요: <strong>576932</strong></p>',
-              },
-            ],
+            message: {
+              id: '99',
+              message_ref: 'ref_v1_test_99',
+              folder: 'INBOX',
+              uid: 99,
+              from: 'OpenAI <noreply@tm.openai.com>',
+              to: 'alias@icloud.com',
+              subject: 'ChatGPT 临时登录验证',
+              date: '2026-09-20T10:00:00Z',
+              preview: '다음 임시 인증 코드를 입력해 계속하세요: 576932',
+              body: '<p>다음 임시 인증 코드를 입력해 계속하세요: <strong>576932</strong></p>',
+              content_type: 'text/html',
+              body_complete: true,
+            },
           },
         })
       }),
@@ -449,16 +455,28 @@ describe('InboxTableView WebMail 首屏 Capability 防竞争与退避重试 (PR-
       </MemoryRouter>,
     )
 
-    // 初始首屏先呈现信封
+    // 1. 初始首屏呈现信封元数据，且严禁自动发起 /api/messages 批量正文
     await waitFor(() => {
       expect(screen.getByText('ChatGPT 临时登录验证')).toBeInTheDocument()
     })
+    expect(batchMessagesCount).toBe(0)
+    expect(detailRequestCount).toBe(0)
 
-    // /api/messages 返回后，响应式提取出 576932 并渲染到验证码列
+    // 2. 用户点击单封邮件，触发按需拉取单封正文
+    fireEvent.click(screen.getByRole('button', { name: 'ChatGPT 临时登录验证' }))
+
     await waitFor(() => {
+      expect(detailRequestCount).toBe(1)
       expect(screen.getByText('576932')).toBeInTheDocument()
-      expect(screen.getByText(/探测到/)).toBeInTheDocument()
     })
+
+    // 3. 关闭详情弹窗后，再次点击同一封邮件：直接命中缓存，detailRequestCount 保持为 1
+    const dialog = screen.getByRole('dialog')
+    const closeBtn = within(dialog).getByRole('button', { name: '关闭' })
+    fireEvent.click(closeBtn)
+
+    fireEvent.click(screen.getByRole('button', { name: 'ChatGPT 临时登录验证' }))
+    expect(detailRequestCount).toBe(1)
   })
 })
 
