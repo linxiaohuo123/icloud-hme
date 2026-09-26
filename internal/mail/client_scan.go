@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 fmt, sort, strings, time, github.com/emersion/go-imap
- * [OUTPUT]: 对外提供 ScanPageOptions, ScanPageResult, (*Client).ScanMailboxUIDPage
- * [POS]: internal/mail 的增量 UID 分页扫描核心 (PR-04A F07)，支持固定 upper bound、UID 升序检索、最旧 pageSize 切片与 metadata-first 小标头拉取，接入 MailPerf 观测
+ * [OUTPUT]: 对外提供 ScanPageOptions, ScanPageResult, (*Client).ScanMailboxUIDPage, metadataRecipientHeaderSection
+ * [POS]: internal/mail 的增量 UID 分页扫描核心 (PR-04A F07 / PR-MAIL-02)，支持固定 upper bound、UID 升序检索、最旧 pageSize 切片与 metadata-first 小标头拉取，接入 MailPerf 观测
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -136,15 +136,7 @@ func (c *Client) ScanMailboxUIDPage(opts ScanPageOptions) (res ScanPageResult, r
 		seqset.AddNum(u)
 	}
 
-	section := &imap.BodySectionName{
-		BodyPartName: imap.BodyPartName{
-			Specifier: imap.HeaderSpecifier,
-			Fields: []string{
-				"To", "Cc", "Delivered-To", "X-Original-To", "Envelope-To", "X-Forwarded-To", "Resent-To", "X-Envelope-To", "Original-Recipient", "X-Apple-Original-To", "X-Apple-Recipient", "Subject", "From",
-			},
-		},
-		Peek: true,
-	}
+	section := metadataRecipientHeaderSection()
 
 	items := []imap.FetchItem{
 		imap.FetchUid,
@@ -196,3 +188,17 @@ func (c *Client) ScanMailboxUIDPage(opts ScanPageOptions) (res ScanPageResult, r
 		HasMore:     hasMore,
 	}, nil
 }
+
+// metadataRecipientHeaderSection 返回用于元数据第一阶段结构化过滤的收件人 Header 节 (PR-04A / PR-MAIL-02)。
+func metadataRecipientHeaderSection() *imap.BodySectionName {
+	return &imap.BodySectionName{
+		BodyPartName: imap.BodyPartName{
+			Specifier: imap.HeaderSpecifier,
+			Fields: []string{
+				"To", "Cc", "Delivered-To", "X-Original-To", "Envelope-To", "X-Forwarded-To", "Resent-To", "X-Envelope-To", "Original-Recipient", "X-Apple-Original-To", "X-Apple-Recipient", "Subject", "From",
+			},
+		},
+		Peek: true,
+	}
+}
+
