@@ -710,6 +710,7 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 				}
 			}
 			if m.matches(recipient) {
+				candidateCount++
 				m.UIDValidity = mbox.UidValidity
 				m.UID = msg.Uid
 				m.Provider = "imap"
@@ -728,7 +729,6 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 			return err
 		}
 		fetchMS += time.Since(fetchStart).Milliseconds()
-		candidateCount = len(matchedCandidates)
 
 		// 只有在元数据阶段结构化收件人确认匹配后，才进入第二阶段拉取完整正文 (PR-MAIL-02)
 		if candidateCount > 0 {
@@ -883,6 +883,7 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 			continue
 		}
 		if m.matches(recipient) {
+			candidateCount++
 			cands = append(cands, m)
 		}
 	}
@@ -891,7 +892,6 @@ func (c *Client) forEachRecentMatching(folder, recipient string, limit int, days
 		return err
 	}
 	fetchMS += time.Since(fetchStart).Milliseconds()
-	candidateCount = len(cands)
 
 	if candidateCount == 0 {
 		return nil

@@ -17,6 +17,7 @@ import (
 // 验证 toMessageWithHeaderOnly 仅通过 Header 提取结构化收件人 (To, Delivered-To, X-Original-To, Envelope-To)，且 Preview 保持为空
 func TestToMessageWithHeaderOnly_ExtractsStructuralRecipients(t *testing.T) {
 	headerText := "To: direct@icloud.com\r\n" +
+		"Cc: cc_alias@icloud.com\r\n" +
 		"Delivered-To: delivered@icloud.com\r\n" +
 		"X-Original-To: orig@icloud.com\r\n" +
 		"Envelope-To: envelope@icloud.com\r\n" +
@@ -25,7 +26,7 @@ func TestToMessageWithHeaderOnly_ExtractsStructuralRecipients(t *testing.T) {
 	section := &imap.BodySectionName{
 		BodyPartName: imap.BodyPartName{
 			Specifier: imap.HeaderSpecifier,
-			Fields:    []string{"To", "Delivered-To", "X-Original-To", "Envelope-To", "Subject"},
+			Fields:    []string{"To", "Cc", "Delivered-To", "X-Original-To", "Envelope-To", "Subject"},
 		},
 	}
 
@@ -54,14 +55,14 @@ func TestToMessageWithHeaderOnly_ExtractsStructuralRecipients(t *testing.T) {
 		t.Fatalf("Metadata-first 阶段 Preview 必须为空，实际: %q", msg.Preview)
 	}
 
-	// 3. 验证结构化收件人完整包含 To, Delivered-To, X-Original-To, Envelope-To
+	// 3. 验证结构化收件人完整包含 To, Cc, Delivered-To, X-Original-To, Envelope-To
 	recipients := msg.RecipientAddresses()
 	recipMap := make(map[string]bool)
 	for _, r := range recipients {
 		recipMap[r] = true
 	}
 
-	expected := []string{"direct@icloud.com", "delivered@icloud.com", "orig@icloud.com", "envelope@icloud.com"}
+	expected := []string{"direct@icloud.com", "cc_alias@icloud.com", "delivered@icloud.com", "orig@icloud.com", "envelope@icloud.com"}
 	for _, exp := range expected {
 		if !recipMap[exp] {
 			t.Errorf("缺少结构化收件人: %s (当前收件人: %v)", exp, recipients)
@@ -74,6 +75,9 @@ func TestToMessageWithHeaderOnly_ExtractsStructuralRecipients(t *testing.T) {
 	}
 	if !msg.matches("delivered@icloud.com") {
 		t.Fatal("应当匹配 Delivered-To 中的别名")
+	}
+	if !msg.matches("cc_alias@icloud.com") {
+		t.Fatal("应当匹配 Cc 中的别名")
 	}
 	if msg.matches("unrelated@icloud.com") {
 		t.Fatal("不应当匹配无关地址")

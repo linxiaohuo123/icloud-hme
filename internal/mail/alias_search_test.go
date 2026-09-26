@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -95,8 +96,36 @@ func parseAddrParts(addr string) (string, string) {
 	return addr[:at], addr[at+1:]
 }
 
-func spinMockMailServer(t *testing.T, totalMessages int, searchUIDs []uint32, mails map[uint32]mockMailItem) (port int, getCommands func() []string, stop func()) {
+type mockServerOption func(*mockServerSettings)
+
+type mockServerSettings struct {
+	failUIDMetadataAfterN   int
+	failFetchMetadataAfterN int
+}
+
+func withFailUIDMetadataAfter(n int) mockServerOption {
+	return func(s *mockServerSettings) { s.failUIDMetadataAfterN = n }
+}
+
+func withFailFetchMetadataAfter(n int) mockServerOption {
+	return func(s *mockServerSettings) { s.failFetchMetadataAfterN = n }
+}
+
+func spinMockMailServer(t *testing.T, totalMessages int, searchUIDs []uint32, mails map[uint32]mockMailItem, opts ...mockServerOption) (port int, getCommands func() []string, stop func()) {
 	t.Helper()
+	var settings mockServerSettings
+	for _, opt := range opts {
+		opt(&settings)
+	}
+
+	var sortedMails []mockMailItem
+	for _, m := range mails {
+		sortedMails = append(sortedMails, m)
+	}
+	sort.Slice(sortedMails, func(i, j int) bool {
+		return sortedMails[i].SeqNum < sortedMails[j].SeqNum
+	})
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen failed: %v", err)
@@ -162,7 +191,9 @@ func spinMockMailServer(t *testing.T, totalMessages int, searchUIDs []uint32, ma
 					// UID FETCH <seqset> (...)
 					isBody := strings.Contains(strings.ToUpper(trimmed), "BODY.PEEK[]") || strings.Contains(strings.ToUpper(trimmed), "BODY[]")
 					var resps []string
-					for _, mail := range mails {
+					metadataSent := 0
+					failed := false
+					for _, mail := range sortedMails {
 						if seqsetContainsUID(fields[3], mail.UID) {
 							fUser, fHost := parseAddrParts(mail.FromAddr)
 							tUser, tHost := parseAddrParts(mail.ToAddr)
@@ -174,10 +205,19 @@ func spinMockMailServer(t *testing.T, totalMessages int, searchUIDs []uint32, ma
 								lit := mail.headerLiteral()
 								resps = append(resps, fmt.Sprintf("* %d FETCH (UID %d FLAGS () INTERNALDATE %q ENVELOPE (%q %q ((NIL NIL %q %q)) NIL NIL ((NIL NIL %q %q)) NIL NIL NIL NIL) BODY[HEADER.FIELDS (TO CC DELIVERED-TO X-ORIGINAL-TO ENVELOPE-TO X-FORWARDED-TO RESENT-TO X-ENVELOPE-TO ORIGINAL-RECIPIENT X-APPLE-ORIGINAL-TO X-APPLE-RECIPIENT SUBJECT FROM)] {%d}\r\n%s)\r\n",
 									mail.SeqNum, mail.UID, mail.DateStr, mail.DateStr, mail.Subject, fUser, fHost, tUser, tHost, len(lit), lit))
+								metadataSent++
+								if settings.failUIDMetadataAfterN > 0 && metadataSent >= settings.failUIDMetadataAfterN {
+									failed = true
+									break
+								}
 							}
 						}
 					}
-					resps = append(resps, tag+" OK UID FETCH completed\r\n")
+					if failed {
+						resps = append(resps, tag+" NO [SERVERBUG] partial metadata fetch connection dropped\r\n")
+					} else {
+						resps = append(resps, tag+" OK UID FETCH completed\r\n")
+					}
 					for _, r := range resps {
 						_, _ = conn.Write([]byte(r))
 					}
@@ -186,7 +226,9 @@ func spinMockMailServer(t *testing.T, totalMessages int, searchUIDs []uint32, ma
 				// FETCH <seqset> (...)
 				isBody := strings.Contains(strings.ToUpper(trimmed), "BODY.PEEK[]") || strings.Contains(strings.ToUpper(trimmed), "BODY[]")
 				var resps []string
-				for _, mail := range mails {
+				metadataSent := 0
+				failed := false
+				for _, mail := range sortedMails {
 					if seqsetContainsUID(fields[2], mail.SeqNum) {
 						fUser, fHost := parseAddrParts(mail.FromAddr)
 						tUser, tHost := parseAddrParts(mail.ToAddr)
@@ -198,10 +240,19 @@ func spinMockMailServer(t *testing.T, totalMessages int, searchUIDs []uint32, ma
 							lit := mail.headerLiteral()
 							resps = append(resps, fmt.Sprintf("* %d FETCH (UID %d FLAGS () INTERNALDATE %q ENVELOPE (%q %q ((NIL NIL %q %q)) NIL NIL ((NIL NIL %q %q)) NIL NIL NIL NIL) BODY[HEADER.FIELDS (TO CC DELIVERED-TO X-ORIGINAL-TO ENVELOPE-TO X-FORWARDED-TO RESENT-TO X-ENVELOPE-TO ORIGINAL-RECIPIENT X-APPLE-ORIGINAL-TO X-APPLE-RECIPIENT SUBJECT FROM)] {%d}\r\n%s)\r\n",
 								mail.SeqNum, mail.UID, mail.DateStr, mail.DateStr, mail.Subject, fUser, fHost, tUser, tHost, len(lit), lit))
+							metadataSent++
+							if settings.failFetchMetadataAfterN > 0 && metadataSent >= settings.failFetchMetadataAfterN {
+								failed = true
+								break
+							}
 						}
 					}
 				}
-				resps = append(resps, tag+" OK FETCH completed\r\n")
+				if failed {
+					resps = append(resps, tag+" NO [SERVERBUG] partial metadata fetch connection dropped\r\n")
+				} else {
+					resps = append(resps, tag+" OK FETCH completed\r\n")
+				}
 				for _, r := range resps {
 					_, _ = conn.Write([]byte(r))
 				}
@@ -756,11 +807,12 @@ func TestAliasSearch_SinceUIDEnforced(t *testing.T) {
 	}
 }
 
-// TestAliasSearch_ImmunityAgainstFromAndSubject 验证第八节红线：
+// TestAliasSearch_ImmunityAgainstFromSubjectAndBody 验证第八节红线：
 // 1. From 等于目标 alias，但 To 是 unrelated@other.com -> 不匹配；
 // 2. Subject 包含 "Mail for target@icloud.com"，但 To 是 unrelated@other.com -> 不匹配；
-// 3. 绝不能因为 From 或 Subject 判定匹配而发起任何正文拉取。
-func TestAliasSearch_ImmunityAgainstFromAndSubject(t *testing.T) {
+// 3. Body 明确包含 "target@icloud.com"，但结构化收件人头不匹配 -> 不匹配；
+// 4. 绝不能因为 From、Subject 或 Body 命中字串而判定匹配并拉取正文。
+func TestAliasSearch_ImmunityAgainstFromSubjectAndBody(t *testing.T) {
 	mails := map[uint32]mockMailItem{
 		101: {
 			SeqNum:      1,
@@ -782,9 +834,19 @@ func TestAliasSearch_ImmunityAgainstFromAndSubject(t *testing.T) {
 			DeliveredTo: "unrelated@other.com",
 			Body:        "Body 102",
 		},
+		103: {
+			SeqNum:      3,
+			UID:         103,
+			DateStr:     "26-Sep-2026 00:02:00 +0000",
+			Subject:     "Unrelated newsletter",
+			FromAddr:    "newsletter@other.com",
+			ToAddr:      "unrelated@other.com",
+			DeliveredTo: "unrelated@other.com",
+			Body:        "Please send feedback to target@icloud.com for support", // Body 包含别名
+		},
 	}
 
-	port, getCommands, stop := spinMockMailServer(t, 2, []uint32{101, 102}, mails)
+	port, getCommands, stop := spinMockMailServer(t, 3, []uint32{101, 102, 103}, mails)
 	defer stop()
 
 	c := createTestClient(t, port)
@@ -795,7 +857,7 @@ func TestAliasSearch_ImmunityAgainstFromAndSubject(t *testing.T) {
 		t.Fatalf("FindByRecipientInFolder failed: %v", err)
 	}
 	if len(receivedMsgs) != 0 {
-		t.Fatalf("From 或 Subject 匹配伪阳性防守失败: 期望命中 0 封, 实际命中 %d 封", len(receivedMsgs))
+		t.Fatalf("From, Subject 或 Body 匹配伪阳性防守失败: 期望命中 0 封, 实际命中 %d 封", len(receivedMsgs))
 	}
 
 	// 验证未发出任何正文拉取命令
@@ -803,7 +865,161 @@ func TestAliasSearch_ImmunityAgainstFromAndSubject(t *testing.T) {
 	for _, cmd := range cmds {
 		u := strings.ToUpper(cmd)
 		if strings.Contains(u, "BODY.PEEK[]") || strings.Contains(u, "BODY[]") {
-			t.Fatalf("From/Subject 误判防守失败: 不应发出正文拉取命令: %s", cmd)
+			t.Fatalf("From/Subject/Body 误判防守失败: 不应发出正文拉取命令: %s", cmd)
+		}
+	}
+}
+
+// TestDirectSearch_PartialMetadataFetchFailure_PreservesCandidateCount 验证 FIX-1：
+// Direct SEARCH metadata 阶段多封邮件，已确认 1 封 candidate，随后 FETCH 报错中断：
+// 1. metadata_fetch_received > 0 (等于 1)
+// 2. candidate_count > 0 (等于 1，不因 FETCH error 被清零)
+// 3. body_fetch_requested == 0 (未完整成功，绝不进入第二阶段)
+// 4. err == true (整个调用正常向调用方返回错误)
+func TestDirectSearch_PartialMetadataFetchFailure_PreservesCandidateCount(t *testing.T) {
+	mails := map[uint32]mockMailItem{
+		101: {
+			SeqNum:      1,
+			UID:         101,
+			DateStr:     "26-Sep-2026 00:00:00 +0000",
+			Subject:     "Candidate 1",
+			ToAddr:      "target@icloud.com",
+			DeliveredTo: "target@icloud.com",
+			Body:        "Body 101",
+		},
+		102: {
+			SeqNum:      2,
+			UID:         102,
+			DateStr:     "26-Sep-2026 00:01:00 +0000",
+			Subject:     "Candidate 2",
+			ToAddr:      "target@icloud.com",
+			DeliveredTo: "target@icloud.com",
+			Body:        "Body 102",
+		},
+	}
+
+	port, getCommands, stop := spinMockMailServer(t, 2, []uint32{101, 102}, mails, withFailUIDMetadataAfter(1))
+	defer stop()
+
+	c := createTestClient(t, port)
+	defer c.ForceClose()
+
+	oldEnabled := mailPerfEnabled
+	oldSink := mailPerfSink
+	mailPerfEnabled = true
+	var perfKV []any
+	mailPerfSink = func(op string, kv ...any) {
+		if op == "find_by_recipient" {
+			perfKV = kv
+		}
+	}
+	defer func() {
+		mailPerfEnabled = oldEnabled
+		mailPerfSink = oldSink
+	}()
+
+	_, err := c.FindByRecipientInFolder("target@icloud.com", "INBOX", 10, 0)
+	if err == nil {
+		t.Fatalf("partial metadata fetch 失败时应当返回错误")
+	}
+
+	// 验证未进入第二阶段 BODY fetch
+	cmds := getCommands()
+	for _, cmd := range cmds {
+		u := strings.ToUpper(cmd)
+		if strings.Contains(u, "BODY.PEEK[]") || strings.Contains(u, "BODY[]") {
+			t.Fatalf("metadata fetch 出错时绝不得进入第二阶段 BODY fetch: %s", cmd)
+		}
+	}
+
+	if perfKV == nil {
+		t.Fatalf("未记录 find_by_recipient 性能日志")
+	}
+	assertKV := map[string]string{
+		"metadata_fetch_requested": "2",
+		"metadata_fetch_received":  "1",
+		"candidate_count":          "1",
+		"body_fetch_requested":     "0",
+		"body_fetch_received":      "0",
+		"err":                      "true",
+	}
+	for k, want := range assertKV {
+		if got, _ := findKV(perfKV, k); got != want {
+			t.Errorf("MailPerf %s = %q, want %q", k, got, want)
+		}
+	}
+}
+
+// TestRecentFallback_PartialMetadataFetchFailure_PreservesCandidateCount 验证 FIX-1 在 Fallback 路径的表现：
+// 邮箱扫描 10 封，已收到 1 封匹配 candidate 后 FETCH 中断：
+// candidate_count 保留为 1，body_fetch_requested=0, err=true。
+func TestRecentFallback_PartialMetadataFetchFailure_PreservesCandidateCount(t *testing.T) {
+	mails := make(map[uint32]mockMailItem)
+	for i := uint32(1); i <= 10; i++ {
+		to := fmt.Sprintf("other%d@domain.com", i)
+		delivered := to
+		if i == 1 {
+			delivered = "target@icloud.com"
+		}
+		mails[i] = mockMailItem{
+			SeqNum:      i,
+			UID:         i,
+			DateStr:     "26-Sep-2026 00:00:00 +0000",
+			Subject:     fmt.Sprintf("Mail %d", i),
+			ToAddr:      to,
+			DeliveredTo: delivered,
+			Body:        "Body",
+		}
+	}
+
+	// searchUIDs 为空直接进 fallback，设置在返回 1 封 metadata 后断开
+	port, getCommands, stop := spinMockMailServer(t, 10, nil, mails, withFailFetchMetadataAfter(1))
+	defer stop()
+
+	c := createTestClient(t, port)
+	defer c.ForceClose()
+
+	oldEnabled := mailPerfEnabled
+	oldSink := mailPerfSink
+	mailPerfEnabled = true
+	var perfKV []any
+	mailPerfSink = func(op string, kv ...any) {
+		if op == "recent_fallback" {
+			perfKV = kv
+		}
+	}
+	defer func() {
+		mailPerfEnabled = oldEnabled
+		mailPerfSink = oldSink
+	}()
+
+	_, err := c.FindByRecipientInFolder("target@icloud.com", "INBOX", 5, 0)
+	if err == nil {
+		t.Fatalf("partial metadata fetch 失败时应当返回错误")
+	}
+
+	cmds := getCommands()
+	for _, cmd := range cmds {
+		u := strings.ToUpper(cmd)
+		if strings.Contains(u, "BODY.PEEK[]") || strings.Contains(u, "BODY[]") {
+			t.Fatalf("metadata fetch 出错时绝不得进入第二阶段 BODY fetch: %s", cmd)
+		}
+	}
+
+	if perfKV == nil {
+		t.Fatalf("未记录 recent_fallback 性能日志")
+	}
+	assertKV := map[string]string{
+		"metadata_fetch_requested": "10",
+		"metadata_fetch_received":  "1",
+		"candidate_count":          "1",
+		"body_fetch_requested":     "0",
+		"body_fetch_received":      "0",
+		"err":                      "true",
+	}
+	for k, want := range assertKV {
+		if got, _ := findKV(perfKV, k); got != want {
+			t.Errorf("MailPerf %s = %q, want %q", k, got, want)
 		}
 	}
 }
