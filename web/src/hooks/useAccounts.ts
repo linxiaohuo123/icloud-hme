@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 api/client 的 request/ApiError，依赖 api/types 的 AccountSummary，依赖 react 的 useState/useEffect/useCallback
  * [OUTPUT]: 对外提供 useAccounts hook 与 fetchAccountsDeduped 共享拉取函数, clearAccountsCache, invalidateAccounts, getAccountsCacheState
- * [POS]: web/src/hooks 的全局账号数据流中枢，具备 generation 保护、AbortController 取消、登出隔离与 SWR 缓存
+ * [POS]: web/src/hooks 的全局账号数据流中枢，具备 generation 保护、AbortController 取消、登出隔离、事件去重与 SWR 缓存
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -24,6 +24,16 @@ let inflight: {
 
 const listeners = new Set<(data: AccountSummary[]) => void>()
 
+function expireAccountsCache() {
+  currentGeneration++
+  if (inflight) {
+    inflight.controller.abort()
+    inflight = null
+  }
+  hasCache = false
+  cacheTime = 0
+}
+
 function notifyListeners(data: AccountSummary[]) {
   cacheData = data
   hasCache = true
@@ -33,14 +43,8 @@ function notifyListeners(data: AccountSummary[]) {
 
 /** 清理全局账号缓存（测试重置、登出或手动强制失效时调用） */
 export function clearAccountsCache() {
-  currentGeneration++
-  if (inflight) {
-    inflight.controller.abort()
-    inflight = null
-  }
+  expireAccountsCache()
   cacheData = []
-  hasCache = false
-  cacheTime = 0
   listeners.forEach((fn) => fn([]))
 }
 
@@ -60,6 +64,7 @@ if (typeof window !== 'undefined') {
   window.addEventListener('auth-logout', () => {
     clearAccountsCache()
   })
+  window.addEventListener('account-updated', expireAccountsCache)
 }
 
 /**
@@ -70,17 +75,12 @@ if (typeof window !== 'undefined') {
  * 3. dispatch account-updated 事件, detail 附带 accountId。
  */
 export function invalidateAccounts(accountId?: string) {
-  currentGeneration++
-  if (inflight) {
-    inflight.controller.abort()
-    inflight = null
-  }
-  hasCache = false
-  cacheTime = 0
   if (typeof window !== 'undefined') {
     window.dispatchEvent(
       new CustomEvent('account-updated', { detail: { accountId } }),
     )
+  } else {
+    expireAccountsCache()
   }
 }
 
@@ -151,12 +151,16 @@ export function useAccounts() {
 
   const refresh = useCallback(async (force = true) => {
     setLoading(true)
+    const pending = fetchAccountsDeduped(force)
+    const requestGeneration = currentGeneration
     try {
-      const data = await fetchAccountsDeduped(force)
+      const data = await pending
+      if (requestGeneration !== currentGeneration) return data
       setAccounts(data)
       setError(null)
       return data
     } catch (err) {
+      if (requestGeneration !== currentGeneration) return cacheData
       if (err instanceof Error && err.name === 'ApiError' && (err as { code?: string }).code === 'ABORTED') {
         return cacheData
       }
@@ -164,7 +168,7 @@ export function useAccounts() {
       setError(msg)
       throw err
     } finally {
-      setLoading(false)
+      if (requestGeneration === currentGeneration) setLoading(false)
     }
   }, [])
 
@@ -173,12 +177,13 @@ export function useAccounts() {
     const handler = (data: AccountSummary[]) => {
       setAccounts(data)
       setLoading(false)
+      setError(null)
     }
     listeners.add(handler)
 
     // 挂载时若未缓存或已过期，静默刷新
     if (!hasCache || Date.now() - cacheTime >= CACHE_TTL) {
-      void refresh(false)
+      void refresh(false).catch(() => {})
     } else {
       setAccounts(cacheData)
       setLoading(false)
@@ -186,7 +191,7 @@ export function useAccounts() {
 
     // 监听全局 account-updated 事件（如新建、修改、切换别名后立即刷新）
     const onAccountUpdated = () => {
-      void refresh(true)
+      void refresh(false).catch(() => {})
     }
     window.addEventListener('account-updated', onAccountUpdated)
 

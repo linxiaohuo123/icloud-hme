@@ -149,6 +149,15 @@ describe('AliasesPage', () => {
     expect(await screen.findByText(/暂无别名/)).toBeInTheDocument()
   })
 
+  it('账号列表请求失败时不误报暂无账号', async () => {
+    server.use(http.get('/api/accounts', () =>
+      HttpResponse.json({ success: false, code: 'INTERNAL_ERROR', message: '账号服务不可用' }, { status: 500 }),
+    ))
+    renderPage()
+    expect(await screen.findByText('账号加载失败，请点击顶部重试')).toBeInTheDocument()
+    expect(screen.queryByText(/暂无账号/)).not.toBeInTheDocument()
+  })
+
   it('全局别名部分读取失败时持续显示不完整提示', async () => {
     server.use(
       http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),

@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 react 的 createContext/useContext/useEffect/useState/useCallback
  * [OUTPUT]: 对外提供 ThemeProvider 容器与 useTheme Hook
- * [POS]: web/src/components 的主题核心管理器，控制全局 data-theme 属性与持久化
+ * [POS]: web/src/components 的主题核心管理器，控制全局 data-theme 属性与容错持久化
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -32,9 +32,13 @@ const ThemeContext = createContext<ThemeContextType>({
 
 function getInitialTheme(): ThemeMode {
   if (typeof window === 'undefined') return 'light'
-  const saved = localStorage.getItem(STORAGE_KEY)
-  if (saved === 'light' || saved === 'dark') {
-    return saved
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY)
+    if (saved === 'light' || saved === 'dark') {
+      return saved
+    }
+  } catch {
+    // 存储受限时仍可使用系统主题
   }
   if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
     return 'dark'

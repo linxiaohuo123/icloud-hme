@@ -91,6 +91,15 @@ describe('SchedulePage', () => {
     mockApi()
   })
 
+  it('账号请求失败时显示失败状态，不误报暂无账号', async () => {
+    server.use(http.get('/api/accounts', () =>
+      HttpResponse.json({ success: false, code: 'INTERNAL_ERROR', message: '账号服务不可用' }, { status: 500 }),
+    ))
+    renderPage()
+    expect(await screen.findByText('账号加载失败，请点击顶部重试')).toBeInTheDocument()
+    expect(screen.queryByText('暂无账号，请先在「账号管理」页添加账号')).not.toBeInTheDocument()
+  })
+
   it('总计每小时配额只统计已启用账号,未配置账号不计幻影默认配额', async () => {
     renderPage()
     await screen.findByText('自动补货账号')

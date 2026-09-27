@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 hooks/useAccounts, api/client 的 request/ApiError, api/types 的 ScheduleConfig/ScheduleLog/ScheduleStatus/AccountSummary, components/ToastProvider, components/icons, components/schedule
- * [OUTPUT]: 对外提供 SchedulePage 定时别名任务与调度大盘组件
+ * [OUTPUT]: 对外提供 SchedulePage 定时别名任务与调度大盘组件，区分账号加载中、失败与空列表
  * [POS]: web/src/pages 的核心页面，组装 ScheduleMetrics, ScheduleAccountRow, ScheduleMacroHintBar, ScheduleLogConsole，支持常规补货与强制全员补货(?all=true)
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -17,7 +17,7 @@ import { ScheduleMetrics } from '../components/schedule/ScheduleMetrics'
 import { useAccounts } from '../hooks/useAccounts'
 
 export default function SchedulePage() {
-  const { accounts } = useAccounts()
+  const { accounts, loading: accountsLoading, error: accountsError } = useAccounts()
   const [configs, setConfigs] = useState<Record<string, ScheduleConfig>>({})
   const [logs, setLogs] = useState<ScheduleLog[]>([])
   const [status, setStatus] = useState<ScheduleStatus | null>(null)
@@ -411,7 +411,7 @@ export default function SchedulePage() {
                 {accounts.length === 0 ? (
                   <tr>
                     <td colSpan={5} className="text-center text-muted" style={{ padding: '28px' }}>
-                      暂无账号，请先在「账号管理」页添加账号
+                      {accountsLoading ? '账号加载中…' : accountsError ? '账号加载失败，请点击顶部重试' : '暂无账号，请先在「账号管理」页添加账号'}
                     </td>
                   </tr>
                 ) : (

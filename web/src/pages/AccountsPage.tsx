@@ -252,7 +252,7 @@ export default function AccountsPage() {
   const { show } = useToast()
 
   function handleRetry() {
-    void refresh(true)
+    void refresh(true).catch(() => {})
   }
 
   async function handleDelete() {

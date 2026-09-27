@@ -1,11 +1,13 @@
 import { beforeEach, describe, expect, it } from 'vitest'
-import { waitFor } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import { http, HttpResponse } from 'msw'
 import { server } from '../test/server'
 import {
   clearAccountsCache,
   fetchAccountsDeduped,
   getAccountsCacheState,
+  invalidateAccounts,
+  useAccounts,
 } from './useAccounts'
 import type { AccountSummary } from '../api/types'
 
@@ -49,6 +51,11 @@ const mockAccountB: AccountSummary = {
   has_proxy: false,
   last_validated: new Date().toISOString(),
   created_at: new Date().toISOString(),
+}
+
+function AccountsProbe({ label }: { label: string }) {
+  const { accounts, error, loading } = useAccounts()
+  return <div data-testid={label}>{loading ? 'loading:' : 'ready:'}{error ?? accounts[0]?.name ?? 'empty'}</div>
 }
 
 describe('useAccounts Global Cache Lifecycle', () => {
@@ -159,5 +166,43 @@ describe('useAccounts Global Cache Lifecycle', () => {
     const second = await fetchAccountsDeduped(false)
     expect(second).toEqual([])
     expect(networkCalls).toBe(1)
+  })
+
+  it('账号更新时多个订阅者共用一次请求', async () => {
+    let networkCalls = 0
+    let data = [mockAccountA]
+    server.use(http.get('/api/accounts', () => {
+      networkCalls++
+      return HttpResponse.json({ success: true, data })
+    }))
+
+    render(<><AccountsProbe label="first" /><AccountsProbe label="second" /></>)
+    await waitFor(() => expect(screen.getByTestId('first')).toHaveTextContent('Account A'))
+    expect(networkCalls).toBe(1)
+
+    data = [mockAccountB]
+    invalidateAccounts(mockAccountA.id)
+    await waitFor(() => expect(screen.getByTestId('first')).toHaveTextContent('Account B'))
+    expect(screen.getByTestId('second')).toHaveTextContent('Account B')
+    expect(networkCalls).toBe(2)
+  })
+
+  it('旧请求取消后不能提前结束新请求的加载状态', async () => {
+    const first = createDeferred<AccountSummary[]>()
+    const second = createDeferred<AccountSummary[]>()
+    let networkCalls = 0
+    server.use(http.get('/api/accounts', async () => {
+      networkCalls++
+      return HttpResponse.json({ success: true, data: await (networkCalls === 1 ? first.promise : second.promise) })
+    }))
+
+    render(<AccountsProbe label="account" />)
+    await waitFor(() => expect(networkCalls).toBe(1))
+    invalidateAccounts(mockAccountA.id)
+    await waitFor(() => expect(networkCalls).toBe(2))
+    first.resolve([mockAccountA])
+    await waitFor(() => expect(screen.getByTestId('account')).toHaveTextContent('loading:empty'))
+    second.resolve([mockAccountB])
+    await waitFor(() => expect(screen.getByTestId('account')).toHaveTextContent('ready:Account B'))
   })
 })

@@ -1,17 +1,18 @@
 /**
- * [INPUT]: 依赖 react-router-dom 的 Outlet/Link, hooks/useAccounts 的 useAccounts, components/Sidebar, components/ErrorBoundary
- * [OUTPUT]: 对外提供 AppShell 现代工作台整体布局壳
+ * [INPUT]: 依赖 react-router-dom 的 Outlet/Link/useLocation, hooks/useAccounts 的 useAccounts, components/Sidebar, components/ErrorBoundary
+ * [OUTPUT]: 对外提供 AppShell 现代工作台整体布局壳与账号加载失败重试入口
  * [POS]: web/src/components 的顶层受保护路由骨架，融合左侧暗色导航与右侧主视口，提供全局 Cookie 失效告警条
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
-import { Link, Outlet } from 'react-router-dom'
+import { Link, Outlet, useLocation } from 'react-router-dom'
 import { useAccounts } from '../hooks/useAccounts'
 import Sidebar from './Sidebar'
 import ErrorBoundary from './ErrorBoundary'
 
 export default function AppShell() {
-  const { accounts } = useAccounts()
+  const location = useLocation()
+  const { accounts, loading, error, refresh } = useAccounts()
   const expiredAccounts = accounts.filter((a) => a.status === 'error' || !a.has_cookies)
 
   return (
@@ -21,6 +22,14 @@ export default function AppShell() {
       </a>
       <Sidebar />
       <main id="main-content" className="app-main-content">
+        {error && location.pathname !== '/accounts' && (
+          <div className="alert-banner alert-danger" role="alert" style={{ margin: '16px 24px 0', display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '12px 16px' }}>
+            <span style={{ minWidth: 0, overflowWrap: 'anywhere' }}>账号列表加载失败：{error}</span>
+            <button type="button" className="btn btn-sm btn-secondary" disabled={loading} onClick={() => void refresh(true).catch(() => {})}>
+              {loading ? '重试中…' : '重试'}
+            </button>
+          </div>
+        )}
         {expiredAccounts.length > 0 && (
           <div
             className="alert-banner alert-danger"

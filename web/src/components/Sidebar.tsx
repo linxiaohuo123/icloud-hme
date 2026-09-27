@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 react-router-dom 的 NavLink/useNavigate/useLocation, api/client 的 request, api/types 的 AccountSummary, components/ThemeProvider 的 useTheme, components/icons
- * [OUTPUT]: 对外提供 Sidebar 导航组件
+ * [OUTPUT]: 对外提供 Sidebar 导航组件，区分账号加载中、失败与空列表
  * [POS]: web/src/components 的核心布局组件，贯穿整个应用左侧，提供全局中枢、主题切换与多账号工作台切换
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -63,7 +63,7 @@ const AccountItem = memo(function AccountItem({ acc, active }: { acc: AccountSum
 })
 
 export default function Sidebar({ onAddAccount }: SidebarProps) {
-  const { accounts } = useAccounts()
+  const { accounts, loading, error } = useAccounts()
   const [search, setSearch] = useState('')
   const [scrollTop, setScrollTop] = useState(0)
   const listRef = useRef<HTMLDivElement>(null)
@@ -214,7 +214,7 @@ export default function Sidebar({ onAddAccount }: SidebarProps) {
         >
           {filtered.length === 0 ? (
             <div className="sidebar-empty-accounts">
-              {search ? '无匹配账号' : '暂无账号'}
+              {loading ? '账号加载中…' : error ? '账号加载失败' : search ? '无匹配账号' : '暂无账号'}
             </div>
           ) : filtered.length <= 25 ? (
             // 数量较少时直接渲染

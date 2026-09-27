@@ -58,7 +58,7 @@ export default function AliasesPage() {
   const { show, showCopyable } = useToast()
   const queryAccId = searchParams.get('account_id')
 
-  const { accounts } = useAccounts()
+  const { accounts, loading: accountsLoading, error: accountsError } = useAccounts()
   const [accountId, setAccountId] = useState(() => queryAccId || 'all')
   const [aliases, setAliases] = useState<Alias[]>([])
   const [loading, setLoading] = useState(true)
@@ -368,7 +368,19 @@ export default function AliasesPage() {
     }
   }
 
-  if (accounts.length === 0 && !loading && !error) {
+  if (accounts.length === 0 && accountsLoading) {
+    return <div className="page-container"><p className="empty-state" role="status">账号加载中…</p></div>
+  }
+
+  if (accounts.length === 0 && accountsError) {
+    return (
+      <div className="page-container">
+        <p className="empty-state">账号加载失败，请点击顶部重试</p>
+      </div>
+    )
+  }
+
+  if (accounts.length === 0 && !accountsLoading && !loading && !error) {
     return (
       <div className="page-container">
         <p className="empty-state">暂无账号，请先到「账号」页面添加账号</p>
