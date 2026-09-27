@@ -1,5 +1,9 @@
 # iCloud HME 发布与升级手册 (Release Runbook)
 
+## V3 → V4 升级
+
+V4 启动时会为缺少 `accounts.apple_dsid` 的历史数据库补列，保留现有账号记录。升级前程序会在 `data/backups/` 自动创建一致性备份；继续使用原有 `ICLOUD_HME_MASTER_KEY`，不要删除或重建 `data` 目录。Docker Compose 部署更新后，用 `docker compose logs --tail=100 icloud-hme` 和 `curl -fsS http://127.0.0.1:8081/readyz` 确认启动成功。
+
 ## V1 → V2 升级流程 (Upgrade Runbook)
 
 适用于从旧版本 (Schema V1，含明文凭据/Token) 升级到当前版本 (Schema V2，AES-256-GCM 凭据加密与 Token 哈希存储)。

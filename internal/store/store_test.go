@@ -40,6 +40,47 @@ func TestRevokedSessionPersistsAcrossStoreRestart(t *testing.T) {
 	}
 }
 
+func TestV3AccountsWithoutAppleDSIDUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.DB().Exec(`INSERT INTO accounts (id, name, cookies, created_at, updated_at)
+		VALUES ('legacy_account', 'Legacy', '', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().Exec(`ALTER TABLE accounts DROP COLUMN apple_dsid`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().Exec(`PRAGMA user_version = 3`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		upgraded, err := NewStore(dir)
+		if err != nil {
+			t.Fatalf("upgrade attempt %d failed: %v", attempt+1, err)
+		}
+		accounts, err := upgraded.ListAllAccounts()
+		if err != nil || len(accounts) != 1 || accounts[0].ID != "legacy_account" || accounts[0].AppleDSID != "" {
+			_ = upgraded.Close()
+			t.Fatalf("legacy account was not preserved: accounts=%+v err=%v", accounts, err)
+		}
+		if err := upgraded.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backups, err := filepath.Glob(filepath.Join(dir, "backups", "pre-migrate-v3-to-v4-*.db"))
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("expected one pre-migration backup, got %v: %v", backups, err)
+	}
+}
+
 func TestRevocationMigrationFromExistingV2(t *testing.T) {
 	dir := t.TempDir()
 	st, err := NewStore(dir)

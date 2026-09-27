@@ -341,6 +341,22 @@ func (s *Store) initSchema(dbExistedBefore bool) error {
 			if err := tx.Commit(); err != nil {
 				return fmt.Errorf("commit migration v2 to v3 tx failed: %w", err)
 			}
+		case 3:
+			tx, err := s.db.Begin()
+			if err != nil {
+				return fmt.Errorf("begin migration v3 to v4 tx failed: %w", err)
+			}
+			if err := ensureColumn(tx, "accounts", "apple_dsid", "TEXT DEFAULT ''"); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migrate v3 to v4 failed: %w", err)
+			}
+			if _, err := tx.Exec("PRAGMA user_version = 4;"); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("set schema version 4 failed: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit migration v3 to v4 tx failed: %w", err)
+			}
 		default:
 			return fmt.Errorf("unsupported migration path from version %d", currentV)
 		}
