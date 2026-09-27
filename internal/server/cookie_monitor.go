@@ -236,6 +236,15 @@ func (m *CookieMonitor) validateAccount(id, name string) {
 				"账号的 Cookie 已失效，账号已标记为 error，出号链路已停止使用该账号，请尽快到管理台更新 Cookie。")
 		}
 		m.setPrevStatus(id, "error")
+	case errors.Is(err, account.ErrAccountIdentityMismatch):
+		m.logs.Add(fmt.Sprintf("账号=%s Apple 身份与绑定账号不一致", name))
+		log.Printf("[CookieMonitor] 账号=%s(%s) Apple 身份不一致: %v", name, id, err)
+		if prev != "error" {
+			m.emit(notify.KindCookieExpired, id, name,
+				"iCloud 账号身份不一致",
+				"当前 Cookie 对应的 Apple 身份与绑定账号不一致，已停止使用该账号，请核对 Cookie。")
+		}
+		m.setPrevStatus(id, "error")
 	default:
 		// 瞬时错误(网络/超时):不改状态，避免网络抖动引发大面积误判
 		m.logs.Add(fmt.Sprintf("账号=%s 校验暂时失败(网络原因)，保留原状态", name))

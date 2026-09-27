@@ -271,6 +271,7 @@ func migrateV0ToV1(tx *sql.Tx) error {
 		id            TEXT PRIMARY KEY,
 		name          TEXT NOT NULL DEFAULT '',
 		real_email    TEXT DEFAULT '',
+		apple_dsid    TEXT DEFAULT '',
 		icloud_email  TEXT DEFAULT '',
 		cookies       TEXT DEFAULT '{}',
 		host          TEXT DEFAULT 'icloud.com',
@@ -371,6 +372,7 @@ func migrateV0ToV1(tx *sql.Tx) error {
 		col   string
 		def   string
 	}{
+		{"accounts", "apple_dsid", "TEXT DEFAULT ''"},
 		{"lease_records", "token_name", "TEXT DEFAULT ''"},
 		{"api_tokens", "scopes", "TEXT NOT NULL DEFAULT 'admin'"},
 		{"schedules", "alias_label", "TEXT DEFAULT 'scheduled'"},

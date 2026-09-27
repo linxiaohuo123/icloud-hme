@@ -25,6 +25,32 @@ import (
 	"icloud-hme/internal/store"
 )
 
+type invalidCookieBackend struct{ *fakeBackend }
+
+func (b *invalidCookieBackend) UpdateCookies(string, string) (account.Summary, error) {
+	return account.Summary{}, &BackendError{Status: http.StatusUnprocessableEntity, Code: "COOKIE_SAVED_INVALID", Message: "Cookie 已保存，但校验未通过"}
+}
+
+func TestCookieValidationFailureInvalidatesMailCache(t *testing.T) {
+	be := &invalidCookieBackend{&fakeBackend{accounts: []account.Summary{{ID: "acc_1", Name: "owner"}}}}
+	s := newWithBackend(be, Config{AdminPassword: "admin-pass-2026-strong"})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+	s.mailReadService.cache["acc_1:message"] = messageCacheEntry{}
+	s.mailReadService.mailboxCache["acc_1"] = mailboxCacheEntry{}
+	sess, csrf := login(t, ts, "admin-pass-2026-strong")
+	req := authedReq(t, ts, "PUT", "/api/accounts/acc_1/cookies", `{"cookies":"session=invalid"}`)
+	req.AddCookie(&http.Cookie{Name: "hme_session", Value: sess})
+	req.Header.Set("X-CSRF-Token", csrf)
+	status, body, _ := do(t, req)
+	if status != http.StatusUnprocessableEntity || !strings.Contains(body, "COOKIE_SAVED_INVALID") {
+		t.Fatalf("expected saved-invalid response, got %d: %s", status, body)
+	}
+	if s.mailReadService.CacheLen() != 0 || len(s.mailReadService.mailboxCache) != 0 || s.mailReadService.getAccountGen("acc_1") == 0 {
+		t.Fatal("saved credential change must invalidate mail caches and in-flight generation")
+	}
+}
+
 // writeSecretAccounts 把含秘密的账号写入测试数据目录。
 func writeSecretAccounts(t *testing.T, dir string) {
 	t.Helper()

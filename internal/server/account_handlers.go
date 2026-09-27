@@ -13,6 +13,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -190,12 +191,15 @@ func (s *Server) updateCookiesHandler(c *gin.Context) {
 	}
 
 	sum, err := s.be.UpdateCookies(id, raw)
+	if s.mailReadService != nil {
+		var be *BackendError
+		if err == nil || (errors.As(err, &be) && be.Code == "COOKIE_SAVED_INVALID") {
+			s.mailReadService.InvalidateAccount(id)
+		}
+	}
 	if err != nil {
 		backendFail(c, err)
 		return
-	}
-	if s.mailReadService != nil {
-		s.mailReadService.InvalidateAccount(id)
 	}
 	ok(c, sum)
 }

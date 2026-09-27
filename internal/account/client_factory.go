@@ -47,6 +47,9 @@ func (m *Manager) HMEClient(id string, verbose bool) (*hme.Client, error) {
 // HMEClientWithPassword 为指定账号创建一个新的 HME 客户端,使用账号密码登录。
 // 登录成功后会自动获取 Cookie 并保存到账号配置。
 func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTPProvider) (*hme.Client, error) {
+	entry := m.hmePool.acquire(id)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 	m.mu.RLock()
 	acc, ok := m.accounts[id]
 	var snap *Account
@@ -72,44 +75,47 @@ func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTP
 	if err != nil {
 		return nil, err
 	}
+	keepClient := false
+	defer func() {
+		if !keepClient {
+			client.Close()
+		}
+	}()
 
 	if err := client.Login(email, password, otpProvider); err != nil {
 		return nil, err
 	}
 
-	// 先保存 accountLogin 返回的 Cookie，随后通过 validate 刷新会话并再次持久化。
-	// 国区与美区都走同一条刷新链路，避免只保存登录阶段的临时 token。
-	saved, err := m.saveSessionIfCurrent(id, snap.credentialEpoch, snap.Host, snap.Proxy, client.CookieSnapshot(), "", true)
-	if err != nil {
+	if err := client.ValidateSession(); err != nil {
 		return nil, err
 	}
-	if !saved {
-		return nil, ErrSessionChanged
-	}
-	epoch := snap.credentialEpoch + 1
-	if err := client.ValidateSession(); err != nil {
-		// validate 的失败响应也可能携带 Set-Cookie，尽量保留服务端最新状态。
-		_, _ = m.saveSessionIfCurrent(id, epoch, snap.Host, snap.Proxy, client.CookieSnapshot(), "", false)
+	if err := verifyAppleIdentity(snap, client.AccountInfo()); err != nil {
 		return nil, err
 	}
 
-	// 保存 validate 刷新后的 Cookie 和账号状态。
+	// 校验身份后一次保存完整会话，避免中途将另一 Apple 账号的 Cookie 绑定到旧库存。
 	m.mu.Lock()
 	cur, ok := m.accounts[id]
 	if !ok {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
-	if cur.credentialEpoch != epoch || cur.Host != snap.Host || cur.Proxy != snap.Proxy {
+	if cur.credentialEpoch != snap.credentialEpoch || cur.Host != snap.Host || cur.Proxy != snap.Proxy {
 		m.mu.Unlock()
 		return nil, ErrSessionChanged
 	}
+	if err := verifyAppleIdentity(cur, client.AccountInfo()); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
 	old := *cur
 	cur.Cookies = client.CookieSnapshot()
+	cur.ServiceURL = client.ServiceURL()
 	cur.Status = "active"
 	cur.LastValidated = time.Now().Format(time.RFC3339)
 	cur.LastError = ""
 	if info := client.AccountInfo(); info != nil {
+		cur.AppleDSID = info.DSID
 		cur.RealEmail = firstNonEmpty(info.AppleID, info.PrimaryEmail)
 		if cur.ICloudEmail == "" {
 			cur.ICloudEmail = deriveICloudEmail(info)
@@ -118,12 +124,15 @@ func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTP
 	saveErr := m.saveAccount(cur)
 	if saveErr != nil {
 		*cur = old
+	} else {
+		cur.credentialEpoch++
 	}
 	m.mu.Unlock()
 	if saveErr != nil {
 		return nil, saveErr
 	}
 
+	keepClient = true
 	return client, nil
 }
 

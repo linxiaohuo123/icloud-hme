@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 api/client 的 request/ApiError，依赖 components/Dialog
- * [OUTPUT]: 对外提供 CookieDialog 对话框组件 (Cookie 文本录入、保存成功自动清空)
+ * [OUTPUT]: 对外提供 CookieDialog 对话框组件 (Cookie 文本录入、保存后状态刷新)
  * [POS]: web/src/components 的凭据更新弹窗，用于向指定账号提交 iCloud Cookie 字符串
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -14,10 +14,11 @@ interface CookieDialogProps {
   open: boolean
   onClose: () => void
   onSaved: () => void
+  onChanged: () => void
 }
 
 /** 更新 Cookie 对话框:提交后清空 textarea */
-export default function CookieDialog({ accountId, open, onClose, onSaved }: CookieDialogProps) {
+export default function CookieDialog({ accountId, open, onClose, onSaved, onChanged }: CookieDialogProps) {
   const [cookies, setCookies] = useState('')
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -40,7 +41,11 @@ export default function CookieDialog({ accountId, open, onClose, onSaved }: Cook
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('account-updated', { detail: { accountId } }))
       }
-    } catch (err) {      setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
+    } catch (err) {
+      if (err instanceof ApiError && err.code === 'COOKIE_SAVED_INVALID') {
+        onChanged()
+      }
+      setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
     } finally {
       setSubmitting(false)
     }

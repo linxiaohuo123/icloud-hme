@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 errors, fmt, strings, time, unicode/utf8, icloud-hme/internal/hme
- * [OUTPUT]: 对外提供 ErrCookieExpired, (*Manager).UpdateCookies, (*Manager).ValidateAccount, (*Manager).markAccountError；校验凭据代际并回滚保存失败的内存修改
+ * [OUTPUT]: 对外提供 ErrCookieExpired, ErrAccountIdentityMismatch, ErrCookiesSavedInvalid, (*Manager).UpdateCookies, (*Manager).ValidateAccount, (*Manager).markAccountError；校验账号身份与凭据代际
  * [POS]: internal/account 的账号会话校验、健康巡检状态机与凭据失效判定
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -21,12 +21,37 @@ import (
 // ErrCookieExpired 表示账号 Cookie 已被 Apple 判定失效(401/403)，需要人工更新。
 // 后台健康监控依据本哨兵错误区分"凭据级失效"与"瞬时网络错误"。
 var ErrCookieExpired = errors.New("cookie expired")
+var ErrAccountIdentityMismatch = errors.New("Apple 账号身份与当前母账号不一致，请新建账号")
+var ErrCookiesSavedInvalid = errors.New("Cookie 已保存，但校验未通过")
+
+func verifyAppleIdentity(acc *Account, info *hme.AccountInfo) error {
+	if acc.AppleDSID != "" {
+		if info == nil || info.DSID == "" || info.DSID != acc.AppleDSID {
+			return ErrAccountIdentityMismatch
+		}
+		return nil
+	}
+	if acc.LastValidated != "" || acc.AliasTotal > 0 {
+		current := strings.TrimSpace(acc.RealEmail)
+		incoming := ""
+		if info != nil {
+			incoming = firstNonEmpty(info.AppleID, info.PrimaryEmail)
+		}
+		if current == "" || incoming == "" || !strings.EqualFold(current, incoming) {
+			return ErrAccountIdentityMismatch
+		}
+	}
+	return nil
+}
 
 // UpdateCookies 更新指定账号的 Cookie,并自动校验会话有效性。
 func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 	if len(cookies) == 0 {
 		return fmt.Errorf("cookies 不能为空")
 	}
+	entry := m.hmePool.acquire(id)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 	m.mu.RLock()
 	acc, ok := m.accounts[id]
 	var snap *Account
@@ -59,10 +84,14 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 			snap.Status = "error"
 			snap.LastError = "Cookie 校验失败: " + err.Error()
 		} else {
+			if err := verifyAppleIdentity(snap, client.AccountInfo()); err != nil {
+				return err
+			}
 			snap.Status = "active"
 			snap.LastValidated = time.Now().Format(time.RFC3339)
 			snap.LastError = ""
 			if info := client.AccountInfo(); info != nil {
+				snap.AppleDSID = info.DSID
 				snap.RealEmail = firstNonEmpty(info.AppleID, info.PrimaryEmail)
 				if snap.ICloudEmail == "" {
 					snap.ICloudEmail = deriveICloudEmail(info)
@@ -93,6 +122,12 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 		m.mu.Unlock()
 		return ErrSessionChanged
 	}
+	if validateErr == nil && err == nil {
+		if identityErr := verifyAppleIdentity(cur, client.AccountInfo()); identityErr != nil {
+			m.mu.Unlock()
+			return identityErr
+		}
+	}
 	old := *cur
 	cur.Cookies = snap.Cookies
 	cur.ServiceURL = ""
@@ -100,6 +135,7 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 	cur.LastValidated = snap.LastValidated
 	cur.LastError = snap.LastError
 	cur.RealEmail = snap.RealEmail
+	cur.AppleDSID = snap.AppleDSID
 	if cur.ICloudEmail == "" {
 		cur.ICloudEmail = snap.ICloudEmail
 	}
@@ -114,7 +150,13 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 		cur.credentialEpoch++
 	}
 	m.mu.Unlock()
-	return errors.Join(err, validateErr, saveErr)
+	if saveErr != nil {
+		return errors.Join(err, validateErr, saveErr)
+	}
+	if validationErr := errors.Join(err, validateErr); validationErr != nil {
+		return fmt.Errorf("%w: %v", ErrCookiesSavedInvalid, validationErr)
+	}
+	return nil
 }
 
 // ValidateAccount 对指定账号执行一次会话校验并刷新状态(供后台健康监控周期调用)。
@@ -173,6 +215,10 @@ func (m *Manager) ValidateAccountWithContext(ctx context.Context, id string) err
 		if errors.Is(err, ErrSessionChanged) {
 			return err
 		}
+		if errors.Is(err, ErrAccountIdentityMismatch) {
+			m.markAccountError(id, epoch, err.Error())
+			return err
+		}
 		m.mu.RLock()
 		current, exists := m.accounts[id]
 		changed := !exists || current.credentialEpoch != epoch
@@ -202,6 +248,11 @@ func (m *Manager) ValidateAccountWithContext(ctx context.Context, id string) err
 		m.mu.Unlock()
 		return ErrSessionChanged
 	}
+	if identityErr := verifyAppleIdentity(cur, accountInfo); identityErr != nil {
+		m.mu.Unlock()
+		m.markAccountError(id, epoch, identityErr.Error())
+		return identityErr
+	}
 	old := *cur
 	if refreshedCookies != nil {
 		cur.Cookies = refreshedCookies
@@ -213,6 +264,9 @@ func (m *Manager) ValidateAccountWithContext(ctx context.Context, id string) err
 		cur.ServiceURL = serviceURL
 	}
 	if accountInfo != nil {
+		if accountInfo.DSID != "" {
+			cur.AppleDSID = accountInfo.DSID
+		}
 		cur.RealEmail = firstNonEmpty(accountInfo.AppleID, accountInfo.PrimaryEmail)
 		if cur.ICloudEmail == "" {
 			cur.ICloudEmail = deriveICloudEmail(accountInfo)

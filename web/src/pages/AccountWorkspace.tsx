@@ -377,6 +377,11 @@ export default function AccountWorkspace() {
             open={cookieOpen}
             accountId={account.id}
             onClose={() => setCookieOpen(false)}
+            onChanged={() => {
+              invalidateAccounts(account.id)
+              setAliases([])
+              void loadAccountData()
+            }}
             onSaved={() => {
               setCookieOpen(false)
               invalidateAccounts(account.id)
@@ -437,14 +442,14 @@ export default function AccountWorkspace() {
               accountId={account.id}
               selectedIds={Array.from(selectedIds)}
               onClose={() => setBatchEditOpen(false)}
-              onSaved={(succeededIds, newLabel) => {
+              onSaved={(succeededIds, newLabel, warning) => {
                 const idSet = new Set(succeededIds)
                 setAliases((prev) =>
                   prev.map((a) => (idSet.has(a.anonymousId) ? { ...a, label: newLabel } : a)),
                 )
-                setSelectedIds(new Set())
+                setSelectedIds((prev) => new Set([...prev].filter((id) => !idSet.has(id))))
                 setBatchEditOpen(false)
-                show(`已成功批量修改 ${succeededIds.length} 个别名的备注`)
+                show(`已成功批量修改 ${succeededIds.length} 个别名的备注${warning ? `；${warning}` : ''}`)
               }}
             />
           )}

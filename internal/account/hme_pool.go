@@ -246,6 +246,13 @@ func hmeFingerprint(acc *Account) string {
 // WithHMEClientContext 借出账号级 HME 客户端执行 fn，借锁阶段响应 Context 取消 (PR-05 F10)。
 // 调用返回后客户端留在池中复用。
 func (m *Manager) WithHMEClientContext(ctx context.Context, id string, fn func(*hme.Client) error) error {
+	return m.WithHMEClientContextSession(ctx, id, func(client *hme.Client, _ uint64) error {
+		return fn(client)
+	})
+}
+
+// WithHMEClientContextSession 将借出时的凭据代际交给需要提交本地状态的调用方。
+func (m *Manager) WithHMEClientContextSession(ctx context.Context, id string, fn func(*hme.Client, uint64) error) error {
 	entry := m.hmePool.acquire(id)
 
 	if !entry.mu.TryLock() {
@@ -296,8 +303,16 @@ func (m *Manager) WithHMEClientContext(ctx context.Context, id string, fn func(*
 		entry.fingerprint = fp
 		entry.credentialEpoch = snap.credentialEpoch
 	}
+	if snap.Status == "error" && (snap.AppleDSID != "" || snap.LastValidated != "" || snap.AliasTotal > 0) {
+		if err := entry.client.ValidateSessionWithContext(ctx); err != nil {
+			return err
+		}
+		if err := verifyAppleIdentity(snap, entry.client.AccountInfo()); err != nil {
+			return err
+		}
+	}
 
-	runErr := fn(entry.client)
+	runErr := fn(entry.client, snap.credentialEpoch)
 
 	// 回写刷新后的会话；仅当业务本身成功时才把回写失败上抛
 	newCookies := entry.client.CookieSnapshot()

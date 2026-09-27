@@ -41,6 +41,7 @@ type BatchUpdateResult struct {
 	Total     int      `json:"total"`
 	Succeeded []string `json:"succeeded"`
 	Failed    []string `json:"failed"`
+	LastError string   `json:"last_error,omitempty"`
 }
 
 // aliasCacheTTL 是内存别名缓存生命周期(15分钟)。
@@ -48,7 +49,8 @@ type BatchUpdateResult struct {
 const aliasCacheTTL = 15 * time.Minute
 
 type aliasCacheItem struct {
-	aliases []hme.Alias
+	aliases         []hme.Alias
+	credentialEpoch uint64
 	// total/active 在写入缓存时算一次并固化。
 	// 若改为每次 ListAccounts 现场求和，2000 账号 × 200 别名就是每次调用 40 万次迭代。
 	total     int
@@ -129,7 +131,9 @@ func (b *managerBackend) reconcileIntentsWithClient(ctx context.Context, client 
 	aliases, listErr := client.ListAliasesWithContext(ctx)
 	if listErr != nil {
 		for i := range intents {
-			_ = b.store.UpdateReserveIntentState(ctx, intents[i].IntentID, store.IntentStateOutcomeUnknown, "", "", fmt.Sprintf("reconciliation list failed: %v", listErr))
+			if err := b.store.UpdateReserveIntentState(ctx, intents[i].IntentID, store.IntentStateOutcomeUnknown, "", "", fmt.Sprintf("reconciliation list failed: %v", listErr)); err != nil {
+				return fmt.Errorf("保存别名核对失败状态 %s: %w", intents[i].IntentID, err)
+			}
 			intents[i].State = store.IntentStateOutcomeUnknown
 		}
 		return listErr
@@ -146,15 +150,23 @@ func (b *managerBackend) reconcileIntentsWithClient(ctx context.Context, client 
 		}
 
 		if found != nil {
-			// FOUND: 证实已在上游成功落盘
-			_ = b.store.UpdateReserveIntentState(ctx, it.IntentID, store.IntentStateSucceeded, found.AnonymousID, "", "")
-			_ = b.store.AddInventoryAlias(it.AccountID, *found, "created", true)
-			_ = b.store.UpsertAliasRoutes(it.AccountID, []string{found.Email})
+			// 原请求的用途未知，恢复的别名必须隔离，避免被公共或定向分配。
+			if err := b.store.AddRecoveredInventoryAlias(it.AccountID, *found); err != nil {
+				return fmt.Errorf("保存恢复别名 %s: %w", found.Email, err)
+			}
+			if err := b.store.UpsertAliasRoutes(it.AccountID, []string{found.Email}); err != nil {
+				return fmt.Errorf("保存恢复别名路由 %s: %w", found.Email, err)
+			}
+			if err := b.store.UpdateReserveIntentState(ctx, it.IntentID, store.IntentStateSucceeded, found.AnonymousID, "", ""); err != nil {
+				return fmt.Errorf("保存别名核对结果 %s: %w", it.IntentID, err)
+			}
 			intents[i].State = store.IntentStateSucceeded
 			intents[i].AnonymousID = found.AnonymousID
 		} else {
 			// INCONCLUSIVE_NOT_FOUND: 坚决保持 outcome_unknown，严禁标记失败，严禁产生第二候选！
-			_ = b.store.UpdateReserveIntentState(ctx, it.IntentID, store.IntentStateOutcomeUnknown, "", "", "reconciliation inconclusive: candidate not found in upstream list")
+			if err := b.store.UpdateReserveIntentState(ctx, it.IntentID, store.IntentStateOutcomeUnknown, "", "", "reconciliation inconclusive: candidate not found in upstream list"); err != nil {
+				return fmt.Errorf("保存别名核对未决状态 %s: %w", it.IntentID, err)
+			}
 			intents[i].State = store.IntentStateOutcomeUnknown
 		}
 	}
@@ -315,12 +327,15 @@ func (b *managerBackend) ReconcileUnresolvedIntents(ctx context.Context) ([]stor
 		return nil, nil
 	}
 
+	var reconcileErrors []error
 	for i := range intents {
-		_ = b.mgr.WithHMEClient(intents[i].AccountID, func(client *hme.Client) error {
+		if err := b.mgr.WithHMEClientContext(ctx, intents[i].AccountID, func(client *hme.Client) error {
 			return b.reconcileIntentsWithClient(ctx, client, intents[i:i+1])
-		})
+		}); err != nil {
+			reconcileErrors = append(reconcileErrors, fmt.Errorf("核对未决别名 %s: %w", intents[i].IntentID, err))
+		}
 	}
-	return intents, nil
+	return intents, errors.Join(reconcileErrors...)
 }
 
 // BatchCreateAlias 批量创建 HME 别名 (1-5个)。
@@ -418,14 +433,27 @@ func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID 
 }
 
 func (b *managerBackend) getCachedAliases(accountID string) ([]hme.Alias, bool) {
+	var epoch uint64
+	if b.mgr != nil {
+		var exists bool
+		epoch, exists = b.mgr.CredentialEpoch(accountID)
+		if !exists {
+			return nil, false
+		}
+	}
 	b.aliasMu.RLock()
 	defer b.aliasMu.RUnlock()
 	if b.aliasCache == nil {
 		return nil, false
 	}
 	item, ok := b.aliasCache[accountID]
-	if !ok || time.Since(item.fetchedAt) >= aliasCacheTTL {
+	if !ok || item.credentialEpoch != epoch || time.Since(item.fetchedAt) >= aliasCacheTTL {
 		return nil, false
+	}
+	if b.mgr != nil {
+		if current, ok := b.mgr.CredentialEpoch(accountID); !ok || current != epoch {
+			return nil, false
+		}
 	}
 	cached := make([]hme.Alias, len(item.aliases))
 	copy(cached, item.aliases)
@@ -433,6 +461,18 @@ func (b *managerBackend) getCachedAliases(accountID string) ([]hme.Alias, bool) 
 }
 
 func (b *managerBackend) setCachedAliases(accountID string, aliases []hme.Alias) {
+	var epoch uint64
+	if b.mgr != nil {
+		var ok bool
+		epoch, ok = b.mgr.CredentialEpoch(accountID)
+		if !ok {
+			return
+		}
+	}
+	b.setCachedAliasesAtEpoch(accountID, epoch, aliases)
+}
+
+func (b *managerBackend) setCachedAliasesAtEpoch(accountID string, epoch uint64, aliases []hme.Alias) {
 	// 计数在写入侧一次算清，读取侧只做 O(1) 取值
 	active := 0
 	for i := range aliases {
@@ -449,10 +489,11 @@ func (b *managerBackend) setCachedAliases(accountID string, aliases []hme.Alias)
 	cached := make([]hme.Alias, len(aliases))
 	copy(cached, aliases)
 	b.aliasCache[accountID] = &aliasCacheItem{
-		aliases:   cached,
-		total:     len(cached),
-		active:    active,
-		fetchedAt: time.Now(),
+		aliases:         cached,
+		credentialEpoch: epoch,
+		total:           len(cached),
+		active:          active,
+		fetchedAt:       time.Now(),
 	}
 }
 
@@ -485,7 +526,7 @@ func (b *managerBackend) RefreshAliases(accountID string) ([]hme.Alias, error) {
 // RefreshAliasesContext 支持 Context 贯穿的强制穿透拉取 (PR-05 F10)。
 func (b *managerBackend) RefreshAliasesContext(ctx context.Context, accountID string) ([]hme.Alias, error) {
 	var aliases []hme.Alias
-	err := b.mgr.WithHMEClientContext(ctx, accountID, func(client *hme.Client) error {
+	err := b.mgr.WithHMEClientContextSession(ctx, accountID, func(client *hme.Client, epoch uint64) error {
 		var listErr error
 		aliases, listErr = client.ListAliasesWithContext(ctx)
 		if listErr != nil {
@@ -498,10 +539,13 @@ func (b *managerBackend) RefreshAliasesContext(ctx context.Context, accountID st
 			}
 		}
 		// 与同账号 HME 创建共用客户端锁，避免旧快照在创建成功后回写计数或缓存。
-		if err := b.mgr.UpdateAliasCounts(accountID, len(aliases), activeCount); err != nil {
+		if err := b.mgr.UpdateAliasCountsIfEpoch(accountID, epoch, len(aliases), activeCount); err != nil {
+			if errors.Is(err, account.ErrSessionChanged) {
+				return err
+			}
 			return &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_ERROR", Message: "别名数量保存失败"}
 		}
-		b.setCachedAliases(accountID, aliases)
+		b.setCachedAliasesAtEpoch(accountID, epoch, aliases)
 		return nil
 	})
 	if err != nil {
@@ -816,8 +860,15 @@ func (b *managerBackend) BatchUpdateAliases(accountID string, anonymousIDs []str
 		wg.Wait()
 		return nil
 	})
-	if borrowErr != nil && errors.Is(borrowErr, account.ErrHMEClientUnavailable) {
-		return result, mapAccountErr(borrowErr)
+	if borrowErr != nil {
+		if errors.Is(borrowErr, account.ErrHMEClientUnavailable) {
+			return result, mapAccountErr(borrowErr)
+		}
+		if len(result.Succeeded)+len(result.Failed) == 0 {
+			return result, classifyUpstreamErr("批量更新备注失败", borrowErr)
+		}
+		log.Printf("[HME] 账号 %s 批量备注已提交，但会话未同步: %v", accountID, borrowErr)
+		result.LastError = "批量修改已提交，但账号会话未同步，请刷新列表核对"
 	}
 
 	if len(result.Succeeded) > 0 {

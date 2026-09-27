@@ -31,6 +31,8 @@ HTTP JSON API，所有接口均采用标准 JSON 格式交互。
 | `INVALID_CREDENTIALS` | 401 | 管理员登录密码错误 |
 | `CSRF_INVALID` | 403 | 浏览器 Session 模式下缺少有效 `X-CSRF-Token` |
 | `ACCOUNT_NOT_FOUND` | 404 | 指定的 iCloud 账号不存在 |
+| `ACCOUNT_IDENTITY_MISMATCH` | 409 | 新 Cookie 或密码登录对应另一 Apple 账号，原账号和库存保持不变 |
+| `COOKIE_SAVED_INVALID` | 422 | 新 Cookie 已保存，但 Apple 会话校验失败；账号状态已更新，需刷新状态 |
 | `VALIDATION_ERROR` | 400 | 请求体或 Query 参数校验失败 |
 | `ALIAS_LIMIT_REACHED` | 400 | 单账号活跃别名已达 Apple 750 上限，网关层自动熔断拦截 |
 | `OTP_REQUIRED` | 409 | iCloud 账号登录需要双重认证 (2FA) 验证码 |
@@ -238,6 +240,7 @@ Content-Type: application/json
 }
 ```
 *支持纯文本 Cookie 串或标准 JSON 字典对象。*
+*已验证身份的账号只能更新同一 Apple 身份的 Cookie；校验失败时可能返回 `COOKIE_SAVED_INVALID`，此时 Cookie 和错误状态已保存。*
 
 ### 9. 设置 IMAP 专用密码 (App Password)
 
@@ -859,6 +862,7 @@ Content-Type: application/json
 }
 ```
 - 单次最多批量修改 100 个别名。
+- 响应中的 `succeeded` 和 `failed` 分别列出成功与失败的别名 ID。若 Apple 已处理修改但本地账号会话未同步，响应还会包含 `last_error`；此时应刷新列表核对结果。
 
 ### 27. 停用别名
 

@@ -48,6 +48,18 @@ func TestCookieMonitorEmitsExpiredAndRecovered(t *testing.T) {
 	}
 }
 
+func TestCookieMonitorIdentityMismatchNotifiesOnce(t *testing.T) {
+	sink := &recordingSink{}
+	fake := &fakeBackend{accounts: []account.Summary{{ID: "acc_1", Name: "一号", HasCookies: true, Status: "active"}}}
+	fake.validateFunc = func(string) error { return account.ErrAccountIdentityMismatch }
+	mon := NewCookieMonitor(fake, 30*time.Minute, sink)
+	mon.validateAccount("acc_1", "一号")
+	mon.validateAccount("acc_1", "一号")
+	if got := countKinds(sink.events, notify.KindCookieExpired); got != 1 {
+		t.Fatalf("identity mismatch must notify once, got %d", got)
+	}
+}
+
 // TestCookieMonitorQuotaEdge 校验配额水位只在首次越过阈值时告警。
 func TestCookieMonitorQuotaEdge(t *testing.T) {
 	sink := &recordingSink{threshold: 90}

@@ -15,13 +15,14 @@ interface BatchEditAliasDialogProps {
   aliases?: Array<{ anonymousId: string; accountId?: string; account_id?: string }>
   open: boolean
   onClose: () => void
-  onSaved: (succeededIds: string[], newLabel: string) => void
+  onSaved: (succeededIds: string[], newLabel: string, warning?: string) => void
 }
 
 interface BatchUpdateResponse {
   total: number
   succeeded: string[]
   failed: string[]
+  last_error?: string
 }
 
 export default function BatchEditAliasDialog({
@@ -53,10 +54,17 @@ export default function BatchEditAliasDialog({
     setError('')
     const trimmedLabel = label.trim()
     const trimmedNote = note.trim()
+    const allSucceeded: string[] = []
+    const warnings = new Set<string>()
+    let failedCount = 0
+    const warningText = (extra?: string) => {
+      const details = failedCount > 0 ? [`${failedCount} 个别名修改失败`] : []
+      details.push(...warnings)
+      if (extra) details.push(extra)
+      return details.join('；')
+    }
 
     try {
-      const allSucceeded: string[] = []
-
       // 辅助函数：按 100 上限分批提交单个账号下的别名
       async function processAccountBatch(targetAcc: string, ids: string[]) {
         const chunkSize = 100
@@ -72,6 +80,8 @@ export default function BatchEditAliasDialog({
             }),
           })
           if (res.succeeded) allSucceeded.push(...res.succeeded)
+          failedCount += res.failed?.length ?? 0
+          if (res.last_error) warnings.add(res.last_error)
         }
       }
 
@@ -88,6 +98,9 @@ export default function BatchEditAliasDialog({
           if (acc) {
             if (!accGroups.has(acc)) accGroups.set(acc, [])
             accGroups.get(acc)!.push(id)
+          } else {
+            failedCount++
+            warnings.add('部分别名缺少所属账号')
           }
         }
         for (const [grpAcc, grpIds] of accGroups.entries()) {
@@ -97,13 +110,19 @@ export default function BatchEditAliasDialog({
         await processAccountBatch(accountId, selectedIds)
       }
 
+      const warning = warningText()
       if (allSucceeded.length > 0) {
-        onSaved(allSucceeded, trimmedLabel)
+        onSaved(allSucceeded, trimmedLabel, warning || undefined)
       } else {
-        setError('批量修改未成功，请检查账号凭据有效性或网络连接')
+        setError(warning || '批量修改未成功，请检查账号凭据有效性或网络连接')
       }
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '批量更新别名失败')
+      const message = err instanceof ApiError ? err.message : '批量更新别名失败'
+      if (allSucceeded.length > 0) {
+        onSaved(allSucceeded, trimmedLabel, warningText(`后续批次未完成：${message}`))
+      } else {
+        setError(warningText(message))
+      }
     } finally {
       setSubmitting(false)
     }

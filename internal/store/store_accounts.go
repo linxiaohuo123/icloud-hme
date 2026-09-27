@@ -27,6 +27,7 @@ type AccountRecord struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
 	RealEmail     string `json:"real_email"`
+	AppleDSID     string `json:"apple_dsid"`
 	ICloudEmail   string `json:"icloud_email"`
 	CookiesJSON   string `json:"cookies"` // JSON map[string]string
 	Host          string `json:"host"`
@@ -80,12 +81,12 @@ func (s *Store) SaveAccount(rec *AccountRecord) error {
 	}
 
 	query := `
-	INSERT INTO accounts (id, name, real_email, icloud_email, cookies, host, service_url,
+	INSERT INTO accounts (id, name, real_email, apple_dsid, icloud_email, cookies, host, service_url,
 		proxy, app_password, mailbox, status, alias_total, alias_active,
 		last_validated, last_error, created_at, tags, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
-		name=excluded.name, real_email=excluded.real_email, icloud_email=excluded.icloud_email,
+		name=excluded.name, real_email=excluded.real_email, apple_dsid=excluded.apple_dsid, icloud_email=excluded.icloud_email,
 		cookies=excluded.cookies, host=excluded.host, service_url=excluded.service_url,
 		proxy=excluded.proxy, app_password=excluded.app_password, mailbox=excluded.mailbox,
 		status=excluded.status, alias_total=excluded.alias_total, alias_active=excluded.alias_active,
@@ -93,7 +94,7 @@ func (s *Store) SaveAccount(rec *AccountRecord) error {
 		tags=excluded.tags, updated_at=excluded.updated_at;
 	`
 	_, err := s.db.Exec(query,
-		rec.ID, rec.Name, rec.RealEmail, rec.ICloudEmail, cookies,
+		rec.ID, rec.Name, rec.RealEmail, rec.AppleDSID, rec.ICloudEmail, cookies,
 		rec.Host, rec.ServiceURL, proxy, appPassword, mailbox,
 		rec.Status, rec.AliasTotal, rec.AliasActive,
 		rec.LastValidated, rec.LastError, rec.CreatedAt, rec.TagsJSON, rec.UpdatedAt,
@@ -102,7 +103,7 @@ func (s *Store) SaveAccount(rec *AccountRecord) error {
 }
 
 var validAccountColumns = map[string]bool{
-	"name": true, "real_email": true, "icloud_email": true, "cookies": true,
+	"name": true, "real_email": true, "apple_dsid": true, "icloud_email": true, "cookies": true,
 	"host": true, "service_url": true, "proxy": true, "app_password": true,
 	"mailbox": true, "status": true, "alias_total": true, "alias_active": true,
 	"last_validated": true, "last_error": true, "created_at": true, "tags": true,
@@ -195,10 +196,10 @@ func (s *Store) SaveAccountsBatch(recs []*AccountRecord) error {
 	defer func() { _ = tx.Rollback() }()
 
 	stmt, err := tx.Prepare(`
-	INSERT OR IGNORE INTO accounts (id, name, real_email, icloud_email, cookies, host,
+	INSERT OR IGNORE INTO accounts (id, name, real_email, apple_dsid, icloud_email, cookies, host,
 		service_url, proxy, app_password, mailbox, status, alias_total, alias_active,
 		last_validated, last_error, created_at, tags, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -234,7 +235,7 @@ func (s *Store) SaveAccountsBatch(recs []*AccountRecord) error {
 		}
 
 		if _, err := stmt.Exec(
-			r.ID, r.Name, r.RealEmail, r.ICloudEmail, cookies,
+			r.ID, r.Name, r.RealEmail, r.AppleDSID, r.ICloudEmail, cookies,
 			r.Host, r.ServiceURL, proxy, appPassword, mailbox,
 			r.Status, r.AliasTotal, r.AliasActive,
 			r.LastValidated, r.LastError, r.CreatedAt, r.TagsJSON, r.UpdatedAt,
@@ -251,7 +252,7 @@ func (s *Store) SaveAccountsBatch(recs []*AccountRecord) error {
 
 // GetAccount 按 ID 查询单个账号。未找到返回 nil, nil。
 func (s *Store) GetAccount(id string) (*AccountRecord, error) {
-	row := s.db.QueryRow(`SELECT id, name, real_email, icloud_email, cookies, host,
+	row := s.db.QueryRow(`SELECT id, name, real_email, apple_dsid, icloud_email, cookies, host,
 		service_url, proxy, app_password, mailbox, status, alias_total, alias_active,
 		last_validated, last_error, created_at, tags, updated_at
 		FROM accounts WHERE id=?`, id)
@@ -271,7 +272,7 @@ func (s *Store) GetAccount(id string) (*AccountRecord, error) {
 
 // ListAllAccounts 返回全部账号记录（内存缓存初始化用）。
 func (s *Store) ListAllAccounts() ([]*AccountRecord, error) {
-	rows, err := s.db.Query(`SELECT id, name, real_email, icloud_email, cookies, host,
+	rows, err := s.db.Query(`SELECT id, name, real_email, apple_dsid, icloud_email, cookies, host,
 		service_url, proxy, app_password, mailbox, status, alias_total, alias_active,
 		last_validated, last_error, created_at, tags, updated_at
 		FROM accounts ORDER BY created_at ASC`)
@@ -288,7 +289,7 @@ func (s *Store) ListAccountsPaged(offset, limit int) ([]*AccountRecord, int, err
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM accounts`).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.db.Query(`SELECT id, name, real_email, icloud_email, cookies, host,
+	rows, err := s.db.Query(`SELECT id, name, real_email, apple_dsid, icloud_email, cookies, host,
 		service_url, proxy, app_password, mailbox, status, alias_total, alias_active,
 		last_validated, last_error, created_at, tags, updated_at
 		FROM accounts ORDER BY created_at ASC LIMIT ? OFFSET ?`, limit, offset)
@@ -317,7 +318,7 @@ type rowScanner interface {
 
 func scanAccountRow(row rowScanner, rec *AccountRecord) error {
 	return row.Scan(
-		&rec.ID, &rec.Name, &rec.RealEmail, &rec.ICloudEmail, &rec.CookiesJSON,
+		&rec.ID, &rec.Name, &rec.RealEmail, &rec.AppleDSID, &rec.ICloudEmail, &rec.CookiesJSON,
 		&rec.Host, &rec.ServiceURL, &rec.Proxy, &rec.AppPassword, &rec.MailboxJSON,
 		&rec.Status, &rec.AliasTotal, &rec.AliasActive,
 		&rec.LastValidated, &rec.LastError, &rec.CreatedAt, &rec.TagsJSON, &rec.UpdatedAt,

@@ -196,7 +196,9 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 	if reconciler, ok := be.(interface {
 		ReconcileUnresolvedIntents(context.Context) ([]store.HmeReserveIntent, error)
 	}); ok {
-		if list, err := reconciler.ReconcileUnresolvedIntents(context.Background()); err == nil && len(list) > 0 {
+		if list, err := reconciler.ReconcileUnresolvedIntents(context.Background()); err != nil {
+			log.Printf("[Server] 启动恢复未决别名失败，将在后续建号前重试: %v", err)
+		} else if len(list) > 0 {
 			log.Printf("[Server] 启动恢复: 扫描处理 %d 个未决 HME reserve 意图", len(list))
 		}
 	}

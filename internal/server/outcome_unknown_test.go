@@ -653,16 +653,80 @@ func TestFault_CrashAfterReserveSendBeforeResponse(t *testing.T) {
 		t.Fatalf("数据库持久化 anonymousID 期望 anon_crash_a, 实际: %s", savedIntent.AnonymousID)
 	}
 
-	// 检查 inventory 自动入库
-	var invCount int
-	_ = st2.DB().QueryRowContext(ctx, "SELECT COUNT(1) FROM alias_inventory WHERE email = ? AND account_id = ?", candA, accID).Scan(&invCount)
-	if invCount != 1 {
-		t.Fatalf("期望候选 A 录入 alias_inventory, 实际未查到")
+	// 恢复时尚无可证实的领用主体，只能隔离，不能进入可分配库存。
+	inv, err := st2.GetInventoryAlias(candA)
+	if err != nil {
+		t.Fatalf("期望候选 A 录入 alias_inventory: %v", err)
+	}
+	if inv.AccountID != accID || inv.AllocationState != store.AllocationQuarantined || inv.SourceType != "recovered" {
+		t.Fatalf("恢复库存应被隔离: %+v", inv)
+	}
+	if available := st2.CountAuthoritativeAvailableAliases(); available != 0 {
+		t.Fatalf("恢复别名不能进入公共号池，可用数=%d", available)
+	}
+	_, err = st2.RecordAllocation(&store.AliasAllocation{
+		AllocationID: "alloc_recovered", AliasEmail: candA, AccountID: accID,
+		OwnerKind: "token", OwnerID: "tok_recovered", Status: "allocated",
+	}, "")
+	if !errors.Is(err, store.ErrAllocationConflict) {
+		t.Fatalf("恢复别名不能被定向分配: %v", err)
 	}
 
 	// 6. 核心铁律断言：绝对没有调用 Generate 生成候选 B！
 	if calls := atomic.LoadInt32(&generateCalls); calls != 0 {
 		t.Fatalf("CRITICAL: 重启恢复期间产生候选 B: generateCalls=%d", calls)
+	}
+}
+
+func TestFault_ReconcileInventoryFailureRemainsRetryable(t *testing.T) {
+	const accountID = "acc_reconcile_failure"
+	const candidate = "reconcile_failure@icloud.com"
+	server, backend, st, _ := setupFaultTestEnvironment(t, accountID, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/hme/list" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"success":true,"result":{"hmeEmails":[{"hme":%q,"anonymousId":"anon_recovered","isActive":true}]}}`, candidate)
+	}))
+	defer server.Close()
+	defer st.Close()
+
+	ctx := context.Background()
+	intent, err := st.CreateReserveIntent(ctx, accountID, candidate, "original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateReserveIntentState(ctx, intent.IntentID, store.IntentStateReserveSent, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().Exec(`CREATE TRIGGER fail_recovered_inventory BEFORE INSERT ON alias_inventory BEGIN SELECT RAISE(FAIL, 'injected inventory failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.ReconcileUnresolvedIntents(ctx); err == nil || !strings.Contains(err.Error(), "injected inventory failure") {
+		t.Fatalf("库存写入失败应向上传递: %v", err)
+	}
+	saved, err := st.GetReserveIntent(ctx, intent.IntentID)
+	if err != nil || saved.State != store.IntentStateReserveSent {
+		t.Fatalf("库存失败后意图应保持未决: intent=%+v err=%v", saved, err)
+	}
+	if _, err := st.GetInventoryAlias(candidate); err == nil {
+		t.Fatal("库存写入失败后不应留下库存记录")
+	}
+
+	if _, err := st.DB().Exec(`DROP TRIGGER fail_recovered_inventory`); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟旧恢复路径留下的可领取记录；重试必须把它隔离。
+	if err := st.AddInventoryAlias(accountID, hme.Alias{Email: candidate, AnonymousID: "anon_recovered", Active: true}, "created", true); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := backend.ReconcileUnresolvedIntents(ctx)
+	if err != nil || len(recovered) != 1 || recovered[0].State != store.IntentStateSucceeded {
+		t.Fatalf("重试应完成恢复: intents=%+v err=%v", recovered, err)
+	}
+	inv, err := st.GetInventoryAlias(candidate)
+	if err != nil || inv.AllocationState != store.AllocationQuarantined || inv.SourceType != "recovered" {
+		t.Fatalf("重试后库存应隔离: inventory=%+v err=%v", inv, err)
 	}
 }
 
@@ -1096,5 +1160,3 @@ func TestFault_ResolvedIntentAllowsLaterIndependentCreate(t *testing.T) {
 		t.Fatalf("候选 B 未能持久化为 succeeded: %v", err)
 	}
 }
-
-

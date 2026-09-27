@@ -40,6 +40,7 @@ type Account struct {
 	ID              string            `json:"id"`
 	Name            string            `json:"name"`
 	RealEmail       string            `json:"real_email"`
+	AppleDSID       string            `json:"apple_dsid,omitempty"`
 	ICloudEmail     string            `json:"icloud_email"`
 	Cookies         map[string]string `json:"cookies"`
 	Host            string            `json:"host"`
@@ -262,6 +263,7 @@ func (a *Account) validateCookies() {
 		a.ServiceURL = serviceURL
 	}
 	if info := client.AccountInfo(); info != nil {
+		a.AppleDSID = info.DSID
 		a.RealEmail = firstNonEmpty(info.AppleID, info.PrimaryEmail)
 		if a.ICloudEmail == "" {
 			a.ICloudEmail = deriveICloudEmail(info)
@@ -714,11 +716,32 @@ func (m *Manager) saveSessionIfCurrent(id string, epoch uint64, host, proxy stri
 
 // UpdateAliasCounts 更新指定账号的别名统计数据并持久化。
 func (m *Manager) UpdateAliasCounts(id string, total, active int) error {
+	return m.updateAliasCounts(id, total, active, nil)
+}
+
+func (m *Manager) UpdateAliasCountsIfEpoch(id string, epoch uint64, total, active int) error {
+	return m.updateAliasCounts(id, total, active, &epoch)
+}
+
+func (m *Manager) CredentialEpoch(id string) (uint64, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return 0, false
+	}
+	return acc.credentialEpoch, true
+}
+
+func (m *Manager) updateAliasCounts(id string, total, active int, epoch *uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	acc, ok := m.accounts[id]
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
+	}
+	if epoch != nil && acc.credentialEpoch != *epoch {
+		return ErrSessionChanged
 	}
 	oldTotal, oldActive := acc.AliasTotal, acc.AliasActive
 	acc.AliasTotal = total

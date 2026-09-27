@@ -443,6 +443,7 @@ export default function AccountsPage() {
           accountId={cookieFor.id}
           open
           onClose={() => setCookieFor(null)}
+          onChanged={() => invalidateAccounts(cookieFor.id)}
           onSaved={() => {
             const targetId = cookieFor.id
             setCookieFor(null)

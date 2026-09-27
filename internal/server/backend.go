@@ -216,10 +216,13 @@ func (b *managerBackend) UpdateCookies(id, cookies string) (account.Summary, err
 	if err != nil {
 		return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: err.Error()}
 	}
-	if err := b.mgr.UpdateCookies(id, parsed); err != nil {
-		return account.Summary{}, mapAccountErr(err)
-	}
+	updateErr := b.mgr.UpdateCookies(id, parsed)
+	// 校验失败也可能已保存新凭据和错误状态，旧别名快照不能继续复用。
+	b.invalidateAliasCache(id)
 	b.invalidateSummaryCache()
+	if updateErr != nil {
+		return account.Summary{}, mapAccountErr(updateErr)
+	}
 	sum, ok := b.mgr.GetAccount(id)
 	if !ok {
 		return account.Summary{}, &BackendError{Status: http.StatusNotFound, Code: "ACCOUNT_NOT_FOUND", Message: "账号不存在"}
@@ -312,11 +315,13 @@ func (b *managerBackend) LoginAccount(id, password, otpCode string) (account.Sum
 	}
 
 	client, err := b.mgr.HMEClientWithPassword(id, password, otpProvider)
+	// 登录 Cookie 可能已保存，后续校验失败也必须丢弃旧别名快照。
+	b.invalidateAliasCache(id)
+	b.invalidateSummaryCache()
 	if err != nil {
 		return account.Summary{}, classifyLoginErr(err)
 	}
-	_ = client
-	b.invalidateSummaryCache()
+	defer client.Close()
 	sum, ok := b.mgr.GetAccount(id)
 	if !ok {
 		return account.Summary{}, &BackendError{Status: http.StatusNotFound, Code: "ACCOUNT_NOT_FOUND", Message: "账号不存在"}
@@ -326,6 +331,9 @@ func (b *managerBackend) LoginAccount(id, password, otpCode string) (account.Sum
 
 // classifyLoginErr 把 iCloud 登录错误映射为稳定错误。
 func classifyLoginErr(err error) *BackendError {
+	if errors.Is(err, account.ErrAccountIdentityMismatch) {
+		return &BackendError{Status: http.StatusConflict, Code: "ACCOUNT_IDENTITY_MISMATCH", Message: err.Error()}
+	}
 	msg := err.Error()
 	if strings.Contains(msg, "需要提供 OTP") {
 		return &BackendError{Status: http.StatusConflict, Code: "OTP_REQUIRED", Message: "需要提供 OTP 验证码"}
@@ -384,6 +392,12 @@ func (b *managerBackend) ValidateAccountContext(ctx context.Context, id string) 
 
 // mapAccountErr 把账号管理器错误映射为稳定错误。
 func mapAccountErr(err error) *BackendError {
+	if errors.Is(err, account.ErrAccountIdentityMismatch) {
+		return &BackendError{Status: http.StatusConflict, Code: "ACCOUNT_IDENTITY_MISMATCH", Message: err.Error()}
+	}
+	if errors.Is(err, account.ErrCookiesSavedInvalid) {
+		return &BackendError{Status: http.StatusUnprocessableEntity, Code: "COOKIE_SAVED_INVALID", Message: "Cookie 已保存，但 Apple 校验未通过，请检查凭据或网络"}
+	}
 	msg := err.Error()
 	if strings.Contains(msg, "账号不存在") {
 		return &BackendError{Status: http.StatusNotFound, Code: "ACCOUNT_NOT_FOUND", Message: "账号不存在"}
@@ -398,6 +412,9 @@ func mapAccountErr(err error) *BackendError {
 func classifyUpstreamErr(fixedMsg string, err error) *BackendError {
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, account.ErrAccountIdentityMismatch) {
+		return mapAccountErr(err)
 	}
 	if errors.Is(err, hme.ErrOutcomeUnknown) {
 		return &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_OUTCOME_UNKNOWN", Message: "上游写操作结果未知，需核对后处理"}

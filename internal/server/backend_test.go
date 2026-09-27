@@ -969,6 +969,116 @@ func TestCreateAliasKeepsSuccessWhenSessionChangesAfterReserve(t *testing.T) {
 	}
 }
 
+func TestBatchUpdateAliasesReportsPreflightFailure(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+	mgr, err := account.NewManager(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+	sum, err := mgr.AddAccountWithInput(account.AddAccountInput{
+		Name: "preflight", ICloudEmail: "owner@icloud.com", Proxy: proxy.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.SaveSession(sum.ID, map[string]string{"X-APPLE-WEBAUTH-TOKEN": "token"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	be := &managerBackend{mgr: mgr}
+	result, err := be.BatchUpdateAliases(sum.ID, []string{"anon_1"}, "new label", "")
+	var backendErr *BackendError
+	if !errors.As(err, &backendErr) || backendErr.Code != "UPSTREAM_FAILURE" {
+		t.Fatalf("service preflight failure must be returned: result=%+v err=%v", result, err)
+	}
+	if len(result.Succeeded) != 0 || len(result.Failed) != 0 {
+		t.Fatalf("preflight failure must not report attempted updates: %+v", result)
+	}
+}
+
+func TestUpdateCookiesInvalidatesAliasCacheAfterValidationFailure(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+	mgr, err := account.NewManager(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+	sum, err := mgr.AddAccountWithInput(account.AddAccountInput{
+		Name: "cookie update", ICloudEmail: "owner@icloud.com", Proxy: proxy.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.SaveSession(sum.ID, map[string]string{"X-APPLE-WEBAUTH-TOKEN": "old-token"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	be := &managerBackend{mgr: mgr}
+	be.setCachedAliases(sum.ID, []hme.Alias{{AnonymousID: "stale_alias", Active: true}})
+	_, err = be.UpdateCookies(sum.ID, `{"X-APPLE-WEBAUTH-TOKEN":"new-token"}`)
+	if err == nil {
+		t.Fatal("validation through failing proxy should return an error")
+	}
+	acc, ok := mgr.GetAccount(sum.ID)
+	if !ok || acc.Cookies["X-APPLE-WEBAUTH-TOKEN"] != "new-token" {
+		t.Fatalf("updated credentials should be stored despite validation error: account=%+v", acc)
+	}
+	if _, cached := be.getCachedAliases(sum.ID); cached {
+		t.Fatal("credential update must evict stale alias cache despite validation error")
+	}
+}
+
+func TestBatchUpdateAliasesKeepsResultsWhenSessionSaveFails(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mgr, err := account.NewManager(t.TempDir(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+	var updateCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/hme/updateMetaData" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		updateCalls.Add(1)
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer upstream.Close()
+	sum, err := mgr.AddAccountWithInput(account.AddAccountInput{Name: "batch", ICloudEmail: "owner@icloud.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.SaveSession(sum.ID, map[string]string{"X-APPLE-WEBAUTH-TOKEN": "token"}, upstream.URL); err != nil {
+		t.Fatal(err)
+	}
+	be := &managerBackend{mgr: mgr, store: st}
+	be.setCachedAliases(sum.ID, []hme.Alias{{AnonymousID: "anon_1", Label: "old label"}})
+	if _, err := st.DB().Exec(`CREATE TRIGGER fail_session_save BEFORE UPDATE ON accounts BEGIN SELECT RAISE(FAIL, 'injected session save failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := be.BatchUpdateAliases(sum.ID, []string{"anon_1"}, "new label", "")
+	if err != nil || len(result.Succeeded) != 1 || result.Succeeded[0] != "anon_1" || result.LastError == "" {
+		t.Fatalf("upstream success must be reported with session warning: result=%+v err=%v", result, err)
+	}
+	if updateCalls.Load() != 1 {
+		t.Fatalf("upstream update calls=%d, want 1", updateCalls.Load())
+	}
+	aliases, ok := be.getCachedAliases(sum.ID)
+	if !ok || len(aliases) != 1 || aliases[0].Label != "new label" {
+		t.Fatalf("successful update should refresh cached label: aliases=%+v found=%t", aliases, ok)
+	}
+}
+
 func TestConcurrentAliasCreationRespectsAccountLimit(t *testing.T) {
 	st, err := store.NewStore(t.TempDir())
 	if err != nil {

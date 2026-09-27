@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 database/sql, fmt, errors, strings, time, icloud-hme/internal/hme
- * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation 模型及 migrateInventory, AddInventoryAlias, GetInventoryAlias, SyncAliasInventory, CountAuthoritativeAvailableAliases, UpdateAliasRemoteState, PromoteUnknownToAvailable, CountDormantPoolAliases
+ * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation 模型及 migrateInventory, AddInventoryAlias, AddRecoveredInventoryAlias, GetInventoryAlias, SyncAliasInventory, CountAuthoritativeAvailableAliases, UpdateAliasRemoteState, PromoteUnknownToAvailable, CountDormantPoolAliases
  * [POS]: internal/store 的别名库存实体与迁移定义层，维护 alias_inventory, alias_allocations, operations 表结构与元数据
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -61,7 +61,7 @@ type AliasInventory struct {
 	ProviderAliasID string          `json:"provider_alias_id"`
 	RemoteState     RemoteState     `json:"remote_state"`
 	AllocationState AllocationState `json:"allocation_state"`
-	SourceType      string          `json:"source_type"` // "replenish", "manual", "on_demand", "legacy_unknown"
+	SourceType      string          `json:"source_type"` // "replenish", "created", "recovered", "manual", "on_demand", "legacy_unknown"
 	LastVerifiedAt  string          `json:"last_verified_at"`
 	SnapshotVersion int             `json:"snapshot_version"`
 }
@@ -93,8 +93,6 @@ type Operation struct {
 	CreatedAt      string `json:"created_at"`
 	UpdatedAt      string `json:"updated_at"`
 }
-
-
 
 // ReconcileAvailableInventory 安全收敛库存状态：严禁无凭据激活 unknown 存量别名，隔离保护账号与孤儿资产
 func (s *Store) ReconcileAvailableInventory() (int64, error) {
@@ -261,6 +259,45 @@ func (s *Store) AddInventoryAlias(accountID string, alias hme.Alias, sourceType 
 	`
 	_, err := s.db.Exec(q, email, accountID, alias.AnonymousID, remoteState, allocState, sourceType, now)
 	return err
+}
+
+// AddRecoveredInventoryAlias 隔离恢复的未决别名；已有分配或保留状态不回退。
+func (s *Store) AddRecoveredInventoryAlias(accountID string, alias hme.Alias) error {
+	email := strings.TrimSpace(strings.ToLower(alias.Email))
+	if accountID == "" || email == "" {
+		return errors.New("account_id and email must not be empty")
+	}
+	remoteState := RemoteActive
+	if !alias.Active {
+		remoteState = RemoteInactive
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(`
+		INSERT INTO alias_inventory (
+			email, account_id, provider_alias_id, remote_state, allocation_state, source_type, last_verified_at, snapshot_version
+		) VALUES (?, ?, ?, ?, 'quarantined', 'recovered', ?, 1)
+		ON CONFLICT(email) DO UPDATE SET
+			remote_state = excluded.remote_state,
+			provider_alias_id = CASE WHEN excluded.provider_alias_id != '' THEN excluded.provider_alias_id ELSE alias_inventory.provider_alias_id END,
+			allocation_state = CASE WHEN alias_inventory.allocation_state IN ('unknown', 'available') THEN 'quarantined' ELSE alias_inventory.allocation_state END,
+			source_type = CASE WHEN alias_inventory.allocation_state IN ('unknown', 'available') THEN 'recovered' ELSE alias_inventory.source_type END,
+			last_verified_at = excluded.last_verified_at
+		WHERE alias_inventory.account_id = excluded.account_id
+	`, email, accountID, alias.AnonymousID, remoteState, now)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("recovered alias %s belongs to another account", email)
+	}
+	return nil
 }
 
 // GetInventoryAlias 按邮箱查询库存记录
