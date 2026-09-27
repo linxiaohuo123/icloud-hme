@@ -51,7 +51,10 @@ type Backend interface {
 	UpdateProxy(string, string) (account.Summary, error)
 	UpdateCookies(string, string) (account.Summary, error)
 	SetAppPassword(string, string, string) (account.Summary, error)
+	SetAppPasswordContext(context.Context, string, string, string) (account.Summary, error)
 	SetMailbox(string, account.MailboxConfig) (account.Summary, error)
+	SetMailboxContext(context.Context, string, account.MailboxConfig) (account.Summary, error)
+	RemoveMailbox(string) (account.Summary, error)
 	LoginAccount(string, string, string) (account.Summary, error)
 	RemoveAccount(string) bool
 	CreateAlias(string, string) (*hme.CreateResult, error)
@@ -226,12 +229,22 @@ func (b *managerBackend) UpdateCookies(id, cookies string) (account.Summary, err
 
 // SetAppPassword 设置 iCloud 邮箱与 App 专用密码并测试 IMAP 连接。
 func (b *managerBackend) SetAppPassword(id, icloudEmail, appPassword string) (account.Summary, error) {
-	if err := b.mgr.SetAppPassword(id, icloudEmail, appPassword); err != nil {
+	return b.SetAppPasswordContext(context.Background(), id, icloudEmail, appPassword)
+}
+
+func (b *managerBackend) SetAppPasswordContext(ctx context.Context, id, icloudEmail, appPassword string) (account.Summary, error) {
+	if err := b.mgr.SetAppPasswordContext(ctx, id, icloudEmail, appPassword); err != nil {
+		if errors.Is(err, account.ErrMailConfigPersistence) {
+			return account.Summary{}, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_FAILURE", Message: "iCloud 邮箱配置保存失败"}
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return account.Summary{}, classifyUpstreamErr("IMAP 验证失败", err)
+		}
 		msg := err.Error()
 		if strings.Contains(msg, "账号不存在") {
 			return account.Summary{}, &BackendError{Status: http.StatusNotFound, Code: "ACCOUNT_NOT_FOUND", Message: "账号不存在"}
 		}
-		if strings.Contains(msg, "不能为空") {
+		if strings.Contains(msg, "不能为空") || strings.Contains(msg, "无效") {
 			return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: msg}
 		}
 		return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "IMAP 验证失败: " + msg}
@@ -246,7 +259,17 @@ func (b *managerBackend) SetAppPassword(id, icloudEmail, appPassword string) (ac
 
 // SetMailbox configures and verifies an external IMAP mailbox.
 func (b *managerBackend) SetMailbox(id string, config account.MailboxConfig) (account.Summary, error) {
-	if err := b.mgr.SetMailbox(id, config); err != nil {
+	return b.SetMailboxContext(context.Background(), id, config)
+}
+
+func (b *managerBackend) SetMailboxContext(ctx context.Context, id string, config account.MailboxConfig) (account.Summary, error) {
+	if err := b.mgr.SetMailboxContext(ctx, id, config); err != nil {
+		if errors.Is(err, account.ErrMailConfigPersistence) {
+			return account.Summary{}, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_FAILURE", Message: "收件邮箱配置保存失败"}
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return account.Summary{}, classifyUpstreamErr("收件邮箱验证失败", err)
+		}
 		msg := err.Error()
 		if strings.Contains(msg, "账号不存在") {
 			return account.Summary{}, &BackendError{Status: http.StatusNotFound, Code: "ACCOUNT_NOT_FOUND", Message: "账号不存在"}
@@ -255,6 +278,22 @@ func (b *managerBackend) SetMailbox(id string, config account.MailboxConfig) (ac
 			return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: msg}
 		}
 		return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "收件邮箱验证失败: " + msg}
+	}
+	b.invalidateSummaryCache()
+	sum, ok := b.mgr.GetAccount(id)
+	if !ok {
+		return account.Summary{}, &BackendError{Status: http.StatusNotFound, Code: "ACCOUNT_NOT_FOUND", Message: "账号不存在"}
+	}
+	return sum.Summary(), nil
+}
+
+// RemoveMailbox 解除外部收件邮箱绑定。
+func (b *managerBackend) RemoveMailbox(id string) (account.Summary, error) {
+	if err := b.mgr.RemoveMailbox(id); err != nil {
+		if errors.Is(err, account.ErrMailConfigPersistence) {
+			return account.Summary{}, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_FAILURE", Message: "收件邮箱配置保存失败"}
+		}
+		return account.Summary{}, mapAccountErr(err)
 	}
 	b.invalidateSummaryCache()
 	sum, ok := b.mgr.GetAccount(id)
@@ -311,9 +350,9 @@ func classifyLoginErr(err error) *BackendError {
 
 // RemoveAccount 删除账号并彻底驱逐关联的内存别名缓存。
 func (b *managerBackend) RemoveAccount(id string) bool {
-	b.invalidateAliasCache(id)
 	ok := b.mgr.RemoveAccount(id)
 	if ok {
+		b.invalidateAliasCache(id)
 		// 账号已被删除，立即作废列表快照，避免它还出现在列表/选号里
 		b.invalidateSummaryCache()
 	}

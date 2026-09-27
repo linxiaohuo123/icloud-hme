@@ -61,6 +61,55 @@ func TestSchedulerRunOnce(t *testing.T) {
 	}
 }
 
+func TestSchedulerPauseStopsRemainingCreates(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	const id = "acc_pause"
+	if err := st.SaveScheduleConfig(store.ScheduleConfig{AccountID: id, Enabled: true, HourlyQuota: 5}); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	calls := 0
+	sched := NewScheduler(st, func(ctx context.Context, accountID, label string) (*hme.CreateResult, error) {
+		calls++
+		if calls == 1 {
+			close(started)
+			<-release
+		}
+		return &hme.CreateResult{Email: "created@icloud.com"}, nil
+	}, func() []account.Summary {
+		return []account.Summary{{ID: id, Name: "pause", Status: "active"}}
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sched.RunOnce(true, 2)
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first create did not start")
+	}
+	cfg := st.GetScheduleConfig(id)
+	cfg.Enabled = false
+	if err := st.SaveScheduleConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("scheduler did not stop")
+	}
+	if calls != 1 {
+		t.Fatalf("paused account created %d aliases, want 1", calls)
+	}
+}
+
 // 计划触发且 0 个启用账号时空转静默:不产生日志也不创建;手动触发正常执行
 func TestSchedulerSilentIdleRound(t *testing.T) {
 	tempDir := t.TempDir()

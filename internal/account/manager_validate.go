@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 errors, fmt, strings, time, unicode/utf8, icloud-hme/internal/hme
- * [OUTPUT]: 对外提供 ErrCookieExpired, (*Manager).UpdateCookies, (*Manager).ValidateAccount, (*Manager).markAccountError
+ * [OUTPUT]: 对外提供 ErrCookieExpired, (*Manager).UpdateCookies, (*Manager).ValidateAccount, (*Manager).markAccountError；校验凭据代际并回滚保存失败的内存修改
  * [POS]: internal/account 的账号会话校验、健康巡检状态机与凭据失效判定
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -40,10 +40,12 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 
 	// 自动校验 Cookie 是否有效(锁外对快照操作)
 	snap.Cookies = cookies
+	originalHost := snap.Host
 	if snap.Host == "" {
 		snap.Host = "icloud.com"
 	}
 	aliasesFetched := false
+	var validateErr error
 	client, err := hme.NewClient(cookies, snap.Host, snap.Proxy, false)
 	if err != nil {
 		snap.Status = "error"
@@ -51,6 +53,7 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 	} else {
 		defer client.Close()
 		if err := client.ValidateSession(); err != nil {
+			validateErr = err
 			// validate 即使失败也可能通过 Set-Cookie 刷新部分会话状态。
 			snap.Cookies = client.CookieSnapshot()
 			snap.Status = "error"
@@ -86,7 +89,13 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("账号不存在: %s", id)
 	}
+	if cur.credentialEpoch != snap.credentialEpoch || cur.Host != originalHost || cur.Proxy != snap.Proxy {
+		m.mu.Unlock()
+		return ErrSessionChanged
+	}
+	old := *cur
 	cur.Cookies = snap.Cookies
+	cur.ServiceURL = ""
 	cur.Status = snap.Status
 	cur.LastValidated = snap.LastValidated
 	cur.LastError = snap.LastError
@@ -99,11 +108,13 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 		cur.AliasActive = snap.AliasActive
 	}
 	saveErr := m.saveAccount(cur)
-	m.mu.Unlock()
-	if err != nil {
-		return err
+	if saveErr != nil {
+		*cur = old
+	} else {
+		cur.credentialEpoch++
 	}
-	return saveErr
+	m.mu.Unlock()
+	return errors.Join(err, validateErr, saveErr)
 }
 
 // ValidateAccount 对指定账号执行一次会话校验并刷新状态(供后台健康监控周期调用)。
@@ -129,6 +140,7 @@ func (m *Manager) ValidateAccountWithContext(ctx context.Context, id string) err
 		m.mu.RUnlock()
 		return fmt.Errorf("账号 %s 未配置 Cookie", id)
 	}
+	epoch := acc.credentialEpoch
 	m.mu.RUnlock()
 
 	// 走账号级客户端池: 本函数由 Cookie 监控器对每个账号每轮调用一次，
@@ -158,12 +170,22 @@ func (m *Manager) ValidateAccountWithContext(ctx context.Context, id string) err
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, ErrSessionChanged) {
+			return err
+		}
+		m.mu.RLock()
+		current, exists := m.accounts[id]
+		changed := !exists || current.credentialEpoch != epoch
+		m.mu.RUnlock()
+		if changed {
+			return ErrSessionChanged
+		}
 		if errors.Is(err, ErrHMEClientUnavailable) {
-			m.markAccountError(id, "创建客户端失败")
+			m.markAccountError(id, epoch, "创建客户端失败")
 			return fmt.Errorf("%w: %v", ErrCookieExpired, err)
 		}
 		if isAuthFailure(err.Error()) {
-			m.markAccountError(id, "Cookie 已失效")
+			m.markAccountError(id, epoch, "Cookie 已失效")
 			return fmt.Errorf("%w: %v", ErrCookieExpired, err)
 		}
 		return fmt.Errorf("校验暂时失败: %w", err)
@@ -176,6 +198,11 @@ func (m *Manager) ValidateAccountWithContext(ctx context.Context, id string) err
 		m.mu.Unlock()
 		return fmt.Errorf("账号不存在: %s", id)
 	}
+	if cur.credentialEpoch != epoch {
+		m.mu.Unlock()
+		return ErrSessionChanged
+	}
+	old := *cur
 	if refreshedCookies != nil {
 		cur.Cookies = refreshedCookies
 	}
@@ -201,28 +228,36 @@ func (m *Manager) ValidateAccountWithContext(ctx context.Context, id string) err
 		}
 	}
 	saveErr := m.saveAccount(cur)
+	if saveErr != nil {
+		*cur = old
+	}
 	m.mu.Unlock()
 	return saveErr
 }
 
 // markAccountError 将账号标记为凭据失效并持久化(监控器专用，不改 LastValidated)。
-func (m *Manager) markAccountError(id, reason string) {
+func (m *Manager) markAccountError(id string, epoch uint64, reason string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur, ok := m.accounts[id]
-	if !ok {
+	if !ok || cur.credentialEpoch != epoch {
 		return
 	}
+	oldStatus, oldError := cur.Status, cur.LastError
 	cur.Status = "error"
 	cur.LastError = reason
 	if m.store != nil {
-		_ = m.store.UpdateAccountFields(id, map[string]interface{}{
+		if err := m.store.UpdateAccountFields(id, map[string]interface{}{
 			"status":     "error",
 			"last_error": reason,
-		})
+		}); err != nil {
+			cur.Status, cur.LastError = oldStatus, oldError
+		}
 		return
 	}
-	_ = m.saveJSON()
+	if err := m.saveJSON(); err != nil {
+		cur.Status, cur.LastError = oldStatus, oldError
+	}
 }
 
 // isAuthFailure 判断上游错误是否为凭据级失效(401/403，hme 客户端不重试直接返回)。

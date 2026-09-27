@@ -321,15 +321,15 @@ func spinMockMailServer(t *testing.T, totalMessages int, searchUIDs []uint32, ma
 	}()
 
 	return ln.Addr().(*net.TCPAddr).Port, func() []string {
-		mu.Lock()
-		defer mu.Unlock()
-		cp := make([]string, len(commands))
-		copy(cp, commands)
-		return cp
-	}, func() {
-		_ = ln.Close()
-		<-done
-	}
+			mu.Lock()
+			defer mu.Unlock()
+			cp := make([]string, len(commands))
+			copy(cp, commands)
+			return cp
+		}, func() {
+			_ = ln.Close()
+			<-done
+		}
 }
 
 func createTestClient(t *testing.T, port int) *Client {
@@ -726,6 +726,31 @@ func TestRecentFallback_OneCandidateOutOfTen_FetchesOnlyCandidateBody(t *testing
 	for k, want := range assertKV {
 		if got, _ := findKV(recentPerfKV, k); got != want {
 			t.Errorf("MailPerf %s = %q, want %q", k, got, want)
+		}
+	}
+}
+
+func TestAliasSearch_SummarySkipsBodyFetch(t *testing.T) {
+	mails := map[uint32]mockMailItem{
+		10: {SeqNum: 1, UID: 10, DateStr: "26-Sep-2026 00:00:00 +0000", ToAddr: "alias@icloud.com", Body: "code 123456"},
+		20: {SeqNum: 2, UID: 20, DateStr: "26-Sep-2026 00:01:00 +0000", ToAddr: "other@example.com", Body: "alias@icloud.com"},
+	}
+	port, getCommands, stop := spinMockMailServer(t, 2, []uint32{10, 20}, mails)
+	defer stop()
+	c := createTestClient(t, port)
+	defer c.ForceClose()
+
+	msgs, err := c.FindByRecipientSummaryInFolder("alias@icloud.com", "INBOX", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].UID != 10 || msgs[0].Preview != "" {
+		t.Fatalf("summary should contain only verified metadata: %+v", msgs)
+	}
+	for _, cmd := range getCommands() {
+		upper := strings.ToUpper(cmd)
+		if strings.Contains(upper, "BODY.PEEK[]") || strings.Contains(upper, "BODY[]") {
+			t.Fatalf("summary query fetched full body: %s", cmd)
 		}
 	}
 }
@@ -1179,12 +1204,12 @@ func TestFolderAll_GlobalNewestFirst(t *testing.T) {
 func TestAliasSearch_PartialDirectSearchFallback(t *testing.T) {
 	mails := map[uint32]mockMailItem{
 		10: {
-			SeqNum:   1,
-			UID:      10,
-			DateStr:  "26-Sep-2026 01:00:00 +0000",
-			Subject:  "旧邮件Direct",
-			ToAddr:   "alias@icloud.com",
-			Body:     "正文10",
+			SeqNum:  1,
+			UID:     10,
+			DateStr: "26-Sep-2026 01:00:00 +0000",
+			Subject: "旧邮件Direct",
+			ToAddr:  "alias@icloud.com",
+			Body:    "正文10",
 		},
 		30: {
 			SeqNum:           2,
@@ -1245,12 +1270,12 @@ func TestAliasSearch_PartialDirectSearchFallback(t *testing.T) {
 func TestCase1_PartialDirectDisplacedByNewerFallback(t *testing.T) {
 	mails := map[uint32]mockMailItem{
 		10: {
-			SeqNum:   1,
-			UID:      10,
-			DateStr:  "26-Sep-2026 01:00:00 +0000",
-			Subject:  "旧邮件Direct10",
-			ToAddr:   "alias@icloud.com",
-			Body:     "正文10",
+			SeqNum:  1,
+			UID:     10,
+			DateStr: "26-Sep-2026 01:00:00 +0000",
+			Subject: "旧邮件Direct10",
+			ToAddr:  "alias@icloud.com",
+			Body:    "正文10",
 		},
 		30: {
 			SeqNum:           2,
@@ -1323,20 +1348,20 @@ func TestCase1_PartialDirectDisplacedByNewerFallback(t *testing.T) {
 func TestCase2_FullDirectDisplacedByNewerFallback(t *testing.T) {
 	mails := map[uint32]mockMailItem{
 		10: {
-			SeqNum:   1,
-			UID:      10,
-			DateStr:  "26-Sep-2026 01:00:00 +0000",
-			Subject:  "旧邮件Direct10",
-			ToAddr:   "alias@icloud.com",
-			Body:     "正文10",
+			SeqNum:  1,
+			UID:     10,
+			DateStr: "26-Sep-2026 01:00:00 +0000",
+			Subject: "旧邮件Direct10",
+			ToAddr:  "alias@icloud.com",
+			Body:    "正文10",
 		},
 		20: {
-			SeqNum:   2,
-			UID:      20,
-			DateStr:  "26-Sep-2026 02:00:00 +0000",
-			Subject:  "旧邮件Direct20",
-			ToAddr:   "alias@icloud.com",
-			Body:     "正文20",
+			SeqNum:  2,
+			UID:     20,
+			DateStr: "26-Sep-2026 02:00:00 +0000",
+			Subject: "旧邮件Direct20",
+			ToAddr:  "alias@icloud.com",
+			Body:    "正文20",
 		},
 		30: {
 			SeqNum:           3,

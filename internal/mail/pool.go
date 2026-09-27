@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 sync, time, fmt, strings
+ * [INPUT]: 依赖 context, sync, time, fmt, strings
  * [OUTPUT]: 对外提供 Pool, NewPool 等按账号复用的 IMAP 长连接池管理能力
- * [POS]: internal/mail 的连接复用与生命周期管控层，接入 MailPerf 观测 (pool_wait/ensure/connect/ping/op 耗时)
+ * [POS]: internal/mail 的连接复用与生命周期管控层，贯穿冷连接取消并接入 MailPerf 观测
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -155,7 +155,7 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 		poolWaitMS: poolWaitMS,
 	}
 	ensureStart := time.Now()
-	ensureStats, ensureErr := pc.ensure(p.idleClose)
+	ensureStats, ensureErr := pc.ensureContext(ctx, p.idleClose)
 	perf.ensureMS = time.Since(ensureStart).Milliseconds()
 	perf.stats = ensureStats
 	if ensureErr != nil {
@@ -166,6 +166,14 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 		perf.connErr = isLikelyConnErr(ensureErr)
 		return ensureErr
 	}
+	if err := ctx.Err(); err != nil {
+		if pc.client != nil {
+			pc.client.forceClose()
+			pc.client = nil
+		}
+		perf.err = true
+		return err
+	}
 
 	cli := pc.client
 	if cli == nil {
@@ -174,29 +182,22 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 	}
 
 	// 监听 Context 取消：真正打断底层 TCP/TLS 连接网络 I/O
-	stopWatch := make(chan struct{})
-	defer close(stopWatch)
-
-	go func() {
-		defer func() {
-			_ = recover()
-		}()
-		select {
-		case <-ctx.Done():
-			cli.SetDeadline(time.Now())
-			cli.forceClose()
-		case <-stopWatch:
-		}
-	}()
-
 	cli.SetDeadline(time.Now().Add(IMAPCommandTimeout))
 	defer func() {
 		cli.SetDeadline(time.Time{})
 	}()
+	var stopCancel func()
+	if cli.conn != nil {
+		stopCancel = watchContextClose(ctx, cli.conn)
+		defer stopCancel()
+	}
 
 	opStart := time.Now()
 	err := fn(cli)
 	perf.opMS = time.Since(opStart).Milliseconds()
+	if stopCancel != nil {
+		stopCancel()
+	}
 
 	// 若在执行期间 context 已触发取消，连接已被打断，必须从连接池丢弃，严禁复用 (Issue 13)
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -284,10 +285,10 @@ func (p *Pool) getOrCreateWithServer(email, server string, port int) *pooledConn
 	p.evictOldestLocked()
 
 	pc := &pooledConn{
-		appleID:  email,
-		server:   server,
-		port:     port,
-		sem:      make(chan struct{}, 1),
+		appleID: email,
+		server:  server,
+		port:    port,
+		sem:     make(chan struct{}, 1),
 	}
 	elem := p.lruList.PushFront(pc)
 	p.items[key] = elem
@@ -403,7 +404,14 @@ func logPoolPerfRecord(r *poolPerfRecord) {
 }
 
 func (pc *pooledConn) ensure(idleClose time.Duration) (poolEnsureStats, error) {
+	return pc.ensureContext(context.Background(), idleClose)
+}
+
+func (pc *pooledConn) ensureContext(ctx context.Context, idleClose time.Duration) (poolEnsureStats, error) {
 	var stats poolEnsureStats
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	if pc.client != nil {
 		// 空闲太久主动重建, 避免服务端静默断连
 		if idleClose > 0 && !pc.lastUsed.IsZero() && time.Since(pc.lastUsed) > idleClose {
@@ -419,8 +427,21 @@ func (pc *pooledConn) ensure(idleClose time.Duration) (poolEnsureStats, error) {
 		}
 
 		pingStart := time.Now()
+		conn := pc.client.conn
+		var stopCancel func()
+		if conn != nil {
+			stopCancel = watchContextClose(ctx, conn)
+		}
 		err := pc.client.Ping()
+		if stopCancel != nil {
+			stopCancel()
+		}
 		stats.PingMS = time.Since(pingStart).Milliseconds()
+		if ctx.Err() != nil {
+			pc.client.forceClose()
+			pc.client = nil
+			return stats, ctx.Err()
+		}
 		if err == nil {
 			stats.Reused = true
 			return stats, nil
@@ -441,7 +462,7 @@ func (pc *pooledConn) ensure(idleClose time.Duration) (poolEnsureStats, error) {
 		c.SetProxy(pc.proxyURL)
 	}
 	connectStart := time.Now()
-	connectErr := c.Connect()
+	connectErr := c.ConnectContext(ctx)
 	if pc.proxyURL != "" {
 		stats.ProxyConnectMS = time.Since(connectStart).Milliseconds()
 	} else {
@@ -453,6 +474,10 @@ func (pc *pooledConn) ensure(idleClose time.Duration) (poolEnsureStats, error) {
 		pc.lastUsed = time.Now()
 		return stats, nil
 	}
+	if err := ctx.Err(); err != nil {
+		stats.ConnectMS = time.Since(connectStart).Milliseconds()
+		return stats, err
+	}
 	if pc.proxyURL == "" {
 		// FIX-7: 直连失败同样必须记录总建连耗时，禁止 conn_ms=0 + err=true 的错误指标
 		stats.ConnectMS = time.Since(connectStart).Milliseconds()
@@ -462,9 +487,12 @@ func (pc *pooledConn) ensure(idleClose time.Duration) (poolEnsureStats, error) {
 	stats.ProxyFallback = true
 	direct := NewClientWithServer(pc.appleID, pc.appPassword, server, port)
 	directStart := time.Now()
-	directErr := direct.Connect()
+	directErr := direct.ConnectContext(ctx)
 	stats.DirectConnectMS = time.Since(directStart).Milliseconds()
 	stats.ConnectMS = time.Since(connectStart).Milliseconds()
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	if directErr != nil {
 		return stats, connectErr
 	}

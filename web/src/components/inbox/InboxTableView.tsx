@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 api/client (request, ApiError, getMessageDetail), api/types, components (AsyncState, ConfirmDialog, ToastProvider), hooks/useAccounts (fetchAccountsDeduped), utils (clipboard, date, mail, sniffer: buildSniffContext, extractOTPMemoized, parseSenderInfo), ./InboxFilterBar, ./InboxTableRow, ./MailDetailDialog
- * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；支持 externalAliases 直传消灭冗余 I/O、fetchAccountsDeduped 全局缓存共享、INBOX First 首屏优先加载、/api/mailboxes 交互式按需懒加载 (带 pending 队列与 IMAP 避让)、模块级缓存防 Tab 切换重载、Body-on-demand 按需加载单封正文 (零首屏批量正文 I/O)
+ * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；支持仅看明确未读、externalAliases 直传消灭冗余 I/O、fetchAccountsDeduped 全局缓存共享、INBOX First 首屏优先加载、/api/mailboxes 交互式按需懒加载 (带 pending 队列与 IMAP 避让)、模块级缓存防 Tab 切换重载、Body-on-demand 按需加载单封正文 (零首屏批量正文 I/O)
  * [POS]: web/src/components/inbox 的核心视图容器，统一单账号工作台与全局收件箱大盘的数据流与交互
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -189,6 +189,7 @@ export default function InboxTableView({
   const [limit, setLimit] = useState(20)
   const [days, setDays] = useState(7)
   const [autoRefreshInterval, setAutoRefreshInterval] = useState<number>(0)
+  const [unreadOnly, setUnreadOnly] = useState(false)
 
   // 记录通过 CAPABILITY_UNSUPPORTED 降级或静态推断为仅 WebMail 的账号集合
   const [effectiveWebMailAccounts, setEffectiveWebMailAccounts] = useState<Record<string, boolean>>(() => {
@@ -813,6 +814,7 @@ export default function InboxTableView({
   // 数据层一次性计算并附加 OTP 嗅探与发件人解析结果，彻底消灭渲染视图层地毯式大正则计算
   const filteredMessages = useMemo(() => {
     return rawMessages
+      .filter((m) => !unreadOnly || m.unread === true)
       .slice()
       .sort((a, b) => (dateTimestamp(b.date) ?? 0) - (dateTimestamp(a.date) ?? 0))
       .map((m) => {
@@ -830,7 +832,7 @@ export default function InboxTableView({
           sender,
         }
       })
-  }, [rawMessages, accountId])
+  }, [rawMessages, accountId, unreadOnly])
 
   useEffect(() => {
     if (onCountChange) {
@@ -839,7 +841,7 @@ export default function InboxTableView({
   }, [filteredMessages.length, onCountChange])
 
   const currentAccountName = currentAccount?.name || currentAccount?.real_email || (accountId || '未选择')
-  const totalCount = result?.count ?? filteredMessages.length
+  const totalCount = unreadOnly ? filteredMessages.length : (result?.count ?? filteredMessages.length)
   const codesDetectedCount = useMemo(() => {
     return filteredMessages.filter((m) => Boolean(m.otp?.code)).length
   }, [filteredMessages])
@@ -971,6 +973,8 @@ export default function InboxTableView({
           onDaysChange={(val) => setDays(val)}
           autoRefreshInterval={autoRefreshInterval}
           onAutoRefreshIntervalChange={(val) => setAutoRefreshInterval(val)}
+          unreadOnly={unreadOnly}
+          onUnreadOnlyChange={(val) => { setUnreadOnly(val); setPage(1) }}
           loading={loading}
           onSearch={handleSearch}
         />
@@ -981,7 +985,7 @@ export default function InboxTableView({
           error={error}
           onRetry={() => setRetryKey((k) => k + 1)}
           empty={!loading && filteredMessages.length === 0}
-          emptyText={alias ? `未查找到别名 [${alias}] 的邮件` : '收件箱暂无邮件'}
+          emptyText={unreadOnly ? '当前结果中没有未读邮件' : alias ? `未查找到别名 [${alias}] 的邮件` : '收件箱暂无邮件'}
         >
           <div className="table-responsive">
             <table className="table inbox-table">

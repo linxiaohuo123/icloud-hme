@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/mail, internal/account
  * [OUTPUT]: 对外提供 managerBackend 的邮件收发与邮箱管理方法 (ListInbox, ListMailboxes, GetMessage, GetMessages, DeleteMessage, ScanMailboxUIDPage, GetMailboxBoundaryContext)、parseMessageID 与 InboxQuery, InboxResult, ScanPageQuery, ScanPageResult, MessageRef 类型
- * [POS]: internal/server 的邮件业务门面实现；IMAP folder:uid 与 WebMail ThreadID 分流，批量详情降级尽力返回 WebMail 列表，接入 MailPerf 观测 (inbox_query 脱敏埋点)
+ * [POS]: internal/server 的邮件业务门面实现；IMAP 别名列表按需读取正文，WebMail 详情明确标记为不完整预览，接入 MailPerf 观测
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -133,9 +133,17 @@ func (b *managerBackend) ListInboxContext(ctx context.Context, q InboxQuery) (in
 		var e error
 		if q.Alias != "" {
 			if q.SinceUID > 0 {
-				imapMessages, e = mc.FindByRecipientInFolderSince(q.Alias, q.Folder, q.Limit, q.Days, q.SinceUID)
+				if q.WithBody {
+					imapMessages, e = mc.FindByRecipientInFolderSince(q.Alias, q.Folder, q.Limit, q.Days, q.SinceUID)
+				} else {
+					imapMessages, e = mc.FindByRecipientSummaryInFolderSince(q.Alias, q.Folder, q.Limit, q.Days, q.SinceUID)
+				}
 			} else {
-				imapMessages, e = mc.FindByRecipientInFolder(q.Alias, q.Folder, q.Limit, q.Days)
+				if q.WithBody {
+					imapMessages, e = mc.FindByRecipientInFolder(q.Alias, q.Folder, q.Limit, q.Days)
+				} else {
+					imapMessages, e = mc.FindByRecipientSummaryInFolder(q.Alias, q.Folder, q.Limit, q.Days)
+				}
 			}
 		} else {
 			if q.SinceUID > 0 {
@@ -323,30 +331,7 @@ func (b *managerBackend) GetMessageContext(ctx context.Context, accountID string
 		}
 		for _, m := range msgs {
 			if m.ID == ref.ThreadID || (ref.ThreadID != "" && m.ThreadID == ref.ThreadID) {
-				fullRef := mail.MessageRef{
-					Provider:  "webmail",
-					AccountID: accountID,
-					ThreadID:  m.ID,
-				}
-				return &mail.FullMessage{
-					Message: mail.Message{
-						ID:         m.ID,
-						MessageRef: fullRef.Encode(),
-						Folder:     "INBOX",
-						Subject:    m.Subject,
-						From:       m.From,
-						To:         m.To,
-						Date:       m.Date,
-						Preview:    m.Preview,
-						Provider:   "webmail",
-						ThreadID:   m.ID,
-					},
-					Body:         m.Preview,
-					ContentType:  "text/plain",
-					BodyComplete: false, // 显式标识正文不完整（仅预览）
-					Provider:     "webmail",
-					Method:       "web_api",
-				}, nil
+				return webMailPreviewDetail(accountID, m), nil
 			}
 		}
 		return nil, &BackendError{Status: http.StatusNotFound, Code: "MESSAGE_NOT_FOUND", Message: "邮件不存在"}
@@ -401,6 +386,22 @@ func (b *managerBackend) GetMessageContext(ctx context.Context, accountID string
 		}
 	}
 	return nil, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "读取邮件详情失败"}
+}
+
+func webMailPreviewDetail(accountID string, m mail.Message) *mail.FullMessage {
+	ref := mail.MessageRef{Provider: "webmail", AccountID: accountID, ThreadID: m.ID}
+	m.AccountID = accountID
+	m.MessageRef = ref.Encode()
+	m.Provider = "webmail"
+	m.ThreadID = m.ID
+	return &mail.FullMessage{
+		Message:      m,
+		Body:         m.Preview,
+		ContentType:  "text/plain",
+		BodyComplete: false,
+		Provider:     "webmail",
+		Method:       "web_api",
+	}
 }
 
 func (b *managerBackend) GetMessage(accountID string, rawID string) (*mail.FullMessage, error) {

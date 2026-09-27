@@ -559,6 +559,7 @@ func (s *Server) register() {
 				adm.PUT("/accounts/:id/cookies", csrfCheck(s.auth), s.updateCookiesHandler)
 				adm.POST("/accounts/:id/password", csrfCheck(s.auth), s.setAppPasswordHandler)
 				adm.PUT("/accounts/:id/mailbox", csrfCheck(s.auth), s.setMailboxHandler)
+				adm.DELETE("/accounts/:id/mailbox", csrfCheck(s.auth), s.removeMailboxHandler)
 				adm.POST("/accounts/:id/login", csrfCheck(s.auth), s.loginAccountHandler)
 				adm.DELETE("/accounts/:id", csrfCheck(s.auth), s.removeAccountHandler)
 
@@ -693,4 +694,3 @@ func (s *Server) handleReadyz(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
-

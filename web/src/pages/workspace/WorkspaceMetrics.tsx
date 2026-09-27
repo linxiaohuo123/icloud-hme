@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 api/types 的 AccountSummary/Alias, components/icons 的 IconZap/IconAliases/IconCheck/IconShield
  * [OUTPUT]: 对外提供 WorkspaceMetrics 顶部指标卡片组组件
- * [POS]: web/src/pages/workspace 的指标统计组件，展示活跃别名、配额占用、运行状态与凭据健康度
+ * [POS]: web/src/pages/workspace 的指标统计组件，展示活跃别名、配额占用、运行状态与凭据配置状态
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -88,7 +88,7 @@ export default function WorkspaceMetrics({
         <div className="stat-value">
           {account?.has_cookies ? 'Cookie 正常' : '密码登录'}
         </div>
-        <div className="stat-subtext">{account?.mailbox ? 'IMAP 收件箱已连通' : '未配置收件箱'}</div>
+        <div className="stat-subtext">{account?.mailbox ? '外部 IMAP 已配置' : account?.has_app_password ? 'iCloud IMAP 已配置' : '未配置收件箱'}</div>
       </div>
     </div>
   )

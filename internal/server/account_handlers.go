@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 gin, net/http, encoding/json, icloud-hme/internal/account
  * [OUTPUT]: 对外提供 listAccountsHandler, addAccountHandler, updateAccountHandler 等 HTTP 端点
- * [POS]: internal/server 的账号层路由适配器，负责请求反序列化、入参校验与安全 Summary 响应包装
+ * [POS]: internal/server 的账号层路由适配器，负责请求反序列化、邮箱绑定与解绑、入参校验及安全 Summary 响应包装
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -214,7 +214,7 @@ func (s *Server) setAppPasswordHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: icloud_email, app_password 必填")
 		return
 	}
-	sum, err := s.be.SetAppPassword(id, req.ICloudEmail, req.AppPassword)
+	sum, err := s.be.SetAppPasswordContext(c.Request.Context(), id, req.ICloudEmail, req.AppPassword)
 	if err != nil {
 		backendFail(c, err)
 		return
@@ -240,9 +240,22 @@ func (s *Server) setMailboxHandler(c *gin.Context) {
 		return
 	}
 	accountID := c.Param("id")
-	sum, err := s.be.SetMailbox(accountID, account.MailboxConfig{
+	sum, err := s.be.SetMailboxContext(c.Request.Context(), accountID, account.MailboxConfig{
 		Provider: req.Provider, Email: req.Email, IMAPHost: req.IMAPHost, IMAPPort: req.IMAPPort, Password: req.AuthorizationCode,
 	})
+	if err != nil {
+		backendFail(c, err)
+		return
+	}
+	if s.mailReadService != nil {
+		s.mailReadService.InvalidateAccount(accountID)
+	}
+	ok(c, sum)
+}
+
+func (s *Server) removeMailboxHandler(c *gin.Context) {
+	accountID := c.Param("id")
+	sum, err := s.be.RemoveMailbox(accountID)
 	if err != nil {
 		backendFail(c, err)
 		return
@@ -284,18 +297,18 @@ func (s *Server) loginAccountHandler(c *gin.Context) {
 func (s *Server) removeAccountHandler(c *gin.Context) {
 	id := c.Param("id")
 	if !s.be.RemoveAccount(id) {
-		failCode(c, http.StatusNotFound, "ACCOUNT_NOT_FOUND", "账号不存在")
+		if _, err := s.be.GetAccount(id); err == nil {
+			failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "删除账号失败")
+		} else {
+			failCode(c, http.StatusNotFound, "ACCOUNT_NOT_FOUND", "账号不存在")
+		}
 		return
 	}
 	if s.mailReadService != nil {
 		s.mailReadService.InvalidateAccount(id)
 	}
-	if s.store != nil {
-		_ = s.store.DeleteScheduleConfig(id)
-		// 【BUG-14 修复】级联清理路由表,防止残留路由指向已删除账号
-		_ = s.store.DeleteAliasRoutesForAccount(id)
-		// 级联隔离预存库存,防止幽灵别名出号
-		_ = s.store.QuarantineInventoryForAccount(id)
+	if s.syncWorker != nil {
+		s.syncWorker.ForgetAccount(id)
 	}
 	ok(c, gin.H{"id": id})
 }

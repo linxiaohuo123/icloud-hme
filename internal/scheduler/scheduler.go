@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 icloud-hme/internal/account, icloud-hme/internal/hme, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 Scheduler, NewScheduler, LogEntry, Status, isInDailyWindow, isTransientCreateError, isDurationExpired
- * [POS]: internal/scheduler 的定时别名补货引擎与环形日志中心，负责平滑号池供给与风控防封
+ * [POS]: internal/scheduler 的定时别名补货引擎与环形日志中心，执行前复查配置以跳过已暂停任务
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -80,19 +80,19 @@ type AccountsProvider func() []account.Summary
 
 // Scheduler 定时调度引擎
 type Scheduler struct {
-	store         *store.Store
-	creator       AliasCreator
-	accounts      AccountsProvider
-	logs          *RingBuffer
-	interval      time.Duration
-	stopCh        chan struct{}
-	running       bool
-	runMu         sync.Mutex
-	mu            sync.Mutex
-	roundRunning  atomic.Bool  // 当前是否有一轮补货正在执行
-	lastRunAt     atomic.Int64 // 最近一轮完成时间(UnixNano, 0=从未执行)
-	paceMu        sync.Mutex
-	lastPacedRun  map[string]time.Time // 记录每个账号最近一次发号时间(用于平滑平摊)
+	store        *store.Store
+	creator      AliasCreator
+	accounts     AccountsProvider
+	logs         *RingBuffer
+	interval     time.Duration
+	stopCh       chan struct{}
+	running      bool
+	runMu        sync.Mutex
+	mu           sync.Mutex
+	roundRunning atomic.Bool  // 当前是否有一轮补货正在执行
+	lastRunAt    atomic.Int64 // 最近一轮完成时间(UnixNano, 0=从未执行)
+	paceMu       sync.Mutex
+	lastPacedRun map[string]time.Time // 记录每个账号最近一次发号时间(用于平滑平摊)
 	// wg 跟踪在途的补货轮次，使 Stop 能等到本轮收敛后再放行停机。
 	wg            sync.WaitGroup
 	ctx           context.Context
@@ -361,7 +361,7 @@ func (s *Scheduler) run(manual, includeDisabled bool, countPerAccount int) (int,
 					return
 				default:
 				}
-				c, e := s.processAccount(runCtx, a, countPerAccount, stopCh)
+				c, e := s.processAccount(runCtx, a, manual, includeDisabled, countPerAccount, stopCh)
 				createdTotal.Add(int64(c))
 				errorTotal.Add(int64(e))
 			}
@@ -389,7 +389,7 @@ func (s *Scheduler) run(manual, includeDisabled bool, countPerAccount int) (int,
 }
 
 // processAccount 负责单个账号的配额校验与别名生成。
-func (s *Scheduler) processAccount(ctx context.Context, a account.Summary, countPerAccount int, stopCh <-chan struct{}) (int, int) {
+func (s *Scheduler) processAccount(ctx context.Context, a account.Summary, manual, includeDisabled bool, countPerAccount int, stopCh <-chan struct{}) (int, int) {
 	cfg := s.store.GetScheduleConfig(a.ID)
 	accName := a.Name
 	if accName == "" {
@@ -420,6 +420,14 @@ func (s *Scheduler) processAccount(ctx context.Context, a account.Summary, count
 			s.logs.Add(fmt.Sprintf("[%s] 补货任务被中断", accName))
 			return created, errTotal
 		default:
+		}
+		cfg = s.store.GetScheduleConfig(a.ID)
+		if !includeDisabled && !cfg.Enabled {
+			return created, errTotal
+		}
+		if !manual && (cfg.Mode == "duration" && isDurationExpired(cfg, time.Now()) ||
+			cfg.Mode == "daily_window" && !isInDailyWindow(time.Now(), cfg.StartTime, cfg.EndTime)) {
+			return created, errTotal
 		}
 
 		// 配额前置快速守卫（不提前扣减，统一交由 creator/be.CreateAlias 原子仲裁）

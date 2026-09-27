@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, bogdanfinn/tls-client, bogdanfinn/fhttp 进行 TLS 指纹伪造，依赖 Google UUID
  * [OUTPUT]: 对外提供 WebClient、NewWebClient、ListInboxContext、ListInbox、SearchMailsContext、SearchMails、FindByAliasContext、FindByAlias
- * [POS]: internal/mail 的 Web 邮件读取客户端，当账号未配置 App 专用密码时作为回退通道 (支持真正的 Context 取消)
+ * [POS]: internal/mail 的 Web 邮件读取客户端，支持 Context 取消、结构化业务错误与已读解析、结构化收件人核验
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -263,6 +263,12 @@ func (c *WebClient) resolveMccGateway() error {
 
 // threadSearchResp 是 thread/search 接口的响应结构。
 type threadSearchResp struct {
+	Success          *bool  `json:"success"`
+	ErrorCode        string `json:"errorCode"`
+	ErrorDescription string `json:"errorDescription"`
+	Error            struct {
+		Message string `json:"errorMessage"`
+	} `json:"error"`
 	TotalThreadsReturned int `json:"totalThreadsReturned"`
 	ThreadList           []struct {
 		ThreadID     string          `json:"threadId"`
@@ -273,6 +279,7 @@ type threadSearchResp struct {
 		Recipients   json.RawMessage `json:"recipients"`
 		Preview      string          `json:"preview"`
 		Timestamp    int64           `json:"timestamp"`
+		Flags        []string        `json:"flags"`
 	} `json:"threadList"`
 }
 
@@ -307,13 +314,19 @@ func (c *WebClient) searchContext(ctx context.Context, payload string) ([]Messag
 		}
 		return nil, fmt.Errorf("获取邮件失败: HTTP %d - %s", resp.StatusCode, truncate(snippet, 300))
 	}
-	if strings.Contains(string(body), `"success":false`) {
-		return nil, fmt.Errorf("获取邮件失败: %s", truncate(string(body), 300))
-	}
-
 	var result threadSearchResp
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("解析邮件响应失败: %w", err)
+	}
+	if result.ErrorCode != "" || (result.Success != nil && !*result.Success) {
+		detail := strings.TrimSpace(strings.Join([]string{result.ErrorCode, result.ErrorDescription, result.Error.Message}, " "))
+		if detail == "" {
+			detail = "服务端返回失败"
+		}
+		return nil, fmt.Errorf("获取邮件失败: %s", detail)
+	}
+	if result.ThreadList == nil {
+		return nil, fmt.Errorf("解析邮件响应失败: 缺少 threadList")
 	}
 
 	messages := make([]Message, 0, len(result.ThreadList))
@@ -331,7 +344,7 @@ func (c *WebClient) searchContext(ctx context.Context, payload string) ([]Messag
 			Provider: "webmail",
 			ThreadID: t.ThreadID,
 		}
-		messages = append(messages, Message{
+		message := Message{
 			ID:         t.ThreadID,
 			MessageRef: ref.Encode(),
 			Folder:     "INBOX",
@@ -342,7 +355,12 @@ func (c *WebClient) searchContext(ctx context.Context, payload string) ([]Messag
 			Date:       date,
 			Provider:   "webmail",
 			ThreadID:   t.ThreadID,
-		})
+		}
+		if t.Flags != nil {
+			unread := !hasAttr(t.Flags, `\Seen`)
+			message.Unread = &unread
+		}
+		messages = append(messages, message)
 	}
 	return messages, nil
 }
@@ -411,20 +429,23 @@ func (c *WebClient) SearchMails(query string, limit int) ([]Message, error) {
 	return c.SearchMailsContext(context.Background(), query, limit)
 }
 
-// FindByAliasContext 查找发给指定别名的邮件 (支持 context 取消)——优先使用服务端搜索,并回退本地过滤。
+// FindByAliasContext 查找发给指定别名的邮件 (支持 context 取消)。
 func (c *WebClient) FindByAliasContext(ctx context.Context, alias string, limit int) ([]Message, error) {
-	// 优先使用服务端检索
+	// 搜索也可能命中主题或正文，必须再次核验结构化收件人。
 	messages, err := c.SearchMailsContext(ctx, alias, limit)
-	if err == nil && len(messages) > 0 {
-		for i := range messages {
-			if messages[i].To == "" {
-				messages[i].To = alias
+	if err == nil {
+		matched := make([]Message, 0, len(messages))
+		for _, m := range messages {
+			if m.matches(alias) {
+				matched = append(matched, m)
 			}
 		}
-		return messages, nil
+		if len(matched) > 0 {
+			return matched, nil
+		}
 	}
 
-	// 回退到拉取收件箱并在本地过滤
+	// 服务端搜索无可核验结果时，回退最近邮件的结构化收件人核验。
 	batchSize := limit * 2
 	if batchSize < 50 {
 		batchSize = 50
@@ -434,16 +455,10 @@ func (c *WebClient) FindByAliasContext(ctx context.Context, alias string, limit 
 		return nil, err
 	}
 
-	// 本地过滤: To/CC/BCC 或主题/正文预览中包含 alias
+	// 主题、发件人和正文中的地址不能证明收件归属。
 	filtered := make([]Message, 0, limit)
 	for _, m := range raw {
-		if strings.Contains(strings.ToLower(m.Subject), strings.ToLower(alias)) ||
-			strings.Contains(strings.ToLower(m.From), strings.ToLower(alias)) ||
-			strings.Contains(strings.ToLower(m.To), strings.ToLower(alias)) ||
-			strings.Contains(strings.ToLower(m.Preview), strings.ToLower(alias)) {
-			if m.To == "" {
-				m.To = alias
-			}
+		if m.matches(alias) {
 			filtered = append(filtered, m)
 			if len(filtered) >= limit {
 				break

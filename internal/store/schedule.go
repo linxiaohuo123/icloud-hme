@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 log, strings, time, icloud-hme/internal/store (Store)
  * [OUTPUT]: 对外提供 ScheduleConfig 类型, GetScheduleConfig, ListScheduleConfigs, SaveScheduleConfig, DeleteScheduleConfig, TryReserveQuota, ReleaseQuota, RemainingQuota, IncrementHourlyQuota, GetSetting, SaveSetting
- * [POS]: internal/store 的定时任务与配额调度持久化领域，支持小时级限流与系统 KV 设置
+ * [POS]: internal/store 的定时任务与配额持久化领域，配置更新不覆盖配额仲裁状态
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -94,16 +94,15 @@ func (s *Store) ListScheduleConfigs() []ScheduleConfig {
 	return res
 }
 
-// SaveScheduleConfig 保存调度配置(线程安全)。
-// 与 TryReserveQuota 共用同一把锁，避免"读-改-写"把已扣减的小时计数回退成旧值。
+// SaveScheduleConfig 保存调度配置，不覆盖配额仲裁字段。
 func (s *Store) SaveScheduleConfig(cfg ScheduleConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.saveScheduleConfigLocked(cfg)
+	return s.saveScheduleConfigLocked(cfg, false)
 }
 
 // saveScheduleConfigLocked 是 SaveScheduleConfig 的加锁内核，调用方必须持有 s.mu。
-func (s *Store) saveScheduleConfigLocked(cfg ScheduleConfig) error {
+func (s *Store) saveScheduleConfigLocked(cfg ScheduleConfig, updateQuota bool) error {
 	if cfg.HourlyQuota <= 0 {
 		cfg.HourlyQuota = 5
 	}
@@ -127,16 +126,16 @@ func (s *Store) saveScheduleConfigLocked(cfg ScheduleConfig) error {
 		enabled = excluded.enabled,
 		hourly_quota = excluded.hourly_quota,
 		alias_label = excluded.alias_label,
-		current_hour_count = CASE WHEN excluded.last_hour_window > 0 THEN excluded.current_hour_count ELSE schedules.current_hour_count END,
-		last_hour_window = CASE WHEN excluded.last_hour_window > 0 THEN excluded.last_hour_window ELSE schedules.last_hour_window END,
-		last_run_at = CASE WHEN excluded.last_run_at != '' THEN excluded.last_run_at ELSE schedules.last_run_at END,
+		current_hour_count = CASE WHEN ? THEN excluded.current_hour_count ELSE schedules.current_hour_count END,
+		last_hour_window = CASE WHEN ? THEN excluded.last_hour_window ELSE schedules.last_hour_window END,
+		last_run_at = CASE WHEN ? THEN excluded.last_run_at ELSE schedules.last_run_at END,
 		mode = excluded.mode,
 		start_time = excluded.start_time,
 		end_time = excluded.end_time,
 		duration_hours = excluded.duration_hours,
 		started_at = CASE WHEN excluded.mode != 'duration' THEN '' WHEN excluded.started_at != '' THEN excluded.started_at ELSE schedules.started_at END;
 	`
-	_, err := s.db.Exec(query, cfg.AccountID, enabledInt, cfg.HourlyQuota, cfg.AliasLabel, cfg.CurrentHourCount, cfg.LastHourWindow, cfg.LastRunAt, cfg.Mode, cfg.StartTime, cfg.EndTime, cfg.DurationHours, cfg.StartedAt)
+	_, err := s.db.Exec(query, cfg.AccountID, enabledInt, cfg.HourlyQuota, cfg.AliasLabel, cfg.CurrentHourCount, cfg.LastHourWindow, cfg.LastRunAt, cfg.Mode, cfg.StartTime, cfg.EndTime, cfg.DurationHours, cfg.StartedAt, updateQuota, updateQuota, updateQuota)
 	return err
 }
 
@@ -171,7 +170,7 @@ func (s *Store) TryReserveQuota(accountID string, count int) (allowed bool, rema
 
 	cfg.CurrentHourCount += count
 	cfg.LastRunAt = time.Now().Format(time.RFC3339)
-	if err := s.saveScheduleConfigLocked(cfg); err != nil {
+	if err := s.saveScheduleConfigLocked(cfg, true); err != nil {
 		// 落库失败则回滚内存计数，拒绝本次预留，避免重启后配额归零超额出号
 		cfg.CurrentHourCount -= count
 		return false, cfg.HourlyQuota - cfg.CurrentHourCount
@@ -194,7 +193,7 @@ func (s *Store) ReleaseQuota(accountID string, count int) {
 		if cfg.CurrentHourCount < 0 {
 			cfg.CurrentHourCount = 0
 		}
-		_ = s.saveScheduleConfigLocked(cfg)
+		_ = s.saveScheduleConfigLocked(cfg, true)
 	}
 }
 

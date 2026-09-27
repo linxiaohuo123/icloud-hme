@@ -307,6 +307,9 @@ func TestDeleteAccountCascadesAliasRoutes(t *testing.T) {
 	if err := s.UpsertAliasRoutes("acc_gone", []string{"a@icloud.com", "b@icloud.com"}); err != nil {
 		t.Fatalf("UpsertAliasRoutes failed: %v", err)
 	}
+	if _, err := s.db.Exec(`INSERT INTO alias_inventory (email, account_id, remote_state, allocation_state) VALUES ('a@icloud.com', 'acc_gone', 'active', 'available')`); err != nil {
+		t.Fatal(err)
+	}
 	if got := s.CountAliasRoutes(); got != 2 {
 		t.Fatalf("期望 2 条路由, 实际 %d", got)
 	}
@@ -316,6 +319,73 @@ func TestDeleteAccountCascadesAliasRoutes(t *testing.T) {
 	}
 	if got := s.CountAliasRoutes(); got != 0 {
 		t.Fatalf("账号注销后路由应被级联清理, 实际残留 %d 条", got)
+	}
+	var remote, allocation string
+	if err := s.db.QueryRow(`SELECT remote_state, allocation_state FROM alias_inventory WHERE email = 'a@icloud.com'`).Scan(&remote, &allocation); err != nil {
+		t.Fatal(err)
+	}
+	if remote != "deleted" || allocation != "quarantined" {
+		t.Fatalf("账号注销后库存未隔离: %s/%s", remote, allocation)
+	}
+}
+
+func TestDeleteAccountRollsBackWhenRouteCleanupFails(t *testing.T) {
+	s, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().Format(time.RFC3339)
+	if err := s.SaveAccount(&AccountRecord{ID: "acc_rollback", Name: "x", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertAliasRoutes("acc_rollback", []string{"rollback@icloud.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO alias_inventory (email, account_id, remote_state, allocation_state) VALUES ('rollback@icloud.com', 'acc_rollback', 'active', 'available')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`CREATE TRIGGER fail_route_delete BEFORE DELETE ON alias_routes BEGIN SELECT RAISE(ABORT, 'route delete failed'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteAccount("acc_rollback"); err == nil {
+		t.Fatal("route cleanup failure must abort account deletion")
+	}
+	if acc, err := s.GetAccount("acc_rollback"); err != nil || acc == nil {
+		t.Fatalf("account was not rolled back: account=%v err=%v", acc, err)
+	}
+	if got := s.CountAliasRoutes(); got != 1 {
+		t.Fatalf("route was not rolled back: %d", got)
+	}
+	var remote, allocation string
+	if err := s.db.QueryRow(`SELECT remote_state, allocation_state FROM alias_inventory WHERE email = 'rollback@icloud.com'`).Scan(&remote, &allocation); err != nil {
+		t.Fatal(err)
+	}
+	if remote != "active" || allocation != "available" {
+		t.Fatalf("inventory was not rolled back: %s/%s", remote, allocation)
+	}
+}
+
+func TestSaveScheduleConfigPreservesReservedQuota(t *testing.T) {
+	s, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.SaveScheduleConfig(ScheduleConfig{AccountID: "acc_quota", Enabled: true, HourlyQuota: 5, LastRunAt: "2020-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	stale := s.GetScheduleConfig("acc_quota")
+	if ok, _ := s.TryReserveQuota("acc_quota", 1); !ok {
+		t.Fatal("quota reservation failed")
+	}
+	stale.Enabled = false
+	if err := s.SaveScheduleConfig(stale); err != nil {
+		t.Fatal(err)
+	}
+	got := s.GetScheduleConfig("acc_quota")
+	if got.Enabled || got.CurrentHourCount != 1 || s.RemainingQuota("acc_quota") != 4 || got.LastRunAt == stale.LastRunAt {
+		t.Fatalf("stale config overwrote quota: %+v", got)
 	}
 }
 

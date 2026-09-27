@@ -14,7 +14,8 @@ describe('snippets', () => {
   it('buildCurlSnippet generates complete two-step instructions with encoded tag', () => {
     const curl = buildCurlSnippet(origin, 'my tag', token)
     expect(curl).toContain('curl -X POST "http://localhost:8081/api/quick-create?tag=my%20tag"')
-    expect(curl).toContain('curl "http://localhost:8081/api/verify-code?email=mysterious.tiger_0x@icloud.com&timeout=60&auto_delete=true"')
+    expect(curl).toContain('curl "http://localhost:8081/api/verify-code?email=mysterious.tiger_0x@icloud.com&timeout=60"')
+    expect(curl).not.toContain('auto_delete=true')
     expect(curl).toContain(`Bearer ${token}`)
 
     // 行连接符必须是「字面反斜杠 + 换行」两个字符。
@@ -31,5 +32,6 @@ describe('snippets', () => {
     expect(py).toContain('TAG = "tiktok"')
     expect(py).toContain('requests.post')
     expect(py).toContain('requests.get')
+    expect(py).not.toContain('auto_delete')
   })
 })

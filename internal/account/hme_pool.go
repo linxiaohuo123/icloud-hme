@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 crypto/sha256, encoding/hex, sort, sync, sync/atomic, time, icloud-hme/internal/hme
- * [OUTPUT]: 对外提供 hmeClientPool, hmeFingerprint 与 Manager.WithHMEClient
+ * [OUTPUT]: 对外提供 hmeClientPool, hmeFingerprint、ErrSessionChanged 与 Manager.WithHMEClient
  * [POS]: internal/account 的 HME 客户端按账号复用池，通过复用 transport 的空闲连接跳过每次请求的完整 TLS 握手
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -25,6 +25,7 @@ import (
 //
 // 调用方据此把错误映射为「账号类」错误，而不是上游故障，保持与改造前的错误语义一致。
 var ErrHMEClientUnavailable = errors.New("HME 客户端不可用")
+var ErrSessionChanged = errors.New("账号会话已更新，请重试操作")
 
 const (
 	// defaultHMEClientIdleTTL 是空闲客户端被回收前的保留时长。
@@ -43,10 +44,11 @@ const (
 // 串行化是必要的 —— hme.Client 内部虽有 stateMu 保护端点解析，但 ListAliases 的
 // 「置空端点 → 重新校验」自愈流程与其它并发操作交错时仍会读到空端点。
 type hmeClientEntry struct {
-	mu          sync.Mutex
-	fingerprint string
-	client      *hme.Client
-	lastUsed    atomic.Int64 // UnixNano
+	mu              sync.Mutex
+	fingerprint     string
+	credentialEpoch uint64
+	client          *hme.Client
+	lastUsed        atomic.Int64 // UnixNano
 }
 
 // hmeClientPool 按账号 ID 缓存并复用 HME 客户端。
@@ -277,7 +279,7 @@ func (m *Manager) WithHMEClientContext(ctx context.Context, id string, fn func(*
 	}
 
 	fp := hmeFingerprint(snap)
-	if entry.client == nil || entry.fingerprint != fp {
+	if entry.client == nil || entry.fingerprint != fp || entry.credentialEpoch != snap.credentialEpoch {
 		if entry.client != nil {
 			entry.client.Close()
 			entry.client = nil
@@ -292,6 +294,7 @@ func (m *Manager) WithHMEClientContext(ctx context.Context, id string, fn func(*
 		}
 		entry.client = client
 		entry.fingerprint = fp
+		entry.credentialEpoch = snap.credentialEpoch
 	}
 
 	runErr := fn(entry.client)
@@ -299,8 +302,16 @@ func (m *Manager) WithHMEClientContext(ctx context.Context, id string, fn func(*
 	// 回写刷新后的会话；仅当业务本身成功时才把回写失败上抛
 	newCookies := entry.client.CookieSnapshot()
 	newServiceURL := entry.client.ServiceURL()
-	if saveErr := m.SaveSession(id, newCookies, newServiceURL); saveErr != nil && runErr == nil {
+	saved, saveErr := m.saveSessionIfCurrent(id, snap.credentialEpoch, snap.Host, snap.Proxy, newCookies, newServiceURL, false)
+	if saveErr != nil && runErr == nil {
 		return saveErr
+	}
+	if !saved {
+		entry.fingerprint = ""
+		if runErr == nil {
+			return ErrSessionChanged
+		}
+		return runErr
 	}
 
 	// 同步条目指纹，避免下次借出时因正常会话刷新被误判为凭据变更而摧毁长连接

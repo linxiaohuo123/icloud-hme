@@ -10,12 +10,14 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -62,16 +64,16 @@ type fakeBackend struct {
 	listInboxQuery   InboxQuery
 	reloadCount      int
 
-	onClose       func()
-	onCreateAlias        func(accountID, label string) (*hme.CreateResult, error)
-	onCreateAliasContext func(ctx context.Context, accountID, label string) (*hme.CreateResult, error)
+	onClose                   func()
+	onCreateAlias             func(accountID, label string) (*hme.CreateResult, error)
+	onCreateAliasContext      func(ctx context.Context, accountID, label string) (*hme.CreateResult, error)
 	onBatchCreateAliasContext func(ctx context.Context, accountID string, count int, labelPrefix string) (*BatchCreateResult, error)
-	onListAliases        func(accountID string) ([]hme.Alias, error)
-	onListAliasesContext func(ctx context.Context, accountID string) ([]hme.Alias, error)
-	onListInbox        func(q InboxQuery) (InboxResult, error)
-	onListInboxContext func(ctx context.Context, q InboxQuery) (InboxResult, error)
-	onListMailboxes        func(accountID string) ([]mail.Folder, error)
-	onListMailboxesContext func(ctx context.Context, accountID string) ([]mail.Folder, error)
+	onListAliases             func(accountID string) ([]hme.Alias, error)
+	onListAliasesContext      func(ctx context.Context, accountID string) ([]hme.Alias, error)
+	onListInbox               func(q InboxQuery) (InboxResult, error)
+	onListInboxContext        func(ctx context.Context, q InboxQuery) (InboxResult, error)
+	onListMailboxes           func(accountID string) ([]mail.Folder, error)
+	onListMailboxesContext    func(ctx context.Context, accountID string) ([]mail.Folder, error)
 
 	validateID               string
 	validateFunc             func(id string) error
@@ -83,11 +85,11 @@ type fakeBackend struct {
 
 	onSetAliasActive        func(accountID, anonymousID string, active bool) (bool, error)
 	onSetAliasActiveContext func(ctx context.Context, accountID, anonymousID string, active bool) (bool, error)
-	onDeleteAlias       func(accountID, anonymousID string) error
-	getMessageFunc      func(accountID string, id string) (*mail.FullMessage, error)
-	getMessagesFunc     func(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error)
-	mailboxBoundaryFunc func(accountID, folder string) (string, uint32, uint32, error)
-	store               *store.Store
+	onDeleteAlias           func(accountID, anonymousID string) error
+	getMessageFunc          func(accountID string, id string) (*mail.FullMessage, error)
+	getMessagesFunc         func(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error)
+	mailboxBoundaryFunc     func(accountID, folder string) (string, uint32, uint32, error)
+	store                   *store.Store
 }
 
 func (f *fakeBackend) ListAccounts() []account.Summary {
@@ -146,11 +148,29 @@ func (f *fakeBackend) SetAppPassword(id, email, appPassword string) (account.Sum
 	return f.accounts[0], nil
 }
 
+func (f *fakeBackend) SetAppPasswordContext(ctx context.Context, id, email, appPassword string) (account.Summary, error) {
+	return f.SetAppPassword(id, email, appPassword)
+}
+
 func (f *fakeBackend) SetMailbox(id string, config account.MailboxConfig) (account.Summary, error) {
 	if len(f.accounts) == 0 {
 		return account.Summary{}, fmt.Errorf("fake: 收件邮箱设置失败")
 	}
 	return f.accounts[0], nil
+}
+
+func (f *fakeBackend) SetMailboxContext(ctx context.Context, id string, config account.MailboxConfig) (account.Summary, error) {
+	return f.SetMailbox(id, config)
+}
+
+func (f *fakeBackend) RemoveMailbox(id string) (account.Summary, error) {
+	if len(f.accounts) == 0 {
+		return account.Summary{}, fmt.Errorf("fake: 收件邮箱解绑失败")
+	}
+	sum := f.accounts[0]
+	sum.Mailbox = nil
+	f.accounts[0] = sum
+	return sum, nil
 }
 
 func (f *fakeBackend) LoginAccount(id, password, otp string) (account.Summary, error) {
@@ -890,6 +910,240 @@ func TestListInboxWithBodyQuery(t *testing.T) {
 	fb.mu.RUnlock()
 	if !withBody {
 		t.Fatalf("expected WithBody=true in InboxQuery")
+	}
+}
+
+func TestCreateAliasKeepsSuccessWhenSessionChangesAfterReserve(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mgr, err := account.NewManager(t.TempDir(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	const candidate = "session_changed@icloud.com"
+	var upstream *httptest.Server
+	var reserveCalls atomic.Int32
+	var accountID string
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/hme/generate":
+			_, _ = fmt.Fprintf(w, `{"success":true,"result":{"hme":%q}}`, candidate)
+		case "/v1/hme/reserve":
+			reserveCalls.Add(1)
+			if err := mgr.SaveSession(accountID, map[string]string{"X-APPLE-WEBAUTH-TOKEN": "new-token"}, upstream.URL); err != nil {
+				t.Errorf("update credentials: %v", err)
+			}
+			_, _ = fmt.Fprintf(w, `{"success":true,"result":{"hme":{"hme":%q,"anonymousId":"anon_success"}}}`, candidate)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	sum, err := mgr.AddAccountWithInput(account.AddAccountInput{Name: "test", ICloudEmail: "user@icloud.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountID = sum.ID
+	if err := mgr.SaveSession(accountID, map[string]string{"X-APPLE-WEBAUTH-TOKEN": "old-token"}, upstream.URL); err != nil {
+		t.Fatal(err)
+	}
+	be := &managerBackend{mgr: mgr, store: st}
+	res, err := be.CreateAliasContext(context.Background(), accountID, "test")
+	if err != nil || res == nil || res.Email != candidate {
+		t.Fatalf("successful reserve must be delivered: result=%+v err=%v", res, err)
+	}
+	if reserveCalls.Load() != 1 {
+		t.Fatalf("reserve calls = %d, want 1", reserveCalls.Load())
+	}
+	if remaining := st.RemainingQuota(accountID); remaining != 4 {
+		t.Fatalf("successful reserve released quota: remaining=%d", remaining)
+	}
+	if acc, ok := mgr.GetAccount(accountID); !ok || acc.AliasTotal != 1 {
+		t.Fatalf("successful reserve did not update local count: account=%+v", acc)
+	}
+}
+
+func TestConcurrentAliasCreationRespectsAccountLimit(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mgr, err := account.NewManager(t.TempDir(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+	reserveStarted := make(chan struct{})
+	releaseReserve := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseReserve) })
+	var reserveCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/hme/generate":
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hme":"limit@icloud.com"}}`))
+		case "/v1/hme/reserve":
+			if reserveCalls.Add(1) == 1 {
+				close(reserveStarted)
+				<-releaseReserve
+			}
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hme":{"hme":"limit@icloud.com","anonymousId":"anon_limit"}}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+	sum, err := mgr.AddAccountWithInput(account.AddAccountInput{Name: "limit", ICloudEmail: "limit-owner@icloud.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.SaveSession(sum.ID, map[string]string{"X-APPLE-WEBAUTH-TOKEN": "token"}, upstream.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.UpdateAliasCounts(sum.ID, account.MaxAliasesPerAccount-1, account.MaxAliasesPerAccount-1); err != nil {
+		t.Fatal(err)
+	}
+	be := &managerBackend{mgr: mgr, store: st}
+	type result struct {
+		alias *hme.CreateResult
+		err   error
+	}
+	first := make(chan result, 1)
+	second := make(chan result, 1)
+	go func() {
+		alias, err := be.CreateAliasContext(context.Background(), sum.ID, "first")
+		first <- result{alias, err}
+	}()
+	select {
+	case <-reserveStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first reserve did not start")
+	}
+	go func() {
+		alias, err := be.CreateAliasContext(context.Background(), sum.ID, "second")
+		second <- result{alias, err}
+	}()
+	deadline := time.After(5 * time.Second)
+	for st.RemainingQuota(sum.ID) != 3 {
+		select {
+		case <-deadline:
+			t.Fatal("second request did not reserve quota")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	releaseOnce.Do(func() { close(releaseReserve) })
+	a, b := <-first, <-second
+	if a.err != nil || a.alias == nil {
+		t.Fatalf("first creation failed: %+v", a)
+	}
+	var backendErr *BackendError
+	if b.alias != nil || !errors.As(b.err, &backendErr) || backendErr.Code != "ALIAS_LIMIT_REACHED" {
+		t.Fatalf("second creation passed account limit: %+v", b)
+	}
+	if reserveCalls.Load() != 1 || st.RemainingQuota(sum.ID) != 4 {
+		t.Fatalf("unexpected reserve or quota state: reserves=%d remaining=%d", reserveCalls.Load(), st.RemainingQuota(sum.ID))
+	}
+}
+
+func TestRefreshAliasesReportsCountPersistenceFailure(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := account.NewManager(t.TempDir(), st)
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/hme/list" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true,"result":{"hmeEmails":[{"hme":"saved@icloud.com","anonymousId":"anon_saved","isActive":true}]}}`))
+	}))
+	defer upstream.Close()
+	sum, err := mgr.AddAccountWithInput(account.AddAccountInput{Name: "refresh", ICloudEmail: "owner@icloud.com"})
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if err := mgr.SaveSession(sum.ID, map[string]string{"X-APPLE-WEBAUTH-TOKEN": "token"}, upstream.URL); err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	be := &managerBackend{mgr: mgr, store: st}
+	_, err = be.RefreshAliasesContext(context.Background(), sum.ID)
+	var backendErr *BackendError
+	if !errors.As(err, &backendErr) || backendErr.Code != "PERSISTENCE_ERROR" {
+		t.Fatalf("count persistence failure should be explicit: %v", err)
+	}
+	if _, ok := be.getCachedAliases(sum.ID); ok {
+		t.Fatal("failed refresh must not populate alias cache")
+	}
+	if acc, ok := mgr.GetAccount(sum.ID); !ok || acc.AliasTotal != 0 || acc.AliasActive != 0 {
+		t.Fatalf("failed refresh changed local counts: %+v", acc)
+	}
+}
+
+func TestAliasMutationsKeepRemoteSuccessWhenSessionChanges(t *testing.T) {
+	mgr, err := account.NewManager(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+	var accountID string
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/hme/deactivate" && r.URL.Path != "/v1/hme/delete" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if err := mgr.SaveSession(accountID, map[string]string{"X-APPLE-WEBAUTH-TOKEN": r.URL.Path}, upstream.URL); err != nil {
+			t.Errorf("replace session: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer upstream.Close()
+	sum, err := mgr.AddAccountWithInput(account.AddAccountInput{Name: "mutation", ICloudEmail: "owner@icloud.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountID = sum.ID
+	if err := mgr.SaveSession(accountID, map[string]string{"X-APPLE-WEBAUTH-TOKEN": "initial"}, upstream.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.UpdateAliasCounts(accountID, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	be := &managerBackend{mgr: mgr}
+	be.setCachedAliases(accountID, []hme.Alias{{Email: "alias@icloud.com", AnonymousID: "anon_1", Active: true}})
+	if ok, err := be.SetAliasActiveContext(context.Background(), accountID, "anon_1", false); err != nil || !ok {
+		t.Fatalf("successful deactivation should be delivered: ok=%v err=%v", ok, err)
+	}
+	if acc, ok := mgr.GetAccount(accountID); !ok || acc.AliasActive != 0 {
+		t.Fatalf("deactivation count not saved: %+v", acc)
+	}
+	be.setCachedAliases(accountID, []hme.Alias{{Email: "alias@icloud.com", AnonymousID: "anon_1", Active: false}})
+	if err := be.DeleteAlias(accountID, "anon_1"); err != nil {
+		t.Fatalf("successful deletion should be delivered: %v", err)
+	}
+	if acc, ok := mgr.GetAccount(accountID); !ok || acc.AliasTotal != 0 || acc.AliasActive != 0 {
+		t.Fatalf("deletion count not saved: %+v", acc)
+	}
+	if _, ok := be.getCachedAliases(accountID); ok {
+		t.Fatal("deleted alias remained cached")
 	}
 }
 

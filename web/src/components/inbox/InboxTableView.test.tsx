@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 @testing-library/react, vitest, msw, react-router-dom, components/inbox/InboxTableView
- * [OUTPUT]: 对外提供 InboxTableView 跨账号并发防污染、详情缓存隔离与 WebMail 首屏 capability 防竞争及退避重试单元测试
+ * [OUTPUT]: 对外提供 InboxTableView 跨账号并发防污染、详情缓存隔离、仅看未读与 WebMail 首屏 capability 防竞争及退避重试单元测试
  * [POS]: web/src/components/inbox 的单元测试防线
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -46,6 +46,36 @@ const mockAccounts: AccountSummary[] = [
     created_at: '2026-09-20T00:00:00Z',
   },
 ]
+
+it('仅看未读只显示明确标记为未读的邮件', async () => {
+  server.use(
+    http.get('/api/accounts', () => HttpResponse.json({ success: true, data: mockAccounts })),
+    http.get('/api/aliases', () => HttpResponse.json({ success: true, data: [] })),
+    http.get('/api/mailboxes', () => HttpResponse.json({ success: true, data: { folders: [] } })),
+    http.get('/api/inbox', () => HttpResponse.json({
+      success: true,
+      data: {
+        account_id: 'acc_1', count: 3, method: 'imap', messages: [
+          { id: 'unread', from: 'a@example.com', to: 'to@icloud.com', subject: '未读邮件', date: '2026-09-20T10:00:00Z', preview: '', unread: true },
+          { id: 'read', from: 'b@example.com', to: 'to@icloud.com', subject: '已读邮件', date: '2026-09-20T09:00:00Z', preview: '', unread: false },
+          { id: 'unknown', from: 'c@example.com', to: 'to@icloud.com', subject: '未知状态邮件', date: '2026-09-20T08:00:00Z', preview: '' },
+        ],
+      },
+    })),
+  )
+  render(
+    <MemoryRouter>
+      <ToastProvider>
+        <InboxTableView accountId="acc_1" fixedAccount />
+      </ToastProvider>
+    </MemoryRouter>,
+  )
+  await screen.findByText('未读邮件')
+  fireEvent.click(screen.getByRole('checkbox', { name: '仅看未读' }))
+  expect(screen.getByText('未读邮件')).toBeInTheDocument()
+  expect(screen.queryByText('已读邮件')).not.toBeInTheDocument()
+  expect(screen.queryByText('未知状态邮件')).not.toBeInTheDocument()
+})
 
 describe('InboxTableView 跨账号防污染与缓存隔离 (PR-02)', () => {
   it('当 propAccountId 变更时隔离旧账户缓存并不污染新账户视图', async () => {

@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 errors, fmt, log, sync, time, icloud-hme/internal/account, icloud-hme/internal/notify, icloud-hme/internal/scheduler
  * [OUTPUT]: 对外提供 CookieMonitor, NewCookieMonitor, EventSink
- * [POS]: server 的 Cookie 健康监控器 (PR-07 §10.4)，周期校验账号会话、凭据失效即标记 error 并在跳变沿推送通知，支持平稳停机等待
+ * [POS]: server 的 Cookie 健康监控器，按校验开始时间节流、记录凭据状态跳变并支持平稳停机
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -184,6 +184,7 @@ func (m *CookieMonitor) validateOnce() {
 	gap := m.perAccountGap(len(targets))
 
 	checked := 0
+	var nextStart time.Time
 	for _, acc := range targets {
 		select {
 		case <-m.stopCh:
@@ -191,13 +192,17 @@ func (m *CookieMonitor) validateOnce() {
 		default:
 		}
 		if checked > 0 && gap > 0 {
-			select {
-			case <-m.stopCh:
-				return
-			case <-time.After(gap):
+			wait := time.Until(nextStart)
+			if wait > 0 {
+				select {
+				case <-m.stopCh:
+					return
+				case <-time.After(wait):
+				}
 			}
 		}
 		checked++
+		nextStart = time.Now().Add(gap)
 		m.validateAccount(acc.ID, acc.Name)
 	}
 	if checked > 0 {

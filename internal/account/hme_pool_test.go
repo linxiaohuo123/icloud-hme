@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 testing, errors, fmt, time, icloud-hme/internal/hme, icloud-hme/internal/store
- * [OUTPUT]: 对外提供 HME 客户端按账号复用、凭据变更重建、池容量回收与借出失败语义的回归测试
+ * [OUTPUT]: 对外提供 HME 客户端按账号复用、凭据变更重建、迟到回写拦截、保存失败回滚、池容量回收与借出失败语义的回归测试
  * [POS]: internal/account 的 HME 客户端池单元测试
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -166,6 +166,25 @@ func TestWithHMEClientRebuildsOnCredentialChange(t *testing.T) {
 	}
 }
 
+func TestWithHMEClientRebuildsOnSameCookieReplacement(t *testing.T) {
+	mgr := newPoolTestManager(t, 1)
+	id := firstAccountIDs(mgr, 1)[0]
+	var before, after *hme.Client
+	if err := mgr.WithHMEClient(id, func(c *hme.Client) error { before = c; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	acc, _ := mgr.GetAccount(id)
+	if err := mgr.SaveSession(id, acc.Cookies, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.WithHMEClient(id, func(c *hme.Client) error { after = c; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if before == after {
+		t.Fatal("显式替换凭据后，即使 Cookie 相同也必须重建客户端")
+	}
+}
+
 // 账号不存在 / 未配置 Cookie 时返回可识别的借出失败错误，
 // 使调用方能映射为账号类错误而不是上游故障。
 func TestWithHMEClientUnavailableSemantics(t *testing.T) {
@@ -203,6 +222,88 @@ func TestWithHMEClientPropagatesCallbackError(t *testing.T) {
 	err := mgr.WithHMEClient(id, func(*hme.Client) error { return sentinel })
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("回调错误应原样上抛, 实际 %v", err)
+	}
+}
+
+func TestWithHMEClientDoesNotOverwriteNewCredentials(t *testing.T) {
+	mgr := newPoolTestManager(t, 1)
+	id := firstAccountIDs(mgr, 1)[0]
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- mgr.WithHMEClient(id, func(*hme.Client) error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+	newCookies := map[string]string{"X-APPLE-WEBAUTH-TOKEN": "new-token"}
+	if err := mgr.SaveSession(id, newCookies, ""); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, ErrSessionChanged) {
+		t.Fatalf("旧请求应被拒绝回写: %v", err)
+	}
+	acc, _ := mgr.GetAccount(id)
+	if acc.Cookies["X-APPLE-WEBAUTH-TOKEN"] != "new-token" {
+		t.Fatalf("新 Cookie 被旧请求覆盖: %+v", acc.Cookies)
+	}
+	if err := mgr.WithHMEClient(id, func(c *hme.Client) error {
+		if c.CookieSnapshot()["X-APPLE-WEBAUTH-TOKEN"] != "new-token" {
+			t.Fatal("下次借出必须使用新 Cookie")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWithHMEClientDoesNotWriteAcrossReload(t *testing.T) {
+	mgr := newPoolTestManager(t, 1)
+	id := firstAccountIDs(mgr, 1)[0]
+	mgr.mu.Lock()
+	err := mgr.saveAccount(mgr.accounts[id])
+	mgr.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- mgr.WithHMEClient(id, func(*hme.Client) error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+	if err := mgr.Reload(); err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, ErrSessionChanged) {
+		t.Fatalf("重载前请求不能写入重载后的账号: %v", err)
+	}
+}
+
+func TestSaveSessionRestoresMemoryOnPersistenceFailure(t *testing.T) {
+	mgr := newPoolTestManager(t, 1)
+	id := firstAccountIDs(mgr, 1)[0]
+	before, _ := mgr.GetAccount(id)
+	if err := mgr.Store().Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.SaveSession(id, map[string]string{"X-APPLE-WEBAUTH-TOKEN": "new-token"}, "https://new.example"); err == nil {
+		t.Fatal("数据库关闭后保存应失败")
+	}
+	after, _ := mgr.GetAccount(id)
+	if after.Cookies["X-APPLE-WEBAUTH-TOKEN"] != before.Cookies["X-APPLE-WEBAUTH-TOKEN"] || after.ServiceURL != before.ServiceURL {
+		t.Fatalf("保存失败后内存未恢复: before=%+v after=%+v", before, after)
 	}
 }
 

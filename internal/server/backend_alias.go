@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/account, internal/hme, internal/store
  * [OUTPUT]: 对外提供 managerBackend 的别名相关方法 (CreateAlias, BatchCreateAlias, ListAliases, RefreshAliases, SetAliasActive, UpdateAlias, BatchUpdateAliases, DeleteAlias) 与 BatchCreateResult, BatchUpdateResult 类型
- * [POS]: internal/server 的别名业务门面实现
+ * [POS]: internal/server 的别名业务门面实现，按账号锁内仲裁数量上限并保留上游成功结果
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -92,6 +92,13 @@ func (b *managerBackend) CreateAliasContext(ctx context.Context, accountID, labe
 		result = res
 		return nil
 	})
+	if result != nil {
+		if err != nil {
+			log.Printf("[HME] 账号 %s 别名已创建，但会话回写失败: %v", accountID, err)
+		}
+		b.invalidateAliasCache(accountID)
+		return result, nil
+	}
 	if err != nil {
 		if !errors.Is(err, hme.ErrOutcomeUnknown) && b.store != nil {
 			b.store.ReleaseQuota(accountID, 1)
@@ -99,11 +106,13 @@ func (b *managerBackend) CreateAliasContext(ctx context.Context, accountID, labe
 		if errors.Is(err, account.ErrHMEClientUnavailable) {
 			return nil, mapAccountErr(err)
 		}
+		var backendErr *BackendError
+		if errors.As(err, &backendErr) {
+			return nil, backendErr
+		}
 		return nil, classifyUpstreamErr("创建邮箱失败", err)
 	}
-	_ = b.mgr.AdjustAliasCounts(accountID, 1, 1)
-	b.invalidateAliasCache(accountID)
-	return result, nil
+	return nil, fmt.Errorf("创建邮箱未返回结果")
 }
 
 func (b *managerBackend) getAccountMutationLock(accountID string) *sync.Mutex {
@@ -152,18 +161,25 @@ func (b *managerBackend) reconcileIntentsWithClient(ctx context.Context, client 
 }
 
 // durableCreateAlias 执行符合 F03 铁律的持久化创建状态机：
-// 0. Account-level unresolved gate: 在调用任何 Generate 之前，检查是否存在 prepared, reserve_sent, outcome_unknown 的意图；
-//    若存在先核对，核对后若仍未解决，坚决阻断新创建并返回 hme.ErrOutcomeUnknown，严禁 Generate，严禁 Reserve，严禁生成候选 B！
-// 1. Generate candidate A
-// 2. 持久化 intent(A, prepared) 并 Commit SQLite
-// 3. 标记状态为 reserve_sent 并 Commit SQLite
-// 4. 才向网络发送 Reserve(A)
-// 5. 成功 -> succeeded; 明确失败 -> confirmed_failed 并允许重试下一候选; 未知异常 -> outcome_unknown 并坚决阻断重试
+//  0. Account-level unresolved gate: 在调用任何 Generate 之前，检查是否存在 prepared, reserve_sent, outcome_unknown 的意图；
+//     若存在先核对，核对后若仍未解决，坚决阻断新创建并返回 hme.ErrOutcomeUnknown，严禁 Generate，严禁 Reserve，严禁生成候选 B！
+//  1. Generate candidate A
+//  2. 持久化 intent(A, prepared) 并 Commit SQLite
+//  3. 标记状态为 reserve_sent 并 Commit SQLite
+//  4. 才向网络发送 Reserve(A)
+//  5. 成功 -> succeeded; 明确失败 -> confirmed_failed 并允许重试下一候选; 未知异常 -> outcome_unknown 并坚决阻断重试
 func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Client, accountID, label string, maxRetries int) (*hme.CreateResult, error) {
 	// 针对单账号串行化写操作与未决门禁检查，避免并发 check empty -> Generate 穿透窗口
 	lock := b.getAccountMutationLock(accountID)
 	lock.Lock()
 	defer lock.Unlock()
+	if acc, ok := b.mgr.GetAccount(accountID); ok && (acc.AliasTotal >= account.MaxAliasesPerAccount || acc.AliasActive >= account.MaxAliasesPerAccount) {
+		return nil, &BackendError{
+			Status:  http.StatusBadRequest,
+			Code:    "ALIAS_LIMIT_REACHED",
+			Message: fmt.Sprintf("账号 %s 别名数量已达本地上限 (%d)", accountID, account.MaxAliasesPerAccount),
+		}
+	}
 
 	// 0. Account-level unresolved gate
 	if b.store != nil {
@@ -263,7 +279,12 @@ func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Cli
 
 		// 6. 成功
 		if b.store != nil && intentID != "" {
-			_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateSucceeded, anonID, "", "")
+			if err := b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateSucceeded, anonID, "", ""); err != nil {
+				log.Printf("[HME] 账号 %s 别名已创建，但意图状态回写失败: %v", accountID, err)
+			}
+		}
+		if err := b.mgr.AdjustAliasCounts(accountID, 1, 1); err != nil {
+			log.Printf("[HME] 账号 %s 别名已创建，但数量回写失败: %v", accountID, err)
 		}
 
 		return &hme.CreateResult{
@@ -343,6 +364,7 @@ func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID 
 		SkippedCount: 0,
 	}
 
+	batchCompleted := false
 	batchErr := b.mgr.WithHMEClientContext(ctx, accountID, func(client *hme.Client) error {
 		for i := 0; i < count; i++ {
 			lbl := labelPrefix
@@ -355,10 +377,14 @@ func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID 
 			}
 			resp.Created = append(resp.Created, *res)
 			resp.CreatedCount++
-			_ = b.mgr.AdjustAliasCounts(accountID, 1, 1)
 		}
+		batchCompleted = true
 		return nil
 	})
+	if batchCompleted && batchErr != nil {
+		log.Printf("[HME] 账号 %s 批量别名已创建，但会话回写失败: %v", accountID, batchErr)
+		batchErr = nil
+	}
 	if batchErr != nil {
 		resp.SkippedCount = count - resp.CreatedCount
 		resp.LastError = batchErr.Error()
@@ -374,6 +400,10 @@ func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID 
 		if resp.CreatedCount == 0 {
 			if errors.Is(batchErr, account.ErrHMEClientUnavailable) {
 				return nil, mapAccountErr(batchErr)
+			}
+			var backendErr *BackendError
+			if errors.As(batchErr, &backendErr) {
+				return nil, backendErr
 			}
 			return nil, classifyUpstreamErr("批量创建失败", batchErr)
 		}
@@ -457,23 +487,32 @@ func (b *managerBackend) RefreshAliasesContext(ctx context.Context, accountID st
 	err := b.mgr.WithHMEClientContext(ctx, accountID, func(client *hme.Client) error {
 		var listErr error
 		aliases, listErr = client.ListAliasesWithContext(ctx)
-		return listErr
+		if listErr != nil {
+			return listErr
+		}
+		activeCount := 0
+		for _, al := range aliases {
+			if al.Active {
+				activeCount++
+			}
+		}
+		// 与同账号 HME 创建共用客户端锁，避免旧快照在创建成功后回写计数或缓存。
+		if err := b.mgr.UpdateAliasCounts(accountID, len(aliases), activeCount); err != nil {
+			return &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_ERROR", Message: "别名数量保存失败"}
+		}
+		b.setCachedAliases(accountID, aliases)
+		return nil
 	})
 	if err != nil {
 		if errors.Is(err, account.ErrHMEClientUnavailable) {
 			return nil, mapAccountErr(err)
 		}
+		var backendErr *BackendError
+		if errors.As(err, &backendErr) {
+			return nil, backendErr
+		}
 		return nil, classifyUpstreamErr("获取别名列表失败", err)
 	}
-	activeCount := 0
-	for _, al := range aliases {
-		if al.Active {
-			activeCount++
-		}
-	}
-	_ = b.mgr.UpdateAliasCounts(accountID, len(aliases), activeCount)
-	b.setCachedAliases(accountID, aliases)
-
 	// 返回防御性独立拷贝，避免并发调用者直接修改缓存底切片
 	res := make([]hme.Alias, len(aliases))
 	copy(res, aliases)
@@ -619,6 +658,7 @@ func (b *managerBackend) SetAliasActiveContext(ctx context.Context, accountID, a
 	targetAnonID := resolvedAnonID
 
 	var success bool
+	var remoteCompleted bool
 	err = b.mgr.WithHMEClientContext(ctx, accountID, func(client *hme.Client) error {
 		var opErr error
 		if active {
@@ -626,8 +666,22 @@ func (b *managerBackend) SetAliasActiveContext(ctx context.Context, accountID, a
 		} else {
 			success, opErr = client.DeactivateHMEWithContext(ctx, targetAnonID)
 		}
+		if opErr == nil && success {
+			remoteCompleted = true
+			delta := -1
+			if active {
+				delta = 1
+			}
+			if countErr := b.mgr.AdjustAliasCounts(accountID, 0, delta); countErr != nil {
+				log.Printf("[HME] 账号 %s 别名状态已改变，但数量回写失败: %v", accountID, countErr)
+			}
+		}
 		return opErr
 	})
+	if remoteCompleted && err != nil {
+		log.Printf("[HME] 账号 %s 别名状态已改变，但会话回写失败: %v", accountID, err)
+		err = nil
+	}
 	if err != nil {
 		if errors.Is(err, account.ErrHMEClientUnavailable) {
 			return false, mapAccountErr(err)
@@ -648,12 +702,7 @@ func (b *managerBackend) SetAliasActiveContext(ctx context.Context, accountID, a
 		return false, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILED", Message: msg}
 	}
 
-	if active {
-		_ = b.mgr.AdjustAliasCounts(accountID, 0, 1)
-	} else {
-		_ = b.mgr.AdjustAliasCounts(accountID, 0, -1)
-	}
-
+	b.invalidateAliasCache(accountID)
 	if b.store != nil {
 		rState := store.RemoteInactive
 		if active {
@@ -672,7 +721,6 @@ func (b *managerBackend) SetAliasActiveContext(ctx context.Context, accountID, a
 		}
 	}
 
-	b.invalidateAliasCache(accountID)
 	return success, nil
 }
 
@@ -829,15 +877,28 @@ func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
 			}
 		}
 	}
+	deleted := false
 	err = b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
-		return client.Delete(targetAnonID)
+		if err := client.Delete(targetAnonID); err != nil {
+			return err
+		}
+		deleted = true
+		if countErr := b.mgr.AdjustAliasCounts(accountID, -1, deltaActive); countErr != nil {
+			log.Printf("[HME] 账号 %s 别名已删除，但数量回写失败: %v", accountID, countErr)
+		}
+		return nil
 	})
+	if deleted && err != nil {
+		log.Printf("[HME] 账号 %s 别名已删除，但会话回写失败: %v", accountID, err)
+		err = nil
+	}
 	if err != nil {
 		if errors.Is(err, account.ErrHMEClientUnavailable) {
 			return mapAccountErr(err)
 		}
 		return classifyUpstreamErr("删除失败", err)
 	}
+	b.invalidateAliasCache(accountID)
 	if b.store != nil {
 		if stErr := b.store.UpdateAliasRemoteState(accountID, targetAnonID, resolvedEmail, store.RemoteDeleted); stErr != nil {
 			return &BackendError{
@@ -848,7 +909,5 @@ func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
 		}
 	}
 
-	_ = b.mgr.AdjustAliasCounts(accountID, -1, deltaActive)
-	b.invalidateAliasCache(accountID)
 	return nil
 }

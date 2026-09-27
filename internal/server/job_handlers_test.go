@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 encoding/json, net/http, net/http/httptest, path/filepath, strings, testing, time, icloud-hme/internal/account, icloud-hme/internal/store
- * [OUTPUT]: 对外提供 TestCreateJobHandlers
+ * [OUTPUT]: 对外提供作业生命周期、保存失败响应及 next_run_at 契约测试
  * [POS]: internal/server 的自动化创建作业标准 RESTful 门面集成测试
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -156,5 +156,40 @@ func TestCreateJobHandlers(t *testing.T) {
 	defer respErr.Body.Close()
 	if respErr.StatusCode != http.StatusBadRequest {
 		t.Fatalf("非法 mode 期望 400, 得到 %d", respErr.StatusCode)
+	}
+}
+
+func TestCreateJobHandlersReportPersistenceErrors(t *testing.T) {
+	st, err := store.NewStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newWithBackendAndStore(&fakeBackend{accounts: []account.Summary{{ID: "acc_1", Name: "test"}}}, Config{APIKey: "test-key", SessionTTL: time.Hour}, st)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ method, path, body string }{
+		{"POST", "/api/create/jobs", `{"account_id":"acc_1","mode":"always"}`},
+		{"POST", "/api/create/jobs/job_acc_1/pause", ""},
+		{"POST", "/api/create/jobs/job_acc_1/resume", ""},
+		{"DELETE", "/api/create/jobs/job_acc_1", ""},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+		req.Header.Set("X-API-Key", "test-key")
+		if tc.body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(resp, req)
+		if resp.Code != http.StatusInternalServerError || !strings.Contains(resp.Body.String(), "PERSISTENCE_ERROR") {
+			t.Errorf("%s %s: got %d %s", tc.method, tc.path, resp.Code, resp.Body.String())
+		}
+	}
+}
+
+func TestCreateJobResponseDoesNotGuessNextRun(t *testing.T) {
+	resp := toJobResp(store.ScheduleConfig{AccountID: "acc_1", Enabled: true, Mode: "always"}, time.Now())
+	if resp.NextRunAt != "" {
+		t.Fatalf("无法准确预测执行时刻时应省略 next_run_at: %q", resp.NextRunAt)
 	}
 }

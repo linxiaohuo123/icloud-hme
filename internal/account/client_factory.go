@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/hme, internal/mail, time, strings, fmt
  * [OUTPUT]: 对外提供 HMEClient, HMEClientWithPassword, MailClient, WithMailClient, WebMailClient
- * [POS]: internal/account 的外设客户端装配与连接池驱动工厂
+ * [POS]: internal/account 的外设客户端装配与连接池驱动工厂，密码登录回写按凭据代际校验
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -79,12 +79,17 @@ func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTP
 
 	// 先保存 accountLogin 返回的 Cookie，随后通过 validate 刷新会话并再次持久化。
 	// 国区与美区都走同一条刷新链路，避免只保存登录阶段的临时 token。
-	if err := m.SaveCookies(id, client.CookieSnapshot()); err != nil {
+	saved, err := m.saveSessionIfCurrent(id, snap.credentialEpoch, snap.Host, snap.Proxy, client.CookieSnapshot(), "", true)
+	if err != nil {
 		return nil, err
 	}
+	if !saved {
+		return nil, ErrSessionChanged
+	}
+	epoch := snap.credentialEpoch + 1
 	if err := client.ValidateSession(); err != nil {
 		// validate 的失败响应也可能携带 Set-Cookie，尽量保留服务端最新状态。
-		_ = m.SaveCookies(id, client.CookieSnapshot())
+		_, _ = m.saveSessionIfCurrent(id, epoch, snap.Host, snap.Proxy, client.CookieSnapshot(), "", false)
 		return nil, err
 	}
 
@@ -95,6 +100,11 @@ func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTP
 		m.mu.Unlock()
 		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
+	if cur.credentialEpoch != epoch || cur.Host != snap.Host || cur.Proxy != snap.Proxy {
+		m.mu.Unlock()
+		return nil, ErrSessionChanged
+	}
+	old := *cur
 	cur.Cookies = client.CookieSnapshot()
 	cur.Status = "active"
 	cur.LastValidated = time.Now().Format(time.RFC3339)
@@ -106,6 +116,9 @@ func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTP
 		}
 	}
 	saveErr := m.saveAccount(cur)
+	if saveErr != nil {
+		*cur = old
+	}
 	m.mu.Unlock()
 	if saveErr != nil {
 		return nil, saveErr

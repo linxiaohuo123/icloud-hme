@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/store, github.com/gin-gonic/gin, time, strings, net/http
  * [OUTPUT]: 对外提供 listCreateJobsHandler, upsertCreateJobHandler, pauseCreateJobHandler, resumeCreateJobHandler, deleteCreateJobHandler
- * [POS]: internal/server 的自动化创建作业标准 RESTful 门面，对外提供兼容主流生态的生命周期控制接口
+ * [POS]: internal/server 的自动化创建作业标准 RESTful 门面，写入失败显式报错，无法准确预测时省略 next_run_at
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -71,10 +71,6 @@ func jobStatus(cfg store.ScheduleConfig, now time.Time) string {
 
 func toJobResp(cfg store.ScheduleConfig, now time.Time) createJobResp {
 	status := jobStatus(cfg, now)
-	nextRun := ""
-	if status == "running" {
-		nextRun = now.Add(1 * time.Minute).Format(time.RFC3339)
-	}
 	return createJobResp{
 		ID:            "job_" + cfg.AccountID,
 		AccountID:     cfg.AccountID,
@@ -85,7 +81,6 @@ func toJobResp(cfg store.ScheduleConfig, now time.Time) createJobResp {
 		StartTime:     cfg.StartTime,
 		EndTime:       cfg.EndTime,
 		CreatedCount:  cfg.CurrentHourCount,
-		NextRunAt:     nextRun,
 		CreatedAt:     cfg.StartedAt,
 		UpdatedAt:     cfg.LastRunAt,
 	}
@@ -172,8 +167,11 @@ func (s *Server) upsertCreateJobHandler(c *gin.Context) {
 		cfg.StartedAt = ""
 	}
 
-	_ = s.store.SaveScheduleConfig(cfg)
-	ok(c, toJobResp(cfg, now))
+	if err := s.store.SaveScheduleConfig(cfg); err != nil {
+		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "保存任务失败")
+		return
+	}
+	ok(c, toJobResp(s.store.GetScheduleConfig(req.AccountID), now))
 }
 
 func validateJobScheduleParams(req *upsertJobReq) error {
@@ -216,8 +214,11 @@ func (s *Server) pauseCreateJobHandler(c *gin.Context) {
 	}
 	cfg := s.store.GetScheduleConfig(accID)
 	cfg.Enabled = false
-	_ = s.store.SaveScheduleConfig(cfg)
-	ok(c, toJobResp(cfg, time.Now()))
+	if err := s.store.SaveScheduleConfig(cfg); err != nil {
+		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "暂停任务失败")
+		return
+	}
+	ok(c, toJobResp(s.store.GetScheduleConfig(accID), time.Now()))
 }
 
 // resumeCreateJobHandler 处理 POST /api/create/jobs/:id/resume。
@@ -233,8 +234,11 @@ func (s *Server) resumeCreateJobHandler(c *gin.Context) {
 	if cfg.Mode == "duration" {
 		cfg.StartedAt = now.Format(time.RFC3339)
 	}
-	_ = s.store.SaveScheduleConfig(cfg)
-	ok(c, toJobResp(cfg, now))
+	if err := s.store.SaveScheduleConfig(cfg); err != nil {
+		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "恢复任务失败")
+		return
+	}
+	ok(c, toJobResp(s.store.GetScheduleConfig(accID), now))
 }
 
 // deleteCreateJobHandler 处理 DELETE /api/create/jobs/:id。
@@ -245,8 +249,9 @@ func (s *Server) deleteCreateJobHandler(c *gin.Context) {
 		failCode(c, http.StatusNotFound, "NOT_FOUND", "任务或账号不存在")
 		return
 	}
-	if s.store != nil {
-		_ = s.store.DeleteScheduleConfig(accID)
+	if err := s.store.DeleteScheduleConfig(accID); err != nil {
+		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "删除任务失败")
+		return
 	}
 	ok(c, gin.H{"id": id, "deleted": true})
 }

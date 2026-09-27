@@ -2,9 +2,70 @@ package account
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"icloud-hme/internal/store"
 )
+
+func TestUpdateCookiesReturnsValidationFailure(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "proxy denied", http.StatusForbidden)
+	}))
+	defer proxy.Close()
+
+	m, err := NewManager(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	acc, err := m.AddAccount("test", "", "icloud.com", proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = m.UpdateCookies(acc.ID, map[string]string{"session": "invalid"})
+	if err == nil {
+		t.Fatal("Cookie validation failure must be returned to the API")
+	}
+	saved, ok := m.GetAccount(acc.ID)
+	if !ok || saved.Status != "error" || saved.LastError == "" {
+		t.Fatalf("failed account status must be retained: %+v", saved)
+	}
+}
+
+func TestUpdateCookiesRestoresMemoryOnPersistenceFailure(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "proxy denied", http.StatusForbidden)
+	}))
+	defer proxy.Close()
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := NewManager(t.TempDir(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	acc, err := m.AddAccount("test", "", "icloud.com", proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _ := m.GetAccount(acc.ID)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UpdateCookies(acc.ID, map[string]string{"session": "new"}); err == nil {
+		t.Fatal("保存失败应返回错误")
+	}
+	after, _ := m.GetAccount(acc.ID)
+	if after.Status != before.Status || after.LastError != before.LastError || len(after.Cookies) != len(before.Cookies) {
+		t.Fatalf("保存失败后应恢复旧账号: before=%+v after=%+v", before, after)
+	}
+}
 
 // TestValidateAccountGuards 校验 ValidateAccount 的无网络守护路径:
 // 账号不存在与未配置 Cookie 都直接报错，不触发任何上游请求。

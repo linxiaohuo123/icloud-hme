@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 os, filepath, sync, github.com/google/uuid, icloud-hme/internal/mail, icloud-hme/internal/store
+ * [INPUT]: 依赖 context, os, filepath, sync, github.com/google/uuid, icloud-hme/internal/mail, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 Account, MailboxConfig, Manager, NewManager
- * [POS]: internal/account 的核心账号管理器与状态机；业务逻辑拆解至 manager_validate.go
+ * [POS]: internal/account 的核心账号管理器与状态机，负责邮箱凭据限时预检、绑定与解绑、凭据代际及会话保存失败回滚；会话校验拆解至 manager_validate.go
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -11,6 +11,8 @@
 package account
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,25 +30,30 @@ import (
 // MaxAliasesPerAccount 是 Apple 官方单个 iCloud 账号的 Hide My Email 别名物理上限 (实测与官方实践为 750 个)。
 const MaxAliasesPerAccount = 750
 
+const mailPreflightTimeout = 30 * time.Second
+
+var ErrMailConfigPersistence = errors.New("邮箱配置保存失败")
+
 // Account 描述一个 iCloud 账号。
 type Account struct {
-	ID            string            `json:"id"`
-	Name          string            `json:"name"`
-	RealEmail     string            `json:"real_email"`
-	ICloudEmail   string            `json:"icloud_email"`
-	Cookies       map[string]string `json:"cookies"`
-	Host          string            `json:"host"`
-	ServiceURL    string            `json:"service_url,omitempty"` // 已解析的 HME 服务端点
-	Proxy         string            `json:"proxy,omitempty"`       // HTTP/SOCKS5 代理
-	AppPassword   string            `json:"app_password,omitempty"`
-	Mailbox       *MailboxConfig    `json:"mailbox,omitempty"`
-	Status        string            `json:"status"` // active / error
-	AliasTotal    int               `json:"alias_total"`
-	AliasActive   int               `json:"alias_active"`
-	LastValidated string            `json:"last_validated"`
-	LastError     string            `json:"last_error,omitempty"`
-	CreatedAt     string            `json:"created_at"`
-	Tags          []string          `json:"tags,omitempty"`
+	credentialEpoch uint64
+	ID              string            `json:"id"`
+	Name            string            `json:"name"`
+	RealEmail       string            `json:"real_email"`
+	ICloudEmail     string            `json:"icloud_email"`
+	Cookies         map[string]string `json:"cookies"`
+	Host            string            `json:"host"`
+	ServiceURL      string            `json:"service_url,omitempty"` // 已解析的 HME 服务端点
+	Proxy           string            `json:"proxy,omitempty"`       // HTTP/SOCKS5 代理
+	AppPassword     string            `json:"app_password,omitempty"`
+	Mailbox         *MailboxConfig    `json:"mailbox,omitempty"`
+	Status          string            `json:"status"` // active / error
+	AliasTotal      int               `json:"alias_total"`
+	AliasActive     int               `json:"alias_active"`
+	LastValidated   string            `json:"last_validated"`
+	LastError       string            `json:"last_error,omitempty"`
+	CreatedAt       string            `json:"created_at"`
+	Tags            []string          `json:"tags,omitempty"`
 }
 
 // MailboxConfig describes an external mailbox used to receive forwarded mail.
@@ -118,7 +125,16 @@ func (m *Manager) Reload() error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.load()
+	previous := m.accounts
+	if err := m.load(); err != nil {
+		return err
+	}
+	for id, acc := range m.accounts {
+		if old, ok := previous[id]; ok {
+			acc.credentialEpoch = old.credentialEpoch + 1
+		}
+	}
+	return nil
 }
 
 // AddAccount 添加一个账号。cookieInput 可为空,后续可通过 /login 获取。
@@ -434,6 +450,14 @@ func statusRank(status string) int {
 
 // SetMailbox validates and stores an external IMAP mailbox after testing it.
 func (m *Manager) SetMailbox(id string, config MailboxConfig) error {
+	return m.SetMailboxContext(context.Background(), id, config)
+}
+
+// SetMailboxContext 在限定时间内验证收件箱，并在保存失败时恢复旧配置。
+func (m *Manager) SetMailboxContext(ctx context.Context, id string, config MailboxConfig) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	config.Provider = strings.TrimSpace(config.Provider)
 	config.Email = strings.TrimSpace(config.Email)
 	config.IMAPHost = strings.TrimSpace(config.IMAPHost)
@@ -453,7 +477,12 @@ func (m *Manager) SetMailbox(id string, config MailboxConfig) error {
 	if ok {
 		proxyURL = acc.Proxy
 		if config.Password == "" && acc.Mailbox != nil && acc.Mailbox.Password != "" {
-			config.Password = acc.Mailbox.Password
+			old := acc.Mailbox
+			if !strings.EqualFold(config.Email, old.Email) || !strings.EqualFold(config.IMAPHost, old.IMAPHost) || config.IMAPPort != old.IMAPPort {
+				m.mu.RUnlock()
+				return fmt.Errorf("更换收件邮箱或服务器时授权码不能为空")
+			}
+			config.Password = old.Password
 		}
 	}
 	m.mu.RUnlock()
@@ -463,39 +492,83 @@ func (m *Manager) SetMailbox(id string, config MailboxConfig) error {
 	if config.Password == "" {
 		return fmt.Errorf("授权码不能为空")
 	}
+	preflightCtx, cancel := context.WithTimeout(ctx, mailPreflightTimeout)
+	defer cancel()
 	mc := mail.NewClientWithServer(config.Email, config.Password, config.IMAPHost, config.IMAPPort)
 	useProxy := proxyURL != "" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "true" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "1"
 	if useProxy {
 		mc.SetProxy(proxyURL)
 	}
-	if err := mc.Connect(); err != nil {
+	if err := mc.ConnectContext(preflightCtx); err != nil {
+		if preflightCtx.Err() != nil {
+			return preflightCtx.Err()
+		}
 		if useProxy {
 			directMC := mail.NewClientWithServer(config.Email, config.Password, config.IMAPHost, config.IMAPPort)
-			if directErr := directMC.Connect(); directErr == nil {
+			if directErr := directMC.ConnectContext(preflightCtx); directErr == nil {
 				mc = directMC
 				goto connectedMailbox
 			}
 		}
+		if preflightCtx.Err() != nil {
+			return preflightCtx.Err()
+		}
 		return err
 	}
 connectedMailbox:
-	_, err := mc.InboxCount()
-	mc.Disconnect()
+	_, err := mc.InboxCountContext(preflightCtx)
+	mc.ForceClose()
 	if err != nil {
+		return err
+	}
+	if err := preflightCtx.Err(); err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := preflightCtx.Err(); err != nil {
+		return err
+	}
 	acc, ok = m.accounts[id]
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
+	oldMailbox := acc.Mailbox
 	acc.Mailbox = &config
-	return m.saveAccount(acc)
+	if err := m.saveAccount(acc); err != nil {
+		acc.Mailbox = oldMailbox
+		return fmt.Errorf("%w: %w", ErrMailConfigPersistence, err)
+	}
+	return nil
+}
+
+// RemoveMailbox 解除外部邮箱绑定，恢复账号原有的 iCloud IMAP 或 WebMail 读取路径。
+func (m *Manager) RemoveMailbox(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	oldMailbox := acc.Mailbox
+	acc.Mailbox = nil
+	if err := m.saveAccount(acc); err != nil {
+		acc.Mailbox = oldMailbox
+		return fmt.Errorf("%w: %w", ErrMailConfigPersistence, err)
+	}
+	return nil
 }
 
 // SetAppPassword 设置 iCloud 邮箱和 App 专用密码,并测试 IMAP 连接。
 func (m *Manager) SetAppPassword(id, icloudEmail, appPassword string) error {
+	return m.SetAppPasswordContext(context.Background(), id, icloudEmail, appPassword)
+}
+
+// SetAppPasswordContext 在限定时间内验证 iCloud IMAP 凭据。
+func (m *Manager) SetAppPasswordContext(ctx context.Context, id, icloudEmail, appPassword string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	icloudEmail = strings.TrimSpace(icloudEmail)
 	appPassword = strings.ReplaceAll(strings.TrimSpace(appPassword), " ", "")
 	if icloudEmail == "" {
@@ -523,6 +596,8 @@ func (m *Manager) SetAppPassword(id, icloudEmail, appPassword string) error {
 	}
 
 	// 测试连接(锁外，遵循直连开关并支持代理故障直连降级)
+	preflightCtx, cancel := context.WithTimeout(ctx, mailPreflightTimeout)
+	defer cancel()
 	var mc *mail.Client
 	useProxy := proxyURL != "" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "true" && os.Getenv("ICLOUD_HME_IMAP_DIRECT") != "1"
 	if useProxy {
@@ -530,35 +605,48 @@ func (m *Manager) SetAppPassword(id, icloudEmail, appPassword string) error {
 	} else {
 		mc = mail.NewClient(icloudEmail, appPassword)
 	}
-	if err := mc.Connect(); err != nil {
+	if err := mc.ConnectContext(preflightCtx); err != nil {
+		if preflightCtx.Err() != nil {
+			return preflightCtx.Err()
+		}
 		if useProxy {
 			directMC := mail.NewClient(icloudEmail, appPassword)
-			if directErr := directMC.Connect(); directErr == nil {
+			if directErr := directMC.ConnectContext(preflightCtx); directErr == nil {
 				mc = directMC
 				goto connectedAppPwd
 			}
 		}
+		if preflightCtx.Err() != nil {
+			return preflightCtx.Err()
+		}
 		return err
 	}
 connectedAppPwd:
-	count, err := mc.InboxCount()
-	mc.Disconnect()
+	_, err := mc.InboxCountContext(preflightCtx)
+	mc.ForceClose()
 	if err != nil {
+		return err
+	}
+	if err := preflightCtx.Err(); err != nil {
 		return err
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := preflightCtx.Err(); err != nil {
+		return err
+	}
 	acc, ok = m.accounts[id]
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
+	oldEmail, oldPassword := acc.ICloudEmail, acc.AppPassword
 	acc.ICloudEmail = icloudEmail
 	acc.AppPassword = appPassword
 	if err := m.saveAccount(acc); err != nil {
-		return err
+		acc.ICloudEmail, acc.AppPassword = oldEmail, oldPassword
+		return fmt.Errorf("%w: %w", ErrMailConfigPersistence, err)
 	}
-	_ = count
 	return nil
 }
 
@@ -576,13 +664,48 @@ func (m *Manager) SaveSession(id string, cookies map[string]string, serviceURL s
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
+	oldCookies, oldServiceURL := acc.Cookies, acc.ServiceURL
 	if cookies != nil {
 		acc.Cookies = cloneCookies(cookies)
 	}
 	if serviceURL != "" {
 		acc.ServiceURL = serviceURL
 	}
-	return m.saveAccount(acc)
+	if err := m.saveAccount(acc); err != nil {
+		acc.Cookies, acc.ServiceURL = oldCookies, oldServiceURL
+		return err
+	}
+	acc.credentialEpoch++
+	return nil
+}
+
+// saveSessionIfCurrent 只接受借出客户端时对应的凭据代际。
+func (m *Manager) saveSessionIfCurrent(id string, epoch uint64, host, proxy string, cookies map[string]string, serviceURL string, replaceCredentials bool) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return false, fmt.Errorf("账号不存在: %s", id)
+	}
+	if acc.credentialEpoch != epoch || acc.Host != host || acc.Proxy != proxy {
+		return false, nil
+	}
+	oldCookies, oldServiceURL := acc.Cookies, acc.ServiceURL
+	acc.Cookies = cloneCookies(cookies)
+	if replaceCredentials {
+		acc.ServiceURL = ""
+	}
+	if serviceURL != "" {
+		acc.ServiceURL = serviceURL
+	}
+	if err := m.saveAccount(acc); err != nil {
+		acc.Cookies, acc.ServiceURL = oldCookies, oldServiceURL
+		return false, err
+	}
+	if replaceCredentials {
+		acc.credentialEpoch++
+	}
+	return true, nil
 }
 
 // UpdateAliasCounts 更新指定账号的别名统计数据并持久化。
@@ -593,15 +716,24 @@ func (m *Manager) UpdateAliasCounts(id string, total, active int) error {
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
+	oldTotal, oldActive := acc.AliasTotal, acc.AliasActive
 	acc.AliasTotal = total
 	acc.AliasActive = active
 	if m.store != nil {
-		return m.store.UpdateAccountFields(id, map[string]interface{}{
+		if err := m.store.UpdateAccountFields(id, map[string]interface{}{
 			"alias_total":  total,
 			"alias_active": active,
-		})
+		}); err != nil {
+			acc.AliasTotal, acc.AliasActive = oldTotal, oldActive
+			return err
+		}
+		return nil
 	}
-	return m.saveJSON()
+	if err := m.saveJSON(); err != nil {
+		acc.AliasTotal, acc.AliasActive = oldTotal, oldActive
+		return err
+	}
+	return nil
 }
 
 // AdjustAliasCounts 增量调整指定账号的别名统计数据并持久化。
@@ -612,6 +744,7 @@ func (m *Manager) AdjustAliasCounts(id string, deltaTotal, deltaActive int) erro
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
+	oldTotal, oldActive := acc.AliasTotal, acc.AliasActive
 	acc.AliasTotal += deltaTotal
 	if acc.AliasTotal < 0 {
 		acc.AliasTotal = 0
@@ -621,10 +754,18 @@ func (m *Manager) AdjustAliasCounts(id string, deltaTotal, deltaActive int) erro
 		acc.AliasActive = 0
 	}
 	if m.store != nil {
-		return m.store.UpdateAccountFields(id, map[string]interface{}{
+		if err := m.store.UpdateAccountFields(id, map[string]interface{}{
 			"alias_total":  acc.AliasTotal,
 			"alias_active": acc.AliasActive,
-		})
+		}); err != nil {
+			acc.AliasTotal, acc.AliasActive = oldTotal, oldActive
+			return err
+		}
+		return nil
 	}
-	return m.saveJSON()
+	if err := m.saveJSON(); err != nil {
+		acc.AliasTotal, acc.AliasActive = oldTotal, oldActive
+		return err
+	}
+	return nil
 }

@@ -55,7 +55,7 @@ function CredentialCell({ acc }: { acc: AccountSummary }) {
   const parts: string[] = []
   if (acc.has_cookies) parts.push('Cookie')
   if (acc.has_app_password) parts.push('App专用密码')
-  if (acc.mailbox) parts.push(`转发至 ${acc.mailbox.email}`)
+  if (acc.mailbox) parts.push(`外部收件箱 ${acc.mailbox.email}`)
   if (acc.has_proxy) parts.push('代理网络')
 
   if (parts.length === 0) {
@@ -502,7 +502,7 @@ export default function AccountsPage() {
           onSaved={() => {
             const targetId = mailboxFor.id
             setMailboxFor(null)
-            show('收件邮箱已接入')
+            show('收件邮箱配置已更新')
             invalidateAccounts(targetId)
           }}
         />

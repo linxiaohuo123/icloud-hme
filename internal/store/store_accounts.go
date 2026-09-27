@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 database/sql, encoding/json, time
  * [OUTPUT]: 对外提供 AccountRecord 结构及 Store 对 accounts 表的完整 CRUD 能力
- * [POS]: internal/store 的账号持久化层，为 account.Manager 提供 SQLite 原子化单行读写，替代 JSON 全量重写
+ * [POS]: internal/store 的账号持久化层，为 account.Manager 提供 SQLite 读写与事务级账号删除清理
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -152,18 +152,35 @@ func (s *Store) UpdateAccountFields(id string, fields map[string]interface{}) er
 	return err
 }
 
-// DeleteAccount 物理删除一个账号，并级联清理其别名路由与预存库存。
+// DeleteAccount 原子删除账号，并清理调度、路由与可用库存。
 //
 // 必须级联:残留路由会把取码请求指向一个已不存在的账号，导致
 // 定向拉取永远失败且不再回退到盲扫兜底。
 // 必须隔离库存:防止未领取的预存别名继续被出号逻辑选中 (幽灵号)。
 func (s *Store) DeleteAccount(id string) error {
-	if _, err := s.db.Exec(`DELETE FROM accounts WHERE id=?`, id); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
 		return err
 	}
-	_ = s.DeleteAliasRoutesForAccount(id)
-	_ = s.QuarantineInventoryForAccount(id)
-	return nil
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE alias_inventory
+		SET remote_state = 'deleted',
+		    allocation_state = CASE WHEN allocation_state = 'available' THEN 'quarantined' ELSE allocation_state END
+		WHERE account_id = ?`, id); err != nil {
+		return fmt.Errorf("隔离账号库存失败: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM alias_routes WHERE account_id = ?`, id); err != nil {
+		return fmt.Errorf("清理账号路由失败: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM schedules WHERE account_id = ?`, id); err != nil {
+		return fmt.Errorf("清理账号调度失败: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM accounts WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("删除账号失败: %w", err)
+	}
+	return tx.Commit()
 }
 
 // SaveAccountsBatch 批量写入账号（用于迁移）。

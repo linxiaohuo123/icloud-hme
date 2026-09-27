@@ -39,9 +39,9 @@ curl -X POST "${origin}/api/quick-create?tag=${safeTag}" \\
 # 参数说明:
 #   email (必填): 待接码别名邮箱
 #   timeout (可选): 最大等待秒数 (默认 30, 上限 120)
-#   auto_delete (可选): 设为 true 时，接码成功后自动在后台停用别名，释放 iCloud 配额
+#   auto_delete 已不支持；需要停用别名时由管理员单独操作
 # ==============================================================================
-curl "${origin}/api/verify-code?email=mysterious.tiger_0x@icloud.com&timeout=60&auto_delete=true" \\
+curl "${origin}/api/verify-code?email=mysterious.tiger_0x@icloud.com&timeout=60" \\
   -H "Authorization: Bearer ${token}"
 
 # 步骤 2 响应示例:
@@ -96,14 +96,13 @@ print(f"[*] 成功获取别名邮箱: {email} (业务标识: {TAG})")
 # time.sleep(3)
 
 # ----------------------------------------------------------------------
-# 步骤 3: 提取验证码 (长轮询等待邮件，auto_delete=True 成功后自动释放配额)
+# 步骤 3: 提取验证码 (长轮询等待邮件)
 # ----------------------------------------------------------------------
 verify_resp = requests.get(
     f"{BASE_URL}/api/verify-code",
     params={
         "email": email,
-        "timeout": 60,
-        "auto_delete": "true"  # 接码成功后自动后台停用该别名，释放配额
+        "timeout": 60
     },
     headers=headers,
     timeout=65

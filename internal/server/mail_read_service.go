@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, errors, strings, sync, time, strconv, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 MailReadService, NewMailReadService, BatchItemResult, batchMessageItemReq
- * [POS]: internal/server 的邮件读取与统一详情缓存应用服务，封装收件箱读取、基于 MessageRef 的规范身份 Join 与缓存对称隔离，接入 MailPerf 观测 (batch_messages 埋点)
+ * [POS]: internal/server 的邮件读取与统一详情缓存应用服务，封装收件箱读取、WebMail 列表预览缓存与基于 MessageRef 的账号隔离，接入 MailPerf 观测
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -424,8 +424,22 @@ func (s *MailReadService) ListInbox(ctx context.Context, q InboxQuery) (InboxRes
 	s.inFlightList[queryKey] = call
 	s.flightMu.Unlock()
 
+	startGen := s.getAccountGen(q.AccountID)
 	go func() {
 		res, err := s.be.ListInboxContext(flightCtx, q)
+		if err == nil && flightCtx.Err() == nil && res.Method == "web_api" {
+			items := make([]batchCommitItem, 0, len(res.Messages))
+			for _, m := range res.Messages {
+				if m.ID == "" {
+					continue
+				}
+				ref := mail.MessageRef{Provider: "webmail", AccountID: q.AccountID, ThreadID: m.ID}
+				items = append(items, batchCommitItem{
+					Key: ref.CacheKey(), Msg: webMailPreviewDetail(q.AccountID, m), Provider: "webmail", Method: "web_api",
+				})
+			}
+			s.commitMessagesBatch(q.AccountID, startGen, items)
+		}
 		cancel()
 
 		s.flightMu.Lock()

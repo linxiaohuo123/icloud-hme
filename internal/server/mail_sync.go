@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 sync, time, net/mail, icloud-hme/internal/mail, icloud-hme/internal/store
- * [OUTPUT]: 对外提供 MailSyncWorker, NewMailSyncWorker
+ * [OUTPUT]: 对外提供 MailSyncWorker, NewMailSyncWorker, ForgetAccount
  * [POS]: server 的后台邮件同步器 (PR-07 §10.2 & §10.4, PR-04A F07)，实现同账号增量 UID 升序分页扫描、固定上界、resumable checkpoint、metadata-first 过滤与正文按需批量拉取
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -65,9 +65,9 @@ type MailSyncWorker struct {
 	wg             sync.WaitGroup
 	fetchWg        sync.WaitGroup
 	mu             sync.RWMutex
-	aliasToAccount map[string]string                   // alias (lower) -> accountID
-	published      map[string]time.Time                // "account|folder|uid|recipient" -> 首次发布时间
-	probeMiss      map[string]time.Time                // alias -> 上次盲扫未命中的时间
+	aliasToAccount map[string]string                  // alias (lower) -> accountID
+	published      map[string]time.Time               // "account|folder|uid|recipient" -> 首次发布时间
+	probeMiss      map[string]time.Time               // alias -> 上次盲扫未命中的时间
 	checkpoints    map[checkpointKey]*checkpointState // (accountID, mailbox, uidValidity) -> checkpoint state (PR-04A F07)
 
 	beforeVerificationPersistHook func(ctx context.Context, target string, uid uint32) error // test hook (PR-04B)
@@ -150,6 +150,22 @@ func (w *MailSyncWorker) RegisterAliasAccount(alias, accountID string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.putRouteLocked(alias, accountID)
+}
+
+// ForgetAccount 移除已删除账号的内存路由，避免后续扫描继续定向到不存在的账号。
+func (w *MailSyncWorker) ForgetAccount(accountID string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for alias, id := range w.aliasToAccount {
+		if id == accountID {
+			delete(w.aliasToAccount, alias)
+		}
+	}
+	for key := range w.checkpoints {
+		if key.accountID == accountID {
+			delete(w.checkpoints, key)
+		}
+	}
 }
 
 // RegisterAliasAccounts 批量登记一批别名的归属，并写穿持久化路由表。

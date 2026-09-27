@@ -1,6 +1,6 @@
 /**
- * [INPUT]: 依赖 encoding/json, io, net/http, net/http/httptest, os, path/filepath, strings, testing, icloud-hme/internal/account, icloud-hme/internal/hme, icloud-hme/internal/store
- * [OUTPUT]: 对外提供 TestAccountResponseNoSecrets, TestAddAndUpdateAccountTags, TestRemoveAccountCascadeDeleteSchedule 等测试套件
+ * [INPUT]: 依赖 context, encoding/json, io, net/http, net/http/httptest, os, path/filepath, strings, testing, icloud-hme/internal/account, icloud-hme/internal/hme, icloud-hme/internal/store
+ * [OUTPUT]: 对外提供 TestAccountResponseNoSecrets, TestRemoveMailboxHandler, TestAddAndUpdateAccountTags 等测试套件
  * [POS]: internal/server 的账号接口与安全边界单元测试
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -8,6 +8,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"icloud-hme/internal/account"
 	"icloud-hme/internal/hme"
@@ -48,6 +50,53 @@ func writeSecretAccounts(t *testing.T, dir string) {
 }`
 	if err := os.WriteFile(filepath.Join(dir, "accounts.json"), []byte(data), 0600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRemoveMailboxHandler(t *testing.T) {
+	f := &fakeBackend{accounts: []account.Summary{{
+		ID: "acc_mailbox", Mailbox: &account.MailboxSummary{Provider: "qq", Email: "owner@qq.com", IMAPHost: "imap.qq.com", IMAPPort: 993},
+	}}}
+	s := newWithBackend(f, Config{AdminPassword: "admin-pass-2026-strong"})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+	sess, csrf := login(t, ts, "admin-pass-2026-strong")
+	req := authedReq(t, ts, http.MethodDelete, "/api/accounts/acc_mailbox/mailbox", "")
+	req.AddCookie(&http.Cookie{Name: "hme_session", Value: sess})
+	req.Header.Set("X-CSRF-Token", csrf)
+	status, body, _ := do(t, req)
+	if status != http.StatusOK || strings.Contains(body, "owner@qq.com") || f.accounts[0].Mailbox != nil {
+		t.Fatalf("unbind should clear mailbox summary: status=%d body=%s", status, body)
+	}
+}
+
+func TestMailboxPreflightCancellationMapsToTimeout(t *testing.T) {
+	mgr, err := account.NewManager(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+	b := &managerBackend{mgr: mgr}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	_, err = b.SetMailboxContext(ctx, "acc_missing", account.MailboxConfig{})
+	be, ok := err.(*BackendError)
+	if !ok || be.Status != http.StatusGatewayTimeout || be.Code != "REQUEST_TIMEOUT" {
+		t.Fatalf("mailbox preflight timeout mapped incorrectly: %v", err)
+	}
+}
+
+func TestInvalidICloudMailboxMapsToValidationError(t *testing.T) {
+	mgr, err := account.NewManager(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+	b := &managerBackend{mgr: mgr}
+	_, err = b.SetAppPasswordContext(context.Background(), "acc_missing", "owner@example.com", "secret")
+	be, ok := err.(*BackendError)
+	if !ok || be.Status != http.StatusBadRequest || be.Code != "VALIDATION_ERROR" {
+		t.Fatalf("invalid iCloud address mapped incorrectly: %v", err)
 	}
 }
 

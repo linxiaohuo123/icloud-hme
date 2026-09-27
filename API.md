@@ -247,7 +247,7 @@ Content-Type: application/json
   "app_password": "abcd-efgh-ijkl-mnop"
 }
 ```
-*提交后服务端将实时连接 `imap.mail.me.com:993` 发起原子握手验证，验证通过后安全入库。*
+*提交后服务端连接 `imap.mail.me.com:993` 验证登录和收件箱访问，预检最多等待 30 秒；验证通过后入库。*
 
 ### 10. 绑定收件搜索邮箱
 
@@ -257,9 +257,20 @@ Authorization: Bearer <API_KEY>
 Content-Type: application/json
 
 {
-  "mailbox": "alias_owner@icloud.com"
+  "provider": "qq",
+  "email": "owner@qq.com",
+  "imap_host": "imap.qq.com",
+  "imap_port": 993,
+  "authorization_code": "邮箱 IMAP 授权码"
 }
 ```
+服务端验证 IMAP 登录和 `INBOX` 访问，预检最多等待 30 秒。修改已绑定邮箱时，只有邮箱地址、服务器和端口都不变，才可留空 `authorization_code` 以沿用原授权码。此操作不会修改 Apple“隐藏邮箱”的转发目标。
+
+```http
+DELETE /api/accounts/:id/mailbox
+Authorization: Bearer <API_KEY>
+```
+解绑后清除本系统的外部 IMAP 配置，读信回到已配置的 iCloud IMAP 或 WebMail；Apple 转发目标不会改变。
 
 ### 11. iCloud 账号密码直接登录 (获取 Cookie)
 
@@ -417,13 +428,14 @@ Authorization: Bearer <API_KEY>
       "status": "running",
       "duration_hours": 12,
       "created_count": 4,
-      "next_run_at": "2026-09-20T14:30:00+08:00",
       "created_at": "2026-09-20T08:00:00+08:00",
       "updated_at": "2026-09-20T14:20:00+08:00"
     }
   ]
 }
 ```
+
+`next_run_at` 暂不返回：执行时刻受调度轮询、时间窗口和配额限制，当前服务无法给出准确预测。任务写入失败时创建、暂停、恢复和删除接口返回 `500 PERSISTENCE_ERROR`。
 
 #### 16.2 创建或更新作业
 ```http
@@ -444,6 +456,7 @@ Content-Type: application/json
   - `"time_window"`：在 `start_time` 与 `end_time`（格式 `"HH:MM"`）窗口内作业。
 
 #### 16.3 暂停作业
+暂停或删除会阻止本轮尚未开始的账号补货；已经向 Apple 发出的建号请求仍可能完成，并计入本小时配额。
 ```http
 POST /api/create/jobs/job_acc_1/pause
 Authorization: Bearer <API_KEY>
@@ -504,11 +517,11 @@ Authorization: Bearer <API_KEY>
 
 **参数说明：**
 - `account_id`：必填，母账号 ID。
-- `alias`：可选，指定别名过滤。底层采用 `To` / `Delivered-To` / `X-Original-To` / `Envelope-To` 四重头与全文深度检索，防止转寄重写漏信。
-- `folder`：可选，默认 `all`（并发检索 `INBOX` 与 `Junk` 垃圾箱按时间合并倒序，杜绝验证邮件被分类拦截）；亦可指定单文件夹如 `INBOX`。
+- `alias`：可选，指定别名过滤。IMAP 先按收件人标头搜索，再核验结构化收件人；QQ/网易只搜索标准 `To`，并回扫最近邮件以兼容转寄重写。WebMail 搜索结果也需有可核验的收件人字段。
+- `folder`：可选，默认 `all`（顺序检索 `INBOX` 与 `Junk` 垃圾箱，再按时间合并）；亦可指定单文件夹如 `INBOX`。
 - `limit`：可选，1–100，默认 20。
 - `days`：可选，1–90，默认 7 天。
-- `body`：可选，传入 `1` 或 `true` 时直接在列表结果中**内联返回每封邮件的完整正文** (`body` 和 `content_type`)，避免多次往返调用。
+- `body`：可选，传入 `1` 或 `true` 时拉取匹配邮件正文；默认只返回摘要元数据。WebMail 只提供邮件预览，不保证完整正文。
 
 **响应：**
 ```json
@@ -541,6 +554,8 @@ Authorization: Bearer <API_KEY>
 ### 18. 单封邮件详情读取
 
 提供两种等价且互补的路由格式，适应不同前端与自动化客户端：
+
+WebMail 只返回不完整的邮件预览 (`body_complete=false`)。列表命中的邮件详情会缓存 10 分钟；缓存过期后，超过最新 100 封的 WebMail 邮件可能无法再通过详情接口找到。IMAP 详情不受此限制。
 
 #### 方式 A：扁平风格
 ```http
@@ -612,13 +627,13 @@ Content-Type: application/json
 ```
 - 单次最多批量拉取 50 封邮件，支持单条 IMAP `UidFetch` 指令批量聚合，自动载入服务端 10 分钟只读内存缓存。
 
-### 20. 删除邮件
+### 20. 删除邮件（当前不支持）
 
 ```http
 DELETE /api/inbox/1042?account_id=acc_1&folder=INBOX
 Authorization: Bearer <API_KEY>
 ```
-- 执行后自动清除该邮件在服务端的内存缓存。
+- 当前接口返回 `400 MAIL_DELETE_UNSUPPORTED`，不会删除邮件或清除缓存。
 
 ### 21. 查询邮箱文件夹列表
 

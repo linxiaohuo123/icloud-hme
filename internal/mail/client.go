@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 github.com/emersion/go-imap, golang.org/x/net/proxy
+ * [INPUT]: 依赖 context, github.com/emersion/go-imap, golang.org/x/net/proxy
  * [OUTPUT]: 对外提供 Client、NewClient、NewClientWithServer、Message、FullMessage
- * [POS]: internal/mail 的 IMAP 邮件读取客户端核心，连接建立与列表搜索 (PR-MAIL-02 支持两阶段 metadata-first 别名发现与候选批量正文拉取)；内容拉取由 client_fetch.go 承载，增量扫描由 client_scan.go 承载，隧道拨号由 dial.go 承载，性能观测由 perf.go 承载
+ * [POS]: internal/mail 的 IMAP 客户端核心，支持可取消建连及列表按需正文；内容拉取由 client_fetch.go 承载，增量扫描由 client_scan.go 承载，隧道拨号由 dial.go 承载
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -12,6 +12,7 @@
 package mail
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-imap"
@@ -131,10 +133,29 @@ func (c *Client) SetProxy(proxyURL string) {
 
 // Connect 连接并登录 IMAP 服务器。已连接且存活时直接复用。
 func (c *Client) Connect() error {
+	return c.ConnectContext(context.Background())
+}
+
+// ConnectContext 将取消与截止时间贯穿连接检查、拨号、握手和登录。
+func (c *Client) ConnectContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if c.cli != nil {
+		var stopCancel func()
+		if c.conn != nil {
+			stopCancel = watchContextClose(ctx, c.conn)
+		}
 		c.SetDeadline(time.Now().Add(IMAPCommandTimeout))
 		err := c.cli.Noop()
+		if stopCancel != nil {
+			stopCancel()
+		}
 		c.SetDeadline(time.Time{})
+		if ctx.Err() != nil {
+			c.forceClose()
+			return ctx.Err()
+		}
 		if err == nil {
 			return nil
 		}
@@ -153,7 +174,7 @@ func (c *Client) Connect() error {
 			u.Scheme = "socks5"
 		}
 		if strings.EqualFold(u.Scheme, "http") || strings.EqualFold(u.Scheme, "https") {
-			rawConn, err = dialHTTPConnect(u, addr, IMAPDialTimeout)
+			rawConn, err = dialHTTPConnectContext(ctx, u, addr, IMAPDialTimeout)
 			if err != nil {
 				return fmt.Errorf("通过 HTTP 代理连接 IMAP 失败: %w", err)
 			}
@@ -162,31 +183,54 @@ func (c *Client) Connect() error {
 			if proxyErr != nil {
 				return fmt.Errorf("创建 IMAP 代理拨号器失败: %w", proxyErr)
 			}
-			rawConn, err = dialer.Dial("tcp", addr)
+			if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+				rawConn, err = contextDialer.DialContext(ctx, "tcp", addr)
+			} else {
+				rawConn, err = dialer.Dial("tcp", addr)
+			}
 			if err != nil {
 				return fmt.Errorf("通过代理连接 IMAP 失败: %w", err)
 			}
 		}
 	} else {
-		rawConn, err = net.DialTimeout("tcp", addr, IMAPDialTimeout)
+		rawConn, err = (&net.Dialer{Timeout: IMAPDialTimeout}).DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return fmt.Errorf("IMAP 连接失败: %w", err)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		_ = rawConn.Close()
+		return err
+	}
+	connected := false
+	defer func() {
+		if !connected {
+			_ = rawConn.Close()
+		}
+	}()
+	stopCancel := watchContextClose(ctx, rawConn)
+	defer stopCancel()
 
 	tlsConn := tls.Client(rawConn, &tls.Config{ServerName: c.server})
 	_ = rawConn.SetDeadline(time.Now().Add(IMAPDialTimeout))
-	if err := tlsConn.Handshake(); err != nil {
-		_ = rawConn.Close()
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("IMAP TLS 握手失败: %w", err)
 	}
 	cli, err := client.New(tlsConn)
 	if err != nil {
-		_ = rawConn.Close()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("IMAP 初始化失败: %w", err)
 	}
 	_ = rawConn.SetDeadline(time.Now().Add(IMAPCommandTimeout))
 	loginErr := cli.Login(c.username, c.password)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if loginErr != nil && (strings.Contains(strings.ToLower(c.server), "mail.me.com") || strings.Contains(strings.ToLower(c.server), "icloud.com")) {
 		lower := strings.ToLower(c.username)
 		if strings.HasSuffix(lower, "@icloud.com") || strings.HasSuffix(lower, "@me.com") || strings.HasSuffix(lower, "@mac.com") {
@@ -202,8 +246,6 @@ func (c *Client) Connect() error {
 		}
 	}
 	if loginErr != nil {
-		_ = cli.Logout()
-		_ = rawConn.Close()
 		if strings.Contains(loginErr.Error(), "Authentication Failed") || strings.Contains(loginErr.Error(), "AUTHENTICATIONFAILED") {
 			lowerServer := strings.ToLower(c.server)
 			if strings.Contains(lowerServer, "qq.com") || strings.Contains(lowerServer, "foxmail.com") {
@@ -219,10 +261,34 @@ func (c *Client) Connect() error {
 		}
 		return fmt.Errorf("IMAP 登录失败 — 请检查邮箱账号、授权码和服务器地址: %w", loginErr)
 	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	stopCancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	_ = rawConn.SetDeadline(time.Time{})
 	c.conn = tlsConn
 	c.cli = cli
+	connected = true
 	return nil
+}
+
+func watchContextClose(ctx context.Context, conn net.Conn) func() {
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+		close(done)
+	})
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if !stop() {
+				<-done
+			}
+		})
+	}
 }
 
 // Ping 探测连接是否仍可用(NOOP)。
@@ -276,10 +342,32 @@ func (c *Client) forceClose() {
 
 // InboxCount 返回收件箱邮件总数。
 func (c *Client) InboxCount() (int, error) {
+	return c.InboxCountContext(context.Background())
+}
+
+// InboxCountContext 限制 SELECT INBOX 的等待时间，并响应请求取消。
+func (c *Client) InboxCountContext(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if c.cli == nil {
 		return 0, fmt.Errorf("未连接")
 	}
+	c.SetDeadline(time.Now().Add(IMAPCommandTimeout))
+	defer c.SetDeadline(time.Time{})
+	var stopCancel func()
+	if c.conn != nil {
+		stopCancel = watchContextClose(ctx, c.conn)
+		defer stopCancel()
+	}
 	mbox, err := c.cli.Select("INBOX", false)
+	if stopCancel != nil {
+		stopCancel()
+	}
+	if ctx.Err() != nil {
+		c.forceClose()
+		return 0, ctx.Err()
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -512,8 +600,22 @@ func (c *Client) FindByRecipient(recipient string, limit int, days int) ([]Messa
 
 // FindByRecipientInFolder 在指定文件夹查找发给指定别名的最近邮件。
 func (c *Client) FindByRecipientInFolder(recipient string, folder string, limit int, days int) ([]Message, error) {
+	return c.findByRecipientInFolderSince(recipient, folder, limit, days, 0, true)
+}
+
+// FindByRecipientSummaryInFolder 仅返回已核验收件人的邮件元数据，供列表使用。
+func (c *Client) FindByRecipientSummaryInFolder(recipient string, folder string, limit int, days int) ([]Message, error) {
+	return c.findByRecipientInFolderSince(recipient, folder, limit, days, 0, false)
+}
+
+// FindByRecipientSummaryInFolderSince 是增量列表的元数据版本。
+func (c *Client) FindByRecipientSummaryInFolderSince(recipient string, folder string, limit int, days int, sinceUID uint32) ([]Message, error) {
+	return c.findByRecipientInFolderSince(recipient, folder, limit, days, sinceUID, false)
+}
+
+func (c *Client) findByRecipientInFolderSince(recipient string, folder string, limit int, days int, sinceUID uint32, includeBody bool) ([]Message, error) {
 	var out []Message
-	err := c.ForEachByRecipientInFolder(recipient, folder, limit, days, func(m Message) bool {
+	err := c.forEachByRecipientInFolderSince(recipient, folder, limit, days, sinceUID, includeBody, func(m Message) bool {
 		out = append(out, m)
 		return len(out) < limit
 	})
@@ -542,6 +644,10 @@ func (c *Client) ForEachByRecipientInFolder(recipient string, folder string, lim
 
 // ForEachByRecipientInFolderSince 在指定文件夹中按 UID lower bound 增量遍历邮件 (Issue 14)。
 func (c *Client) ForEachByRecipientInFolderSince(recipient string, folder string, limit int, days int, sinceUID uint32, onMsg func(Message) bool) error {
+	return c.forEachByRecipientInFolderSince(recipient, folder, limit, days, sinceUID, true, onMsg)
+}
+
+func (c *Client) forEachByRecipientInFolderSince(recipient string, folder string, limit int, days int, sinceUID uint32, includeBody bool, onMsg func(Message) bool) error {
 	if c.cli == nil {
 		return fmt.Errorf("未连接")
 	}
@@ -562,7 +668,7 @@ func (c *Client) ForEachByRecipientInFolderSince(recipient string, folder string
 		if len(folders) == 1 {
 			folderName = folders[0]
 		}
-		return c.forEachByRecipientInMailbox(recipient, folderName, limit, days, sinceUID, onMsg)
+		return c.forEachByRecipientInMailbox(recipient, folderName, limit, days, sinceUID, includeBody, onMsg)
 	}
 
 	// 多文件夹聚合模式 (例如 folder=all 对应 INBOX + Junk，FIX-4)：
@@ -575,7 +681,7 @@ func (c *Client) ForEachByRecipientInFolderSince(recipient string, folder string
 
 	for _, name := range folders {
 		var folderMsgs []Message
-		err := c.forEachByRecipientInMailbox(recipient, name, limit, days, sinceUID, func(m Message) bool {
+		err := c.forEachByRecipientInMailbox(recipient, name, limit, days, sinceUID, includeBody, func(m Message) bool {
 			folderMsgs = append(folderMsgs, m)
 			return len(folderMsgs) < limit
 		})
@@ -618,7 +724,7 @@ func (c *Client) ForEachByRecipientInFolderSince(recipient string, folder string
 	return nil
 }
 
-func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, limit int, days int, sinceUID uint32, onMsg func(Message) bool) (retErr error) {
+func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, limit int, days int, sinceUID uint32, includeBody bool, onMsg func(Message) bool) (retErr error) {
 	opStart := time.Now()
 	mailboxStart := time.Now()
 	mbox, err := c.cli.Select(folder, true)
@@ -851,6 +957,16 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 
 	if limit > 0 && len(candidates) > limit {
 		candidates = candidates[:limit]
+	}
+
+	if !includeBody {
+		for _, m := range candidates {
+			matchedCount++
+			if !onMsg(m) {
+				break
+			}
+		}
+		return nil
 	}
 
 	// Stage 4: 仅针对最终确认的 Top N 候选邮件执行单次批量 UID FETCH BODY

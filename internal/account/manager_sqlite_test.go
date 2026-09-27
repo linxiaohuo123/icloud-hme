@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 testing, os, filepath, icloud-hme/internal/store
- * [OUTPUT]: 测试 Manager 与 SQLite 后端的全生命周期：落盘、细粒度写、自动无损迁移与重载
+ * [OUTPUT]: 测试 Manager 与 SQLite 后端的全生命周期及别名计数写入失败回滚
  * [POS]: internal/account 的集成测试，验证千号规模化存储升级的正确性
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -114,5 +114,41 @@ func TestManagerWithSQLitePersistenceAndMigration(t *testing.T) {
 	recsAfterDel, _ := st.ListAllAccounts()
 	if len(recsAfterDel) != 1 || recsAfterDel[0].ID != sum.ID {
 		t.Fatalf("SQLite 中老账号未被物理删除: %+v", recsAfterDel)
+	}
+}
+
+func TestAliasCountsRollbackWhenPersistenceFails(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := NewManager(dir, st)
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+	sum, err := mgr.AddAccountWithInput(AddAccountInput{Name: "count-test", ICloudEmail: "count@icloud.com"})
+	if err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if err := mgr.UpdateAliasCounts(sum.ID, 3, 2); err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.UpdateAliasCounts(sum.ID, 10, 9); err == nil {
+		t.Fatal("closed store must reject absolute count update")
+	}
+	if err := mgr.AdjustAliasCounts(sum.ID, 1, 1); err == nil {
+		t.Fatal("closed store must reject count adjustment")
+	}
+	acc, ok := mgr.GetAccount(sum.ID)
+	if !ok || acc.AliasTotal != 3 || acc.AliasActive != 2 {
+		t.Fatalf("failed persistence changed in-memory counts: %+v", acc)
 	}
 }

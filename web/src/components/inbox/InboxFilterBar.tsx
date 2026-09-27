@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 components/Select, api/types (AccountSummary, Alias)
- * [OUTPUT]: 对外提供 InboxFilterBar 组件，封装收件箱筛选栏 (账号、别名、文件夹、每页、时间范围、自动刷新) 及 onFolderInteract 懒加载交互支持
+ * [OUTPUT]: 对外提供 InboxFilterBar 组件，封装收件箱筛选栏 (账号、别名、文件夹、每页、时间范围、自动刷新、仅看未读) 及 onFolderInteract 懒加载交互支持
  * [POS]: web/src/components/inbox 的筛选器组件，为 InboxTableView 提供独立的筛选交互与控制
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -27,6 +27,8 @@ export interface InboxFilterBarProps {
   onDaysChange: (val: number) => void
   autoRefreshInterval: number
   onAutoRefreshIntervalChange: (val: number) => void
+  unreadOnly: boolean
+  onUnreadOnlyChange: (val: boolean) => void
   loading: boolean
   onSearch: () => void
 }
@@ -50,6 +52,8 @@ export default function InboxFilterBar({
   onDaysChange,
   autoRefreshInterval,
   onAutoRefreshIntervalChange,
+  unreadOnly,
+  onUnreadOnlyChange,
   loading,
   onSearch,
 }: InboxFilterBarProps) {
@@ -168,6 +172,15 @@ export default function InboxFilterBar({
           style={{ minWidth: 85 }}
         />
       </div>
+
+      <label className="inbox-filter-item inbox-filter-label">
+        <input
+          type="checkbox"
+          checked={unreadOnly}
+          onChange={(event) => onUnreadOnlyChange(event.target.checked)}
+        />
+        仅看未读
+      </label>
 
       <button
         type="button"
