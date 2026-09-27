@@ -227,8 +227,7 @@ func (s *Store) SetBeforePingHookForTest(hook func(ctx context.Context)) {
 }
 
 // Ping 探测底层数据库连通性 (PR-01 用于健康检查 readyz 探针)。
-// 严格避免争抢 s.mu 业务大锁，通过 atomic.Bool 安全读取关闭状态并直接透传给 db.PingContext(ctx)，
-// 原生保证 context 超时与取消能立即从驱动层返回，杜绝探针在业务互斥锁上死等。
+// 严格避免争抢 s.mu 业务大锁，通过 atomic.Bool 安全读取关闭状态并透传给 db.PingContext(ctx)。
 func (s *Store) Ping(ctx context.Context) error {
 	if s == nil || s.closed.Load() {
 		return errors.New("store is closed")
@@ -238,6 +237,9 @@ func (s *Store) Ping(ctx context.Context) error {
 	s.hookMu.RUnlock()
 	if hook != nil {
 		hook(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	db := s.db
 	if db == nil {

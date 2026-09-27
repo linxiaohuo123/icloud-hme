@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 testing, fmt, sync, time, icloud-hme/internal/account, hme, mail, notify, store
  * [OUTPUT]: 对外提供千账号量级的基准压测与扇出探测（ScaleBench 系列）
- * [POS]: internal/server 的规模基线压测套件，用于量化热路径随账号数增长的开销
+ * [POS]: internal/server 的规模基线压测套件，验证未知别名探测逐轮轮转且每轮有界
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -244,7 +244,7 @@ func (c *countingInboxBackend) callCount() int {
 
 // TestScaleMailSyncFanout 探测取码时的别名归属解析成本：
 //   - 路由表命中(出号写穿 / 落库自愈) → 一次主键点查 + 一次定向拉取
-//   - 彻底未知(纯 Apple 侧手工创建的别名) → 盲扫必须被硬上限 + 负缓存约束
+//   - 彻底未知(纯 Apple 侧手工创建的别名) → 单轮探测有硬上限，后续轮次继续轮转
 //   - 进程重启后内存表为空 → 仍必须靠持久化路由表定向解析，绝不能退化成盲扫
 func TestScaleMailSyncFanout(t *testing.T) {
 	if testing.Short() {
@@ -321,12 +321,12 @@ func TestScaleMailSyncFanout(t *testing.T) {
 		t.Fatalf("盲扫必须被硬上限约束在 %d 次以内，实际 %d 次", maxUnknownAliasProbeAccounts, first)
 	}
 
-	// 负缓存: 紧接着再跑一轮不得重复盲扫
+	// 活跃监听继续轮转，以便发现后到达的验证码；单轮仍须有硬上限。
 	wC.syncOnce()
-	if second := beC.callCount(); second != first {
-		t.Fatalf("负缓存失效: 第二轮又发起了 %d 次拉取", second-first)
+	if second := beC.callCount(); second <= first || second-first > maxUnknownAliasProbeAccounts {
+		t.Fatalf("第二轮应继续有界探测, 首轮=%d 总计=%d", first, second)
 	}
-	t.Logf("负缓存生效: 第二轮新增 IMAP 拉取 0 次")
+	t.Logf("第二轮轮转探测新增 IMAP 拉取 %d 次", beC.callCount()-first)
 }
 
 func TestMailSyncWorkerTrigger(t *testing.T) {
@@ -354,4 +354,3 @@ func TestMailSyncWorkerTrigger(t *testing.T) {
 		t.Fatal("MailSyncWorker.Trigger() 未能即时唤醒同步协程")
 	}
 }
-

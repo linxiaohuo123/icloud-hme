@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 sync, time, net/mail, icloud-hme/internal/mail, icloud-hme/internal/store
+ * [INPUT]: 依赖 context, sync, time, icloud-hme/internal/account, mail, store
  * [OUTPUT]: 对外提供 MailSyncWorker, NewMailSyncWorker, ForgetAccount
- * [POS]: server 的后台邮件同步器 (PR-07 §10.2 & §10.4, PR-04A F07)，实现同账号增量 UID 升序分页扫描、固定上界、resumable checkpoint、metadata-first 过滤与正文按需批量拉取
+ * [POS]: server 的后台邮件同步器，实现同账号增量 UID 分页扫描、未知别名有界并发轮转探测、旧版多别名截满时定向补查与取码持久化
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -10,12 +10,15 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
-	stdmail "net/mail"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"icloud-hme/internal/account"
 	"icloud-hme/internal/mail"
 	"icloud-hme/internal/store"
 )
@@ -25,9 +28,6 @@ const publishedWindow = 26 * time.Hour
 
 // maxUnknownAliasProbeAccounts 限制「别名归属未知」时盲扫的账号数上限。
 const maxUnknownAliasProbeAccounts = 20
-
-// unknownAliasMissTTL 是盲扫失败的负缓存时长，避免每轮重复扫同一批账号。
-const unknownAliasMissTTL = 10 * time.Minute
 
 // maxAliasRouteCache 限制内存路由缓存的条目数。
 const maxAliasRouteCache = 50000
@@ -67,7 +67,9 @@ type MailSyncWorker struct {
 	mu             sync.RWMutex
 	aliasToAccount map[string]string                  // alias (lower) -> accountID
 	published      map[string]time.Time               // "account|folder|uid|recipient" -> 首次发布时间
-	probeMiss      map[string]time.Time               // alias -> 上次盲扫未命中的时间
+	probeCursor    map[string]int                     // alias -> 下一批待探测账号的索引
+	probeAccounts  []string                           // 可探测账号列表，用于识别账号变动
+	probeAliasNext int                                // 下一轮优先探测的别名索引
 	checkpoints    map[checkpointKey]*checkpointState // (accountID, mailbox, uidValidity) -> checkpoint state (PR-04A F07)
 
 	beforeVerificationPersistHook func(ctx context.Context, target string, uid uint32) error // test hook (PR-04B)
@@ -90,7 +92,7 @@ func NewMailSyncWorker(be Backend, st *store.Store, eventBus *mail.EventBus, int
 		cancel:         workerCancel,
 		aliasToAccount: make(map[string]string),
 		published:      make(map[string]time.Time),
-		probeMiss:      make(map[string]time.Time),
+		probeCursor:    make(map[string]int),
 		checkpoints:    make(map[checkpointKey]*checkpointState),
 	}
 }
@@ -390,49 +392,104 @@ accountLoop:
 	}
 	fetchWg.Wait()
 
-	// 3. 仍无法归属的野别名(纯粹在 Apple 侧手工创建、本系统从未见过):
-	//    做「有上限 + 负缓存」的盲扫兜底。外部普通请求已在 HTTP 鉴权层拦截，无法触发未知别名。
+	// 3. 仍无法归属的别名按批轮转探测；监听期间新邮件可能随时到达。
+	unknownSet := make(map[string]struct{}, len(unknownAliases))
+	for _, alias := range unknownAliases {
+		unknownSet[alias] = struct{}{}
+	}
+	w.mu.Lock()
+	for alias := range w.probeCursor {
+		if _, watched := unknownSet[alias]; !watched {
+			delete(w.probeCursor, alias)
+		}
+	}
+	w.mu.Unlock()
 	if len(unknownAliases) > 0 {
 		if w.ctx.Err() != nil {
 			return
 		}
-		var probeList []string
-		for _, alias := range unknownAliases {
-			if !w.isRecentProbeMiss(alias) {
-				probeList = append(probeList, alias)
+		var eligible []account.Summary
+		var accountIDs []string
+		for _, acc := range accounts {
+			if acc.HasAppPassword || acc.HasCookies {
+				eligible = append(eligible, acc)
+				accountIDs = append(accountIDs, acc.ID)
 			}
 		}
-		if len(probeList) > 0 {
-			probed := 0
-		probeAccLoop:
-			for _, acc := range accounts {
-				if w.ctx.Err() != nil {
-					break probeAccLoop
-				}
-				if probed >= maxUnknownAliasProbeAccounts {
-					break
-				}
-				if !acc.HasAppPassword && !acc.HasCookies {
-					continue
-				}
-				probed++
-				for _, alias := range probeList {
-					if err := w.ctx.Err(); err != nil {
-						break probeAccLoop
-					}
-					probeCtx, probeCancel := context.WithTimeout(w.ctx, accountSyncTimeout)
-					matched := w.fetchAndPublish(probeCtx, acc.ID, alias)
-					probeCancel()
-					if matched {
-						// 盲扫发现归属: 写穿路由表，此后不再需要盲扫
-						w.RegisterAliasAccounts(acc.ID, []string{alias})
-					}
-				}
+		if len(eligible) == 0 {
+			return
+		}
+		w.mu.Lock()
+		if !slices.Equal(w.probeAccounts, accountIDs) {
+			w.probeAccounts = accountIDs
+			w.probeCursor = make(map[string]int)
+		}
+		w.mu.Unlock()
+		sort.Strings(unknownAliases)
+		w.mu.Lock()
+		aliasStart := w.probeAliasNext % len(unknownAliases)
+		w.probeAliasNext = (aliasStart + 1) % len(unknownAliases)
+		w.mu.Unlock()
+		type probeQuery struct {
+			alias     string
+			accountID string
+			result    InboxResult
+			err       error
+		}
+		queries := make([]*probeQuery, 0, maxUnknownAliasProbeAccounts)
+		budget := maxUnknownAliasProbeAccounts
+		for n := 0; n < len(unknownAliases) && budget > 0; n++ {
+			alias := unknownAliases[(aliasStart+n)%len(unknownAliases)]
+			w.mu.RLock()
+			start := w.probeCursor[alias]
+			w.mu.RUnlock()
+			batchSize := min(budget, len(eligible)-start)
+			for i := 0; i < batchSize; i++ {
+				queries = append(queries, &probeQuery{alias: alias, accountID: eligible[start+i].ID})
 			}
-			// 仅对仍未归属的别名记负缓存，避免下一轮重复扫同一批账号
-			for _, alias := range probeList {
-				if _, known := w.GetAliasAccountOK(alias); !known {
-					w.noteProbeMiss(alias)
+			budget -= batchSize
+			w.mu.Lock()
+			w.probeCursor[alias] = (start + batchSize) % len(eligible)
+			w.mu.Unlock()
+		}
+		tasks := make([]func(), 0, len(queries))
+		for _, query := range queries {
+			q := query
+			tasks = append(tasks, func() {
+				probeCtx, cancel := context.WithTimeout(w.ctx, accountSyncTimeout)
+				defer cancel()
+				q.result, q.err = w.be.ListInboxContext(probeCtx, InboxQuery{
+					AccountID: q.accountID,
+					Alias:     q.alias,
+					Folder:    "all",
+					Limit:     5,
+					Days:      1,
+				})
+			})
+		}
+		runBounded(maxConcurrentAccountSync, "mail_sync.probeAlias", tasks)
+		resolved := make(map[string]struct{})
+		for _, query := range queries {
+			if _, ok := resolved[query.alias]; ok {
+				continue
+			}
+			if query.err != nil {
+				if w.ctx.Err() == nil {
+					log.Printf("[MailSync] 探测账号 %s 失败: %v", query.accountID, query.err)
+				}
+				continue
+			}
+			for _, msg := range query.result.Messages {
+				if msgMatchesRecipient(msg, query.alias) {
+					w.RegisterAliasAccounts(query.accountID, []string{query.alias})
+					w.mu.Lock()
+					delete(w.probeCursor, query.alias)
+					w.mu.Unlock()
+					resolved[query.alias] = struct{}{}
+					accountCtx, cancel := context.WithTimeout(w.ctx, accountSyncTimeout)
+					w.fetchAndPublishBatch(accountCtx, query.accountID, []string{query.alias})
+					cancel()
+					break
 				}
 			}
 		}
@@ -441,14 +498,23 @@ accountLoop:
 
 // fetchAndPublishBatch 按账号增量批量拉取邮件并分发给多个别名等待者 (PR-07 §10.2 & PR-08 Final Hardening §3 & PR-04A F07 & PR-04B)。
 func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID string, aliases []string) bool {
+	matched, err := w.fetchAndPublishBatchResult(ctx, accountID, aliases)
+	if err != nil && ctx.Err() == nil {
+		log.Printf("[MailSync] 账号 %s 同步失败: %v", accountID, err)
+	}
+	return matched
+}
+
+func (w *MailSyncWorker) fetchAndPublishBatchResult(ctx context.Context, accountID string, aliases []string) (bool, error) {
 	if len(aliases) == 0 {
-		return false
+		return false, nil
 	}
 
 	// PR-04B 核心隔离: 分流 strict (具备 baseline 的持久化 verification requests) 与 legacy (无 baseline 的普通订阅者)
 	var strictAliases, legacyAliases []string
 	currentBaselines := make(map[string]uint32)
 	var globalMinUID uint32
+	var scanErr error
 
 	if w.store != nil {
 		for _, alias := range aliases {
@@ -457,7 +523,11 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 				continue
 			}
 			uid, err := w.store.GetMinBaselineUIDByEmail(ctx, norm)
-			if err == nil && uid > 0 {
+			if err != nil {
+				scanErr = err
+				continue
+			}
+			if uid > 0 {
 				strictAliases = append(strictAliases, norm)
 				currentBaselines[norm] = uid
 				if globalMinUID == 0 || uid < globalMinUID {
@@ -478,18 +548,26 @@ func (w *MailSyncWorker) fetchAndPublishBatch(ctx context.Context, accountID str
 
 	var strictMatched, legacyMatched bool
 	if len(strictAliases) > 0 && globalMinUID > 0 {
-		strictMatched = w.scanAndPublishPages(ctx, accountID, strictAliases, currentBaselines, "INBOX", globalMinUID)
+		var err error
+		strictMatched, err = w.scanAndPublishPages(ctx, accountID, strictAliases, currentBaselines, "INBOX", globalMinUID)
+		if err != nil {
+			scanErr = err
+		}
 	}
 	if len(legacyAliases) > 0 {
-		legacyMatched = w.fetchAndPublishLegacyBatch(ctx, accountID, legacyAliases)
+		var err error
+		legacyMatched, err = w.fetchAndPublishLegacyBatch(ctx, accountID, legacyAliases)
+		if err != nil {
+			scanErr = err
+		}
 	}
-	return strictMatched || legacyMatched
+	return strictMatched || legacyMatched, scanErr
 }
 
 // fetchAndPublishLegacyBatch 针对无 baseline 的旧模式订阅者执行基于 ListInboxContext 的单批拉取
-func (w *MailSyncWorker) fetchAndPublishLegacyBatch(ctx context.Context, accountID string, aliases []string) bool {
+func (w *MailSyncWorker) fetchAndPublishLegacyBatch(ctx context.Context, accountID string, aliases []string) (bool, error) {
 	if len(aliases) == 0 {
-		return false
+		return false, nil
 	}
 	var q InboxQuery
 	if len(aliases) == 1 {
@@ -513,13 +591,7 @@ func (w *MailSyncWorker) fetchAndPublishLegacyBatch(ctx context.Context, account
 
 	res, err := w.be.ListInboxContext(ctx, q)
 	if err != nil {
-		if ctx.Err() == nil {
-			log.Printf("[MailSync] 账号 %s 同步邮件失败: %v", accountID, err)
-		}
-		return false
-	}
-	if len(res.Messages) == 0 {
-		return false
+		return false, err
 	}
 
 	aliasSet := make(map[string]struct{}, len(aliases))
@@ -528,57 +600,85 @@ func (w *MailSyncWorker) fetchAndPublishLegacyBatch(ctx context.Context, account
 	}
 
 	hasMatch := false
-	for _, msg := range res.Messages {
-		otp := mail.ExtractOTP(msg.Subject, msg.Preview)
-		if otp == nil {
-			continue
-		}
-
-		for target := range aliasSet {
-			if !msgMatchesRecipient(msg, target) {
+	found := make(map[string]bool, len(aliases))
+	process := func(messages []mail.Message) error {
+		for _, msg := range messages {
+			otp := mail.ExtractOTP(msg.Subject, msg.Preview)
+			if otp == nil {
 				continue
 			}
-			if w.store != nil {
-				completedReqs, err := w.store.CompleteMatchingVerificationRequests(ctx, store.VerificationEventInput{
-					AliasEmail:  target,
-					Provider:    msg.Provider,
-					Mailbox:     msg.Folder,
+
+			for target := range aliasSet {
+				if !msgMatchesRecipient(msg, target) {
+					continue
+				}
+				found[target] = true
+				if w.store != nil {
+					completedReqs, err := w.store.CompleteMatchingVerificationRequests(ctx, store.VerificationEventInput{
+						AliasEmail:  target,
+						Provider:    msg.Provider,
+						Mailbox:     msg.Folder,
+						UIDValidity: msg.UIDValidity,
+						UID:         msg.UID,
+						MessageRef:  msg.MessageRef,
+						Code:        otp.Code,
+						MagicLink:   otp.MagicLink,
+						Now:         time.Now().UTC(),
+					})
+					if err != nil {
+						return err
+					}
+					if len(completedReqs) > 0 {
+						hasMatch = true
+					}
+				}
+				if !w.markPublished(accountID, msg.Folder, msg.UIDValidity, msg.UID, msg.ThreadID, msg.Provider, target) {
+					continue
+				}
+				w.eventBus.PublishEvent(&mail.CachedOTP{
+					EventID:     msg.MessageRef,
+					AccountID:   accountID,
+					Email:       target,
+					Folder:      msg.Folder,
 					UIDValidity: msg.UIDValidity,
 					UID:         msg.UID,
-					MessageRef:  msg.MessageRef,
-					Code:        otp.Code,
-					MagicLink:   otp.MagicLink,
-					Now:         time.Now().UTC(),
+					OTP:         otp,
+					Subject:     msg.Subject,
+					From:        msg.From,
+					Date:        msg.Date,
 				})
-				if err == nil && len(completedReqs) > 0 {
-					hasMatch = true
-				}
+				hasMatch = true
 			}
-			if !w.markPublished(accountID, msg.Folder, msg.UIDValidity, msg.UID, msg.ThreadID, msg.Provider, target) {
+		}
+		return nil
+	}
+	if err := process(res.Messages); err != nil {
+		return hasMatch, err
+	}
+	// 共享窗口截满时，对未命中别名做定向查询，避免其他别名的新邮件挤掉验证码。
+	if len(aliases) > 1 && len(res.Messages) == q.Limit {
+		for _, alias := range aliases {
+			if found[alias] {
 				continue
 			}
-			w.eventBus.PublishEvent(&mail.CachedOTP{
-				EventID:     msg.MessageRef,
-				AccountID:   accountID,
-				Email:       target,
-				Folder:      msg.Folder,
-				UIDValidity: msg.UIDValidity,
-				UID:         msg.UID,
-				OTP:         otp,
-				Subject:     msg.Subject,
-				From:        msg.From,
-				Date:        msg.Date,
-			})
-			hasMatch = true
+			q.Alias = alias
+			q.Limit = 5
+			aliasRes, err := w.be.ListInboxContext(ctx, q)
+			if err != nil {
+				return hasMatch, err
+			}
+			if err := process(aliasRes.Messages); err != nil {
+				return hasMatch, err
+			}
 		}
 	}
-	return hasMatch
+	return hasMatch, nil
 }
 
 // scanAndPublishPages 执行基于 UID 升序增量分页、固定上界、resumable checkpoint 与 metadata-first 的流式扫描 (PR-04A F07)。
-func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID string, aliases []string, currentBaselines map[string]uint32, folder string, baselineUID uint32) bool {
+func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID string, aliases []string, currentBaselines map[string]uint32, folder string, baselineUID uint32) (bool, error) {
 	if len(aliases) == 0 || baselineUID == 0 {
-		return false
+		return false, nil
 	}
 	if folder == "" {
 		folder = "INBOX"
@@ -590,10 +690,13 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 		if ctx.Err() == nil {
 			log.Printf("[MailSync] 获取账号 %s 邮箱边界失败: %v", accountID, err)
 		}
-		return false
+		return false, err
 	}
-	if provider != "imap" || uidValidity == 0 || uidNext <= 1 {
-		return false
+	if provider != "imap" || uidValidity == 0 {
+		return false, fmt.Errorf("账号 %s 的邮箱边界不可用于 IMAP 扫描", accountID)
+	}
+	if uidNext <= 1 {
+		return false, nil
 	}
 	scanUpperUID := uidNext - 1
 
@@ -629,14 +732,19 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 	// 若代际突变，则将数据库中对应未决任务原子置为 invalidated，并重新获取有效的 strict aliases 与 baseline
 	if w.store != nil {
 		for _, alias := range aliases {
-			_, _ = w.store.InvalidateVerificationRequestsForGenerationMismatch(ctx, alias, folder, uidValidity)
+			if _, err := w.store.InvalidateVerificationRequestsForGenerationMismatch(ctx, alias, folder, uidValidity); err != nil {
+				return false, err
+			}
 		}
 		var activeAliases []string
 		newBaselines := make(map[string]uint32, len(aliases))
 		var newMinBaseline uint32
 		for _, alias := range aliases {
 			uid, err := w.store.GetMinBaselineUIDByEmail(ctx, alias)
-			if err == nil && uid > 0 {
+			if err != nil {
+				return false, err
+			}
+			if uid > 0 {
 				activeAliases = append(activeAliases, alias)
 				newBaselines[alias] = uid
 				if newMinBaseline == 0 || uid < newMinBaseline {
@@ -648,7 +756,7 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 		currentBaselines = newBaselines
 		baselineUID = newMinBaseline
 		if len(aliases) == 0 || baselineUID == 0 {
-			return false
+			return false, nil
 		}
 	}
 
@@ -684,7 +792,7 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 
 	// 若 cursor 已经越过固定上界，说明本轮已无新邮件需要扫描
 	if cursor > scanUpperUID {
-		return false
+		return false, nil
 	}
 
 	aliasSet := make(map[string]struct{}, len(aliases))
@@ -693,10 +801,12 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 	}
 
 	hasMatch := false
+	var scanErr error
 
 	// 3. 分页增量扫描循环 (UID 从旧到新 UID ascending，pageSize=50)
 	for cursor <= scanUpperUID {
 		if err := ctx.Err(); err != nil {
+			scanErr = err
 			break
 		}
 
@@ -709,6 +819,7 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 			PageSize:         verificationScanPageSize,
 		})
 		if err != nil {
+			scanErr = err
 			if errors.Is(err, mail.ErrUIDValidityMismatch) {
 				w.mu.Lock()
 				delete(w.checkpoints, cpKey)
@@ -717,6 +828,7 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 			break
 		}
 		if pageRes.UIDValidity != uidValidity {
+			scanErr = mail.ErrUIDValidityMismatch
 			w.mu.Lock()
 			delete(w.checkpoints, cpKey)
 			w.mu.Unlock()
@@ -764,6 +876,7 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 			fullMsgs, err := w.be.GetMessagesContext(ctx, accountID, refs)
 			if err != nil {
 				// 网络错误或取消: 不得提前推进未处理的本页 checkpoint
+				scanErr = err
 				break
 			}
 
@@ -793,6 +906,7 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 					if hook != nil {
 						if err := hook(ctx, target, fullMsg.UID); err != nil {
 							log.Printf("[MailSync] 测试故障注入失败 (%s UID=%d): %v", target, fullMsg.UID, err)
+							scanErr = err
 							pageDurableFailed = true
 							break
 						}
@@ -816,6 +930,7 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 							// 数据库持久化失败:
 							// 当前 page 视为未完成，不推进 checkpoint，不 markPublished，留给下轮重试
 							log.Printf("[MailSync] 持久化验证码终态失败 (%s UID=%d): %v", target, fullMsg.UID, err)
+							scanErr = err
 							pageDurableFailed = true
 							break
 						}
@@ -877,11 +992,7 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 		}
 	}
 
-	return hasMatch
-}
-
-func (w *MailSyncWorker) fetchAndPublish(ctx context.Context, accountID, alias string) bool {
-	return w.fetchAndPublishBatch(ctx, accountID, []string{alias})
+	return hasMatch, scanErr
 }
 
 // resolveAccountFromStore 按「持久化路由表 → 出号流水」的顺序解析别名归属。
@@ -899,30 +1010,6 @@ func (w *MailSyncWorker) resolveAccountFromStore(alias string) (string, bool) {
 	return "", false
 }
 
-// isRecentProbeMiss 判断该别名是否刚盲扫失败过，避免每轮重复扫同一批账号。
-func (w *MailSyncWorker) isRecentProbeMiss(alias string) bool {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	at, ok := w.probeMiss[alias]
-	return ok && time.Since(at) < unknownAliasMissTTL
-}
-
-// noteProbeMiss 记录一次盲扫未命中，并顺带淘汰过期记录。
-func (w *MailSyncWorker) noteProbeMiss(alias string) {
-	now := time.Now()
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.probeMiss == nil {
-		w.probeMiss = make(map[string]time.Time)
-	}
-	for k, t := range w.probeMiss {
-		if now.Sub(t) > unknownAliasMissTTL {
-			delete(w.probeMiss, k)
-		}
-	}
-	w.probeMiss[alias] = now
-}
-
 // msgMatchesRecipient 核验邮件是否明确发给目标别名 (通过 To 或信封收件人头)。
 func msgMatchesRecipient(msg mail.Message, target string) bool {
 	target = strings.ToLower(strings.TrimSpace(target))
@@ -935,27 +1022,4 @@ func msgMatchesRecipient(msg mail.Message, target string) bool {
 		}
 	}
 	return false
-}
-
-// parseRecipientEmails 从收件人字段中解析所有邮箱地址。
-func parseRecipientEmails(raw string) []string {
-	raw = strings.TrimSpace(raw)
-	var emails []string
-	if list, err := stdmail.ParseAddressList(raw); err == nil && len(list) > 0 {
-		for _, a := range list {
-			if a.Address != "" {
-				emails = append(emails, strings.ToLower(a.Address))
-			}
-		}
-		return emails
-	}
-
-	// 兜底提取包含 @ 的部分
-	for _, part := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ';' || r == ' ' }) {
-		part = strings.Trim(part, "<>,;\"' \t\r\n")
-		if strings.Contains(part, "@") {
-			emails = append(emails, strings.ToLower(part))
-		}
-	}
-	return emails
 }

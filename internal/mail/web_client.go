@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 context, bogdanfinn/tls-client, bogdanfinn/fhttp 进行 TLS 指纹伪造，依赖 Google UUID
- * [OUTPUT]: 对外提供 WebClient、NewWebClient、ListInboxContext、ListInbox、SearchMailsContext、SearchMails、FindByAliasContext、FindByAlias
+ * [OUTPUT]: 对外提供 WebClient、NewWebClient、ListInboxContext、ListInbox、SearchMailsContext、SearchMails、FindByAliasContext、FindByAlias、GetThreadContext
  * [POS]: internal/mail 的 Web 邮件读取客户端，支持 Context 取消、结构化业务错误与已读解析、结构化收件人核验
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -283,14 +284,12 @@ type threadSearchResp struct {
 	} `json:"threadList"`
 }
 
-// searchContext 执行 thread/search 请求,返回解析后的邮件列表 (支持 context 取消)。
-func (c *WebClient) searchContext(ctx context.Context, payload string) ([]Message, error) {
+func (c *WebClient) postMailContext(ctx context.Context, path, payload string) ([]byte, error) {
 	if err := c.resolveMccGatewayContext(ctx); err != nil {
 		return nil, err
 	}
 
-	searchURL := c.withParams(c.mccGatewayURL + "/mailws2/v1/thread/search")
-	req, err := http.NewRequestWithContext(ctx, "POST", searchURL, strings.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.withParams(c.mccGatewayURL+path), strings.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -313,6 +312,15 @@ func (c *WebClient) searchContext(ctx context.Context, payload string) ([]Messag
 			return nil, fmt.Errorf("账号未开通 iCloud 邮件功能 (Non iCloud Mail user)")
 		}
 		return nil, fmt.Errorf("获取邮件失败: HTTP %d - %s", resp.StatusCode, truncate(snippet, 300))
+	}
+	return body, nil
+}
+
+// searchContext 执行 thread/search 请求,返回解析后的邮件列表 (支持 context 取消)。
+func (c *WebClient) searchContext(ctx context.Context, payload string) ([]Message, error) {
+	body, err := c.postMailContext(ctx, "/mailws2/v1/thread/search", payload)
+	if err != nil {
+		return nil, err
 	}
 	var result threadSearchResp
 	if err := json.Unmarshal(body, &result); err != nil {
@@ -400,6 +408,42 @@ func parseWebRecipients(toRaw, toRecipientsRaw, recipientsRaw json.RawMessage) s
 		if json.Unmarshal(raw, &singleStr) == nil && singleStr != "" {
 			return singleStr
 		}
+		var singleObj struct {
+			Email   string `json:"email"`
+			Address string `json:"address"`
+		}
+		if json.Unmarshal(raw, &singleObj) == nil {
+			if singleObj.Email != "" {
+				return singleObj.Email
+			}
+			if singleObj.Address != "" {
+				return singleObj.Address
+			}
+		}
+	}
+	return ""
+}
+
+func parseWebDate(raw json.RawMessage) string {
+	var millis int64
+	if err := json.Unmarshal(raw, &millis); err != nil {
+		var value string
+		if json.Unmarshal(raw, &value) != nil {
+			return ""
+		}
+		if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+			return parsed.UTC().Format(time.RFC3339)
+		}
+		millis, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return ""
+		}
+	}
+	if millis > 0 {
+		if millis < 1_000_000_000_000 {
+			return time.Unix(millis, 0).UTC().Format(time.RFC3339)
+		}
+		return time.UnixMilli(millis).UTC().Format(time.RFC3339)
 	}
 	return ""
 }
@@ -429,20 +473,106 @@ func (c *WebClient) SearchMails(query string, limit int) ([]Message, error) {
 	return c.SearchMailsContext(context.Background(), query, limit)
 }
 
+// GetThreadContext 按线程 ID 读取 WebMail 元数据，避免旧邮件详情依赖最近收件箱窗口。
+func (c *WebClient) GetThreadContext(ctx context.Context, threadID string) (*Message, error) {
+	payload := fmt.Sprintf(`{"threadId":%q,"sessionHeaders":{"folder":"INBOX","condstore":1,"qresync":1,"threadmode":1}}`, threadID)
+	body, err := c.postMailContext(ctx, "/mailws2/v1/thread/get", payload)
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Success          *bool  `json:"success"`
+		ErrorCode        string `json:"errorCode"`
+		ErrorDescription string `json:"errorDescription"`
+		Error            struct {
+			Message string `json:"errorMessage"`
+		} `json:"error"`
+		MessageMetadataList []struct {
+			Subject      string          `json:"subject"`
+			Preview      string          `json:"preview"`
+			From         json.RawMessage `json:"from"`
+			To           json.RawMessage `json:"to"`
+			ToRecipients json.RawMessage `json:"toRecipients"`
+			Recipients   json.RawMessage `json:"recipients"`
+			Date         json.RawMessage `json:"date"`
+			Flags        []string        `json:"flags"`
+		} `json:"messageMetadataList"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("解析邮件详情失败: %w", err)
+	}
+	if result.ErrorCode != "" || (result.Success != nil && !*result.Success) {
+		detail := strings.TrimSpace(strings.Join([]string{result.ErrorCode, result.ErrorDescription, result.Error.Message}, " "))
+		if detail == "" {
+			detail = "服务端返回失败"
+		}
+		return nil, fmt.Errorf("获取邮件详情失败: %s", detail)
+	}
+	if result.MessageMetadataList == nil {
+		return nil, fmt.Errorf("解析邮件详情失败: 缺少 messageMetadataList")
+	}
+	if len(result.MessageMetadataList) == 0 {
+		return nil, nil
+	}
+	meta := result.MessageMetadataList[0]
+	for _, candidate := range result.MessageMetadataList[1:] {
+		if parseWebDate(candidate.Date) > parseWebDate(meta.Date) {
+			meta = candidate
+		}
+	}
+	message := &Message{
+		ID:       threadID,
+		ThreadID: threadID,
+		Folder:   "INBOX",
+		Provider: "webmail",
+		From:     parseWebRecipients(meta.From, nil, nil),
+		To:       parseWebRecipients(meta.To, meta.ToRecipients, meta.Recipients),
+		Subject:  meta.Subject,
+		Preview:  sanitizePreview(meta.Preview),
+		Date:     parseWebDate(meta.Date),
+	}
+	if meta.Flags != nil {
+		unread := !hasAttr(meta.Flags, `\Seen`)
+		message.Unread = &unread
+	}
+	return message, nil
+}
+
 // FindByAliasContext 查找发给指定别名的邮件 (支持 context 取消)。
 func (c *WebClient) FindByAliasContext(ctx context.Context, alias string, limit int) ([]Message, error) {
 	// 搜索也可能命中主题或正文，必须再次核验结构化收件人。
-	messages, err := c.SearchMailsContext(ctx, alias, limit)
-	if err == nil {
+	searchLimit := limit
+	for {
+		messages, err := c.SearchMailsContext(ctx, alias, searchLimit)
+		if err != nil {
+			if searchLimit > limit {
+				return nil, err
+			}
+			break
+		}
 		matched := make([]Message, 0, len(messages))
 		for _, m := range messages {
 			if m.matches(alias) {
 				matched = append(matched, m)
 			}
 		}
+		if len(matched) >= limit {
+			return matched[:limit], nil
+		}
+		if len(messages) == searchLimit && searchLimit < 100 {
+			searchLimit *= 2
+			if searchLimit > 100 {
+				searchLimit = 100
+			}
+			continue
+		}
+		if len(messages) == searchLimit {
+			return nil, fmt.Errorf("别名搜索结果超过可核验上限 (%d)", searchLimit)
+		}
 		if len(matched) > 0 {
 			return matched, nil
 		}
+		break
 	}
 
 	// 服务端搜索无可核验结果时，回退最近邮件的结构化收件人核验。

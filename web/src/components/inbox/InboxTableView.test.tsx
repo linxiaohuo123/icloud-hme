@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 @testing-library/react, vitest, msw, react-router-dom, components/inbox/InboxTableView
- * [OUTPUT]: 对外提供 InboxTableView 跨账号并发防污染、详情缓存隔离、仅看未读与 WebMail 首屏 capability 防竞争及退避重试单元测试
+ * [OUTPUT]: 对外提供 InboxTableView 账号加载失败重试、跨账号并发防污染、详情缓存隔离、仅看未读与 WebMail 首屏 capability 防竞争及退避重试单元测试
  * [POS]: web/src/components/inbox 的单元测试防线
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest'
 import InboxTableView from './InboxTableView'
 import { server } from '../../test/server'
 import { ToastProvider } from '../ToastProvider'
+import { clearAccountsCache } from '../../hooks/useAccounts'
 import type { AccountSummary, InboxResult } from '../../api/types'
 
 const mockAccounts: AccountSummary[] = [
@@ -46,6 +47,38 @@ const mockAccounts: AccountSummary[] = [
     created_at: '2026-09-20T00:00:00Z',
   },
 ]
+
+it('账号列表首次失败后点击重试可恢复收件箱', async () => {
+  clearAccountsCache()
+  let accountRequests = 0
+  server.use(
+    http.get('/api/accounts', () => {
+      accountRequests++
+      if (accountRequests === 1) {
+        return HttpResponse.json({ success: false, code: 'UPSTREAM_FAILURE', message: '账号加载失败' }, { status: 503 })
+      }
+      return HttpResponse.json({ success: true, data: mockAccounts })
+    }),
+    http.get('/api/aliases', () => HttpResponse.json({ success: true, data: { account_id: 'acc_1', count: 0, aliases: [] } })),
+    http.get('/api/inbox', () => HttpResponse.json({
+      success: true,
+      data: { account_id: 'acc_1', count: 1, method: 'imap', messages: [{ id: 'mail-1', subject: '重试后邮件', from: 'sender@example.com', to: 'acc1@icloud.com', date: '2026-09-20T10:00:00Z', preview: '正文' }] },
+    })),
+  )
+
+  render(
+    <MemoryRouter>
+      <ToastProvider>
+        <InboxTableView />
+      </ToastProvider>
+    </MemoryRouter>,
+  )
+
+  expect(await screen.findByText('账号加载失败')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: '重试' }))
+  expect(await screen.findByText('重试后邮件')).toBeInTheDocument()
+  expect(accountRequests).toBe(2)
+})
 
 it('仅看未读只显示明确标记为未读的邮件', async () => {
   server.use(

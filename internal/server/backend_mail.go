@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/mail, internal/account
  * [OUTPUT]: 对外提供 managerBackend 的邮件收发与邮箱管理方法 (ListInbox, ListMailboxes, GetMessage, GetMessages, DeleteMessage, ScanMailboxUIDPage, GetMailboxBoundaryContext)、parseMessageID 与 InboxQuery, InboxResult, ScanPageQuery, ScanPageResult, MessageRef 类型
- * [POS]: internal/server 的邮件业务门面实现；IMAP 别名列表按需读取正文，WebMail 详情明确标记为不完整预览，接入 MailPerf 观测
+ * [POS]: internal/server 的邮件业务门面实现；IMAP 别名列表按需读取正文，WebMail 按线程 ID 读取详情元数据并标记为不完整预览，接入 MailPerf 观测
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -63,9 +63,6 @@ type ScanPageResult struct {
 
 // MessageRef 别名映射至 mail.MessageRef，确保统一规范身份
 type MessageRef = mail.MessageRef
-
-// webMailLookupLimit 与 listInboxHandler 的 limit 上限对齐，避免详情回退只扫前 50 封漏信。
-const webMailLookupLimit = 100
 
 // parseMessageID 解析邮件 ID。
 //
@@ -325,14 +322,20 @@ func (b *managerBackend) GetMessageContext(ctx context.Context, accountID string
 		if werr != nil {
 			return nil, classifyInboxErr(werr)
 		}
-		msgs, errList := wmc.ListInboxContext(ctx, webMailLookupLimit)
-		if errList != nil {
-			return nil, classifyInboxErr(errList)
-		}
-		for _, m := range msgs {
-			if m.ID == ref.ThreadID || (ref.ThreadID != "" && m.ThreadID == ref.ThreadID) {
-				return webMailPreviewDetail(accountID, m), nil
+		m, err := wmc.GetThreadContext(ctx, ref.ThreadID)
+		if err != nil {
+			// 保留既有近期邮件读取能力，兼容不支持 thread/get 的网关响应。
+			if recent, listErr := wmc.ListInboxContext(ctx, 100); listErr == nil {
+				for _, candidate := range recent {
+					if candidate.ID == ref.ThreadID {
+						return webMailPreviewDetail(accountID, candidate), nil
+					}
+				}
 			}
+			return nil, classifyInboxErr(err)
+		}
+		if m != nil {
+			return webMailPreviewDetail(accountID, *m), nil
 		}
 		return nil, &BackendError{Status: http.StatusNotFound, Code: "MESSAGE_NOT_FOUND", Message: "邮件不存在"}
 	}

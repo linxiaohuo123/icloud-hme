@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 api/client (request, ApiError, getMessageDetail), api/types, components (AsyncState, ConfirmDialog, ToastProvider), hooks/useAccounts (fetchAccountsDeduped), utils (clipboard, date, mail, sniffer: buildSniffContext, extractOTPMemoized, parseSenderInfo), ./InboxFilterBar, ./InboxTableRow, ./MailDetailDialog
- * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；支持仅看明确未读、externalAliases 直传消灭冗余 I/O、fetchAccountsDeduped 全局缓存共享、INBOX First 首屏优先加载、/api/mailboxes 交互式按需懒加载 (带 pending 队列与 IMAP 避让)、模块级缓存防 Tab 切换重载、Body-on-demand 按需加载单封正文 (零首屏批量正文 I/O)
+ * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；支持账号加载失败后重试、仅看明确未读、externalAliases 直传消灭冗余 I/O、fetchAccountsDeduped 全局缓存共享、INBOX First 首屏优先加载、/api/mailboxes 交互式按需懒加载 (带 pending 队列与 IMAP 避让)、模块级缓存防 Tab 切换重载、Body-on-demand 按需加载单封正文 (零首屏批量正文 I/O)
  * [POS]: web/src/components/inbox 的核心视图容器，统一单账号工作台与全局收件箱大盘的数据流与交互
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -381,6 +381,8 @@ export default function InboxTableView({
       return
     }
     let cancelled = false
+    setLoading(true)
+    setError('')
     fetchAccountsDeduped(retryKey > 0)
       .then((data) => {
         if (cancelled) return
@@ -423,8 +425,6 @@ export default function InboxTableView({
       })
       .catch((err) => {
         if (cancelled) return
-        hasAccountsLoadedRef.current = true
-        setAccountCapabilityReady(true)
         setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
         setLoading(false)
       })
