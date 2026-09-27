@@ -110,6 +110,7 @@ export interface BatchCreateResult {
   remaining_this_hour: number
   message?: string
   last_error?: string
+  audit_failed?: string[]
 }
 
 /** 收件箱查询结果 */

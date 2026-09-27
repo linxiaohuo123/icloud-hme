@@ -26,6 +26,14 @@ import {
 
 type SortDirection = 'asc' | 'desc'
 
+interface AliasListResult {
+  account_id: string
+  count: number
+  aliases: Alias[]
+  complete?: boolean
+  failed_accounts?: string[]
+}
+
 const PAGE_SIZE_OPTIONS = [
   { value: '20', label: '20 条 / 页' },
   { value: '50', label: '50 条 / 页' },
@@ -55,6 +63,7 @@ export default function AliasesPage() {
   const [aliases, setAliases] = useState<Alias[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [failedAccounts, setFailedAccounts] = useState<string[]>([])
   const [retryKey, setRetryKey] = useState(0)
 
   // 跨账号筛选竞态保护
@@ -122,6 +131,7 @@ export default function AliasesPage() {
   useEffect(() => {
     if (accounts.length === 0) {
       setAliases([])
+      setFailedAccounts([])
       setLoading(false)
       return
     }
@@ -131,10 +141,11 @@ export default function AliasesPage() {
     const url = accountId === 'all'
       ? '/api/aliases?account_id=all'
       : `/api/aliases?account_id=${encodeURIComponent(accountId)}`
-    request<{ account_id: string; count: number; aliases: Alias[] }>(url)
+    request<AliasListResult>(url)
       .then((data) => {
         if (cancelled) return
         setAliases(data.aliases ?? [])
+        setFailedAccounts(data.failed_accounts ?? [])
         setError('')
       })
       .catch((err) => {
@@ -254,7 +265,7 @@ export default function AliasesPage() {
       const url = requestedAccountId === 'all'
         ? '/api/aliases?account_id=all&refresh=true'
         : `/api/aliases?account_id=${encodeURIComponent(requestedAccountId)}&refresh=true`
-      const data = await request<{ account_id: string; count: number; aliases: Alias[] }>(url, {
+      const data = await request<AliasListResult>(url, {
         signal: controller.signal,
       })
       // 必须确认: requested account selection 仍等于当前 accountId，且 generation 匹配且未被 abort
@@ -264,9 +275,10 @@ export default function AliasesPage() {
         !controller.signal.aborted
       ) {
         setAliases(data.aliases ?? [])
+        setFailedAccounts(data.failed_accounts ?? [])
         setError('')
         invalidateAccounts(requestedAccountId === 'all' ? undefined : requestedAccountId)
-        show('号池已与 Apple 同步最新数据')
+        show(data.failed_accounts?.length ? `有 ${data.failed_accounts.length} 个账号同步失败，当前结果不完整` : '号池已与 Apple 同步最新数据')
       }
     } catch (err) {
       if (
@@ -286,14 +298,23 @@ export default function AliasesPage() {
     }
   }
 
-  function handleExport(format: 'csv' | 'json' = 'csv') {
-    const a = document.createElement('a')
-    a.href = `/api/aliases/export?account_id=${encodeURIComponent(accountId)}&format=${format}`
-    a.download = ''
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    show('已触发别名资产导出')
+  async function handleExport(format: 'csv' | 'json' = 'csv') {
+    try {
+      const response = await fetch(`/api/aliases/export?account_id=${encodeURIComponent(accountId)}&format=${format}`, { credentials: 'same-origin' })
+      if (!response.ok) {
+        const error = await response.json() as { message?: string }
+        throw new Error(error.message || '导出失败')
+      }
+      const blobUrl = URL.createObjectURL(await response.blob())
+      const a = document.createElement('a')
+      a.href = blobUrl
+      a.download = `icloud_aliases_${new Date().toISOString().slice(0, 10)}.${format}`
+      a.click()
+      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000)
+      show('别名资产已导出')
+    } catch (err) {
+      show(err instanceof Error ? err.message : '导出失败，请重试')
+    }
   }
 
   const copyEmail = useCallback(
@@ -403,7 +424,7 @@ export default function AliasesPage() {
           <button
             type="button"
             className="btn btn-secondary"
-            onClick={() => handleExport('csv')}
+            onClick={() => void handleExport('csv')}
             disabled={accounts.length === 0}
             title="导出当前母账号或全量别名资产 (CSV 格式，自带 Excel BOM)"
           >
@@ -540,6 +561,11 @@ export default function AliasesPage() {
           </div>
         )}
 
+        {failedAccounts.length > 0 && (
+          <div className="alert-error" role="alert" style={{ margin: '12px 20px' }}>
+            {failedAccounts.length} 个账号的别名未能读取，当前列表不完整：{failedAccounts.join('、')}
+          </div>
+        )}
         <AsyncState
           loading={loading && aliases.length === 0}
           error={error}
@@ -803,7 +829,9 @@ export default function AliasesPage() {
           defaultAccountId={accountId}
           onClose={() => setBatchCreateOpen(false)}
           onSuccess={(res) => {
-            show(`已成功生成 ${res.created_count} 个别名`)
+            show(res.audit_failed?.length
+              ? `已生成 ${res.created_count} 个别名，其中 ${res.audit_failed.length} 个未写入出号记录`
+              : `已成功生成 ${res.created_count} 个别名`)
             invalidateAccounts(res.account_id)
             setRetryKey((k) => k + 1)
           }}

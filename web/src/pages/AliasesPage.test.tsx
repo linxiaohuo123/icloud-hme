@@ -149,6 +149,36 @@ describe('AliasesPage', () => {
     expect(await screen.findByText(/暂无别名/)).toBeInTheDocument()
   })
 
+  it('全局别名部分读取失败时持续显示不完整提示', async () => {
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.get('/api/aliases', () => HttpResponse.json({
+        success: true,
+        data: { account_id: 'all', count: 1, aliases: [aliases[0]], complete: false, failed_accounts: ['acc_2'] },
+      })),
+    )
+    renderPage()
+    expect(await screen.findByText('alpha@icloud.com')).toBeInTheDocument()
+    expect(screen.getByRole('alert').textContent).toContain('acc_2')
+    expect(screen.getByRole('alert').textContent).toContain('不完整')
+  })
+
+  it('全量导出不完整时显示服务端错误', async () => {
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.get('/api/aliases', () => HttpResponse.json({ success: true, data: { account_id: 'all', count: 0, aliases: [] } })),
+      http.get('/api/aliases/export', () => HttpResponse.json(
+        { success: false, code: 'INCOMPLETE_EXPORT', message: '部分账号别名读取失败，导出已取消' },
+        { status: 502 },
+      )),
+    )
+    renderPage()
+    const user = userEvent.setup()
+    await screen.findByRole('button', { name: '导出 CSV' })
+    await user.click(screen.getByRole('button', { name: '导出 CSV' }))
+    expect(await screen.findByText('部分账号别名读取失败，导出已取消')).toBeInTheDocument()
+  })
+
   it('按 email/label 大小写不敏感搜索与 active 状态筛选', async () => {
     server.use(
       http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),

@@ -65,28 +65,28 @@ type Config struct {
 
 // Server 封装 Gin 引擎、账号后端与认证。
 type Server struct {
-	be          Backend
-	auth        *auth.Manager
-	limiter     *auth.Limiter
-	cfg         Config
-	r           *gin.Engine
-	eventBus    *mail.EventBus
-	aliasBuffer *AliasBuffer
-	syncWorker  *MailSyncWorker
-	reaper      *AliasReaper
-	cookieMon   *CookieMonitor
-	leasePruner *LeasePruner
+	be              Backend
+	auth            *auth.Manager
+	limiter         *auth.Limiter
+	cfg             Config
+	r               *gin.Engine
+	eventBus        *mail.EventBus
+	aliasBuffer     *AliasBuffer
+	syncWorker      *MailSyncWorker
+	reaper          *AliasReaper
+	cookieMon       *CookieMonitor
+	leasePruner     *LeasePruner
 	notifier        *notify.Sender
 	store           *store.Store
 	allocService    *AliasAllocationService
 	verifyService   *VerificationService
 	mailReadService *MailReadService
 	scheduler       *scheduler.Scheduler
-	startedAt   time.Time
-	autoSyncWg  sync.WaitGroup     // 跟踪启动预热任务收敛 (PR-05 F10)
-	ctx         context.Context    // 【BUG-11】停机信号,由 Close() 触发 cancel
-	cancel      context.CancelFunc // 【BUG-11】停机信号取消函数
-	closeOnce   sync.Once          // 优雅停机幂等保证 (PR-07 §10.4)
+	startedAt       time.Time
+	autoSyncWg      sync.WaitGroup     // 跟踪启动预热任务收敛 (PR-05 F10)
+	ctx             context.Context    // 【BUG-11】停机信号,由 Close() 触发 cancel
+	cancel          context.CancelFunc // 【BUG-11】停机信号取消函数
+	closeOnce       sync.Once          // 优雅停机幂等保证 (PR-07 §10.4)
 }
 
 // New 创建 Server。mgr 为账号管理器,st 为持久化存储(可为 nil),cfg 为安全配置。
@@ -141,14 +141,14 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
-		be:          be,
-		limiter:     auth.NewLimiter(nil, 15*time.Minute, 5, 10000),
-		cfg:         cfg,
-		eventBus:    eventBus,
-		aliasBuffer: aliasBuf,
-		syncWorker:  syncWorker,
-		reaper:      reaper,
-		cookieMon:   mon,
+		be:              be,
+		limiter:         auth.NewLimiter(nil, 15*time.Minute, 5, 10000),
+		cfg:             cfg,
+		eventBus:        eventBus,
+		aliasBuffer:     aliasBuf,
+		syncWorker:      syncWorker,
+		reaper:          reaper,
+		cookieMon:       mon,
 		notifier:        notifier,
 		store:           st,
 		allocService:    NewAliasAllocationService(st, be, syncWorker),
@@ -193,7 +193,9 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 			log.Printf("[Server] 存量库存安全对齐完成: 已隔离/收敛 %d 个受保护或异常别名", n)
 		}
 	}
-	if reconciler, ok := be.(interface{ ReconcileUnresolvedIntents(context.Context) ([]store.HmeReserveIntent, error) }); ok {
+	if reconciler, ok := be.(interface {
+		ReconcileUnresolvedIntents(context.Context) ([]store.HmeReserveIntent, error)
+	}); ok {
 		if list, err := reconciler.ReconcileUnresolvedIntents(context.Background()); err == nil && len(list) > 0 {
 			log.Printf("[Server] 启动恢复: 扫描处理 %d 个未决 HME reserve 意图", len(list))
 		}
@@ -214,9 +216,14 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 			syncWorker.RegisterAliasAccounts(accountID, emails)
 		}
 	}
+	var revocations auth.RevocationStore
+	if st != nil {
+		revocations = st
+	}
 	s.auth, _ = auth.NewManager(auth.Options{
-		Password: cfg.AdminPassword,
-		TTL:      cfg.SessionTTL,
+		Password:    cfg.AdminPassword,
+		TTL:         cfg.SessionTTL,
+		Revocations: revocations,
 	})
 	hasAuth := cfg.AdminPassword != "" || cfg.APIKey != ""
 	s.r = gin.New()
@@ -373,10 +380,10 @@ func (s *Server) autoSyncAccounts() {
 }
 
 // CloseContext 停止后台工作引擎，严格遵守优雅停机生命周期顺序与单一预算约束 (PR-05 F10):
-// 1. 发送上下文取消信号 (停止接纳新工作与预热请求)
-// 2. 并发通知并等待各后台 worker 收敛 (受到传入 ctx 统一预算限制)
-// 3. 只有在 worker 全部平稳收敛后，才依次关闭底层客户端连接池与持久化数据库 (Store)
-//    若超时未完成，严禁提前关闭 Store，避免在途 goroutine 访问已关闭 DB 造成 panic 或数据破坏。
+//  1. 发送上下文取消信号 (停止接纳新工作与预热请求)
+//  2. 并发通知并等待各后台 worker 收敛 (受到传入 ctx 统一预算限制)
+//  3. 只有在 worker 全部平稳收敛后，才依次关闭底层客户端连接池与持久化数据库 (Store)
+//     若超时未完成，严禁提前关闭 Store，避免在途 goroutine 访问已关闭 DB 造成 panic 或数据破坏。
 func (s *Server) CloseContext(ctx context.Context) (err error) {
 	s.closeOnce.Do(func() {
 		// 1. 停止接收新工作，通知所有引用 s.ctx 的后台 goroutine 立即取消

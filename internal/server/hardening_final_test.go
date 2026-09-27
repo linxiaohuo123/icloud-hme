@@ -139,7 +139,10 @@ func TestPR08_FinalHardening_TokenIdentityIsolation(t *testing.T) {
 	}
 
 	// 核验 tokenDisplayName 写入了 lease_records.token_name 作为审计
-	leases, total := st.ListLeases("", "default", "", 10, 0)
+	leases, total, err := st.ListLeases("", "default", "", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if total == 0 || len(leases) == 0 {
 		t.Fatal("expected lease record in store")
 	}
@@ -767,6 +770,3 @@ func TestP1C_ReplenishPersistenceFailurePropagatesError(t *testing.T) {
 		t.Fatalf("P1-C 失败: 调度器日志中未记录持久化失败错误, logs=%+v", logs)
 	}
 }
-
-
-

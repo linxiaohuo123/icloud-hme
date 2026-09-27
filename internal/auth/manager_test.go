@@ -2,7 +2,11 @@ package auth
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +18,27 @@ var fixedNow = time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC)
 // fixedRandom 确定性随机源(用于生成 session ID / CSRF / salt)。
 type fixedRandom struct {
 	seq uint64
+}
+
+type testRevocations struct {
+	entries map[[32]byte]time.Time
+	err     error
+}
+
+func (r *testRevocations) RevokeSession(hash [32]byte, expiresAt time.Time) error {
+	if r.err != nil {
+		return r.err
+	}
+	r.entries[hash] = expiresAt
+	return nil
+}
+
+func (r *testRevocations) IsSessionRevoked(hash [32]byte) (bool, error) {
+	if r.err != nil {
+		return false, r.err
+	}
+	_, ok := r.entries[hash]
+	return ok, nil
 }
 
 func (r *fixedRandom) Read(p []byte) (int, error) {
@@ -42,7 +67,7 @@ func newTestManager(t *testing.T) *Manager {
 // TestManagerWrongPassword 验证错误密码被拒绝。
 func TestManagerWrongPassword(t *testing.T) {
 	m := newTestManager(t)
-	if _, _, ok := m.Login("wrong-password"); ok {
+	if _, _, ok, err := m.Login("wrong-password"); ok || err != nil {
 		t.Fatal("错误密码不应登录成功")
 	}
 }
@@ -50,7 +75,10 @@ func TestManagerWrongPassword(t *testing.T) {
 // TestManagerLoginSuccess 验证正确密码登录并生成会话。
 func TestManagerLoginSuccess(t *testing.T) {
 	m := newTestManager(t)
-	id, sess, ok := m.Login("admin-pass-2026-strong")
+	id, sess, ok, err := m.Login("admin-pass-2026-strong")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("正确密码应登录成功")
 	}
@@ -64,7 +92,10 @@ func TestManagerLoginSuccess(t *testing.T) {
 		t.Fatalf("过期时间错误: %v", sess.ExpiresAt)
 	}
 	// 两个登录 token 不相同(即使使用确定性随机源,ID 也应变化)
-	id2, sess2, ok2 := m.Login("admin-pass-2026-strong")
+	id2, sess2, ok2, err := m.Login("admin-pass-2026-strong")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok2 {
 		t.Fatal("第二次登录应成功")
 	}
@@ -79,7 +110,10 @@ func TestManagerLoginSuccess(t *testing.T) {
 // TestManagerValidate 验证会话校验与 CSRF。
 func TestManagerValidate(t *testing.T) {
 	m := newTestManager(t)
-	id, sess, ok := m.Login("admin-pass-2026-strong")
+	id, sess, ok, err := m.Login("admin-pass-2026-strong")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("登录失败")
 	}
@@ -110,7 +144,10 @@ func TestManagerSessionExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, _, ok := m.Login("admin-pass-2026-strong")
+	id, _, ok, err := m.Login("admin-pass-2026-strong")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("登录失败")
 	}
@@ -124,7 +161,10 @@ func TestManagerSessionExpiry(t *testing.T) {
 // TestManagerLogout 验证退出立即失效。
 func TestManagerLogout(t *testing.T) {
 	m := newTestManager(t)
-	id, _, ok := m.Login("admin-pass-2026-strong")
+	id, _, ok, err := m.Login("admin-pass-2026-strong")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("登录失败")
 	}
@@ -140,7 +180,10 @@ func TestManagerLogout(t *testing.T) {
 // TestManagerStoresHashedKeys 验证 map 不以原始 session ID 为键。
 func TestManagerStoresHashedKeys(t *testing.T) {
 	m := newTestManager(t)
-	id, _, ok := m.Login("admin-pass-2026-strong")
+	id, _, ok, err := m.Login("admin-pass-2026-strong")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("登录失败")
 	}
@@ -202,7 +245,10 @@ func TestManagerSessionLimit(t *testing.T) {
 	}
 	ids := make([]string, 0, maxSessions+5)
 	for i := 0; i < maxSessions+5; i++ {
-		id, _, ok := m.Login("admin-pass-2026-strong")
+		id, _, ok, err := m.Login("admin-pass-2026-strong")
+		if err != nil {
+			t.Fatal(err)
+		}
 		if !ok {
 			t.Fatalf("第 %d 次登录失败", i)
 		}
@@ -228,7 +274,10 @@ func TestManagerSessionLimit(t *testing.T) {
 // TestManagerConstantTimeCompare 验证 CSRF 使用常量时间比较(仅检查行为正确)。
 func TestManagerConstantTimeCompare(t *testing.T) {
 	m := newTestManager(t)
-	id, sess, ok := m.Login("admin-pass-2026-strong")
+	id, sess, ok, err := m.Login("admin-pass-2026-strong")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("登录失败")
 	}
@@ -267,7 +316,10 @@ func TestManagerRestartResilience(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, sess, ok := m1.Login("admin-pass-2026-strong")
+	id, sess, ok, err := m1.Login("admin-pass-2026-strong")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("登录失败")
 	}
@@ -294,5 +346,84 @@ func TestManagerRestartResilience(t *testing.T) {
 	}
 	if !m2.ValidateCSRF(id, sess.CSRFToken) {
 		t.Fatal("客户端保存的原 CSRF 应在服务重启后继续通过校验")
+	}
+}
+
+func TestManagerLogoutSurvivesRestart(t *testing.T) {
+	revocations := &testRevocations{entries: make(map[[32]byte]time.Time)}
+	opts := Options{Password: "admin-pass-2026-strong", Now: func() time.Time { return fixedNow }, Random: &fixedRandom{}, Revocations: revocations}
+	m1, err := NewManager(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _, ok, err := m1.Login(opts.Password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("登录失败")
+	}
+	if err := m1.Logout(id); err != nil {
+		t.Fatal(err)
+	}
+	m2, err := NewManager(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m2.Validate(id); ok {
+		t.Fatal("已撤销会话不能在重启后恢复")
+	}
+
+	id2, _, ok, err := m2.Login(opts.Password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("再次登录失败")
+	}
+	revocations.err = errors.New("revocation store unavailable")
+	if err := m2.Logout(id2); err == nil {
+		t.Fatal("撤销落库失败必须明确返回错误")
+	}
+	if _, ok := m2.Validate(id2); !ok {
+		t.Fatal("撤销失败后原会话应保持有效")
+	}
+}
+
+func TestManagerRejectsLegacySignedSession(t *testing.T) {
+	password := "admin-pass-2026-strong"
+	m, err := NewManager(Options{Password: password, Now: func() time.Time { return fixedNow }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 24)) + "." + fmt.Sprint(fixedNow.Add(time.Hour).Unix())
+	oldKey := sha256.Sum256([]byte("icloud-hme-session-sign-key:" + password))
+	mac := hmac.New(sha256.New, oldKey[:])
+	_, _ = mac.Write([]byte(payload))
+	legacyID := payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if _, ok := m.Validate(legacyID); ok {
+		t.Fatal("旧版签名 Cookie 必须在升级后失效")
+	}
+}
+
+func TestManagerSessionEvictionPersistenceFailure(t *testing.T) {
+	revocations := &testRevocations{entries: make(map[[32]byte]time.Time)}
+	m, err := NewManager(Options{
+		Password:    "admin-pass-2026-strong",
+		Now:         func() time.Time { return fixedNow },
+		Random:      &fixedRandom{},
+		Revocations: revocations,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxSessions; i++ {
+		if _, _, ok, err := m.Login("admin-pass-2026-strong"); !ok || err != nil {
+			t.Fatalf("initial login %d failed: %v", i, err)
+		}
+	}
+	revocations.err = errors.New("database unavailable")
+	if _, _, ok, err := m.Login("admin-pass-2026-strong"); ok || err == nil {
+		t.Fatalf("eviction persistence failure must be explicit: ok=%v err=%v", ok, err)
 	}
 }

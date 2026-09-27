@@ -274,9 +274,9 @@ func (s *Server) deleteTokenHandler(c *gin.Context) {
 
 // recordLease 统一写出一条「已用别名」流水，是全站出号链路的唯一入账口径。
 // 定时调度 / 一键出号 / 手动建号都必须经过这里，否则审计账本与业务 tag 对账会漏统计。
-func (s *Server) recordLease(accountID, email, tag, tokenName string) {
+func (s *Server) recordLease(accountID, email, tag, tokenName string) error {
 	if s.store == nil || email == "" {
-		return
+		return fmt.Errorf("出号流水存储不可用或邮箱为空")
 	}
 	if tag == "" {
 		tag = "default"
@@ -292,8 +292,10 @@ func (s *Server) recordLease(accountID, email, tag, tokenName string) {
 		TokenName:   tokenName,
 	}); err != nil {
 		log.Printf("[Lease] 流水写入失败 email=%s account=%s: %v", email, accountID, err)
+		return err
 	}
 	s.store.UpdateTagLastAssigned(tag)
+	return nil
 }
 
 // scheduledTag 返回账号定时补货使用的业务标识(优先继承母号首个标签，缺省 scheduled)。
@@ -322,7 +324,11 @@ func (s *Server) listLeasesHandler(c *gin.Context) {
 		offset = 0
 	}
 
-	records, total := s.store.ListLeases(aliasQ, tagQ, statusQ, limit, offset)
+	records, total, err := s.store.ListLeases(aliasQ, tagQ, statusQ, limit, offset)
+	if err != nil {
+		backendFail(c, err)
+		return
+	}
 	ok(c, gin.H{
 		"records": records,
 		"total":   total,

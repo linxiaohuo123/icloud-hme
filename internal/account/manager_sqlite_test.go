@@ -117,6 +117,40 @@ func TestManagerWithSQLitePersistenceAndMigration(t *testing.T) {
 	}
 }
 
+func TestAccountEditFailureKeepsMemoryUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mgr, err := NewManager(dir, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+	sum, err := mgr.AddAccountWithInput(AddAccountInput{Name: "original", ICloudEmail: "a@icloud.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().Exec(`CREATE TRIGGER fail_account_edit BEFORE UPDATE ON accounts BEGIN SELECT RAISE(FAIL, 'injected failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	updatedName := "changed"
+	if _, err := mgr.UpdateMetadata(sum.ID, UpdateAccountInput{Name: &updatedName}); err == nil {
+		t.Fatal("metadata update should fail")
+	}
+	if acc, ok := mgr.GetAccount(sum.ID); !ok || acc.Name != "original" {
+		t.Fatalf("failed metadata update changed memory: %+v", acc)
+	}
+	if _, err := mgr.UpdateProxy(sum.ID, "http://proxy.example.com:8080"); err == nil {
+		t.Fatal("proxy update should fail")
+	}
+	if acc, ok := mgr.GetAccount(sum.ID); !ok || acc.Proxy != "" {
+		t.Fatalf("failed proxy update changed memory: %+v", acc)
+	}
+}
+
 func TestAliasCountsRollbackWhenPersistenceFails(t *testing.T) {
 	dir := t.TempDir()
 	st, err := store.NewStore(dir)

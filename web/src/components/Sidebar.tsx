@@ -9,8 +9,10 @@ import { memo, useMemo, useRef, useState } from 'react'
 import { NavLink, useLocation, useNavigate } from 'react-router-dom'
 import type { AccountSummary } from '../api/types'
 import { useAuth } from '../auth/AuthProvider'
+import { ApiError } from '../api/client'
 import { useAccounts } from '../hooks/useAccounts'
 import { useTheme } from './ThemeProvider'
+import { useToast } from './ToastProvider'
 import {
   IconAccounts,
   IconAliases,
@@ -67,6 +69,7 @@ export default function Sidebar({ onAddAccount }: SidebarProps) {
   const listRef = useRef<HTMLDivElement>(null)
 
   const { logout } = useAuth()
+  const { show } = useToast()
   const { theme, toggleTheme } = useTheme()
   const navigate = useNavigate()
   const location = useLocation()
@@ -95,8 +98,12 @@ export default function Sidebar({ onAddAccount }: SidebarProps) {
   const offsetY = startIndex * ITEM_HEIGHT
 
   async function handleLogout() {
-    await logout()
-    navigate('/login')
+    try {
+      await logout()
+      navigate('/login')
+    } catch (err) {
+      show(err instanceof ApiError ? err.message : '退出登录失败，请重试')
+    }
   }
 
   return (

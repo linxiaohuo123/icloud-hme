@@ -251,7 +251,11 @@ func (s *Server) handleLogin(c *gin.Context) {
 		return
 	}
 
-	sessionID, sess, valid := s.auth.Login(req.Password)
+	sessionID, sess, valid, err := s.auth.Login(req.Password)
+	if err != nil {
+		backendFail(c, err)
+		return
+	}
 	if !valid {
 		failCode(c, http.StatusUnauthorized, "INVALID_CREDENTIALS", "管理员密码错误")
 		return
@@ -295,7 +299,10 @@ func (s *Server) handleSession(c *gin.Context) {
 func (s *Server) handleLogout(c *gin.Context) {
 	sessionID := sessionIDFromCookie(c)
 	if sessionID != "" {
-		s.auth.Logout(sessionID)
+		if err := s.auth.Logout(sessionID); err != nil {
+			backendFail(c, err)
+			return
+		}
 	}
 	clearSessionCookie(c, s.cfg.SecureCookie)
 	if s.mailReadService != nil {

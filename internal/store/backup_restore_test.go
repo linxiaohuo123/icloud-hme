@@ -920,7 +920,7 @@ func TestPR09_RestoreV1BackupMigratesToV2(t *testing.T) {
 	}
 
 	// 3. 打开恢复后的 live DB 并断言：
-	// - user_version == 2
+	// - user_version == CurrentSchemaVersion
 	// - 原 legacy token secret 升级后仍可通过认证
 	// - api_tokens 不再保存 plaintext token column
 	// - protected credentials 为 enc:v1
@@ -931,9 +931,9 @@ func TestPR09_RestoreV1BackupMigratesToV2(t *testing.T) {
 	}
 
 	var liveVer int
-	if err := st.db.QueryRow("PRAGMA user_version;").Scan(&liveVer); err != nil || liveVer != 2 {
+	if err := st.db.QueryRow("PRAGMA user_version;").Scan(&liveVer); err != nil || liveVer != CurrentSchemaVersion {
 		st.Close()
-		t.Fatalf("断言失败: live DB user_version 预期为 2，实际为: %d (err: %v)", liveVer, err)
+		t.Fatalf("断言失败: live DB user_version 预期为 %d，实际为: %d (err: %v)", CurrentSchemaVersion, liveVer, err)
 	}
 
 	// api_tokens 不再保存 plaintext token 列
@@ -1209,4 +1209,3 @@ func TestPR09_ValidateProtectedSecrets(t *testing.T) {
 		}
 	})
 }
-

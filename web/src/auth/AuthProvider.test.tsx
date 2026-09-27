@@ -3,7 +3,7 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { beforeEach, describe, expect, it } from 'vitest'
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { AuthProvider, useAuth } from './AuthProvider'
 import { server } from '../test/server'
 import LoginPage from '../pages/LoginPage'
@@ -175,6 +175,27 @@ describe('AuthProvider + LoginPage', () => {
     )
   })
 
+  it('登出请求失败时保持已登录状态并返回错误', async () => {
+    server.use(
+      http.get('/api/auth/session', () =>
+        HttpResponse.json({ success: true, data: { csrf_token: 'csrf-abc', expires_at: '2026-08-05T22:00:00+08:00' } }),
+      ),
+      http.post('/api/auth/logout', () =>
+        HttpResponse.json({ success: false, code: 'PERSISTENCE_ERROR', message: '撤销失败' }, { status: 500 }),
+      ),
+    )
+    render(
+      <MemoryRouter>
+        <AuthProvider><LogoutFailureProbe /></AuthProvider>
+      </MemoryRouter>,
+    )
+    const user = userEvent.setup()
+    await screen.findByTestId('protected')
+    await user.click(screen.getByRole('button', { name: '退出登录' }))
+    expect(await screen.findByText('撤销失败')).toBeInTheDocument()
+    expect(screen.getByTestId('protected')).toBeInTheDocument()
+  })
+
   it('已认证状态访问 /login 自动重定向到 /schedule', async () => {
     server.use(
       http.get('/api/auth/session', () =>
@@ -211,4 +232,15 @@ function LogoutProbe() {
       <button onClick={() => void logout()}>退出登录</button>
     </div>
   )
+}
+
+function LogoutFailureProbe() {
+  const { status, logout } = useAuth()
+  const [failure, setFailure] = useState('')
+  if (status === 'checking') return <p>loading…</p>
+  return <div>
+    {status === 'authenticated' && <p data-testid="protected">已登录页面</p>}
+    <button onClick={() => void logout().catch((err: Error) => setFailure(err.message))}>退出登录</button>
+    {failure && <p>{failure}</p>}
+  </div>
 }

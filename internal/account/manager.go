@@ -313,22 +313,24 @@ func (m *Manager) UpdateMetadata(id string, input UpdateAccountInput) (Summary, 
 	if !ok {
 		return Summary{}, fmt.Errorf("账号不存在: %s", id)
 	}
+	updated := copyAccount(acc)
 	if name != nil {
-		acc.Name = *name
+		updated.Name = *name
 	}
 	if email != nil {
-		acc.ICloudEmail = *email
+		updated.ICloudEmail = *email
 	}
 	if host != nil {
-		acc.Host = *host
+		updated.Host = *host
 	}
 	if input.Tags != nil {
-		acc.Tags = *input.Tags
+		updated.Tags = *input.Tags
 	}
-	if err := m.saveAccount(acc); err != nil {
+	if err := m.saveAccount(updated); err != nil {
 		return Summary{}, err
 	}
-	return acc.Summary(), nil
+	m.accounts[id] = updated
+	return updated.Summary(), nil
 }
 
 // UpdateProxy 更新或清除账号代理。空字符串表示清除。
@@ -343,11 +345,13 @@ func (m *Manager) UpdateProxy(id, proxy string) (Summary, error) {
 	if !ok {
 		return Summary{}, fmt.Errorf("账号不存在: %s", id)
 	}
-	acc.Proxy = proxy
-	if err := m.saveAccount(acc); err != nil {
+	updated := copyAccount(acc)
+	updated.Proxy = proxy
+	if err := m.saveAccount(updated); err != nil {
 		return Summary{}, err
 	}
-	return acc.Summary(), nil
+	m.accounts[id] = updated
+	return updated.Summary(), nil
 }
 
 // RemoveAccount 删除账号。

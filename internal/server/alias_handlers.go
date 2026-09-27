@@ -8,6 +8,7 @@
 package server
 
 import (
+	"context"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -45,12 +46,13 @@ func (s *Server) createAliasHandler(c *gin.Context) {
 	if s.syncWorker != nil {
 		s.syncWorker.RegisterAliasAccount(result.Email, req.AccountID)
 	}
-	s.recordLease(req.AccountID, result.Email, "default", "admin_console")
+	auditErr := s.recordLease(req.AccountID, result.Email, "default", "admin_console")
 	ok(c, gin.H{
-		"email":      result.Email,
-		"label":      result.Label,
-		"created_at": result.CreatedAt,
-		"account_id": req.AccountID,
+		"email":          result.Email,
+		"label":          result.Label,
+		"created_at":     result.CreatedAt,
+		"account_id":     req.AccountID,
+		"audit_recorded": auditErr == nil,
 	})
 }
 
@@ -86,7 +88,9 @@ func (s *Server) createAliasBatchHandler(c *gin.Context) {
 		}
 	}
 	for _, item := range result.Created {
-		s.recordLease(req.AccountID, item.Email, "default", "admin_console")
+		if err := s.recordLease(req.AccountID, item.Email, "default", "admin_console"); err != nil {
+			result.AuditFailed = append(result.AuditFailed, item.Email)
+		}
 	}
 	ok(c, result)
 }
@@ -97,36 +101,7 @@ func (s *Server) listAliasesHandler(c *gin.Context) {
 
 	// 全局号池聚合模式: account_id 为空或为 "all"
 	if accountID == "" || strings.EqualFold(accountID, "all") {
-		accounts := s.be.ListAccounts()
-		// Scatter-Gather 并发并行拉取，固定索引槽位有序收集。
-		// 并发上限 10:防止千号场景一次性打出上千个 TLS 请求触发上游风控。
-		//
-		// 【并发红线】并发段内只允许写 results[i] 这种按索引隔离的槽位。
-		// 绝不就地修改 ListAliases/RefreshAliases 返回的切片 —— Backend 实现
-		// 可能返回内部缓存切片，一旦跨账号共享底层数组，就地写入既是数据竞争，
-		// 又会污染缓存。归属字段的填充统一挪到 runBounded 之后的单线程段完成。
-		results := make([][]hme.Alias, len(accounts))
-		tasks := make([]func(), 0, len(accounts))
-		// Go 1.22+ 每次 for 迭代创建新的循环变量副本,闭包捕获安全 (go.mod: go 1.26)
-		for i, acc := range accounts {
-			if acc.Status == "error" || !acc.HasCookies {
-				continue
-			}
-			tasks = append(tasks, func() {
-				var aliases []hme.Alias
-				var err error
-				if refresh {
-					aliases, err = s.be.RefreshAliases(acc.ID)
-				} else {
-					aliases, err = s.be.ListAliases(acc.ID)
-				}
-				if err != nil {
-					return
-				}
-				results[i] = aliases
-			})
-		}
-		runBounded(10, "alias-scatter-gather", tasks)
+		allAliases, failedAccounts := s.gatherAliases(c.Request.Context(), refresh)
 
 		if refresh && s.store != nil {
 			if n, err := s.store.ReconcileAvailableInventory(); err == nil && n > 0 {
@@ -134,27 +109,12 @@ func (s *Server) listAliasesHandler(c *gin.Context) {
 			}
 		}
 
-		// 单线程装配: 到这一步才写归属字段，输入切片全程视为只读。
-		var allAliases []hme.Alias
-		for i, batch := range results {
-			if len(batch) == 0 {
-				continue
-			}
-			accName := accounts[i].Name
-			if accName == "" {
-				accName = accounts[i].RealEmail
-			}
-			for j := range batch {
-				enriched := batch[j]
-				enriched.AccountID = accounts[i].ID
-				enriched.AccountName = accName
-				allAliases = append(allAliases, enriched)
-			}
-		}
 		ok(c, gin.H{
-			"account_id": "all",
-			"count":      len(allAliases),
-			"aliases":    allAliases,
+			"account_id":      "all",
+			"count":           len(allAliases),
+			"aliases":         allAliases,
+			"complete":        len(failedAccounts) == 0,
+			"failed_accounts": failedAccounts,
 		})
 		return
 	}
@@ -163,9 +123,9 @@ func (s *Server) listAliasesHandler(c *gin.Context) {
 	var aliases []hme.Alias
 	var err error
 	if refresh {
-		aliases, err = s.be.RefreshAliases(accountID)
+		aliases, err = s.be.RefreshAliasesContext(c.Request.Context(), accountID)
 	} else {
-		aliases, err = s.be.ListAliases(accountID)
+		aliases, err = s.be.ListAliasesContext(c.Request.Context(), accountID)
 	}
 	if err != nil {
 		backendFail(c, err)
@@ -197,6 +157,53 @@ func (s *Server) listAliasesHandler(c *gin.Context) {
 		"count":      len(enriched),
 		"aliases":    enriched,
 	})
+}
+
+// gatherAliases returns the available rows and the accounts that could not be read.
+func (s *Server) gatherAliases(ctx context.Context, refresh bool) ([]hme.Alias, []string) {
+	accounts := s.be.ListAccounts()
+	results := make([][]hme.Alias, len(accounts))
+	failed := make([]bool, len(accounts))
+	tasks := make([]func(), 0, len(accounts))
+	for i, acc := range accounts {
+		failed[i] = true
+		if acc.Status == "error" || !acc.HasCookies {
+			continue
+		}
+		tasks = append(tasks, func() {
+			var aliases []hme.Alias
+			var err error
+			if refresh {
+				aliases, err = s.be.RefreshAliasesContext(ctx, acc.ID)
+			} else {
+				aliases, err = s.be.ListAliasesContext(ctx, acc.ID)
+			}
+			if err != nil {
+				return
+			}
+			results[i] = aliases
+			failed[i] = false
+		})
+	}
+	runBounded(10, "alias-scatter-gather", tasks)
+	var all []hme.Alias
+	var failedAccounts []string
+	for i, batch := range results {
+		if failed[i] {
+			failedAccounts = append(failedAccounts, accounts[i].ID)
+			continue
+		}
+		accName := accounts[i].Name
+		if accName == "" {
+			accName = accounts[i].RealEmail
+		}
+		for _, item := range batch {
+			item.AccountID = accounts[i].ID
+			item.AccountName = accName
+			all = append(all, item)
+		}
+	}
+	return all, failedAccounts
 }
 
 type aliasActionReq struct {
@@ -357,41 +364,14 @@ func (s *Server) exportAliasesHandler(c *gin.Context) {
 
 	var aliases []hme.Alias
 	if accountID == "" || strings.EqualFold(accountID, "all") {
-		accounts := s.be.ListAccounts()
-		// 【并发红线】与 listAliasesHandler 同规:并发段只写 results[i]，
-		// 归属字段统一留到 runBounded 之后的单线程段填充，输入切片视为只读。
-		results := make([][]hme.Alias, len(accounts))
-		tasks := make([]func(), 0, len(accounts))
-		for i, a := range accounts {
-			if a.Status == "error" || !a.HasCookies {
-				continue
-			}
-			tasks = append(tasks, func() {
-				list, err := s.be.ListAliases(a.ID)
-				if err != nil {
-					return
-				}
-				results[i] = list
-			})
-		}
-		runBounded(10, "alias-export-gather", tasks)
-		for i, batch := range results {
-			if len(batch) == 0 {
-				continue
-			}
-			accName := accounts[i].Name
-			if accName == "" {
-				accName = accounts[i].RealEmail
-			}
-			for j := range batch {
-				enriched := batch[j]
-				enriched.AccountID = accounts[i].ID
-				enriched.AccountName = accName
-				aliases = append(aliases, enriched)
-			}
+		var failedAccounts []string
+		aliases, failedAccounts = s.gatherAliases(c.Request.Context(), false)
+		if len(failedAccounts) > 0 {
+			failCode(c, http.StatusBadGateway, "INCOMPLETE_EXPORT", "部分账号别名读取失败，导出已取消: "+strings.Join(failedAccounts, ", "))
+			return
 		}
 	} else {
-		list, err := s.be.ListAliases(accountID)
+		list, err := s.be.ListAliasesContext(c.Request.Context(), accountID)
 		if err != nil {
 			backendFail(c, err)
 			return

@@ -38,12 +38,12 @@ func TestPR07_MigratedDatabaseContainsNoPlaintextSecrets(t *testing.T) {
 	dbPath := filepath.Join(dir, "icloud_hme.db")
 
 	const (
-		sentinelToken       = "PLAINTEXT_SECRET_TOKEN_SENTINEL_998877"
-		sentinelCookie      = "PLAINTEXT_COOKIE_VALUE_SENTINEL_112233"
-		sentinelAppPass     = "PLAINTEXT_APP_PASSWORD_SENTINEL_445566"
-		sentinelMailPass    = "PLAINTEXT_MAIL_PASSWORD_SENTINEL_778899"
-		sentinelProxy       = "PLAINTEXT_PROXY_AUTH_SENTINEL_AABBCC"
-		sentinelNotifyHook  = "https://feishu.example.com/hook/PLAINTEXT_NOTIFY_SENTINEL_DDEEFF"
+		sentinelToken      = "PLAINTEXT_SECRET_TOKEN_SENTINEL_998877"
+		sentinelCookie     = "PLAINTEXT_COOKIE_VALUE_SENTINEL_112233"
+		sentinelAppPass    = "PLAINTEXT_APP_PASSWORD_SENTINEL_445566"
+		sentinelMailPass   = "PLAINTEXT_MAIL_PASSWORD_SENTINEL_778899"
+		sentinelProxy      = "PLAINTEXT_PROXY_AUTH_SENTINEL_AABBCC"
+		sentinelNotifyHook = "https://feishu.example.com/hook/PLAINTEXT_NOTIFY_SENTINEL_DDEEFF"
 	)
 
 	// 1. 手工构造一个 V1 数据库 (含明文 token 列和明文凭据)
@@ -569,9 +569,9 @@ func TestPR07_V2CleanupFailureDoesNotFinalizeSchemaVersion(t *testing.T) {
 		t.Fatalf("移除故障后重试 NewStoreWithCipher 失败: %v", err)
 	}
 
-	// 7. 检查 user_version == 2
-	if err := stSuccess.db.QueryRow("PRAGMA user_version;").Scan(&v); err != nil || v != 2 {
-		t.Fatalf("重试成功后 user_version 必须为 2，当前为: %d (err: %v)", v, err)
+	// 7. 检查所有迁移均已完成
+	if err := stSuccess.db.QueryRow("PRAGMA user_version;").Scan(&v); err != nil || v != CurrentSchemaVersion {
+		t.Fatalf("重试成功后 user_version 必须为 %d，当前为: %d (err: %v)", CurrentSchemaVersion, v, err)
 	}
 
 	// 验证业务能通过解密读取数据
@@ -828,4 +828,3 @@ func TestPR07_RotationRejectsSameMasterKey(t *testing.T) {
 		t.Fatalf("期望错误提示 'new master key must differ from current master key'，实际为: %v", err)
 	}
 }
-

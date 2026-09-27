@@ -280,20 +280,6 @@ export default function SchedulePage() {
 
   const handleApplyPreset = useCallback(
     (accountId: string, presetVal: string) => {
-      const cfg = configsRef.current[accountId]
-      const updated = {
-        ...(cfg || {
-          account_id: accountId,
-          enabled: false,
-          hourly_quota: 5,
-          current_hour_count: 0,
-        }),
-        alias_label: presetVal,
-      }
-      setConfigs((prev) => ({
-        ...prev,
-        [accountId]: updated,
-      }))
       void handleUpdateLabel(accountId, presetVal)
     },
     [handleUpdateLabel],

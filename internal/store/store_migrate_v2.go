@@ -110,7 +110,7 @@ func (s *Store) migrateV1ToV2() error {
 		return fmt.Errorf("写入 schema user_version 2 失败: %w", err)
 	}
 
-	if err := validateSchema(s.db); err != nil {
+	if err := validateSchemaVersion(s.db, 2); err != nil {
 		return fmt.Errorf("v2 schema validation failed: %w", err)
 	}
 

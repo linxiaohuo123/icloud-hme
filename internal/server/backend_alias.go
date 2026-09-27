@@ -33,6 +33,7 @@ type BatchCreateResult struct {
 	RemainingThisHour int                `json:"remaining_this_hour"`
 	Message           string             `json:"message,omitempty"`
 	LastError         string             `json:"last_error,omitempty"`
+	AuditFailed       []string           `json:"audit_failed,omitempty"`
 }
 
 // BatchUpdateResult 批量修改别名备注结果。

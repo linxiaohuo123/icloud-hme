@@ -41,6 +41,7 @@ HTTP JSON API，所有接口均采用标准 JSON 格式交互。
 | `UPSTREAM_FAILURE` | 502 | Apple 网关异常或 IMAP 连接超时拒绝 |
 | `PROXY_CHECK_FAILED` | 502 | 代理服务器不可达、认证失败或无法建立外部隧道 |
 | `INTERNAL_ERROR` | 500 | 服务端底层存储或系统不可用 |
+| `INCOMPLETE_EXPORT` | 502 | 全量别名导出时至少一个账号读取失败，未生成导出文件 |
 
 ### 安全与鉴权约定
 
@@ -136,6 +137,9 @@ X-CSRF-Token: <token>
   }
 }
 ```
+撤销记录会持久化；若写库失败，接口返回 500 且不会清除 Cookie，客户端应提示重试。
+首次升级到持久撤销版本时，旧版管理员 Cookie 会失效，需要重新登录一次。
+现有 v2 数据库启动时自动迁移到 v3，创建会话撤销表，并在迁移前生成数据库备份。
 
 ---
 
@@ -318,10 +322,12 @@ Content-Type: application/json
     "email": "fresh_user_8912@icloud.com",
     "label": "GitHub注册",
     "created_at": "2026-09-20T14:20:10+08:00",
-    "account_id": "acc_1"
+    "account_id": "acc_1",
+    "audit_recorded": true
   }
 }
 ```
+`audit_recorded=false` 表示 Apple 已创建该别名，但本地出号流水写入失败；不要重复创建，应记录返回的邮箱并排查存储故障。
 
 ### 14. 智能一键出号 / 分销分配 (号池优先 / 注册机首选推荐)
 
@@ -383,7 +389,7 @@ Content-Type: application/json
 {
   "account_id": "acc_1",
   "count": 3,
-  "note": "批量任务"
+  "label_prefix": "批量任务"
 }
 ```
 - `count`：1–5（单次请求强制钳制在 5 个以内，规避 Apple 突发风控）。
@@ -394,17 +400,18 @@ Content-Type: application/json
   "success": true,
   "data": {
     "account_id": "acc_1",
-    "count": 3,
-    "success": 3,
-    "emails": [
-      "user_alpha@icloud.com",
-      "user_beta@icloud.com",
-      "user_gamma@icloud.com"
-    ],
-    "errors": []
+    "requested": 3,
+    "created_count": 3,
+    "skipped_count": 0,
+    "created": [
+      {"email": "user_alpha@icloud.com", "label": "批量任务 1", "created_at": "2026-09-20T14:20:10Z"},
+      {"email": "user_beta@icloud.com", "label": "批量任务 2", "created_at": "2026-09-20T14:20:11Z"},
+      {"email": "user_gamma@icloud.com", "label": "批量任务 3", "created_at": "2026-09-20T14:20:12Z"}
+    ]
   }
 }
 ```
+若某个已创建别名的流水写入失败，响应会额外包含 `audit_failed` 邮箱数组；这些邮箱已经在 Apple 创建，不应重复申请。
 
 ### 16. 自动化创建作业生命周期 (Create Jobs)
 
@@ -785,6 +792,8 @@ Authorization: Bearer <TOKEN>
 
 ### 23. 获取账号下别名列表
 
+`account_id=all` 或留空时聚合全部账号。响应额外包含 `complete` 和 `failed_accounts`；`complete=false` 时 `count` 仅表示已成功读取的别名数，不能视为全量。
+
 ```http
 GET /api/aliases?account_id=acc_1
 Authorization: Bearer <API_KEY>
@@ -817,7 +826,7 @@ Authorization: Bearer <API_KEY>
 GET /api/aliases/export?account_id=all&format=csv
 Authorization: Bearer <API_KEY>
 ```
-- `account_id`：母账号 ID，传入 `all` 或留空可合并导出系统中所有健康账号的全部别名。
+- `account_id`：母账号 ID，传入 `all` 或留空可合并导出系统中所有账号的别名；任何账号读取失败时返回 `502 INCOMPLETE_EXPORT`，不输出不完整文件。
 - `format`：`csv`（默认，带 UTF-8 BOM，Excel 直接双击不乱码）或 `json`。
 
 ### 25. 编辑别名标签与备注
@@ -973,7 +982,7 @@ Content-Type: application/json
 
 记录全站每一个被分配出的别名流水与归属 Token（定时调度产出同样入账，`token_name` 为 `scheduler`）：
 
-- `GET /api/leases?alias=...&tag=...&status=...&limit=20&offset=0`：分页多维检索出号流水与交付状态（`limit` 上限 500）
+- `GET /api/leases?alias=...&tag=...&status=...&limit=20&offset=0`：`alias` 同时搜索别名邮箱和账号 ID，分页检索出号流水与交付状态（`limit` 上限 500；查询故障返回 500）
 - `PATCH /api/leases/:id/status`：更新流水状态 `{"status": "completed"}`（仅接受 `completed` / `leased` / `abandoned`）
 
 ### 34. 定时调度配置与运行大盘 (Schedules)

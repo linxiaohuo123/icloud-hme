@@ -398,10 +398,11 @@ export default function AccountWorkspace() {
             open={createAliasOpen}
             accountId={account.id}
             onClose={() => setCreateAliasOpen(false)}
-            onCreated={() => {
+            onCreated={(email, auditRecorded) => {
               setCreateAliasOpen(false)
               invalidateAccounts(account.id)
               void loadAccountData()
+              if (!auditRecorded) show(`别名 ${email} 已创建，但出号流水写入失败，请勿重复创建`)
             }}
           />
           {confirmDeleteAlias && (

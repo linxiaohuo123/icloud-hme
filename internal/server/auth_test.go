@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -149,7 +150,7 @@ func TestAuthSessionFlow(t *testing.T) {
 // TestAuthLogout 验证退出后同一 Cookie 立即失效。
 func TestAuthLogout(t *testing.T) {
 	f := &fakeBackend{}
-	_, ts := newTestServer(f)
+	s, ts := newTestServer(f)
 	defer ts.Close()
 
 	sess, csrf := login(t, ts, "admin-pass-2026-strong")
@@ -168,6 +169,16 @@ func TestAuthLogout(t *testing.T) {
 	status, _, _ = do(t, req)
 	if status != http.StatusUnauthorized {
 		t.Fatalf("退出后 GET 期望 401,得到 %d", status)
+	}
+
+	restarted := newWithBackendAndStore(f, Config{AdminPassword: "admin-pass-2026-strong"}, s.store)
+	tsAfterRestart := httptest.NewServer(restarted.Handler())
+	defer tsAfterRestart.Close()
+	req = authedReq(t, tsAfterRestart, "GET", "/api/accounts", "")
+	req.AddCookie(&http.Cookie{Name: "hme_session", Value: sess})
+	status, _, _ = do(t, req)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("重建服务后旧 Cookie 应保持失效,得到 %d", status)
 	}
 }
 

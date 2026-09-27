@@ -14,7 +14,7 @@ import {
   useState,
   type ReactNode,
 } from 'react'
-import { request, registerUnauthorizedHandler, setCSRFToken } from '../api/client'
+import { ApiError, request, registerUnauthorizedHandler, setCSRFToken } from '../api/client'
 import type { LoginResult } from '../api/types'
 
 type AuthStatus = 'checking' | 'anonymous' | 'authenticated'
@@ -62,8 +62,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = useCallback(async () => {
     try {
       await request('/api/auth/logout', { method: 'POST' })
-    } catch {
-      // 无论请求结果如何都清空本地状态
+    } catch (err) {
+      if (!(err instanceof ApiError && err.status === 401 && err.code === 'AUTH_REQUIRED')) {
+        throw err
+      }
     }
     setCSRFToken(null)
     setStatus('anonymous')

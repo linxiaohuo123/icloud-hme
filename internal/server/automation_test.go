@@ -224,7 +224,10 @@ func TestExternalAllocateAndVerifyRoutes(t *testing.T) {
 	}
 
 	// 2. 验证流水中正确记录了 TokenName
-	leases, total := st.ListLeases("", "chatgpt", "", 10, 0)
+	leases, total, err := st.ListLeases("", "chatgpt", "", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if total == 0 || len(leases) == 0 {
 		t.Fatalf("期望记录出号流水，实际未找到")
 	}

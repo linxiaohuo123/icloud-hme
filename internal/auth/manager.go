@@ -37,10 +37,17 @@ const (
 
 // Options 是 Manager 的构造选项。
 type Options struct {
-	Password string
-	TTL      time.Duration
-	Now      func() time.Time
-	Random   io.Reader
+	Password    string
+	TTL         time.Duration
+	Now         func() time.Time
+	Random      io.Reader
+	Revocations RevocationStore
+}
+
+// RevocationStore keeps revoked sessions invalid across process restarts.
+type RevocationStore interface {
+	RevokeSession([32]byte, time.Time) error
+	IsSessionRevoked([32]byte) (bool, error)
 }
 
 // Session 是一次管理员会话的公开信息。
@@ -67,6 +74,7 @@ type Manager struct {
 	random      io.Reader
 	sessions    map[[32]byte]sessionRecord
 	blacklisted map[[32]byte]time.Time
+	revocations RevocationStore
 }
 
 // NewManager 创建会话管理器。
@@ -94,7 +102,7 @@ func NewManager(opts Options) (*Manager, error) {
 	// argon2id: time=1, memory=64*1024 KiB, threads=4, keyLen=32
 	derived := argon2.IDKey([]byte(opts.Password), salt, 1, 64*1024, 4, 32)
 
-	signKeyHash := sha256.Sum256([]byte("icloud-hme-session-sign-key:" + opts.Password))
+	signKeyHash := sha256.Sum256([]byte("icloud-hme-session-sign-key:v2:" + opts.Password))
 	signKey := signKeyHash[:]
 
 	return &Manager{
@@ -106,19 +114,20 @@ func NewManager(opts Options) (*Manager, error) {
 		random:      opts.Random,
 		sessions:    make(map[[32]byte]sessionRecord),
 		blacklisted: make(map[[32]byte]time.Time),
+		revocations: opts.Revocations,
 	}, nil
 }
 
 // Login 校验管理员密码;成功时创建会话并返回 session ID。
-func (m *Manager) Login(password string) (sessionID string, session Session, ok bool) {
+func (m *Manager) Login(password string) (sessionID string, session Session, ok bool, err error) {
 	derived := argon2.IDKey([]byte(password), m.salt, 1, 64*1024, 4, 32)
 	if subtle.ConstantTimeCompare(derived, m.password) != 1 {
-		return "", Session{}, false
+		return "", Session{}, false, nil
 	}
 
 	idBytes := make([]byte, 24)
 	if _, err := io.ReadFull(m.random, idBytes); err != nil {
-		return "", Session{}, false
+		return "", Session{}, false, fmt.Errorf("生成会话 ID 失败: %w", err)
 	}
 	expiresAt := m.now().Add(m.ttl)
 	expStr := strconv.FormatInt(expiresAt.Unix(), 10)
@@ -136,10 +145,12 @@ func (m *Manager) Login(password string) (sessionID string, session Session, ok 
 	m.pruneLocked()
 	// 会话数达到上限时淘汰最早过期的会话,防止内存无界增长
 	if len(m.sessions) >= maxSessions {
-		m.evictOldestLocked()
+		if err := m.evictOldestLocked(); err != nil {
+			return "", Session{}, false, fmt.Errorf("持久化会话淘汰失败: %w", err)
+		}
 	}
 	if _, exists := m.sessions[key]; exists {
-		return "", Session{}, false
+		return "", Session{}, false, fmt.Errorf("会话 ID 冲突")
 	}
 	m.sessions[key] = sessionRecord{
 		csrfHash:  sha256.Sum256([]byte(token)),
@@ -147,7 +158,7 @@ func (m *Manager) Login(password string) (sessionID string, session Session, ok 
 		expiresAt: expiresAt,
 	}
 
-	return sessionID, Session{CSRFToken: token, ExpiresAt: expiresAt}, true
+	return sessionID, Session{CSRFToken: token, ExpiresAt: expiresAt}, true, nil
 }
 
 // Validate 校验会话是否有效;支持服务重启后的签名自愈。
@@ -192,6 +203,12 @@ func (m *Manager) Validate(sessionID string) (Session, bool) {
 	if subtle.ConstantTimeCompare([]byte(parts[2]), []byte(expectedSig)) != 1 {
 		return Session{}, false
 	}
+	if m.revocations != nil {
+		revoked, err := m.revocations.IsSessionRevoked(key)
+		if err != nil || revoked {
+			return Session{}, false
+		}
+	}
 
 	// 签名合法，派生确定性 CSRF Token 并写回内存缓存
 	csrfToken := deriveCSRFToken(m.signKey, sessionID)
@@ -225,16 +242,22 @@ func (m *Manager) ValidateCSRF(sessionID, token string) bool {
 }
 
 // Logout 删除会话。
-func (m *Manager) Logout(sessionID string) {
+func (m *Manager) Logout(sessionID string) error {
 	key := sha256.Sum256([]byte(sessionID))
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	expiresAt := m.now().Add(m.ttl)
 	if rec, exists := m.sessions[key]; exists {
-		m.blacklisted[key] = rec.expiresAt
-		delete(m.sessions, key)
-	} else {
-		m.blacklisted[key] = m.now().Add(m.ttl)
+		expiresAt = rec.expiresAt
 	}
+	if m.revocations != nil {
+		if err := m.revocations.RevokeSession(key, expiresAt); err != nil {
+			return err
+		}
+	}
+	m.blacklisted[key] = expiresAt
+	delete(m.sessions, key)
+	return nil
 }
 
 // pruneLocked 清理所有过期会话,须持锁调用。
@@ -253,7 +276,7 @@ func (m *Manager) pruneLocked() {
 }
 
 // evictOldestLocked 淘汰最早过期的会话,须持锁调用。
-func (m *Manager) evictOldestLocked() {
+func (m *Manager) evictOldestLocked() error {
 	oldest := time.Time{}
 	var oldestKey [32]byte
 	for key, rec := range m.sessions {
@@ -263,7 +286,13 @@ func (m *Manager) evictOldestLocked() {
 		}
 	}
 	if !oldest.IsZero() {
+		if m.revocations != nil {
+			if err := m.revocations.RevokeSession(oldestKey, oldest); err != nil {
+				return err
+			}
+		}
 		m.blacklisted[oldestKey] = oldest
 		delete(m.sessions, oldestKey)
 	}
+	return nil
 }

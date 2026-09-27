@@ -178,13 +178,14 @@ func (s *Store) PruneLeases(cutoff time.Time, batch int) (int, error) {
 // 已用别名流水 Leases
 // ────────────────────────────────────────────────────────────────
 
-func (s *Store) ListLeases(aliasQuery, tagQuery, statusQuery string, limit, offset int) ([]LeaseRecord, int) {
+func (s *Store) ListLeases(aliasQuery, tagQuery, statusQuery string, limit, offset int) ([]LeaseRecord, int, error) {
 	whereClauses := []string{"1=1"}
 	args := []any{}
 
 	if aliasQuery != "" {
-		whereClauses = append(whereClauses, "LOWER(email) LIKE ?")
-		args = append(args, "%"+strings.ToLower(aliasQuery)+"%")
+		whereClauses = append(whereClauses, "(LOWER(email) LIKE ? OR LOWER(account_id) LIKE ?)")
+		search := "%" + strings.ToLower(aliasQuery) + "%"
+		args = append(args, search, search)
 	}
 	if tagQuery != "" && tagQuery != "all" {
 		whereClauses = append(whereClauses, "LOWER(tag) = LOWER(?)")
@@ -199,10 +200,12 @@ func (s *Store) ListLeases(aliasQuery, tagQuery, statusQuery string, limit, offs
 
 	var total int
 	countQuery := "SELECT COUNT(*) FROM lease_records WHERE " + whereSQL
-	_ = s.db.QueryRow(countQuery, args...).Scan(&total)
+	if err := s.db.QueryRow(countQuery, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count leases: %w", err)
+	}
 
 	if total == 0 || offset >= total {
-		return []LeaseRecord{}, total
+		return []LeaseRecord{}, total, nil
 	}
 
 	if limit <= 0 {
@@ -213,22 +216,22 @@ func (s *Store) ListLeases(aliasQuery, tagQuery, statusQuery string, limit, offs
 
 	rows, err := s.db.Query(query, queryArgs...)
 	if err != nil {
-		return []LeaseRecord{}, total
+		return nil, 0, fmt.Errorf("query leases: %w", err)
 	}
 	defer rows.Close()
 
 	records := make([]LeaseRecord, 0, limit)
 	for rows.Next() {
 		var rec LeaseRecord
-		if err := rows.Scan(&rec.ID, &rec.Email, &rec.AccountID, &rec.Tag, &rec.Status, &rec.AllocatedAt, &rec.CompletedAt, &rec.TokenName); err == nil {
-			records = append(records, rec)
+		if err := rows.Scan(&rec.ID, &rec.Email, &rec.AccountID, &rec.Tag, &rec.Status, &rec.AllocatedAt, &rec.CompletedAt, &rec.TokenName); err != nil {
+			return nil, 0, fmt.Errorf("scan lease: %w", err)
 		}
+		records = append(records, rec)
 	}
-	// 【BUG-05 修复】迭代中断时记录日志
 	if err := rows.Err(); err != nil {
-		log.Printf("[Store] ListLeases 迭代中断: %v", err)
+		return nil, 0, fmt.Errorf("iterate leases: %w", err)
 	}
-	return records, total
+	return records, total, nil
 }
 
 func (s *Store) RecordLease(rec LeaseRecord) error {
@@ -242,14 +245,23 @@ func (s *Store) RecordLease(rec LeaseRecord) error {
 		rec.Status = "completed"
 	}
 	rec.Email = normalizeEmail(rec.Email)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 	query := `INSERT INTO lease_records (id, email, account_id, tag, status, allocated_at, completed_at, token_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-	if _, err := s.db.Exec(query, rec.ID, rec.Email, rec.AccountID, rec.Tag, rec.Status, rec.AllocatedAt, rec.CompletedAt, rec.TokenName); err != nil {
+	if _, err := tx.Exec(query, rec.ID, rec.Email, rec.AccountID, rec.Tag, rec.Status, rec.AllocatedAt, rec.CompletedAt, rec.TokenName); err != nil {
 		return err
 	}
 	if rec.AccountID != "" && rec.Email != "" {
-		_ = s.UpsertAliasRoutes(rec.AccountID, []string{rec.Email})
+		if _, err := tx.Exec(`INSERT INTO alias_routes (email, account_id, updated_at) VALUES (?, ?, ?)
+			ON CONFLICT(email) DO UPDATE SET account_id = excluded.account_id, updated_at = excluded.updated_at`,
+			rec.Email, rec.AccountID, time.Now().Format(time.RFC3339)); err != nil {
+			return err
+		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // normalizeEmail 归一化邮箱用于等值比较与索引匹配。

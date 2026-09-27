@@ -448,6 +448,82 @@ func TestListAliasesHandler(t *testing.T) {
 	}
 }
 
+func TestGlobalAliasesReportsPartialResultsAndBlocksExport(t *testing.T) {
+	f := &fakeBackend{
+		accounts: []account.Summary{
+			{ID: "acc_ok", Name: "OK", Status: "active", HasCookies: true},
+			{ID: "acc_failed", Name: "Failed", Status: "active", HasCookies: true},
+		},
+		onListAliases: func(id string) ([]hme.Alias, error) {
+			if id == "acc_failed" {
+				return nil, fmt.Errorf("upstream unavailable")
+			}
+			return []hme.Alias{{Email: "ok@icloud.com"}}, nil
+		},
+	}
+	s := newWithBackend(f, Config{AdminPassword: "admin-pass-2026-strong"})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+	sess, _ := login(t, ts, "admin-pass-2026-strong")
+
+	req := authedReq(t, ts, "GET", "/api/aliases?account_id=all&refresh=true", "")
+	req.AddCookie(&http.Cookie{Name: "hme_session", Value: sess})
+	status, body, _ := do(t, req)
+	if status != http.StatusOK {
+		t.Fatalf("partial list status=%d body=%s", status, body)
+	}
+	var listed struct {
+		Data struct {
+			Count          int      `json:"count"`
+			Complete       bool     `json:"complete"`
+			FailedAccounts []string `json:"failed_accounts"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(body), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if listed.Data.Count != 1 || listed.Data.Complete || len(listed.Data.FailedAccounts) != 1 || listed.Data.FailedAccounts[0] != "acc_failed" {
+		t.Fatalf("partial state missing: %+v", listed.Data)
+	}
+
+	req = authedReq(t, ts, "GET", "/api/aliases/export?account_id=all&format=csv", "")
+	req.AddCookie(&http.Cookie{Name: "hme_session", Value: sess})
+	status, body, _ = do(t, req)
+	if status != http.StatusBadGateway || !strings.Contains(body, "INCOMPLETE_EXPORT") {
+		t.Fatalf("incomplete export should fail: status=%d body=%s", status, body)
+	}
+}
+
+func TestCreateAliasReportsAuditFailureWithoutHidingCreatedAlias(t *testing.T) {
+	f := &fakeBackend{created: &hme.CreateResult{Email: "created@icloud.com", Label: "test"}}
+	s := newWithBackend(f, Config{AdminPassword: "admin-pass-2026-strong"})
+	if _, err := s.store.DB().Exec(`CREATE TRIGGER fail_lease BEFORE INSERT ON lease_records BEGIN SELECT RAISE(FAIL, 'injected failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+	sess, csrf := login(t, ts, "admin-pass-2026-strong")
+	req := authedReq(t, ts, "POST", "/api/create", `{"account_id":"acc_1","label":"test"}`)
+	req.AddCookie(&http.Cookie{Name: "hme_session", Value: sess})
+	req.Header.Set("X-CSRF-Token", csrf)
+	status, body, _ := do(t, req)
+	if status != http.StatusOK {
+		t.Fatalf("created alias result must remain available: status=%d body=%s", status, body)
+	}
+	var result struct {
+		Data struct {
+			Email         string `json:"email"`
+			AuditRecorded bool   `json:"audit_recorded"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(body), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Data.Email != "created@icloud.com" || result.Data.AuditRecorded {
+		t.Fatalf("audit failure was hidden: %+v", result.Data)
+	}
+}
+
 // TestAddAndUpdateAccountTags 验证在添加和修改账号时正确持久化和更新 Tags。
 func TestAddAndUpdateAccountTags(t *testing.T) {
 	dir := t.TempDir()

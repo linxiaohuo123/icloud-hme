@@ -15,8 +15,8 @@ import (
 	"time"
 )
 
-// CurrentSchemaVersion 数据库正式版本基线 (PR-07 版本为 2)
-const CurrentSchemaVersion = 2
+// CurrentSchemaVersion 数据库正式版本基线
+const CurrentSchemaVersion = 3
 
 type schemaExecutor interface {
 	Exec(query string, args ...any) (sql.Result, error)
@@ -628,13 +628,17 @@ func backfillAliasRoutesTx(tx *sql.Tx) error {
 
 // validateSchema 校验数据库结构完整性
 func validateSchema(db *sql.DB) error {
+	return validateSchemaVersion(db, CurrentSchemaVersion)
+}
+
+func validateSchemaVersion(db *sql.DB, expectedVersion int) error {
 	// 1. 检查 user_version
 	var v int
 	if err := db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
 		return fmt.Errorf("schema validation failed: check user_version error: %w", err)
 	}
-	if v != CurrentSchemaVersion {
-		return fmt.Errorf("schema validation failed: expected user_version %d, got %d", CurrentSchemaVersion, v)
+	if v != expectedVersion {
+		return fmt.Errorf("schema validation failed: expected user_version %d, got %d", expectedVersion, v)
 	}
 
 	// 2. 检查关键表
@@ -651,6 +655,9 @@ func validateSchema(db *sql.DB) error {
 		"operations",
 		"hme_reserve_intents",
 		"verification_requests",
+	}
+	if expectedVersion >= 3 {
+		requiredTables = append(requiredTables, "revoked_sessions")
 	}
 	for _, tbl := range requiredTables {
 		var count int
@@ -691,6 +698,12 @@ func validateSchema(db *sql.DB) error {
 		{"verification_requests", "magic_link"},
 		{"verification_requests", "baseline_uidvalidity"},
 		{"verification_requests", "code"},
+	}
+	if expectedVersion >= 3 {
+		requiredCols = append(requiredCols,
+			struct{ table, col string }{"revoked_sessions", "session_hash"},
+			struct{ table, col string }{"revoked_sessions", "expires_at"},
+		)
 	}
 	for _, rc := range requiredCols {
 		has, err := tableHasColumn(db, rc.table, rc.col)

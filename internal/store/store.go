@@ -320,6 +320,25 @@ func (s *Store) initSchema(dbExistedBefore bool) error {
 			if err := s.migrateV1ToV2(); err != nil {
 				return fmt.Errorf("migrate v1 to v2 failed: %w", err)
 			}
+		case 2:
+			tx, err := s.db.Begin()
+			if err != nil {
+				return fmt.Errorf("begin migration v2 to v3 tx failed: %w", err)
+			}
+			if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS revoked_sessions (
+				session_hash BLOB PRIMARY KEY,
+				expires_at INTEGER NOT NULL
+			)`); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migrate v2 to v3 failed: %w", err)
+			}
+			if _, err := tx.Exec("PRAGMA user_version = 3;"); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("set schema version 3 failed: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit migration v2 to v3 tx failed: %w", err)
+			}
 		default:
 			return fmt.Errorf("unsupported migration path from version %d", currentV)
 		}

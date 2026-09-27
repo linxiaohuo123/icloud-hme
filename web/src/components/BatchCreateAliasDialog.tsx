@@ -224,6 +224,12 @@ export default function BatchCreateAliasDialog({
             </div>
           )}
 
+          {result.audit_failed && result.audit_failed.length > 0 && (
+            <div className="alert-error" role="alert" style={{ marginBottom: 16 }}>
+              已生成但未写入出号记录：{result.audit_failed.join('、')}。请勿重复创建。
+            </div>
+          )}
+
           <div className="form-actions" style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
             <button type="button" className="btn btn-primary" onClick={handleClose}>
               完成

@@ -13,7 +13,7 @@ interface CreateAliasDialogProps {
   accountId: string
   open: boolean
   onClose: () => void
-  onCreated: (email: string) => void
+  onCreated: (email: string, auditRecorded: boolean) => void
 }
 
 /** 创建别名对话框 */
@@ -36,12 +36,12 @@ export default function CreateAliasDialog({
     setSubmitting(true)
     setError('')
     try {
-      const data = await request<{ email: string }>('/api/create', {
+      const data = await request<{ email: string; audit_recorded?: boolean }>('/api/create', {
         method: 'POST',
         body: JSON.stringify({ account_id: accountId, label: label.trim() }),
       })
       setLabel('')
-      onCreated(data.email)
+      onCreated(data.email, data.audit_recorded !== false)
     } catch (err) {
       setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
     } finally {

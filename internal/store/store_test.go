@@ -8,6 +8,7 @@
 package store
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,104 @@ import (
 	"testing"
 	"time"
 )
+
+func TestRevokedSessionPersistsAcrossStoreRestart(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte("session-token"))
+	if err := st.RevokeSession(hash, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if revoked, err := reopened.IsSessionRevoked(hash); err != nil || !revoked {
+		t.Fatalf("revocation lost after restart: revoked=%v err=%v", revoked, err)
+	}
+}
+
+func TestRevocationMigrationFromExistingV2(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordLease(LeaseRecord{Email: "existing@icloud.com", AccountID: "acc_existing", Tag: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().Exec(`DROP TABLE revoked_sessions`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().Exec(`PRAGMA user_version = 2`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("existing v2 database failed to upgrade: %v", err)
+	}
+	defer upgraded.Close()
+	var version int
+	if err := upgraded.DB().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != CurrentSchemaVersion {
+		t.Fatalf("schema version = %d, err = %v", version, err)
+	}
+	if got := upgraded.CountLeases(); got != 1 {
+		t.Fatalf("existing lease lost during migration: %d", got)
+	}
+	hash := sha256.Sum256([]byte("upgraded-session"))
+	if err := upgraded.RevokeSession(hash, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("revocation table missing after migration: %v", err)
+	}
+}
+
+func TestListLeasesSearchAndDatabaseFailure(t *testing.T) {
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.RecordLease(LeaseRecord{Email: "alias@icloud.com", AccountID: "acc_search_target", Tag: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	records, total, err := st.ListLeases("search_target", "", "", 10, 0)
+	if err != nil || total != 1 || len(records) != 1 {
+		t.Fatalf("account ID search failed: total=%d rows=%d err=%v", total, len(records), err)
+	}
+	if _, err := st.DB().Exec(`DROP TABLE lease_records`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.ListLeases("", "", "", 10, 0); err == nil {
+		t.Fatal("database query failure must be returned")
+	}
+}
+
+func TestRecordLeaseRollsBackWhenRouteWriteFails(t *testing.T) {
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.DB().Exec(`CREATE TRIGGER fail_route BEFORE INSERT ON alias_routes BEGIN SELECT RAISE(FAIL, 'injected route failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordLease(LeaseRecord{Email: "alias@icloud.com", AccountID: "acc_1", Tag: "default"}); err == nil {
+		t.Fatal("route write failure must abort lease insert")
+	}
+	if got := st.CountLeases(); got != 0 {
+		t.Fatalf("lease insert was not rolled back: %d", got)
+	}
+}
 
 const testMasterKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
@@ -429,7 +528,10 @@ func TestStorePersistence(t *testing.T) {
 	if err := s.RecordLease(lease); err != nil {
 		t.Fatalf("RecordLease failed: %v", err)
 	}
-	records, total := s.ListLeases("", "gpt-register", "all", 10, 0)
+	records, total, err := s.ListLeases("", "gpt-register", "all", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if total != 1 || len(records) != 1 {
 		t.Fatalf("ListLeases failed: count=%d, total=%d", len(records), total)
 	}
@@ -490,7 +592,10 @@ func TestStoreMigration(t *testing.T) {
 		t.Fatalf("Migrated tokens mismatch: %+v", tokens)
 	}
 
-	leases, total := s.ListLeases("", "", "all", 10, 0)
+	leases, total, err := s.ListLeases("", "", "all", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if total != 1 || len(leases) != 1 || leases[0].Email != "legacy@icloud.com" {
 		t.Fatalf("Migrated leases mismatch: total=%d, leases=%+v", total, leases)
 	}
@@ -562,19 +667,28 @@ func TestStoreLeasePagination(t *testing.T) {
 	}
 
 	// 分页查询第一页 (50 条)
-	p1, total := s.ListLeases("", "batch-test", "completed", 50, 0)
+	p1, total, err := s.ListLeases("", "batch-test", "completed", 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if total != 150 || len(p1) != 50 {
 		t.Fatalf("Page 1 mismatch: total=%d, len=%d", total, len(p1))
 	}
 
 	// 分页查询最后一页 (50 条)
-	p3, total3 := s.ListLeases("", "batch-test", "completed", 50, 100)
+	p3, total3, err := s.ListLeases("", "batch-test", "completed", 50, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if total3 != 150 || len(p3) != 50 {
 		t.Fatalf("Page 3 mismatch: total=%d, len=%d", total3, len(p3))
 	}
 
 	// 越界查询
-	empty, totalEmpty := s.ListLeases("", "batch-test", "completed", 50, 200)
+	empty, totalEmpty, err := s.ListLeases("", "batch-test", "completed", 50, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if totalEmpty != 150 || len(empty) != 0 {
 		t.Fatalf("Out of bounds mismatch: total=%d, len=%d", totalEmpty, len(empty))
 	}
@@ -624,7 +738,7 @@ func BenchmarkListLeases(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = s.ListLeases("", "bench", "completed", 50, 0)
+		_, _, _ = s.ListLeases("", "bench", "completed", 50, 0)
 	}
 }
 
@@ -753,7 +867,10 @@ func TestStoreUpdateLeaseStatusCaseInsensitive(t *testing.T) {
 		t.Fatalf("UpdateLeaseStatus with uppercase email failed: %v", err)
 	}
 
-	leases, _ := s.ListLeases("", "test", "completed", 10, 0)
+	leases, _, err := s.ListLeases("", "test", "completed", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(leases) != 1 || leases[0].Email != "mixedcase.user@example.com" {
 		t.Fatalf("期望查到状态已更新为 completed 的流水, 实际: %+v", leases)
 	}

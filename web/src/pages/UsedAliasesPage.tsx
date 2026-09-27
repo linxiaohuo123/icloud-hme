@@ -28,6 +28,8 @@ import { formatDate, formatFullDate, formatRelativeTime, parseDate } from '../ut
 /** 领用状态 → 中文文案 + 语义色；未收录的状态一律走中性徽章，绝不误报绿色 */
 const STATUS_META: Record<string, { label: string; pill: string }> = {
   completed: { label: '已完成', pill: 'active' },
+  leased: { label: '已领用', pill: 'pending' },
+  abandoned: { label: '已放弃', pill: 'error' },
   allocated: { label: '已分配', pill: 'pending' },
   used: { label: '已使用', pill: 'pending' },
   revoked: { label: '已废弃', pill: 'error' },
