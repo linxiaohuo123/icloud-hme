@@ -33,151 +33,101 @@ func sessionIDFromCookie(c *gin.Context) string {
 	return ""
 }
 
-// requireSession 校验会话,失败返回 401/AUTH_REQUIRED。支持全局 API Key 及动态 Tokens 旁路。
-//
-// 通过后写入两个上下文键:
-//
-// requireExternalV2Auth 严格仅支持 Bearer Token / X-API-Key 认证，彻底拒绝 Cookie 会话，杜绝 CSRF 与混淆代理 (Issue 19 方案 A)
+// requestAPIKey extracts the explicit credential shared by both authentication routes.
+func requestAPIKey(c *gin.Context) string {
+	if key := c.GetHeader("X-API-Key"); key != "" {
+		return key
+	}
+	header := c.GetHeader("Authorization")
+	if strings.HasPrefix(header, "Bearer ") {
+		return strings.TrimPrefix(header, "Bearer ")
+	}
+	return ""
+}
+
+func authenticateAPIKey(c *gin.Context, reqKey, apiKey string, st *store.Store) bool {
+	if apiKey != "" && subtle.ConstantTimeCompare([]byte(reqKey), []byte(apiKey)) == 1 {
+		c.Set("is_api_key_auth", true)
+		c.Set("token_name", "global_api_key")
+		c.Set("auth_scopes", store.ScopeAdmin)
+		c.Set("principal", auth.Principal{
+			Kind: auth.PrincipalAdmin, ID: "admin", TokenName: "global_api_key",
+			Scopes: []string{store.ScopeAdmin},
+		})
+		return true
+	}
+	if st == nil {
+		return false
+	}
+	id, tokenName, scopes, ok := st.ValidateTokenPrincipal(reqKey)
+	if !ok {
+		return false
+	}
+	var scopeList []string
+	if strings.TrimSpace(scopes) == "" || strings.TrimSpace(scopes) == store.ScopeAdmin {
+		scopeList = []string{store.ScopeAdmin}
+	} else {
+		for _, scope := range strings.Split(scopes, ",") {
+			if scope = strings.TrimSpace(scope); scope != "" {
+				scopeList = append(scopeList, scope)
+			}
+		}
+	}
+	c.Set("is_api_key_auth", true)
+	c.Set("token_name", tokenName)
+	c.Set("auth_scopes", scopes)
+	c.Set("principal", auth.Principal{
+		Kind: auth.PrincipalToken, ID: id, TokenName: tokenName, Scopes: scopeList,
+	})
+	return true
+}
+
+// requireExternalV2Auth only accepts explicit credentials and rejects Cookie sessions.
 func requireExternalV2Auth(apiKey string, st *store.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		reqKey := c.GetHeader("X-API-Key")
-		if reqKey == "" {
-			authHeader := c.GetHeader("Authorization")
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				reqKey = strings.TrimPrefix(authHeader, "Bearer ")
-			}
-		}
+		reqKey := requestAPIKey(c)
 		if reqKey == "" {
 			failCode(c, http.StatusUnauthorized, "AUTH_REQUIRED", "外部 v2 接口仅支持 Bearer Token 认证，拒绝 Cookie 会话")
-			c.Abort()
 			return
 		}
-		// 恒时比较全局 API Key
-		if apiKey != "" && subtle.ConstantTimeCompare([]byte(reqKey), []byte(apiKey)) == 1 {
-			p := auth.Principal{
-				Kind:      auth.PrincipalAdmin,
-				ID:        "admin",
-				TokenName: "global_api_key",
-				Scopes:    []string{store.ScopeAdmin},
-			}
-			c.Set("is_api_key_auth", true)
-			c.Set("token_name", "global_api_key")
-			c.Set("auth_scopes", store.ScopeAdmin)
-			c.Set("principal", p)
-			c.Next()
+		if !authenticateAPIKey(c, reqKey, apiKey, st) {
+			failCode(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key / Bearer Token 无效")
 			return
 		}
-		if st != nil {
-			if id, tokName, scopes, ok := st.ValidateTokenPrincipal(reqKey); ok {
-				var scopeList []string
-				if strings.TrimSpace(scopes) == "" || strings.TrimSpace(scopes) == store.ScopeAdmin {
-					scopeList = []string{store.ScopeAdmin}
-				} else {
-					for _, sc := range strings.Split(scopes, ",") {
-						sc = strings.TrimSpace(sc)
-						if sc != "" {
-							scopeList = append(scopeList, sc)
-						}
-					}
-				}
-				p := auth.Principal{
-					Kind:      auth.PrincipalToken,
-					ID:        id,
-					TokenName: tokName,
-					Scopes:    scopeList,
-				}
-				c.Set("is_api_key_auth", true)
-				c.Set("token_name", tokName)
-				c.Set("auth_scopes", scopes)
-				c.Set("principal", p)
-				c.Next()
-				return
-			}
-		}
-		failCode(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key / Bearer Token 无效")
-		c.Abort()
+		c.Next()
 	}
 }
 
-// requireSession 校验会话,失败返回 401/AUTH_REQUIRED。支持全局 API Key 及动态 Tokens 旁路。
+// requireSession accepts an explicit API key or a valid administrator Cookie session.
 func requireSession(mgr *authManager, apiKey string, st *store.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		reqKey := c.GetHeader("X-API-Key")
-		if reqKey == "" {
-			authHeader := c.GetHeader("Authorization")
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				reqKey = strings.TrimPrefix(authHeader, "Bearer ")
-			}
-		}
-		if reqKey != "" {
-			// 恒时比较, 避免环境变量 Key 的时序侧信道
-			if apiKey != "" && subtle.ConstantTimeCompare([]byte(reqKey), []byte(apiKey)) == 1 {
-				p := auth.Principal{
-					Kind:      auth.PrincipalAdmin,
-					ID:        "admin",
-					TokenName: "global_api_key",
-					Scopes:    []string{store.ScopeAdmin},
-				}
-				c.Set("is_api_key_auth", true)
-				c.Set("token_name", "global_api_key")
-				c.Set("auth_scopes", store.ScopeAdmin)
-				c.Set("principal", p)
-				c.Next()
+		if reqKey := requestAPIKey(c); reqKey != "" {
+			if !authenticateAPIKey(c, reqKey, apiKey, st) {
+				failCode(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
 				return
 			}
-			if st != nil {
-				if id, tokName, scopes, ok := st.ValidateTokenPrincipal(reqKey); ok {
-					var scopeList []string
-					if strings.TrimSpace(scopes) == "" || strings.TrimSpace(scopes) == store.ScopeAdmin {
-						scopeList = []string{store.ScopeAdmin}
-					} else {
-						for _, sc := range strings.Split(scopes, ",") {
-							sc = strings.TrimSpace(sc)
-							if sc != "" {
-								scopeList = append(scopeList, sc)
-							}
-						}
-					}
-					p := auth.Principal{
-						Kind:      auth.PrincipalToken,
-						ID:        id,
-						TokenName: tokName,
-						Scopes:    scopeList,
-					}
-					c.Set("is_api_key_auth", true)
-					c.Set("token_name", tokName)
-					c.Set("auth_scopes", scopes)
-					c.Set("principal", p)
-					c.Next()
-					return
-				}
-			}
-			failCode(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
-			c.Abort()
+			c.Next()
 			return
 		}
-
 		sessionID := sessionIDFromCookie(c)
 		if sessionID == "" {
 			failCode(c, http.StatusUnauthorized, "AUTH_REQUIRED", "请先登录或提供有效的 API Key")
-			c.Abort()
+			return
+		}
+		if mgr == nil {
+			failCode(c, http.StatusUnauthorized, "AUTH_REQUIRED", "管理员密码登录未启用")
 			return
 		}
 		if _, ok := mgr.Validate(sessionID); !ok {
 			failCode(c, http.StatusUnauthorized, "AUTH_REQUIRED", "会话已失效,请重新登录")
-			c.Abort()
 			return
 		}
-		p := auth.Principal{
-			Kind:      auth.PrincipalAdmin,
-			ID:        "admin",
-			TokenName: "admin_session",
-			Scopes:    []string{store.ScopeAdmin},
-		}
 		c.Set("session_id", sessionID)
-		// 浏览器管理员会话拥有全部作用域
 		c.Set("auth_scopes", store.ScopeAdmin)
-		c.Set("principal", p)
+		c.Set("principal", auth.Principal{
+			Kind: auth.PrincipalAdmin, ID: "admin", TokenName: "admin_session",
+			Scopes: []string{store.ScopeAdmin},
+		})
 		c.Next()
 	}
 }
@@ -235,6 +185,10 @@ func clearSessionCookie(c *gin.Context, secure bool) {
 
 // handleLogin 处理 POST /api/auth/login。
 func (s *Server) handleLogin(c *gin.Context) {
+	if s.auth == nil {
+		failCode(c, http.StatusUnauthorized, "AUTH_REQUIRED", "管理员密码登录未启用")
+		return
+	}
 	var req struct {
 		Password string `json:"password"`
 	}
@@ -280,7 +234,7 @@ func formatRetryAfter(d time.Duration) string {
 // handleSession 处理 GET /api/auth/session。
 func (s *Server) handleSession(c *gin.Context) {
 	sessionID := sessionIDFromCookie(c)
-	if sessionID == "" {
+	if sessionID == "" || s.auth == nil {
 		failCode(c, http.StatusUnauthorized, "AUTH_REQUIRED", "请先登录")
 		return
 	}
@@ -298,7 +252,7 @@ func (s *Server) handleSession(c *gin.Context) {
 // handleLogout 处理 POST /api/auth/logout(需会话 + CSRF)。
 func (s *Server) handleLogout(c *gin.Context) {
 	sessionID := sessionIDFromCookie(c)
-	if sessionID != "" {
+	if sessionID != "" && s.auth != nil {
 		if err := s.auth.Logout(sessionID); err != nil {
 			backendFail(c, err)
 			return

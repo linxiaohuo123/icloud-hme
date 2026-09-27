@@ -287,6 +287,7 @@ func (s *Scheduler) run(manual, includeDisabled bool, countPerAccount int) (int,
 
 	// 统计需要处理的账号
 	var targetAccs []account.Summary
+	selectionErrors := 0
 	now := time.Now()
 	for _, a := range accs {
 		// 严禁调度私人/受保护账号：统一使用 account.IsProtectedAccount 判定
@@ -294,7 +295,12 @@ func (s *Scheduler) run(manual, includeDisabled bool, countPerAccount int) (int,
 			continue
 		}
 
-		cfg := s.store.GetScheduleConfig(a.ID)
+		cfg, err := s.store.GetScheduleConfig(a.ID)
+		if err != nil {
+			s.logs.Add(fmt.Sprintf("[%s] 读取调度配置失败: %v", a.ID, err))
+			selectionErrors++
+			continue
+		}
 		if !cfg.Enabled && !includeDisabled {
 			continue
 		}
@@ -305,7 +311,13 @@ func (s *Scheduler) run(manual, includeDisabled bool, countPerAccount int) (int,
 			if cfg.Mode == "daily_window" && !isInDailyWindow(now, cfg.StartTime, cfg.EndTime) {
 				continue
 			}
-			if !s.shouldPacedRun(a.ID, now) {
+			paced, err := s.shouldPacedRun(a.ID, now)
+			if err != nil {
+				s.logs.Add(fmt.Sprintf("[%s] 读取剩余配额失败: %v", a.ID, err))
+				selectionErrors++
+				continue
+			}
+			if !paced {
 				continue
 			}
 		}
@@ -321,7 +333,7 @@ func (s *Scheduler) run(manual, includeDisabled bool, countPerAccount int) (int,
 				s.logs.Add("没有已启用的定时任务，本轮未执行任何补货（如需对全部账号强推，请使用「强制全部补货」）")
 			}
 		}
-		return 0, 0
+		return 0, selectionErrors
 	}
 
 	startMsg := fmt.Sprintf("开始补货 · 共 %d 个账号 · 每账号 %d 个", len(targetAccs), countPerAccount)
@@ -385,18 +397,22 @@ func (s *Scheduler) run(manual, includeDisabled bool, countPerAccount int) (int,
 	}
 	s.logs.Add(endMsg)
 
-	return totalCreated, totalErrors
+	return totalCreated, totalErrors + selectionErrors
 }
 
 // processAccount 负责单个账号的配额校验与别名生成。
 func (s *Scheduler) processAccount(ctx context.Context, a account.Summary, manual, includeDisabled bool, countPerAccount int, stopCh <-chan struct{}) (int, int) {
-	cfg := s.store.GetScheduleConfig(a.ID)
 	accName := a.Name
 	if accName == "" {
 		accName = a.RealEmail
 	}
 	if accName == "" {
 		accName = a.ID
+	}
+	cfg, err := s.store.GetScheduleConfig(a.ID)
+	if err != nil {
+		s.logs.Add(fmt.Sprintf("[%s] 读取调度配置失败: %v", accName, err))
+		return 0, 1
 	}
 
 	if a.Status != "active" {
@@ -421,7 +437,11 @@ func (s *Scheduler) processAccount(ctx context.Context, a account.Summary, manua
 			return created, errTotal
 		default:
 		}
-		cfg = s.store.GetScheduleConfig(a.ID)
+		cfg, err = s.store.GetScheduleConfig(a.ID)
+		if err != nil {
+			s.logs.Add(fmt.Sprintf("[%s] 读取调度配置失败: %v", accName, err))
+			return created, errTotal + 1
+		}
 		if !includeDisabled && !cfg.Enabled {
 			return created, errTotal
 		}
@@ -432,7 +452,11 @@ func (s *Scheduler) processAccount(ctx context.Context, a account.Summary, manua
 
 		// 配额前置快速守卫（不提前扣减，统一交由 creator/be.CreateAlias 原子仲裁）
 		if s.store != nil {
-			rem := s.store.RemainingQuota(a.ID)
+			rem, err := s.store.RemainingQuota(a.ID)
+			if err != nil {
+				s.logs.Add(fmt.Sprintf("[%s] 读取剩余配额失败: %v", accName, err))
+				return created, errTotal + 1
+			}
 			if rem <= 0 {
 				s.logs.Add(fmt.Sprintf("[%s] 本小时额度已用满 (%d/%d)", accName, cfg.HourlyQuota, cfg.HourlyQuota))
 				break
@@ -555,27 +579,30 @@ func isInDailyWindow(now time.Time, startStr, endStr string) bool {
 }
 
 // shouldPacedRun 检查在拟人化平滑模式下当前时间是否允许该账号创建
-func (s *Scheduler) shouldPacedRun(accountID string, now time.Time) bool {
+func (s *Scheduler) shouldPacedRun(accountID string, now time.Time) (bool, error) {
 	s.paceMu.Lock()
 	defer s.paceMu.Unlock()
 
 	last, exists := s.lastPacedRun[accountID]
 	if !exists {
-		return true
+		return true, nil
 	}
 	if s.store == nil {
-		return true
+		return true, nil
 	}
 
-	remQuota := s.store.RemainingQuota(accountID)
+	remQuota, err := s.store.RemainingQuota(accountID)
+	if err != nil {
+		return false, err
+	}
 	if remQuota <= 0 {
-		return false
+		return false, nil
 	}
 
 	hourEnd := now.Truncate(time.Hour).Add(time.Hour)
 	remTime := hourEnd.Sub(now)
 	if remTime <= time.Minute {
-		return true
+		return true, nil
 	}
 
 	spacing := remTime / time.Duration(remQuota+1)
@@ -583,7 +610,7 @@ func (s *Scheduler) shouldPacedRun(accountID string, now time.Time) bool {
 		spacing = 2 * time.Minute
 	}
 
-	return now.Sub(last) >= spacing
+	return now.Sub(last) >= spacing, nil
 }
 
 func (s *Scheduler) recordPacedRun(accountID string, now time.Time) {

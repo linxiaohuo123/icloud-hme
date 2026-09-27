@@ -94,7 +94,10 @@ func TestSchedulerPauseStopsRemainingCreates(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("first create did not start")
 	}
-	cfg := st.GetScheduleConfig(id)
+	cfg, err := st.GetScheduleConfig(id)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg.Enabled = false
 	if err := st.SaveScheduleConfig(cfg); err != nil {
 		t.Fatal(err)
@@ -388,7 +391,10 @@ func TestSchedulerDoubleQuotaPrevention(t *testing.T) {
 	// 模拟 production server.go 中的 creator (它会调用 TryReserveQuota)
 	createdCount := 0
 	mockCreator := func(ctx context.Context, id, label string) (*hme.CreateResult, error) {
-		allowed, _ := st.TryReserveQuota(id, 1)
+		allowed, _, err := st.TryReserveQuota(id, 1)
+		if err != nil {
+			return nil, err
+		}
 		if !allowed {
 			return nil, fmt.Errorf("RATE_LIMITED: 配额已用完")
 		}
@@ -404,7 +410,10 @@ func TestSchedulerDoubleQuotaPrevention(t *testing.T) {
 		t.Fatalf("期望成功创建满配额 2 个，实际 created=%d errs=%d", created, errs)
 	}
 
-	cfg := st.GetScheduleConfig(accID)
+	cfg, err := st.GetScheduleConfig(accID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cfg.CurrentHourCount != 2 {
 		t.Fatalf("配额计数应精确为 2 (无双重扣减)，实际为 %d", cfg.CurrentHourCount)
 	}

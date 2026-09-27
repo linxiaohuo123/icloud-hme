@@ -642,7 +642,11 @@ func TestRemoveAccountCascadeDeleteSchedule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(st.ListScheduleConfigs()) != 1 {
+	configs, err := st.ListScheduleConfigs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configs) != 1 {
 		t.Fatal("保存后 schedules 应有 1 条记录")
 	}
 
@@ -666,7 +670,11 @@ func TestRemoveAccountCascadeDeleteSchedule(t *testing.T) {
 	}
 
 	// 关键验证：SQLite schedules 表中该账号记录已被物理级联删除，零幽灵残留
-	if len(st.ListScheduleConfigs()) != 0 {
+	configs, err = st.ListScheduleConfigs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configs) != 0 {
 		t.Fatal("删除账号后，其调度配置未被级联物理删除，存在幽灵残留")
 	}
 }

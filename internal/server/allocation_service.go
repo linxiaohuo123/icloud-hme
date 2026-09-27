@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -36,6 +35,7 @@ var (
 	ErrTagNotAllowed = errors.New("specified tag is not allowed for this principal")
 	// ErrIdempotencyKeyRequired 强制要求幂等键
 	ErrIdempotencyKeyRequired = errors.New("idempotency key required")
+	ErrInvalidAllocationMode  = errors.New("invalid allocation mode")
 )
 
 // AllocationRequest 统一出号请求
@@ -133,6 +133,16 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 	if !p.CanAllocate() {
 		return nil, ErrScopeDenied
 	}
+	mode := strings.TrimSpace(req.Mode)
+	if mode == "" {
+		mode = "pool"
+	}
+	switch mode {
+	case "pool", "pool_only", "create":
+	default:
+		return nil, ErrInvalidAllocationMode
+	}
+	req.Mode = mode
 
 	// 1. 外部令牌安全防护：绝不允许指定 account_id 或远程创号 (403 优先级高于参数校验)
 	if p.Kind == auth.PrincipalToken && !p.IsAdmin() {
@@ -178,11 +188,6 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		if _, err := s.be.GetAccount(req.AccountID); err != nil {
 			return nil, err
 		}
-	}
-
-	mode := req.Mode
-	if mode == "" {
-		mode = "pool"
 	}
 
 	principalKind := string(p.Kind)
@@ -249,90 +254,63 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		poolAccountIDs = []string{}
 	}
 
-	// 3. 显式幂等分配分支 (如 external/v2 或携带 IdempotencyKey 的请求)
+	operationKind := "allocate"
 	if req.IdempotencyKey != "" {
-		alloc, op, err := s.store.ClaimInventoryAlias(
-			ctx,
-			principalKind,
-			principalID,
-			"v2_allocate",
-			req.IdempotencyKey,
-			req.RequestHash,
-			req.Tag,
-			poolAccountIDs,
-		)
-		if err != nil {
-			if errors.Is(err, store.ErrNoAvailableInventory) {
-				return nil, ErrPoolEmpty
-			}
-			if errors.Is(err, store.ErrOperationPending) {
-				return &AllocationResult{Operation: op}, err
-			}
-			return nil, err
-		}
-		if alloc != nil {
+		operationKind = "v2_allocate"
+	}
+	if mode != "create" {
+		alloc, op, err := s.store.ClaimInventoryAlias(ctx, principalKind, principalID, operationKind,
+			req.IdempotencyKey, req.RequestHash, req.Tag, poolAccountIDs)
+		if err == nil && alloc != nil {
 			if s.syncWorker != nil {
 				s.syncWorker.RegisterAliasAccount(alloc.AliasEmail, alloc.AccountID)
 			}
-			return &AllocationResult{
-				Allocation: alloc,
-				Operation:  op,
-				Source:     "pool",
-			}, nil
+			source := "pool"
+			if op != nil && op.ResultSource != "" {
+				source = op.ResultSource
+			}
+			return &AllocationResult{Allocation: alloc, Operation: op, Source: source}, nil
+		}
+		if !errors.Is(err, store.ErrNoAvailableInventory) {
+			return &AllocationResult{Operation: op}, err
+		}
+		if !p.IsAdmin() || mode == "pool_only" {
+			return nil, ErrPoolEmpty
 		}
 	}
 
-	// 4. 普通出号链路：严禁将 Apple 远端 active 别名自动当 available 发放 (Issue 9)
-	// 所有出号必须从 alias_inventory 原子认领，并下推账号池过滤到 SQL (Issue 11)
-	alloc, op, err := s.store.ClaimInventoryAlias(
-		ctx,
-		principalKind,
-		principalID,
-		"allocate",
-		req.IdempotencyKey,
-		req.RequestHash,
-		req.Tag,
-		poolAccountIDs,
-	)
-	if err == nil && alloc != nil {
-		if s.syncWorker != nil {
-			s.syncWorker.RegisterAliasAccount(alloc.AliasEmail, alloc.AccountID)
-		}
-		return &AllocationResult{
-			Allocation: alloc,
-			Operation:  op,
-			Source:     "pool",
-		}, nil
-	}
-
-	// 5. 核心仲裁 (B3)：只有真正确定为空池 (ErrNoAvailableInventory) 才允许后续降级处理；
-	// 任何数据库故障、DB locked、上下文取消或约束冲突，原样分类返回，严禁触发现场建号！
-	if !errors.Is(err, store.ErrNoAvailableInventory) {
-		return nil, err
-	}
-
-	// 若库存池为空 (POOL_EMPTY)
-	// 【PR-05-1 Section II 核心铁律】外部令牌在库存为空时严禁 fallback 远程创号，必须立即返回 503 POOL_EMPTY
-	if p.Kind == auth.PrincipalToken && !p.IsAdmin() {
-		return nil, ErrPoolEmpty
-	}
-	if mode == "pool_only" {
-		return nil, ErrPoolEmpty
-	}
-
-	// 6. 仅管理员且允许新建 (mode="pool" 或 mode="create") 时，降级现场新建
+	// A keyed remote creation keeps the same operation kind used by historical pool claims.
 	if p.IsAdmin() && s.be != nil {
+		replayed, op, beginErr := s.store.BeginRemoteAllocation(ctx, principalKind, principalID,
+			operationKind, req.IdempotencyKey, req.RequestHash, req.Tag, tokenDisplayName)
+		if beginErr != nil {
+			return &AllocationResult{Operation: op}, beginErr
+		}
+		if replayed != nil {
+			if s.syncWorker != nil {
+				s.syncWorker.RegisterAliasAccount(replayed.AliasEmail, replayed.AccountID)
+			}
+			return &AllocationResult{Allocation: replayed, Operation: op, Source: op.ResultSource}, nil
+		}
 		var res *hme.CreateResult
 		var accountID string
 		var err error
 
 		if req.AccountID != "" {
-			res, err = s.be.CreateAliasContext(ctx, req.AccountID, req.Label)
+			res, err = s.be.CreateAliasForAllocationContext(ctx, req.AccountID, req.Label, op.OperationID)
 			accountID = req.AccountID
 		} else {
-			cands := selectAccountCandidates(s.be.ListAccounts(), req.Tag, s.store)
+			cands, selectErr := selectAccountCandidates(s.be.ListAccounts(), req.Tag, s.store)
+			if selectErr != nil {
+				persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				if stateErr := s.store.MarkRemoteAllocationError(persistCtx, op.OperationID); stateErr != nil {
+					return nil, errors.Join(fmt.Errorf("查询候选账号配额: %w", selectErr), fmt.Errorf("保存出号失败状态: %w", stateErr))
+				}
+				return &AllocationResult{Operation: op}, fmt.Errorf("查询候选账号配额: %w", selectErr)
+			}
 			for _, candID := range cands {
-				res, err = s.be.CreateAliasContext(ctx, candID, req.Label)
+				res, err = s.be.CreateAliasForAllocationContext(ctx, candID, req.Label, op.OperationID)
 				if err == nil && res != nil {
 					accountID = candID
 					break
@@ -348,14 +326,24 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		}
 
 		if err != nil {
+			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if stateErr := s.store.MarkRemoteAllocationError(persistCtx, op.OperationID); stateErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("保存出号失败状态: %w", stateErr))
+			}
 			return nil, err
 		}
 		if res == nil {
+			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if stateErr := s.store.MarkRemoteAllocationError(persistCtx, op.OperationID); stateErr != nil {
+				return nil, stateErr
+			}
 			return nil, ErrPoolEmpty
 		}
 
-		now := time.Now().Format(time.RFC3339)
-		allocID := store.NewOpaqueID("alloc_")
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
 
 		// 现场创建别名先以不可分配暂存状态 (created + unknown) 记入 alias_inventory，
 		// 严禁提前暴露为公共 available 库存，防止被并发的普通 ClaimInventoryAlias 抢先认领
@@ -366,37 +354,28 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 			CreatedAt:   res.CreatedAt,
 			Active:      true,
 		}, "created", false); invErr != nil {
+			_ = s.store.MarkOperationOutcomeUnknown(persistCtx, op.OperationID, res.Email, "LOCAL_PERSISTENCE_FAILED")
 			return nil, fmt.Errorf("upstream created alias %s successfully but local inventory persistence failed (pending reconciliation): %w", res.Email, invErr)
-		}
-		alloc := &store.AliasAllocation{
-			AllocationID: allocID,
-			AliasEmail:   res.Email,
-			AccountID:    accountID,
-			OwnerKind:    principalKind,
-			OwnerID:      principalID,
-			BusinessTag:  req.Tag,
-			AllocatedAt:  now,
-			Status:       "allocated",
 		}
 		if s.beforeRecordAllocationHook != nil {
 			s.beforeRecordAllocationHook(res.Email)
 		}
-		savedAlloc, recErr := s.store.RecordAllocation(alloc, tokenDisplayName)
+		alloc, recErr := s.store.ReconcileUnknownOperation(persistCtx, op.OperationID, store.ReconciliationFound,
+			res.Email, accountID, req.Tag, principalKind, principalID, tokenDisplayName)
 		if recErr != nil {
 			// 本地入账失败时，主动隔离暂存别名，确保不遗留可被其他消费者领取的中间状态
 			_ = s.store.QuarantineInventoryAlias(res.Email)
+			_ = s.store.MarkOperationOutcomeUnknown(persistCtx, op.OperationID, res.Email, "LOCAL_PERSISTENCE_FAILED")
 			return nil, fmt.Errorf("持久化分配凭据失败: %w", recErr)
 		}
-		alloc = savedAlloc
-		if routeErr := s.store.UpsertAliasRoutes(accountID, []string{res.Email}); routeErr != nil {
-			log.Printf("[AllocationService] 更新别名路由失败: %v", routeErr)
-		}
+		op.State, op.ResultRef, op.CandidateEmail, op.ResultSource = "succeeded", alloc.AllocationID, res.Email, "created"
 		if s.syncWorker != nil {
 			s.syncWorker.RegisterAliasAccount(res.Email, accountID)
 		}
 
 		return &AllocationResult{
 			Allocation: alloc,
+			Operation:  op,
 			Source:     "created",
 		}, nil
 	}

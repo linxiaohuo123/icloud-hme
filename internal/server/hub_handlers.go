@@ -22,17 +22,26 @@ import (
 // --- 业务标识 Tags ---
 
 func (s *Server) listTagsHandler(c *gin.Context) {
-	ok(c, s.store.ListTags())
+	tags, err := s.store.ListTags()
+	if err != nil {
+		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "读取业务标识失败")
+		return
+	}
+	ok(c, tags)
 }
 
 // tagExistsFor 检查业务标识名是否已被其他标签占用 (excludeID 为编辑时排除自身)
-func (s *Server) tagExistsFor(tag string, excludeID string) bool {
-	for _, t := range s.store.ListTags() {
+func (s *Server) tagExistsFor(tag string, excludeID string) (bool, error) {
+	tags, err := s.store.ListTags()
+	if err != nil {
+		return false, err
+	}
+	for _, t := range tags {
 		if strings.EqualFold(t.Tag, tag) && t.ID != excludeID {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func (s *Server) createTagHandler(c *gin.Context) {
@@ -57,7 +66,12 @@ func (s *Server) createTagHandler(c *gin.Context) {
 		req.Status = "active"
 	}
 	// tag 列有 UNIQUE 约束: 预检重名, 避免落库报"内部错误"
-	if s.tagExistsFor(req.Tag, "") {
+	exists, err := s.tagExistsFor(req.Tag, "")
+	if err != nil {
+		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "读取业务标识失败")
+		return
+	}
+	if exists {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "业务标识已存在: "+req.Tag)
 		return
 	}
@@ -81,7 +95,11 @@ func (s *Server) updateTagHandler(c *gin.Context) {
 	}
 	// 真 PATCH 语义: 以库中现有记录为基线，只覆盖显式提交的字段，
 	// 避免"只改描述"把 tag/name/status 清空。
-	existing, found := s.findTagByID(id)
+	existing, found, err := s.findTagByID(id)
+	if err != nil {
+		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "读取业务标识失败")
+		return
+	}
 	if !found {
 		failCode(c, http.StatusNotFound, "NOT_FOUND", "业务标识不存在")
 		return
@@ -104,7 +122,12 @@ func (s *Server) updateTagHandler(c *gin.Context) {
 	}
 	req.Tag = strings.TrimSpace(req.Tag)
 	req.Name = strings.TrimSpace(req.Name)
-	if s.tagExistsFor(req.Tag, id) {
+	exists, err := s.tagExistsFor(req.Tag, id)
+	if err != nil {
+		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "读取业务标识失败")
+		return
+	}
+	if exists {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "业务标识已存在: "+req.Tag)
 		return
 	}
@@ -116,13 +139,17 @@ func (s *Server) updateTagHandler(c *gin.Context) {
 }
 
 // findTagByID 按主键定位业务标识。
-func (s *Server) findTagByID(id string) (store.BusinessTag, bool) {
-	for _, t := range s.store.ListTags() {
+func (s *Server) findTagByID(id string) (store.BusinessTag, bool, error) {
+	tags, err := s.store.ListTags()
+	if err != nil {
+		return store.BusinessTag{}, false, err
+	}
+	for _, t := range tags {
 		if t.ID == id {
-			return t, true
+			return t, true, nil
 		}
 	}
-	return store.BusinessTag{}, false
+	return store.BusinessTag{}, false, nil
 }
 
 func (s *Server) deleteTagHandler(c *gin.Context) {
@@ -142,11 +169,14 @@ func (s *Server) deleteTagHandler(c *gin.Context) {
 
 // --- 外部令牌 Tokens ---
 
-// --- 外部令牌 Tokens ---
-
 func (s *Server) listTokensHandler(c *gin.Context) {
 	// 只回显安全前缀: 令牌本体仅在创建/轮换响应中出现一次，杜绝令牌泄露或互相收割
-	ok(c, s.store.ListTokens())
+	tokens, err := s.store.ListTokens()
+	if err != nil {
+		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "读取令牌失败")
+		return
+	}
+	ok(c, tokens)
 }
 
 type createTokenRequest struct {
@@ -361,7 +391,12 @@ func (s *Server) updateLeaseStatusHandler(c *gin.Context) {
 // --- 定时调度 Schedules ---
 
 func (s *Server) listScheduleConfigsHandler(c *gin.Context) {
-	ok(c, s.store.ListScheduleConfigs())
+	configs, err := s.store.ListScheduleConfigs()
+	if err != nil {
+		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "读取调度配置失败")
+		return
+	}
+	ok(c, configs)
 }
 
 // updateScheduleConfigReq 使用指针字段实现真 PATCH 语义:
@@ -392,19 +427,11 @@ func (s *Server) updateScheduleConfigHandler(c *gin.Context) {
 		return
 	}
 
-	cfg := s.store.GetScheduleConfig(accountID)
-	if req.Enabled != nil {
-		cfg.Enabled = *req.Enabled
-	}
 	if req.HourlyQuota != nil {
 		if *req.HourlyQuota < 1 || *req.HourlyQuota > 500 {
 			failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "hourly_quota 必须在 1-500 之间")
 			return
 		}
-		cfg.HourlyQuota = *req.HourlyQuota
-	}
-	if req.AliasLabel != nil {
-		cfg.AliasLabel = strings.TrimSpace(*req.AliasLabel)
 	}
 	if req.Mode != nil {
 		mode := strings.ToLower(strings.TrimSpace(*req.Mode))
@@ -414,31 +441,38 @@ func (s *Server) updateScheduleConfigHandler(c *gin.Context) {
 			failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "mode 必须是 always / daily_window / duration")
 			return
 		}
-		cfg.Mode = mode
 	}
-	if req.StartTime != nil {
-		cfg.StartTime = strings.TrimSpace(*req.StartTime)
-	}
-	if req.EndTime != nil {
-		cfg.EndTime = strings.TrimSpace(*req.EndTime)
-	}
-	if req.DurationHours != nil {
-		cfg.DurationHours = *req.DurationHours
-	}
-	if req.StartedAt != nil {
-		cfg.StartedAt = strings.TrimSpace(*req.StartedAt)
-	}
-	if cfg.Mode == "duration" && cfg.Enabled && strings.TrimSpace(cfg.StartedAt) == "" {
-		cfg.StartedAt = time.Now().Format(time.RFC3339)
-	}
-
-	// 归零配额仲裁字段: SaveScheduleConfig 的 UPSERT 在 last_hour_window<=0 时
-	// 会保留库中原值，从而杜绝陈旧快照把 current_hour_count 回退。
-	cfg.CurrentHourCount = 0
-	cfg.LastHourWindow = 0
-
-	if err := s.store.SaveScheduleConfig(cfg); err != nil {
-		backendFail(c, err)
+	cfg, err := s.store.UpdateScheduleConfig(accountID, func(cfg *store.ScheduleConfig) {
+		if req.Enabled != nil {
+			cfg.Enabled = *req.Enabled
+		}
+		if req.HourlyQuota != nil {
+			cfg.HourlyQuota = *req.HourlyQuota
+		}
+		if req.AliasLabel != nil {
+			cfg.AliasLabel = strings.TrimSpace(*req.AliasLabel)
+		}
+		if req.Mode != nil {
+			cfg.Mode = strings.ToLower(strings.TrimSpace(*req.Mode))
+		}
+		if req.StartTime != nil {
+			cfg.StartTime = strings.TrimSpace(*req.StartTime)
+		}
+		if req.EndTime != nil {
+			cfg.EndTime = strings.TrimSpace(*req.EndTime)
+		}
+		if req.DurationHours != nil {
+			cfg.DurationHours = *req.DurationHours
+		}
+		if req.StartedAt != nil {
+			cfg.StartedAt = strings.TrimSpace(*req.StartedAt)
+		}
+		if cfg.Mode == "duration" && cfg.Enabled && strings.TrimSpace(cfg.StartedAt) == "" {
+			cfg.StartedAt = time.Now().Format(time.RFC3339)
+		}
+	})
+	if err != nil {
+		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "保存调度配置失败")
 		return
 	}
 	ok(c, cfg)

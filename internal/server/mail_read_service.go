@@ -601,17 +601,17 @@ func (s *MailReadService) getMessagesBatchIMAPJoin(ctx context.Context, accountI
 	}
 
 	type pendingItem struct {
+		index  int
 		rawRef string
 		refObj mail.MessageRef
 	}
 
-	var results []BatchItemResult
-	var out []*mail.FullMessage
+	results := make([]BatchItemResult, len(reqItems))
 	var pendingIMAP []pendingItem
 	now := time.Now()
 
 	// 1. 逐项解析与前置缓存匹配
-	for _, m := range reqItems {
+	for i, m := range reqItems {
 		rawRef := strings.TrimSpace(m.MessageRef)
 		folder := strings.TrimSpace(m.Folder)
 		if folder == "" {
@@ -647,10 +647,10 @@ func (s *MailReadService) getMessagesBatchIMAPJoin(ctx context.Context, accountI
 		}
 
 		if refErr != nil {
-			results = append(results, BatchItemResult{
+			results[i] = BatchItemResult{
 				RequestedRef: rawRef,
 				Error:        refErr.Error(),
-			})
+			}
 			continue
 		}
 
@@ -660,36 +660,35 @@ func (s *MailReadService) getMessagesBatchIMAPJoin(ctx context.Context, accountI
 		s.cacheMu.RUnlock()
 
 		if hit && now.Before(entry.expiresAt) {
-			results = append(results, BatchItemResult{
+			results[i] = BatchItemResult{
 				RequestedRef: rawRef,
 				Message:      entry.msg,
-			})
-			out = append(out, entry.msg)
+			}
 			continue
 		}
 
 		// WebMail 单条直接拉取
 		if refObj.Provider == "webmail" {
-			msg, err := s.be.GetMessageContext(ctx, accountID, refObj.ThreadID)
+			msg, err := s.be.GetMessageContext(ctx, accountID, refObj.Encode())
 			if err != nil {
-				results = append(results, BatchItemResult{
+				results[i] = BatchItemResult{
 					RequestedRef: rawRef,
 					Error:        err.Error(),
-				})
+				}
 			} else {
 				msg.Provider = "webmail"
 				msg.Method = "web_api"
 				s.commitMessageCache(cacheKey, accountID, startGen, msg, "webmail", "web_api")
-				results = append(results, BatchItemResult{
+				results[i] = BatchItemResult{
 					RequestedRef: rawRef,
 					Message:      msg,
-				})
-				out = append(out, msg)
+				}
 			}
 			continue
 		}
 
 		pendingIMAP = append(pendingIMAP, pendingItem{
+			index:  i,
 			rawRef: rawRef,
 			refObj: refObj,
 		})
@@ -704,14 +703,14 @@ func (s *MailReadService) getMessagesBatchIMAPJoin(ctx context.Context, accountI
 
 		fetched, err := s.be.GetMessagesContext(ctx, accountID, imapRefs)
 		if err != nil {
-			if len(out) == 0 && len(reqItems) == len(pendingIMAP) {
+			if len(reqItems) == len(pendingIMAP) {
 				return nil, nil, err
 			}
 			for _, pi := range pendingIMAP {
-				results = append(results, BatchItemResult{
+				results[pi.index] = BatchItemResult{
 					RequestedRef: pi.rawRef,
 					Error:        err.Error(),
-				})
+				}
 			}
 		} else {
 			// 构造规范身份查找表 (Identity Map)
@@ -779,21 +778,26 @@ func (s *MailReadService) getMessagesBatchIMAPJoin(ctx context.Context, accountI
 						Provider: provider,
 						Method:   method,
 					})
-					results = append(results, BatchItemResult{
+					results[pi.index] = BatchItemResult{
 						RequestedRef: pi.rawRef,
 						Message:      matched,
-					})
-					out = append(out, matched)
+					}
 				} else {
-					results = append(results, BatchItemResult{
+					results[pi.index] = BatchItemResult{
 						RequestedRef: pi.rawRef,
 						Error:        "message not found",
-					})
+					}
 				}
 			}
 			s.commitMessagesBatch(accountID, startGen, commitItems)
 		}
 	}
 
+	out := make([]*mail.FullMessage, 0, len(results))
+	for _, item := range results {
+		if item.Message != nil {
+			out = append(out, item.Message)
+		}
+	}
 	return out, results, nil
 }

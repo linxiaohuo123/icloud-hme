@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 database/sql, errors, fmt, log, strings, sync/atomic, time, icloud-hme/internal/store (Store)
- * [OUTPUT]: 对外提供 LeaseRecord 类型, PoolCandidate 类型, UpsertAliasRoutes, FindAliasRoute, CountAliasRoutes, DeleteAliasRoutesForAccount, FindLeaseAccount, CountLeases, PruneLeases, ListLeases, RecordLease, UpdateLeaseStatus, ClaimPoolAlias, ClaimPoolAliasByRoutes, CountAvailablePoolAliases, CountConsumedPoolAliases
+ * [OUTPUT]: 对外提供 LeaseRecord 类型, UpsertAliasRoutes, FindAliasRoute, CountAliasRoutes, DeleteAliasRoutesForAccount, FindLeaseAccount, CountLeases, PruneLeases, ListLeases, RecordLease, UpdateLeaseStatus, CountConsumedPoolAliases
  * [POS]: internal/store 的别名认领与出号流水审计领域，维护 alias_routes 路由表与 lease_records 审计日志
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -9,7 +9,6 @@ package store
 
 import (
 	"database/sql"
-	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -26,12 +25,6 @@ type LeaseRecord struct {
 	AllocatedAt string `json:"allocated_at"`
 	CompletedAt string `json:"completed_at,omitempty"`
 	TokenName   string `json:"token_name,omitempty"`
-}
-
-// PoolCandidate 待从别名池领用的候选别名
-type PoolCandidate struct {
-	AccountID string
-	Email     string
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -107,7 +100,12 @@ const settingKeyAliasRoutesBackfilled = "alias_routes_backfilled"
 
 // backfillAliasRoutes 用出号流水回填别名路由。
 func (s *Store) backfillAliasRoutes() {
-	if s.GetSetting(settingKeyAliasRoutesBackfilled) == "1" && s.hasAnyAliasRoute() {
+	marker, err := s.GetSetting(settingKeyAliasRoutesBackfilled)
+	if err != nil {
+		log.Printf("[Store] 读取别名路由回填标记失败: %v", err)
+		return
+	}
+	if marker == "1" && s.hasAnyAliasRoute() {
 		return
 	}
 	res, err := s.db.Exec(`
@@ -287,317 +285,6 @@ func (s *Store) UpdateLeaseStatus(id, status string) error {
 		return fmt.Errorf("记录不存在: %s", id)
 	}
 	return nil
-}
-
-// ClaimPoolAlias 原子地从候选别名列表中挑选第一个未被外部消费者领用的别名并生成领用记录。
-func (s *Store) ClaimPoolAlias(candidates []PoolCandidate, tag, principalKind, principalID, tokenDisplayName string) (*LeaseRecord, error) {
-	if len(candidates) == 0 {
-		return nil, nil
-	}
-	if tag == "" {
-		tag = "default"
-	}
-	if principalKind == "" {
-		principalKind = "token"
-	}
-	if principalID == "" {
-		principalID = tokenDisplayName
-	}
-	if tokenDisplayName == "" {
-		tokenDisplayName = principalID
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	now := time.Now().Format(time.RFC3339)
-
-	prepInv, err := tx.Prepare(`
-		INSERT INTO alias_inventory (email, account_id, remote_state, allocation_state, source_type, snapshot_version)
-		VALUES (?, ?, 'active', 'available', 'pool', 1)
-		ON CONFLICT(email) DO NOTHING
-	`)
-	if err != nil {
-		return nil, err
-	}
-	defer prepInv.Close()
-
-	for _, c := range candidates {
-		norm := normalizeEmail(c.Email)
-		if norm != "" {
-			if _, err := prepInv.Exec(norm, c.AccountID); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	const batchSize = 500
-	for i := 0; i < len(candidates); i += batchSize {
-		end := i + batchSize
-		if end > len(candidates) {
-			end = len(candidates)
-		}
-		chunk := candidates[i:end]
-
-		placeholders := make([]string, len(chunk))
-		args := make([]any, len(chunk))
-		for j, c := range chunk {
-			placeholders[j] = "?"
-			args[j] = normalizeEmail(c.Email)
-		}
-
-		query := fmt.Sprintf(
-			`SELECT email, account_id FROM alias_inventory
-			 WHERE email IN (%s) AND allocation_state = 'available' AND remote_state = 'active'
-			 LIMIT 1`,
-			strings.Join(placeholders, ","),
-		)
-		var candEmail, candAccountID string
-		qErr := tx.QueryRow(query, args...).Scan(&candEmail, &candAccountID)
-		if qErr != nil {
-			if errors.Is(qErr, sql.ErrNoRows) {
-				continue
-			}
-			return nil, qErr
-		}
-
-		res, err := tx.Exec(`
-			UPDATE alias_inventory
-			SET allocation_state = 'allocated'
-			WHERE email = ? AND allocation_state = 'available'
-		`, candEmail)
-		if err != nil {
-			return nil, err
-		}
-		rowsAffected, _ := res.RowsAffected()
-		if rowsAffected == 0 {
-			continue
-		}
-
-		ownerKind := principalKind
-		ownerID := principalID
-
-		allocID := NewOpaqueID("lease_")
-
-		_, err = tx.Exec(`
-			INSERT INTO alias_allocations (allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status)
-			VALUES (?, ?, ?, ?, ?, ?, ?, 'allocated')
-			ON CONFLICT(alias_email) DO UPDATE SET
-				owner_kind = excluded.owner_kind,
-				owner_id = excluded.owner_id,
-				status = 'allocated'
-		`, allocID, candEmail, candAccountID, ownerKind, ownerID, tag, now)
-		if err != nil {
-			return nil, fmt.Errorf("写入 alias_allocations 失败: %w", err)
-		}
-
-		rec := LeaseRecord{
-			ID:          allocID,
-			Email:       candEmail,
-			AccountID:   candAccountID,
-			Tag:         tag,
-			Status:      "completed",
-			AllocatedAt: now,
-			CompletedAt: now,
-			TokenName:   tokenDisplayName,
-		}
-		insQuery := `INSERT INTO lease_records (id, email, account_id, tag, status, allocated_at, completed_at, token_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-		if _, insertErr := tx.Exec(insQuery, rec.ID, rec.Email, rec.AccountID, rec.Tag, rec.Status, rec.AllocatedAt, rec.CompletedAt, rec.TokenName); insertErr != nil {
-			return nil, insertErr
-		}
-
-		if rec.AccountID != "" {
-			_, _ = tx.Exec(`INSERT INTO alias_routes (email, account_id, updated_at) VALUES (?, ?, ?) ON CONFLICT(email) DO UPDATE SET account_id=excluded.account_id`, rec.Email, rec.AccountID, now)
-		}
-
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-
-		s.UpdateTagLastAssigned(tag)
-		return &rec, nil
-	}
-
-	return nil, nil
-}
-
-// ClaimPoolAliasByRoutes 直接从持久化库存表中查找未被消费的可用别名并原子认领。
-func (s *Store) ClaimPoolAliasByRoutes(accountIDs []string, tag, principalKind, principalID, tokenDisplayName string) (*LeaseRecord, error) {
-	if len(accountIDs) == 0 {
-		return nil, nil
-	}
-	if tag == "" {
-		tag = "default"
-	}
-	if principalKind == "" {
-		principalKind = "token"
-	}
-	if principalID == "" {
-		principalID = tokenDisplayName
-	}
-	if tokenDisplayName == "" {
-		tokenDisplayName = principalID
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	now := time.Now().Format(time.RFC3339)
-
-	const batchSize = 200
-	for i := 0; i < len(accountIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(accountIDs) {
-			end = len(accountIDs)
-		}
-		chunk := accountIDs[i:end]
-
-		placeholders := make([]string, len(chunk))
-		args := make([]any, len(chunk))
-		for j, id := range chunk {
-			placeholders[j] = "?"
-			args[j] = id
-		}
-
-		query := fmt.Sprintf(`
-			SELECT email, account_id
-			FROM alias_inventory
-			WHERE account_id IN (%s)
-			  AND allocation_state = 'available'
-			  AND remote_state = 'active'
-			LIMIT 1`,
-			strings.Join(placeholders, ","),
-		)
-
-		var candEmail, candAccountID string
-		err := tx.QueryRow(query, args...).Scan(&candEmail, &candAccountID)
-		if err != nil {
-			continue
-		}
-
-		res, err := tx.Exec(`
-			UPDATE alias_inventory
-			SET allocation_state = 'allocated'
-			WHERE email = ? AND allocation_state = 'available'
-		`, candEmail)
-		if err != nil {
-			return nil, err
-		}
-		rowsAffected, _ := res.RowsAffected()
-		if rowsAffected == 0 {
-			continue
-		}
-
-		ownerKind := principalKind
-		ownerID := principalID
-
-		allocID := NewOpaqueID("lease_")
-
-		_, err = tx.Exec(`
-			INSERT INTO alias_allocations (allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status)
-			VALUES (?, ?, ?, ?, ?, ?, ?, 'allocated')
-			ON CONFLICT(alias_email) DO UPDATE SET
-				owner_kind = excluded.owner_kind,
-				owner_id = excluded.owner_id,
-				status = 'allocated'
-		`, allocID, candEmail, candAccountID, ownerKind, ownerID, tag, now)
-		if err != nil {
-			return nil, fmt.Errorf("写入 alias_allocations 失败: %w", err)
-		}
-
-		rec := LeaseRecord{
-			ID:          allocID,
-			Email:       candEmail,
-			AccountID:   candAccountID,
-			Tag:         tag,
-			Status:      "completed",
-			AllocatedAt: now,
-			CompletedAt: now,
-			TokenName:   tokenDisplayName,
-		}
-		insQuery := `INSERT INTO lease_records (id, email, account_id, tag, status, allocated_at, completed_at, token_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-		if _, insertErr := tx.Exec(insQuery, rec.ID, rec.Email, rec.AccountID, rec.Tag, rec.Status, rec.AllocatedAt, rec.CompletedAt, rec.TokenName); insertErr != nil {
-			return nil, insertErr
-		}
-
-		if rec.AccountID != "" {
-			_, _ = tx.Exec(`INSERT INTO alias_routes (email, account_id, updated_at) VALUES (?, ?, ?) ON CONFLICT(email) DO UPDATE SET account_id=excluded.account_id`, rec.Email, rec.AccountID, now)
-		}
-
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-
-		s.UpdateTagLastAssigned(tag)
-		return &rec, nil
-	}
-
-	return nil, nil
-}
-
-// CountAvailablePoolAliases 统计候选别名列表中未被消费的可用数量。
-func (s *Store) CountAvailablePoolAliases(candidates []PoolCandidate) (int, error) {
-	if len(candidates) == 0 {
-		return 0, nil
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	totalAvailable := 0
-	const batchSize = 500
-	for i := 0; i < len(candidates); i += batchSize {
-		end := i + batchSize
-		if end > len(candidates) {
-			end = len(candidates)
-		}
-		chunk := candidates[i:end]
-
-		placeholders := make([]string, len(chunk))
-		args := make([]any, len(chunk))
-		for j, c := range chunk {
-			placeholders[j] = "?"
-			args[j] = normalizeEmail(c.Email)
-		}
-
-		query := fmt.Sprintf(
-			`SELECT LOWER(email) FROM lease_records WHERE LOWER(email) IN (%s) AND COALESCE(token_name, '') != 'scheduler'`,
-			strings.Join(placeholders, ","),
-		)
-		rows, err := s.db.Query(query, args...)
-		if err != nil {
-			return 0, err
-		}
-		consumed := make(map[string]bool, len(chunk))
-		for rows.Next() {
-			var em string
-			if err := rows.Scan(&em); err == nil {
-				consumed[normalizeEmail(em)] = true
-			}
-		}
-		_ = rows.Close()
-
-		for _, c := range chunk {
-			norm := normalizeEmail(c.Email)
-			if norm != "" && !consumed[norm] {
-				totalAvailable++
-			}
-		}
-	}
-
-	return totalAvailable, nil
 }
 
 // CountConsumedPoolAliases 统计已被外部消费者认领（非 scheduler 占位）的唯一别名数。

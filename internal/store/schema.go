@@ -322,6 +322,9 @@ func migrateV0ToV1(tx *sql.Tx) error {
 		candidate_email TEXT DEFAULT '',
 		result_ref TEXT DEFAULT '',
 		error_code TEXT DEFAULT '',
+		business_tag TEXT DEFAULT '',
+		token_name TEXT DEFAULT '',
+		result_source TEXT NOT NULL DEFAULT 'pool',
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL,
 		CONSTRAINT uq_op_idempotency UNIQUE (principal_kind, principal_id, operation_kind, idempotency_key)
@@ -336,6 +339,7 @@ func migrateV0ToV1(tx *sql.Tx) error {
 		anonymous_id TEXT DEFAULT '',
 		result_ref TEXT DEFAULT '',
 		error_message TEXT DEFAULT '',
+		operation_id TEXT DEFAULT '',
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	);
@@ -394,6 +398,10 @@ func migrateV0ToV1(tx *sql.Tx) error {
 		{"operations", "candidate_email", "TEXT DEFAULT ''"},
 		{"operations", "result_ref", "TEXT DEFAULT ''"},
 		{"operations", "error_code", "TEXT DEFAULT ''"},
+		{"operations", "business_tag", "TEXT DEFAULT ''"},
+		{"operations", "token_name", "TEXT DEFAULT ''"},
+		{"operations", "result_source", "TEXT NOT NULL DEFAULT 'pool'"},
+		{"hme_reserve_intents", "operation_id", "TEXT DEFAULT ''"},
 		{"verification_requests", "baseline_provider", "TEXT DEFAULT ''"},
 		{"verification_requests", "baseline_mailbox", "TEXT DEFAULT 'INBOX'"},
 		{"verification_requests", "baseline_uidvalidity", "INTEGER DEFAULT 0"},

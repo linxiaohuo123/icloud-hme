@@ -200,10 +200,18 @@ func TestStoreConcurrentCreateNoOverwrite(t *testing.T) {
 	}
 	wg.Wait()
 
-	if got := len(s.ListTokens()); got != n {
+	tokens, err := s.ListTokens()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(tokens); got != n {
 		t.Fatalf("并发创建的令牌被覆盖: 期望 %d 行, 实际 %d 行", n, got)
 	}
-	if got := len(s.ListTags()); got != n {
+	tags, err := s.ListTags()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(tags); got != n {
 		t.Fatalf("并发创建的业务标识被覆盖: 期望 %d 行, 实际 %d 行", n, got)
 	}
 	// 每个令牌都必须仍然可用(被覆盖会让旧令牌静默失效)
@@ -341,7 +349,7 @@ func TestAliasRoutesBackfillFromLegacyLeases(t *testing.T) {
 		t.Fatalf("第三次打开 Store 失败: %v", err)
 	}
 	defer s3.Close()
-	if got := s3.GetSetting(settingKeyAliasRoutesBackfilled); got != "1" {
+	if got, err := s3.GetSetting(settingKeyAliasRoutesBackfilled); err != nil || got != "1" {
 		t.Fatalf("回填标记应已落库, 实际 %q", got)
 	}
 	if got := s3.CountAliasRoutes(); got != 2 {
@@ -515,16 +523,26 @@ func TestSaveScheduleConfigPreservesReservedQuota(t *testing.T) {
 	if err := s.SaveScheduleConfig(ScheduleConfig{AccountID: "acc_quota", Enabled: true, HourlyQuota: 5, LastRunAt: "2020-01-01T00:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
-	stale := s.GetScheduleConfig("acc_quota")
-	if ok, _ := s.TryReserveQuota("acc_quota", 1); !ok {
-		t.Fatal("quota reservation failed")
+	stale, err := s.GetScheduleConfig("acc_quota")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _, err := s.TryReserveQuota("acc_quota", 1); err != nil || !ok {
+		t.Fatalf("quota reservation failed: %v", err)
 	}
 	stale.Enabled = false
 	if err := s.SaveScheduleConfig(stale); err != nil {
 		t.Fatal(err)
 	}
-	got := s.GetScheduleConfig("acc_quota")
-	if got.Enabled || got.CurrentHourCount != 1 || s.RemainingQuota("acc_quota") != 4 || got.LastRunAt == stale.LastRunAt {
+	got, err := s.GetScheduleConfig("acc_quota")
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := s.RemainingQuota("acc_quota")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Enabled || got.CurrentHourCount != 1 || remaining != 4 || got.LastRunAt == stale.LastRunAt {
 		t.Fatalf("stale config overwrote quota: %+v", got)
 	}
 }
@@ -542,12 +560,18 @@ func TestStorePersistence(t *testing.T) {
 	if err := s.SaveTag(tag); err != nil {
 		t.Fatalf("SaveTag failed: %v", err)
 	}
-	tags := s.ListTags()
+	tags, err := s.ListTags()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(tags) != 1 || tags[0].Tag != "gpt-register" {
 		t.Fatalf("Tags mismatch: %+v", tags)
 	}
 	s.UpdateTagLastAssigned("gpt-register")
-	tags = s.ListTags()
+	tags, err = s.ListTags()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if tags[0].LastAssignedAt == "" {
 		t.Fatal("UpdateTagLastAssigned failed to update timestamp")
 	}
@@ -578,7 +602,10 @@ func TestStorePersistence(t *testing.T) {
 	}
 
 	// 4. Schedules & Quota
-	allowed, count := s.IncrementHourlyQuota("acc_1")
+	allowed, count, err := s.IncrementHourlyQuota("acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !allowed || count != 1 {
 		t.Fatalf("IncrementHourlyQuota failed: allowed=%v, count=%d", allowed, count)
 	}
@@ -594,7 +621,9 @@ func TestStorePersistence(t *testing.T) {
 		t.Fatalf("NewStore reload failed: %v", err)
 	}
 	defer s2.Close()
-	if len(s2.ListTags()) != 1 || len(s2.ListTokens()) != 1 {
+	reloadedTags, tagErr := s2.ListTags()
+	reloadedTokens, tokenErr := s2.ListTokens()
+	if tagErr != nil || tokenErr != nil || len(reloadedTags) != 1 || len(reloadedTokens) != 1 {
 		t.Fatal("Reload data missing")
 	}
 }
@@ -623,12 +652,18 @@ func TestStoreMigration(t *testing.T) {
 	defer s.Close()
 
 	// 验证数据已迁移到 SQLite
-	tags := s.ListTags()
+	tags, err := s.ListTags()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(tags) != 1 || tags[0].Tag != "legacy-tag" {
 		t.Fatalf("Migrated tags mismatch: %+v", tags)
 	}
 
-	tokens := s.ListTokens()
+	tokens, err := s.ListTokens()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(tokens) != 1 || !tokens[0].NeedsRotation || !s.ValidateToken("legacy_tok") {
 		t.Fatalf("Migrated tokens mismatch: %+v", tokens)
 	}
@@ -645,7 +680,10 @@ func TestStoreMigration(t *testing.T) {
 		t.Fatalf("lease token_name was dropped during migration: %+v", leases[0])
 	}
 
-	sched := s.GetScheduleConfig("acc_old")
+	sched, err := s.GetScheduleConfig("acc_old")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !sched.Enabled || sched.HourlyQuota != 10 {
 		t.Fatalf("Migrated schedule mismatch: %+v", sched)
 	}
@@ -805,19 +843,28 @@ func TestScheduleConfigHourWindowReset(t *testing.T) {
 	}
 
 	// 1. GetScheduleConfig 读取时应当天衣无缝地重置 CurrentHourCount 为 0
-	readCfg := s.GetScheduleConfig("acc_past")
+	readCfg, err := s.GetScheduleConfig("acc_past")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if readCfg.CurrentHourCount != 0 {
 		t.Fatalf("跨小时后 CurrentHourCount 应自动重置为 0, 实际得到: %d", readCfg.CurrentHourCount)
 	}
 
 	// 2. ListScheduleConfigs 读取时也应当一致性返回 0
-	listConfigs := s.ListScheduleConfigs()
+	listConfigs, err := s.ListScheduleConfigs()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(listConfigs) == 0 || listConfigs[0].CurrentHourCount != 0 {
 		t.Fatalf("ListScheduleConfigs 中 CurrentHourCount 应自动重置为 0, 实际得到: %d", listConfigs[0].CurrentHourCount)
 	}
 
 	// 3. RemainingQuota 应当正确呈现为完整的 10
-	rem := s.RemainingQuota("acc_past")
+	rem, err := s.RemainingQuota("acc_past")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if rem != 10 {
 		t.Fatalf("剩余配额应为完整的 10, 实际得到: %d", rem)
 	}
@@ -842,7 +889,11 @@ func TestDeleteScheduleConfig(t *testing.T) {
 		t.Fatalf("SaveScheduleConfig failed: %v", err)
 	}
 
-	if len(s.ListScheduleConfigs()) != 1 {
+	configs, err := s.ListScheduleConfigs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configs) != 1 {
 		t.Fatal("保存后配置列表应有 1 条记录")
 	}
 
@@ -850,7 +901,11 @@ func TestDeleteScheduleConfig(t *testing.T) {
 		t.Fatalf("DeleteScheduleConfig 失败: %v", err)
 	}
 
-	if len(s.ListScheduleConfigs()) != 0 {
+	configs, err = s.ListScheduleConfigs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configs) != 0 {
 		t.Fatal("物理删除后配置列表应为空，杜绝幽灵记录")
 	}
 }

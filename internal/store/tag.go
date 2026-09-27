@@ -8,7 +8,6 @@
 package store
 
 import (
-	"log"
 	"time"
 )
 
@@ -30,25 +29,22 @@ func NewBusinessTagID() string { return newOpaqueID("tag_") }
 // Business Tags
 // ────────────────────────────────────────────────────────────────
 
-func (s *Store) ListTags() []BusinessTag {
+func (s *Store) ListTags() ([]BusinessTag, error) {
 	rows, err := s.db.Query(`SELECT id, name, tag, description, status, created_at, COALESCE(last_assigned_at, '') FROM business_tags ORDER BY created_at DESC`)
 	if err != nil {
-		return []BusinessTag{}
+		return nil, err
 	}
 	defer rows.Close()
 
 	res := make([]BusinessTag, 0)
 	for rows.Next() {
 		var t BusinessTag
-		if err := rows.Scan(&t.ID, &t.Name, &t.Tag, &t.Description, &t.Status, &t.CreatedAt, &t.LastAssignedAt); err == nil {
-			res = append(res, t)
+		if err := rows.Scan(&t.ID, &t.Name, &t.Tag, &t.Description, &t.Status, &t.CreatedAt, &t.LastAssignedAt); err != nil {
+			return nil, err
 		}
+		res = append(res, t)
 	}
-	// 【BUG-05 修复】迭代中断时记录日志,防止底层 IO 错误导致结果静默截断
-	if err := rows.Err(); err != nil {
-		log.Printf("[Store] ListTags 迭代中断: %v", err)
-	}
-	return res
+	return res, rows.Err()
 }
 
 func (s *Store) SaveTag(tag BusinessTag) error {

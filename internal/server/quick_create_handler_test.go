@@ -126,7 +126,10 @@ func TestSelectAccountCandidatesQuotaPriority(t *testing.T) {
 
 	// acc_idle 水位低 (10) 但配额用完 (TryReserve 10)
 	// acc_busy 水位高 (120) 但有配额 (剩余 10)
-	allowed, _ := st.TryReserveQuota("acc_tag_idle", 10)
+	allowed, _, err := st.TryReserveQuota("acc_tag_idle", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !allowed {
 		t.Fatalf("预扣配额失败")
 	}
@@ -148,7 +151,10 @@ func TestSelectAccountCandidatesQuotaPriority(t *testing.T) {
 		},
 	}
 
-	cands := selectAccountCandidates(accounts, "biz_a", st)
+	cands, err := selectAccountCandidates(accounts, "biz_a", st)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(cands) != 2 {
 		t.Fatalf("期望返回 2 个候选, 实际得到: %d", len(cands))
 	}
@@ -186,7 +192,10 @@ func TestSelectAccountCandidatesDualQuotaLimit(t *testing.T) {
 		},
 	}
 
-	cands := selectAccountCandidates(accounts, "default", nil)
+	cands, err := selectAccountCandidates(accounts, "default", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(cands) != 1 || cands[0] != "acc_ok" {
 		t.Fatalf("期望仅筛选出双维均未达上限的 acc_ok, 实际得到: %v", cands)
 	}
@@ -205,7 +214,10 @@ func TestQuickCreateStrictTagIsolation(t *testing.T) {
 		},
 	}
 
-	cands := selectAccountCandidates(accounts, "biz_marketing", nil)
+	cands, err := selectAccountCandidates(accounts, "biz_marketing", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(cands) != 0 {
 		t.Fatalf("期望严格标签隔离下返回 0 候选，禁止借用其他业务账号，实际得到: %v", cands)
 	}
@@ -397,5 +409,3 @@ func TestQuickCreateRoundRobinInterleaving(t *testing.T) {
 		t.Fatalf("第4次出号期望轮转至 beta_2@icloud.com, 实际: %s %s", acc4, em4)
 	}
 }
-
-

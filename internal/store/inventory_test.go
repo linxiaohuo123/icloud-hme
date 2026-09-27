@@ -30,6 +30,27 @@ func insertTestAccount(t *testing.T, st *Store, id string) {
 	}
 }
 
+func TestAddInventoryAliasRejectsOtherAccountWithoutChangingMetadata(t *testing.T) {
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.AddInventoryAlias("acc_1", hme.Alias{Email: "owned@icloud.com", AnonymousID: "original", Active: true}, "replenish", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddInventoryAlias("acc_2", hme.Alias{Email: "owned@icloud.com", AnonymousID: "wrong", Active: false}, "created", false); err == nil {
+		t.Fatal("cross-account inventory conflict succeeded")
+	}
+	inv, err := st.GetInventoryAlias("owned@icloud.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inv.AccountID != "acc_1" || inv.ProviderAliasID != "original" || inv.RemoteState != RemoteActive || inv.AllocationState != AllocationAvailable {
+		t.Fatalf("cross-account conflict changed inventory: %+v", inv)
+	}
+}
+
 // D01: 100 个并发相同幂等请求仅产生一个 allocation，响应结果完全一致
 func TestPR03_D01_ConcurrentIdenticalIdempotentClaim(t *testing.T) {
 	tempDir := t.TempDir()
@@ -142,6 +163,9 @@ func TestPR03_D02_ConcurrentDifferentClaimsNoDuplicate(t *testing.T) {
 
 	if successCount != poolSize {
 		t.Fatalf("expected exactly %d successful claims, got %d", poolSize, successCount)
+	}
+	if consumed := st.CountConsumedPoolAliases(); consumed != poolSize {
+		t.Fatalf("consumed alias count = %d, want %d", consumed, poolSize)
 	}
 }
 
@@ -915,7 +939,3 @@ func TestPromoteUnknownToAvailable(t *testing.T) {
 		t.Fatalf("unexpected claimed alias: %s", alloc.AliasEmail)
 	}
 }
-
-
-
-

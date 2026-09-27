@@ -215,10 +215,10 @@ func TestScheduleConfigPatchSemantics(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("写入完整配置失败: %d %s", resp.StatusCode, body)
 	}
-	if ok, _ := st.TryReserveQuota("acc_1", 3); !ok {
+	if ok, _, err := st.TryReserveQuota("acc_1", 3); err != nil || !ok {
 		t.Fatal("预留 3 个配额应成功")
 	}
-	if got := st.RemainingQuota("acc_1"); got != 7 {
+	if got, err := st.RemainingQuota("acc_1"); err != nil || got != 7 {
 		t.Fatalf("预留后剩余配额应为 7, 实际 %d", got)
 	}
 
@@ -228,7 +228,10 @@ func TestScheduleConfigPatchSemantics(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("部分更新失败: %d %s", resp.StatusCode, body)
 	}
-	cfg := st.GetScheduleConfig("acc_1")
+	cfg, err := st.GetScheduleConfig("acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !cfg.Enabled {
 		t.Fatal("只改配额不应把定时任务静默关闭")
 	}
@@ -240,7 +243,7 @@ func TestScheduleConfigPatchSemantics(t *testing.T) {
 	}
 
 	// 3) 已完成的小时计数不得被陈旧快照回退(否则会绕过小时限流超额建号)
-	if got := st.RemainingQuota("acc_1"); got != 47 {
+	if got, err := st.RemainingQuota("acc_1"); err != nil || got != 47 {
 		t.Fatalf("小时计数被回退: 期望剩余 47 (50-3), 实际 %d", got)
 	}
 }
@@ -384,4 +387,3 @@ func TestPR01SafetyMitigations(t *testing.T) {
 		}
 	}
 }
-

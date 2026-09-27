@@ -59,6 +59,7 @@ type Backend interface {
 	RemoveAccount(string) bool
 	CreateAlias(string, string) (*hme.CreateResult, error)
 	CreateAliasContext(context.Context, string, string) (*hme.CreateResult, error)
+	CreateAliasForAllocationContext(context.Context, string, string, string) (*hme.CreateResult, error)
 	BatchCreateAlias(string, int, string) (*BatchCreateResult, error)
 	BatchCreateAliasContext(context.Context, string, int, string) (*BatchCreateResult, error)
 	ListAliases(string) ([]hme.Alias, error)

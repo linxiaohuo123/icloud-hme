@@ -90,6 +90,9 @@ type Operation struct {
 	CandidateEmail string `json:"candidate_email"`
 	ResultRef      string `json:"result_ref"`
 	ErrorCode      string `json:"error_code"`
+	BusinessTag    string `json:"business_tag,omitempty"`
+	TokenName      string `json:"token_name,omitempty"`
+	ResultSource   string `json:"result_source"`
 	CreatedAt      string `json:"created_at"`
 	UpdatedAt      string `json:"updated_at"`
 }
@@ -256,9 +259,20 @@ func (s *Store) AddInventoryAlias(accountID string, alias hme.Alias, sourceType 
 		remote_state = excluded.remote_state,
 		provider_alias_id = excluded.provider_alias_id,
 		last_verified_at = excluded.last_verified_at
+	WHERE alias_inventory.account_id = excluded.account_id
 	`
-	_, err := s.db.Exec(q, email, accountID, alias.AnonymousID, remoteState, allocState, sourceType, now)
-	return err
+	res, err := s.db.Exec(q, email, accountID, alias.AnonymousID, remoteState, allocState, sourceType, now)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("inventory alias %s belongs to another account", email)
+	}
+	return nil
 }
 
 // AddRecoveredInventoryAlias 隔离恢复的未决别名；已有分配或保留状态不回退。

@@ -13,8 +13,22 @@ import (
 	"strings"
 	"testing"
 
+	"icloud-hme/internal/store"
 	"testing/fstest"
 )
+
+func TestNewReturnsAuthenticationSetupErrorAndClosesOwnedStore(t *testing.T) {
+	dir := t.TempDir()
+	srv, err := New(nil, nil, Config{DataDir: dir, AdminPassword: "short"})
+	if err == nil || srv != nil {
+		t.Fatalf("invalid admin password should fail initialization: server=%v err=%v", srv, err)
+	}
+	st, err := store.NewStore(dir)
+	if err != nil {
+		t.Fatalf("failed initialization retained database lock: %v", err)
+	}
+	defer st.Close()
+}
 
 // TestSPAAPI404JSON 验证 /api/not-found 返回 JSON 404 而非 HTML。
 func TestSPAAPI404JSON(t *testing.T) {

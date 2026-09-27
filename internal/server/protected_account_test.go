@@ -48,7 +48,10 @@ func TestA04_CandidateSelectionProtectsAccountsAndDeniesFallback(t *testing.T) {
 	}
 
 	// 1. 专属标签匹配 (tag="gpt")：只能选出 acc_normal_gpt，严禁选出 acc_prot_tag
-	cands := selectAccountCandidates(accounts, "gpt", nil)
+	cands, err := selectAccountCandidates(accounts, "gpt", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(cands) != 1 || cands[0] != "acc_normal_gpt" {
 		t.Fatalf("expected only ['acc_normal_gpt'], got: %v", cands)
 	}
@@ -64,13 +67,19 @@ func TestA04_CandidateSelectionProtectsAccountsAndDeniesFallback(t *testing.T) {
 		{ID: "acc_prot_name", Name: "私人大号", Status: "active", HasCookies: true, Tags: []string{}},
 		{ID: "acc_other_biz", Name: "Other Biz", Status: "active", HasCookies: true, Tags: []string{"other"}},
 	}
-	candsNoBorrow := selectAccountCandidates(otherBizAccounts, "exclusive_biz", nil)
+	candsNoBorrow, err := selectAccountCandidates(otherBizAccounts, "exclusive_biz", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(candsNoBorrow) != 0 {
 		t.Fatalf("A04 FAILED: selectAccountCandidates must NOT borrow other biz or protected accounts, got: %v", candsNoBorrow)
 	}
 
 	// 3. 公共池候选 (tag="")：只能选出 acc_public，严禁选出 acc_prot_name 或 acc_prot_mixed
-	candsPublic := selectAccountCandidates(accounts, "", nil)
+	candsPublic, err := selectAccountCandidates(accounts, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(candsPublic) != 1 || candsPublic[0] != "acc_public" {
 		t.Fatalf("expected only ['acc_public'], got: %v", candsPublic)
 	}

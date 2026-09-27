@@ -15,9 +15,33 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"icloud-hme/internal/account"
 	"icloud-hme/internal/store"
 )
+
+func TestHubListsReportPersistenceFailure(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st}
+	for name, handler := range map[string]func(*gin.Context){
+		"tags":      srv.listTagsHandler,
+		"tokens":    srv.listTokensHandler,
+		"schedules": srv.listScheduleConfigsHandler,
+	} {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		handler(ctx)
+		if recorder.Code != http.StatusInternalServerError || !bytes.Contains(recorder.Body.Bytes(), []byte("PERSISTENCE_ERROR")) {
+			t.Errorf("%s returned %d %s, want persistence error", name, recorder.Code, recorder.Body.String())
+		}
+	}
+}
 
 func TestHubHandlers(t *testing.T) {
 	tempDir := t.TempDir()

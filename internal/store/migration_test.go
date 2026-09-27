@@ -178,7 +178,10 @@ func TestMIG05_MigrationIdempotency(t *testing.T) {
 	}
 	defer st2.Close()
 
-	tokens := st2.ListTokens()
+	tokens, err := st2.ListTokens()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(tokens) != 1 || tokens[0].Name != "bot" {
 		t.Fatalf("MIG05 失败: 重复迁移破坏原有数据")
 	}

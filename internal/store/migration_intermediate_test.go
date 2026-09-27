@@ -156,6 +156,20 @@ func TestMIG_MID_03_PR06_OperationsIdempotencyTableAndHashEnforcement(t *testing
 		);
 		INSERT INTO operations (operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, created_at, updated_at)
 		VALUES ('op_mid_exist', 'token', 'tok_mid', 'allocate', 'key_idemp_mid', 'orig_hash', 'pending', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z');
+		CREATE TABLE hme_reserve_intents (
+			intent_id TEXT PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			candidate_email TEXT NOT NULL,
+			label TEXT DEFAULT '',
+			state TEXT NOT NULL,
+			anonymous_id TEXT DEFAULT '',
+			result_ref TEXT DEFAULT '',
+			error_message TEXT DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		INSERT INTO hme_reserve_intents (intent_id, account_id, candidate_email, state, created_at, updated_at)
+		VALUES ('intent_mid', 'acc_mid', 'old@icloud.com', 'outcome_unknown', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z');
 	`)
 	if err != nil {
 		t.Fatal(err)
@@ -169,6 +183,14 @@ func TestMIG_MID_03_PR06_OperationsIdempotencyTableAndHashEnforcement(t *testing
 	defer st.Close()
 
 	ctx := context.Background()
+	op, err := st.GetRemoteAllocationOperation(ctx, "op_mid_exist")
+	if err != nil || op.ResultSource != "pool" {
+		t.Fatalf("legacy operation columns were not migrated: operation=%+v err=%v", op, err)
+	}
+	intent, err := st.GetReserveIntent(ctx, "intent_mid")
+	if err != nil || intent.OperationID != "" {
+		t.Fatalf("legacy reserve intent columns were not migrated: intent=%+v err=%v", intent, err)
+	}
 
 	// 1. 相同 key 但不同 hash 必须报 409 冲突
 	_, _, err = st.ClaimInventoryAlias(ctx, "token", "tok_mid", "allocate", "key_idemp_mid", "conflict_hash", "tag", nil)
@@ -326,4 +348,3 @@ func TestMIG_MID_05_IntermediateAliasAllocationMissingAccountID(t *testing.T) {
 		t.Fatalf("MIG-01 失败: account_id backfill 期望 'acc_backfilled_target', 实际: '%s'", alloc.AccountID)
 	}
 }
-

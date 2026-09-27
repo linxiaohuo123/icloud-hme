@@ -27,15 +27,12 @@ func (s *Server) loadNotifySettings() (notify.Settings, error) {
 	if s.store == nil {
 		return defaultSettings, nil
 	}
-	raw := s.store.GetSetting(settingKeyNotify)
-	if raw == "" {
-		return defaultSettings, nil
-	}
-
-	// 必须解密成功，严禁解密失败静默返回默认值
 	plainJSON, err := s.store.GetEncryptedSetting(settingKeyNotify, security.NotifySettingsAAD())
 	if err != nil {
 		return defaultSettings, fmt.Errorf("解密通知配置失败 (Fail Closed): %w", err)
+	}
+	if plainJSON == "" {
+		return defaultSettings, nil
 	}
 
 	var settings notify.Settings

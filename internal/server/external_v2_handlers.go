@@ -58,6 +58,10 @@ func (s *Server) externalV2AllocateHandler(c *gin.Context) {
 	})
 
 	if err != nil {
+		if errors.Is(err, ErrInvalidAllocationMode) {
+			failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "mode 必须是 pool、pool_only 或 create")
+			return
+		}
 		if errors.Is(err, ErrScopeDenied) {
 			failCode(c, http.StatusForbidden, "SCOPE_DENIED", "主体无权调用分配接口")
 			return
@@ -105,8 +109,21 @@ func (s *Server) externalV2AllocateHandler(c *gin.Context) {
 			})
 			return
 		}
+		if errors.Is(err, store.ErrOperationOutcomeUnknown) {
+			opID := ""
+			if allocRes != nil && allocRes.Operation != nil {
+				opID = allocRes.Operation.OperationID
+			}
+			c.JSON(http.StatusBadGateway, apiResp{Success: false, Code: "UPSTREAM_OUTCOME_UNKNOWN", Message: "上游建号结果待核对", Data: gin.H{"operation_id": opID}})
+			return
+		}
 		if errors.Is(err, ErrAllocationNotReady) {
 			failCode(c, http.StatusServiceUnavailable, "ALLOCATION_STATE_NOT_READY", "存储层未就绪")
+			return
+		}
+		var backendErr *BackendError
+		if errors.As(err, &backendErr) {
+			backendFail(c, err)
 			return
 		}
 		failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", "认领别名失败: "+err.Error())

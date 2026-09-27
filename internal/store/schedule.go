@@ -8,7 +8,8 @@
 package store
 
 import (
-	"log"
+	"database/sql"
+	"errors"
 	"strings"
 	"time"
 )
@@ -33,19 +34,22 @@ type ScheduleConfig struct {
 // 定时配置 Schedules
 // ────────────────────────────────────────────────────────────────
 
-func (s *Store) GetScheduleConfig(accountID string) ScheduleConfig {
+func (s *Store) GetScheduleConfig(accountID string) (ScheduleConfig, error) {
 	var cfg ScheduleConfig
 	var enabledInt int
 	query := `SELECT account_id, enabled, hourly_quota, COALESCE(alias_label, 'scheduled'), current_hour_count, last_hour_window, COALESCE(last_run_at, ''), COALESCE(mode, 'always'), COALESCE(start_time, ''), COALESCE(end_time, ''), COALESCE(duration_hours, 0), COALESCE(started_at, '') FROM schedules WHERE account_id = ?`
 	err := s.db.QueryRow(query, accountID).Scan(&cfg.AccountID, &enabledInt, &cfg.HourlyQuota, &cfg.AliasLabel, &cfg.CurrentHourCount, &cfg.LastHourWindow, &cfg.LastRunAt, &cfg.Mode, &cfg.StartTime, &cfg.EndTime, &cfg.DurationHours, &cfg.StartedAt)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		return ScheduleConfig{
 			AccountID:   accountID,
 			Enabled:     false,
 			HourlyQuota: 5,
 			AliasLabel:  "scheduled",
 			Mode:        "always",
-		}
+		}, nil
+	}
+	if err != nil {
+		return ScheduleConfig{}, err
 	}
 	cfg.Enabled = (enabledInt == 1)
 	if strings.TrimSpace(cfg.AliasLabel) == "" {
@@ -58,13 +62,13 @@ func (s *Store) GetScheduleConfig(accountID string) ScheduleConfig {
 	if cfg.LastHourWindow != currentHour {
 		cfg.CurrentHourCount = 0
 	}
-	return cfg
+	return cfg, nil
 }
 
-func (s *Store) ListScheduleConfigs() []ScheduleConfig {
+func (s *Store) ListScheduleConfigs() ([]ScheduleConfig, error) {
 	rows, err := s.db.Query(`SELECT account_id, enabled, hourly_quota, COALESCE(alias_label, 'scheduled'), current_hour_count, last_hour_window, COALESCE(last_run_at, ''), COALESCE(mode, 'always'), COALESCE(start_time, ''), COALESCE(end_time, ''), COALESCE(duration_hours, 0), COALESCE(started_at, '') FROM schedules`)
 	if err != nil {
-		return []ScheduleConfig{}
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -73,25 +77,22 @@ func (s *Store) ListScheduleConfigs() []ScheduleConfig {
 	for rows.Next() {
 		var cfg ScheduleConfig
 		var enabledInt int
-		if err := rows.Scan(&cfg.AccountID, &enabledInt, &cfg.HourlyQuota, &cfg.AliasLabel, &cfg.CurrentHourCount, &cfg.LastHourWindow, &cfg.LastRunAt, &cfg.Mode, &cfg.StartTime, &cfg.EndTime, &cfg.DurationHours, &cfg.StartedAt); err == nil {
-			cfg.Enabled = (enabledInt == 1)
-			if strings.TrimSpace(cfg.AliasLabel) == "" {
-				cfg.AliasLabel = "scheduled"
-			}
-			if strings.TrimSpace(cfg.Mode) == "" {
-				cfg.Mode = "always"
-			}
-			if cfg.LastHourWindow != currentHour {
-				cfg.CurrentHourCount = 0
-			}
-			res = append(res, cfg)
+		if err := rows.Scan(&cfg.AccountID, &enabledInt, &cfg.HourlyQuota, &cfg.AliasLabel, &cfg.CurrentHourCount, &cfg.LastHourWindow, &cfg.LastRunAt, &cfg.Mode, &cfg.StartTime, &cfg.EndTime, &cfg.DurationHours, &cfg.StartedAt); err != nil {
+			return nil, err
 		}
+		cfg.Enabled = (enabledInt == 1)
+		if strings.TrimSpace(cfg.AliasLabel) == "" {
+			cfg.AliasLabel = "scheduled"
+		}
+		if strings.TrimSpace(cfg.Mode) == "" {
+			cfg.Mode = "always"
+		}
+		if cfg.LastHourWindow != currentHour {
+			cfg.CurrentHourCount = 0
+		}
+		res = append(res, cfg)
 	}
-	// 【BUG-05 修复】迭代中断时记录日志
-	if err := rows.Err(); err != nil {
-		log.Printf("[Store] ListScheduleConfigs 迭代中断: %v", err)
-	}
-	return res
+	return res, rows.Err()
 }
 
 // SaveScheduleConfig 保存调度配置，不覆盖配额仲裁字段。
@@ -99,6 +100,21 @@ func (s *Store) SaveScheduleConfig(cfg ScheduleConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.saveScheduleConfigLocked(cfg, false)
+}
+
+// UpdateScheduleConfig serializes a partial update with quota reservations and other config updates.
+func (s *Store) UpdateScheduleConfig(accountID string, update func(*ScheduleConfig)) (ScheduleConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg, err := s.GetScheduleConfig(accountID)
+	if err != nil {
+		return ScheduleConfig{}, err
+	}
+	update(&cfg)
+	if err := s.saveScheduleConfigLocked(cfg, false); err != nil {
+		return ScheduleConfig{}, err
+	}
+	return cfg, nil
 }
 
 // saveScheduleConfigLocked 是 SaveScheduleConfig 的加锁内核，调用方必须持有 s.mu。
@@ -146,14 +162,17 @@ func (s *Store) DeleteScheduleConfig(accountID string) error {
 }
 
 // TryReserveQuota 尝试原子预留指定数量的配额（单次/批量/调度统一入口）
-func (s *Store) TryReserveQuota(accountID string, count int) (allowed bool, remaining int) {
+func (s *Store) TryReserveQuota(accountID string, count int) (allowed bool, remaining int, err error) {
 	if count <= 0 {
-		return true, 0
+		return true, 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cfg := s.GetScheduleConfig(accountID)
+	cfg, err := s.GetScheduleConfig(accountID)
+	if err != nil {
+		return false, 0, err
+	}
 	currentHour := time.Now().Unix() / 3600
 	if cfg.LastHourWindow != currentHour {
 		cfg.LastHourWindow = currentHour
@@ -165,7 +184,7 @@ func (s *Store) TryReserveQuota(accountID string, count int) (allowed bool, rema
 		if rem < 0 {
 			rem = 0
 		}
-		return false, rem
+		return false, rem, nil
 	}
 
 	cfg.CurrentHourCount += count
@@ -173,60 +192,76 @@ func (s *Store) TryReserveQuota(accountID string, count int) (allowed bool, rema
 	if err := s.saveScheduleConfigLocked(cfg, true); err != nil {
 		// 落库失败则回滚内存计数，拒绝本次预留，避免重启后配额归零超额出号
 		cfg.CurrentHourCount -= count
-		return false, cfg.HourlyQuota - cfg.CurrentHourCount
+		return false, cfg.HourlyQuota - cfg.CurrentHourCount, err
 	}
-	return true, cfg.HourlyQuota - cfg.CurrentHourCount
+	return true, cfg.HourlyQuota - cfg.CurrentHourCount, nil
 }
 
 // ReleaseQuota 当别名创建失败时回滚配额
-func (s *Store) ReleaseQuota(accountID string, count int) {
+func (s *Store) ReleaseQuota(accountID string, count int) error {
 	if count <= 0 {
-		return
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cfg := s.GetScheduleConfig(accountID)
+	cfg, err := s.GetScheduleConfig(accountID)
+	if err != nil {
+		return err
+	}
 	currentHour := time.Now().Unix() / 3600
 	if cfg.LastHourWindow == currentHour {
 		cfg.CurrentHourCount -= count
 		if cfg.CurrentHourCount < 0 {
 			cfg.CurrentHourCount = 0
 		}
-		_ = s.saveScheduleConfigLocked(cfg, true)
+		return s.saveScheduleConfigLocked(cfg, true)
 	}
+	return nil
 }
 
 // RemainingQuota 查询指定账号当前小时的剩余创建配额
-func (s *Store) RemainingQuota(accountID string) int {
+func (s *Store) RemainingQuota(accountID string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cfg := s.GetScheduleConfig(accountID)
+	cfg, err := s.GetScheduleConfig(accountID)
+	if err != nil {
+		return 0, err
+	}
 	currentHour := time.Now().Unix() / 3600
 	if cfg.LastHourWindow != currentHour {
-		return cfg.HourlyQuota
+		return cfg.HourlyQuota, nil
 	}
 	rem := cfg.HourlyQuota - cfg.CurrentHourCount
 	if rem < 0 {
-		return 0
+		return 0, nil
 	}
-	return rem
+	return rem, nil
 }
 
-func (s *Store) IncrementHourlyQuota(accountID string) (allowed bool, current int) {
-	ok, _ := s.TryReserveQuota(accountID, 1)
-	cfg := s.GetScheduleConfig(accountID)
-	return ok, cfg.CurrentHourCount
+func (s *Store) IncrementHourlyQuota(accountID string) (allowed bool, current int, err error) {
+	ok, _, err := s.TryReserveQuota(accountID, 1)
+	if err != nil {
+		return false, 0, err
+	}
+	cfg, err := s.GetScheduleConfig(accountID)
+	if err != nil {
+		return false, 0, err
+	}
+	return ok, cfg.CurrentHourCount, nil
 }
 
 // GetSetting 读取系统级 KV 设置,不存在返回空串。
-func (s *Store) GetSetting(key string) string {
+func (s *Store) GetSetting(key string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var value string
-	_ = s.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
-	return value
+	err := s.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return value, err
 }
 
 // SaveSetting 写入系统级 KV 设置 (upsert)。

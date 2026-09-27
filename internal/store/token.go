@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 context, crypto/rand, crypto/sha256, database/sql, encoding/base64, encoding/hex, errors, fmt, log, strings, time, icloud-hme/internal/store (Store, newOpaqueID)
- * [OUTPUT]: 对外提供 APIToken, CreatedToken, Scope 常量, HasScope, NewAPITokenID, GenerateSecureToken, HashToken, SafeTokenPrefix, ListTokens, ListTokensMasked, SaveToken, CreateToken, RotateToken, DeleteToken, ValidateToken, ValidateTokenWithName, ValidateTokenPrincipal, GetToken
+ * [OUTPUT]: 对外提供 APIToken, CreatedToken, Scope 常量, HasScope, NewAPITokenID, GenerateSecureToken, HashToken, SafeTokenPrefix, ListTokens, SaveToken, CreateToken, RotateToken, DeleteToken, ValidateToken, ValidateTokenWithName, ValidateTokenPrincipal, GetToken
  * [POS]: internal/store 的外部 API 令牌安全领域 (PR-07: 不可逆哈希存储、生命周期管理与 CSPRNG 令牌生成)
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -17,7 +17,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"strings"
 	"time"
 )
@@ -151,7 +150,7 @@ func (s *Store) activityFlusher() {
 }
 
 // ListTokens 查询全部令牌记录 (不返回明文 Token 及 TokenHash)
-func (s *Store) ListTokens() []APIToken {
+func (s *Store) ListTokens() ([]APIToken, error) {
 	rows, err := s.db.Query(`
 		SELECT id, name, token_prefix, created_at, COALESCE(last_used_at, ''),
 		       COALESCE(scopes, ''), COALESCE(expires_at, ''), COALESCE(revoked_at, ''),
@@ -160,7 +159,7 @@ func (s *Store) ListTokens() []APIToken {
 		ORDER BY created_at DESC
 	`)
 	if err != nil {
-		return []APIToken{}
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -171,21 +170,14 @@ func (s *Store) ListTokens() []APIToken {
 		if err := rows.Scan(
 			&tok.ID, &tok.Name, &tok.TokenPrefix, &tok.CreatedAt, &tok.LastUsedAt,
 			&tok.Scopes, &tok.ExpiresAt, &tok.RevokedAt, &tok.RotatedAt, &needsRot,
-		); err == nil {
-			tok.NeedsRotation = (needsRot == 1)
-			tok.Token = tok.TokenPrefix + "****"
-			res = append(res, tok)
+		); err != nil {
+			return nil, err
 		}
+		tok.NeedsRotation = (needsRot == 1)
+		tok.Token = tok.TokenPrefix + "****"
+		res = append(res, tok)
 	}
-	if err := rows.Err(); err != nil {
-		log.Printf("[Store] ListTokens 迭代中断: %v", err)
-	}
-	return res
-}
-
-// ListTokensMasked 返回令牌列表 (ListTokens 已保证只返回安全前缀)
-func (s *Store) ListTokensMasked() []APIToken {
-	return s.ListTokens()
+	return res, rows.Err()
 }
 
 // MaskToken 只保留令牌的前 7 位与长度提示，其余打码。

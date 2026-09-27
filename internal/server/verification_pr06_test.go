@@ -202,7 +202,7 @@ func TestPR06_V03_RestartRecoveryPreservesBoundary(t *testing.T) {
 	fb := &fakeBackend{
 		accounts: []account.Summary{{ID: "acc_1", HasAppPassword: true}},
 	}
-	sNew := newWithBackendAndStore(fb, Config{AdminPassword: "admin"}, st)
+	sNew := newWithBackendAndStore(fb, Config{AdminPassword: "admin-test-password"}, st)
 	tsNew := httptest.NewServer(sNew.Handler())
 	defer tsNew.Close()
 

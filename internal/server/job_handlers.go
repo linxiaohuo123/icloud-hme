@@ -117,8 +117,16 @@ func (s *Server) listCreateJobsHandler(c *gin.Context) {
 			failCode(c, http.StatusNotFound, "NOT_FOUND", "账号不存在")
 			return
 		}
-		cfg := s.store.GetScheduleConfig(accountID)
-		rem := s.store.RemainingQuota(accountID)
+		cfg, err := s.store.GetScheduleConfig(accountID)
+		if err != nil {
+			failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "读取任务配置失败")
+			return
+		}
+		rem, err := s.store.RemainingQuota(accountID)
+		if err != nil {
+			failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "读取剩余配额失败")
+			return
+		}
 		ok(c, gin.H{
 			"remaining_this_hour": rem,
 			"jobs":                []createJobResp{toJobResp(cfg, now)},
@@ -129,7 +137,11 @@ func (s *Server) listCreateJobsHandler(c *gin.Context) {
 	accounts := s.be.ListAccounts()
 	jobs := make([]createJobResp, 0, len(accounts))
 	for _, acc := range accounts {
-		cfg := s.store.GetScheduleConfig(acc.ID)
+		cfg, err := s.store.GetScheduleConfig(acc.ID)
+		if err != nil {
+			failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "读取任务配置失败")
+			return
+		}
 		if cfg.Enabled || cfg.Mode != "always" || cfg.DurationHours > 0 || cfg.StartTime != "" {
 			jobs = append(jobs, toJobResp(cfg, now))
 		}
@@ -154,24 +166,24 @@ func (s *Server) upsertCreateJobHandler(c *gin.Context) {
 	}
 
 	now := time.Now()
-	cfg := s.store.GetScheduleConfig(req.AccountID)
-	cfg.Enabled = true
-	cfg.Mode = req.Mode
-	cfg.AliasLabel = req.LabelPrefix
-	cfg.DurationHours = req.DurationHours
-	cfg.StartTime = req.StartTime
-	cfg.EndTime = req.EndTime
-	if req.Mode == "duration" {
-		cfg.StartedAt = now.Format(time.RFC3339)
-	} else {
-		cfg.StartedAt = ""
-	}
-
-	if err := s.store.SaveScheduleConfig(cfg); err != nil {
+	cfg, err := s.store.UpdateScheduleConfig(req.AccountID, func(cfg *store.ScheduleConfig) {
+		cfg.Enabled = true
+		cfg.Mode = req.Mode
+		cfg.AliasLabel = req.LabelPrefix
+		cfg.DurationHours = req.DurationHours
+		cfg.StartTime = req.StartTime
+		cfg.EndTime = req.EndTime
+		if req.Mode == "duration" {
+			cfg.StartedAt = now.Format(time.RFC3339)
+		} else {
+			cfg.StartedAt = ""
+		}
+	})
+	if err != nil {
 		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "保存任务失败")
 		return
 	}
-	ok(c, toJobResp(s.store.GetScheduleConfig(req.AccountID), now))
+	ok(c, toJobResp(cfg, now))
 }
 
 func validateJobScheduleParams(req *upsertJobReq) error {
@@ -212,13 +224,14 @@ func (s *Server) pauseCreateJobHandler(c *gin.Context) {
 		failCode(c, http.StatusNotFound, "NOT_FOUND", "任务或账号不存在")
 		return
 	}
-	cfg := s.store.GetScheduleConfig(accID)
-	cfg.Enabled = false
-	if err := s.store.SaveScheduleConfig(cfg); err != nil {
+	cfg, err := s.store.UpdateScheduleConfig(accID, func(cfg *store.ScheduleConfig) {
+		cfg.Enabled = false
+	})
+	if err != nil {
 		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "暂停任务失败")
 		return
 	}
-	ok(c, toJobResp(s.store.GetScheduleConfig(accID), time.Now()))
+	ok(c, toJobResp(cfg, time.Now()))
 }
 
 // resumeCreateJobHandler 处理 POST /api/create/jobs/:id/resume。
@@ -229,16 +242,17 @@ func (s *Server) resumeCreateJobHandler(c *gin.Context) {
 		return
 	}
 	now := time.Now()
-	cfg := s.store.GetScheduleConfig(accID)
-	cfg.Enabled = true
-	if cfg.Mode == "duration" {
-		cfg.StartedAt = now.Format(time.RFC3339)
-	}
-	if err := s.store.SaveScheduleConfig(cfg); err != nil {
+	cfg, err := s.store.UpdateScheduleConfig(accID, func(cfg *store.ScheduleConfig) {
+		cfg.Enabled = true
+		if cfg.Mode == "duration" {
+			cfg.StartedAt = now.Format(time.RFC3339)
+		}
+	})
+	if err != nil {
 		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "恢复任务失败")
 		return
 	}
-	ok(c, toJobResp(s.store.GetScheduleConfig(accID), now))
+	ok(c, toJobResp(cfg, now))
 }
 
 // deleteCreateJobHandler 处理 DELETE /api/create/jobs/:id。

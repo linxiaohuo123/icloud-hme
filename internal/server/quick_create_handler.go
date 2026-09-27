@@ -34,7 +34,7 @@ type quickCreateReq struct {
 //     若 st != nil，优先划分当前小时仍有剩余配额 (RemainingQuota > 0) 的账号。
 //     在同配额梯度内，按 AliasTotal 升序排序（最低水位优先分配）；
 //     若部分账号配额耗尽，有配额账号排在前面，配额耗尽账号追加在后作为重试备选。
-func selectAccountCandidates(accounts []account.Summary, tag string, st *store.Store) []string {
+func selectAccountCandidates(accounts []account.Summary, tag string, st *store.Store) ([]string, error) {
 	tag = strings.TrimSpace(strings.ToLower(tag))
 	var candidates []account.Summary
 
@@ -70,7 +70,7 @@ func selectAccountCandidates(accounts []account.Summary, tag string, st *store.S
 	}
 
 	if len(candidates) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	sortByTotal := func(list []account.Summary) {
@@ -85,13 +85,17 @@ func selectAccountCandidates(accounts []account.Summary, tag string, st *store.S
 		for i, acc := range candidates {
 			res[i] = acc.ID
 		}
-		return res
+		return res, nil
 	}
 
 	var withQuota []account.Summary
 	var noQuota []account.Summary
 	for _, acc := range candidates {
-		if st.RemainingQuota(acc.ID) > 0 {
+		remaining, err := st.RemainingQuota(acc.ID)
+		if err != nil {
+			return nil, err
+		}
+		if remaining > 0 {
 			withQuota = append(withQuota, acc)
 		} else {
 			noQuota = append(noQuota, acc)
@@ -113,7 +117,7 @@ func selectAccountCandidates(accounts []account.Summary, tag string, st *store.S
 	for i, acc := range ordered {
 		res[i] = acc.ID
 	}
-	return res
+	return res, nil
 }
 
 // selectPoolAccounts 筛选适合从别名池领号的母号 (对齐业务标签隔离；具备凭据；排除受保护账号；不受 500 上限限制因为已有别名无需新建)。
@@ -156,7 +160,7 @@ func selectPoolAccounts(accounts []account.Summary, tag string) []string {
 
 // selectAccountByTag 根据业务标签筛选单个最优母号 (兼顾单点调用兼容性与单测验证)。
 func selectAccountByTag(accounts []account.Summary, tag string) string {
-	cands := selectAccountCandidates(accounts, tag, nil)
+	cands, _ := selectAccountCandidates(accounts, tag, nil)
 	if len(cands) == 0 {
 		return ""
 	}
@@ -219,6 +223,10 @@ func (s *Server) quickCreateHandler(c *gin.Context) {
 	})
 
 	if err != nil {
+		if errors.Is(err, ErrInvalidAllocationMode) {
+			failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "mode 必须是 pool、pool_only 或 create")
+			return
+		}
 		if errors.Is(err, ErrAllocationNotReady) {
 			failCode(c, http.StatusServiceUnavailable, "ALLOCATION_STATE_NOT_READY", "存储层未就绪，无法安全验证别名分配状态")
 			return
@@ -238,6 +246,18 @@ func (s *Server) quickCreateHandler(c *gin.Context) {
 		if errors.Is(err, ErrPoolEmpty) {
 			c.Header("Retry-After", "60")
 			failCode(c, http.StatusServiceUnavailable, "POOL_EMPTY", "当前业务池无可用预存别名，请等待定时补货或使用 mode=pool")
+			return
+		}
+		if errors.Is(err, store.ErrOperationPending) {
+			opID := ""
+			if allocRes != nil && allocRes.Operation != nil {
+				opID = allocRes.Operation.OperationID
+			}
+			c.JSON(http.StatusAccepted, apiResp{Success: true, Data: gin.H{"operation_id": opID, "status": "pending"}})
+			return
+		}
+		if errors.Is(err, store.ErrOperationOutcomeUnknown) {
+			failCode(c, http.StatusBadGateway, "UPSTREAM_OUTCOME_UNKNOWN", "上游建号结果待核对")
 			return
 		}
 		backendFail(c, err)

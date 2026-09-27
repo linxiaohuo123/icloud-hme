@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -28,14 +29,21 @@ type HmeReserveIntent struct {
 	AnonymousID    string `json:"anonymous_id"`
 	ResultRef      string `json:"result_ref"`
 	ErrorMessage   string `json:"error_message"`
+	OperationID    string `json:"operation_id,omitempty"`
 	CreatedAt      string `json:"created_at"`
 	UpdatedAt      string `json:"updated_at"`
 }
 
 // CreateReserveIntent 在向 Apple 发送 Reserve 写请求前持久化 candidate A 的意图 (prepared) 并提交事务
 func (s *Store) CreateReserveIntent(ctx context.Context, accountID, candidateEmail, label string) (*HmeReserveIntent, error) {
+	return s.CreateReserveIntentForOperation(ctx, "", accountID, candidateEmail, label)
+}
+
+// CreateReserveIntentForOperation binds a generated candidate to its allocation operation before Reserve.
+func (s *Store) CreateReserveIntentForOperation(ctx context.Context, operationID, accountID, candidateEmail, label string) (*HmeReserveIntent, error) {
 	accountID = strings.TrimSpace(accountID)
 	candidateEmail = strings.TrimSpace(strings.ToLower(candidateEmail))
+	operationID = strings.TrimSpace(operationID)
 	if accountID == "" || candidateEmail == "" {
 		return nil, errors.New("account_id and candidate_email must not be empty")
 	}
@@ -46,12 +54,38 @@ func (s *Store) CreateReserveIntent(ctx context.Context, accountID, candidateEma
 	now := time.Now().UTC().Format(time.RFC3339)
 	intentID := NewOpaqueID("intent_")
 
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO hme_reserve_intents (
-			intent_id, account_id, candidate_email, label, state, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, intentID, accountID, candidateEmail, label, IntentStatePrepared, now, now)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if operationID != "" {
+		var unresolved int
+		err = tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM hme_reserve_intents WHERE operation_id = ? AND state != 'confirmed_failed'`, operationID).Scan(&unresolved)
+		if err != nil {
+			return nil, err
+		}
+		if unresolved != 0 {
+			return nil, ErrOperationOutcomeUnknown
+		}
+		res, updateErr := tx.ExecContext(ctx, `UPDATE operations SET candidate_email = ?, updated_at = ? WHERE operation_id = ? AND state = 'pending'`, candidateEmail, now, operationID)
+		if updateErr != nil {
+			return nil, updateErr
+		}
+		rows, rowsErr := res.RowsAffected()
+		if rowsErr != nil || rows != 1 {
+			return nil, fmt.Errorf("bind reserve candidate to pending operation %s: rows=%d: %w", operationID, rows, rowsErr)
+		}
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO hme_reserve_intents (
+			intent_id, account_id, candidate_email, label, state, operation_id, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, intentID, accountID, candidateEmail, label, IntentStatePrepared, operationID, now, now)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -61,6 +95,7 @@ func (s *Store) CreateReserveIntent(ctx context.Context, accountID, candidateEma
 		CandidateEmail: candidateEmail,
 		Label:          label,
 		State:          IntentStatePrepared,
+		OperationID:    operationID,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}, nil
@@ -78,7 +113,7 @@ func (s *Store) UpdateReserveIntentState(ctx context.Context, intentID, state, a
 	defer s.mu.Unlock()
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 		UPDATE hme_reserve_intents
 		SET state = ?,
 		    anonymous_id = CASE WHEN ? != '' THEN ? ELSE anonymous_id END,
@@ -87,7 +122,17 @@ func (s *Store) UpdateReserveIntentState(ctx context.Context, intentID, state, a
 		    updated_at = ?
 		WHERE intent_id = ?
 	`, state, anonymousID, anonymousID, resultRef, resultRef, errMsg, errMsg, now, intentID)
-	return err
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("reserve intent %s not found", intentID)
+	}
+	return nil
 }
 
 // GetReserveIntent 获取指定意图记录
@@ -97,11 +142,11 @@ func (s *Store) GetReserveIntent(ctx context.Context, intentID string) (*HmeRese
 
 	var intent HmeReserveIntent
 	err := s.db.QueryRowContext(ctx, `
-		SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), created_at, updated_at
+		SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), COALESCE(operation_id, ''), created_at, updated_at
 		FROM hme_reserve_intents
 		WHERE intent_id = ?
 	`, intentID).Scan(
-		&intent.IntentID, &intent.AccountID, &intent.CandidateEmail, &intent.Label, &intent.State, &intent.AnonymousID, &intent.ResultRef, &intent.ErrorMessage, &intent.CreatedAt, &intent.UpdatedAt,
+		&intent.IntentID, &intent.AccountID, &intent.CandidateEmail, &intent.Label, &intent.State, &intent.AnonymousID, &intent.ResultRef, &intent.ErrorMessage, &intent.OperationID, &intent.CreatedAt, &intent.UpdatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -123,14 +168,14 @@ func (s *Store) ListUnresolvedReserveIntents(ctx context.Context, accountID stri
 
 	if accountID != "" {
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), created_at, updated_at
+			SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), COALESCE(operation_id, ''), created_at, updated_at
 			FROM hme_reserve_intents
 			WHERE account_id = ? AND state IN ('prepared', 'reserve_sent', 'outcome_unknown')
 			ORDER BY created_at ASC
 		`, accountID)
 	} else {
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), created_at, updated_at
+			SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), COALESCE(operation_id, ''), created_at, updated_at
 			FROM hme_reserve_intents
 			WHERE state IN ('prepared', 'reserve_sent', 'outcome_unknown')
 			ORDER BY created_at ASC
@@ -145,7 +190,7 @@ func (s *Store) ListUnresolvedReserveIntents(ctx context.Context, accountID stri
 	for rows.Next() {
 		var it HmeReserveIntent
 		if scanErr := rows.Scan(
-			&it.IntentID, &it.AccountID, &it.CandidateEmail, &it.Label, &it.State, &it.AnonymousID, &it.ResultRef, &it.ErrorMessage, &it.CreatedAt, &it.UpdatedAt,
+			&it.IntentID, &it.AccountID, &it.CandidateEmail, &it.Label, &it.State, &it.AnonymousID, &it.ResultRef, &it.ErrorMessage, &it.OperationID, &it.CreatedAt, &it.UpdatedAt,
 		); scanErr != nil {
 			return nil, scanErr
 		}
@@ -165,13 +210,13 @@ func (s *Store) FindLatestIntentForCandidate(ctx context.Context, candidateEmail
 	candidateEmail = strings.TrimSpace(strings.ToLower(candidateEmail))
 	var intent HmeReserveIntent
 	err := s.db.QueryRowContext(ctx, `
-		SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), created_at, updated_at
+		SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), COALESCE(operation_id, ''), created_at, updated_at
 		FROM hme_reserve_intents
 		WHERE candidate_email = ?
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, candidateEmail).Scan(
-		&intent.IntentID, &intent.AccountID, &intent.CandidateEmail, &intent.Label, &intent.State, &intent.AnonymousID, &intent.ResultRef, &intent.ErrorMessage, &intent.CreatedAt, &intent.UpdatedAt,
+		&intent.IntentID, &intent.AccountID, &intent.CandidateEmail, &intent.Label, &intent.State, &intent.AnonymousID, &intent.ResultRef, &intent.ErrorMessage, &intent.OperationID, &intent.CreatedAt, &intent.UpdatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

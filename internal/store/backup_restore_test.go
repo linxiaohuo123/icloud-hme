@@ -376,14 +376,17 @@ func TestPR06_RestoreRoundTrip(t *testing.T) {
 	defer reopenedStore.Close()
 
 	// 7. 验证原状态完全恢复
-	tokens := reopenedStore.ListTokens()
+	tokens, err := reopenedStore.ListTokens()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(tokens) != 1 || tokens[0].ID != "tok_round_1" || !reopenedStore.ValidateToken("sec_round_123") {
 		t.Fatalf("恢复后 Token 状态未正确还原: %+v", tokens)
 	}
 
-	val := reopenedStore.GetSetting("k_round")
-	if val != "v_round_original" {
-		t.Fatalf("恢复后 Setting 值未正确还原: 期望 'v_round_original', 实际: '%s'", val)
+	val, err := reopenedStore.GetSetting("k_round")
+	if err != nil || val != "v_round_original" {
+		t.Fatalf("恢复后 Setting 值未正确还原: 期望 'v_round_original', 实际: '%s' (%v)", val, err)
 	}
 
 	// 8. 验证 pre-restore 备份存在
@@ -444,9 +447,9 @@ func TestPR06_CorruptBackupCannotReplaceLiveDatabase(t *testing.T) {
 	}
 	defer reopenedStore.Close()
 
-	val := reopenedStore.GetSetting("important_key")
-	if val != "healthy_live_data" {
-		t.Fatalf("现有 live 数据遭到破坏: 实际值: %s", val)
+	val, err := reopenedStore.GetSetting("important_key")
+	if err != nil || val != "healthy_live_data" {
+		t.Fatalf("现有 live 数据遭到破坏: 实际值: %s (%v)", val, err)
 	}
 }
 
@@ -523,7 +526,7 @@ func TestPR06_RestoreRefusesWhileDatabaseInUse(t *testing.T) {
 	}
 
 	// 5. live DB 数据完全不变
-	if val := st.GetSetting("critical_key"); val != "live_data" {
+	if val, err := st.GetSetting("critical_key"); err != nil || val != "live_data" {
 		t.Fatalf("live DB 数据被篡改: 期望 live_data，实际: %s", val)
 	}
 
@@ -555,7 +558,7 @@ func TestPR06_RestoreRefusesWhileDatabaseInUse(t *testing.T) {
 		t.Fatalf("恢复后打开 Store 失败: %v", err)
 	}
 	defer reopened.Close()
-	if val := reopened.GetSetting("critical_key"); val != "backup_data" {
+	if val, err := reopened.GetSetting("critical_key"); err != nil || val != "backup_data" {
 		t.Fatalf("恢复后数据不符合预期: 期望 backup_data，实际: %s", val)
 	}
 }
@@ -610,7 +613,7 @@ func TestPR06_PreRestoreBackupFailureLeavesLiveDatabaseUntouched(t *testing.T) {
 
 	// 6. critical_key 仍严格为 original
 	// 7. 没有 swap，8. 没有删除 live data，9. 不应留下假成功的 restore
-	if val := reopened.GetSetting("critical_key"); val != "original" {
+	if val, err := reopened.GetSetting("critical_key"); err != nil || val != "original" {
 		t.Fatalf("critical_key 未能保持 original: 得到 %s", val)
 	}
 }
@@ -664,7 +667,7 @@ func TestPR06_PostSwapValidationFailureRestoresExactPreRestoreState(t *testing.T
 	defer reopened.Close()
 
 	// 6. key 必须仍为 original
-	if val := reopened.GetSetting("critical_key"); val != "original" {
+	if val, err := reopened.GetSetting("critical_key"); err != nil || val != "original" {
 		t.Fatalf("回滚后数据未恢复为 original: 得到 %s", val)
 	}
 

@@ -69,11 +69,11 @@ func (s *Store) ClaimInventoryAlias(
 	if idempKey != "" {
 		var op Operation
 		err := s.db.QueryRowContext(ctx, `
-			SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, COALESCE(candidate_email, ''), COALESCE(result_ref, ''), COALESCE(error_code, ''), created_at, updated_at
+			SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, COALESCE(candidate_email, ''), COALESCE(result_ref, ''), COALESCE(error_code, ''), COALESCE(result_source, 'pool'), created_at, updated_at
 			FROM operations
 			WHERE principal_kind = ? AND principal_id = ? AND operation_kind = ? AND idempotency_key = ?
 		`, principalKind, principalID, operationKind, idempKey).Scan(
-			&op.OperationID, &op.PrincipalKind, &op.PrincipalID, &op.OperationKind, &op.IdempotencyKey, &op.RequestHash, &op.State, &op.CandidateEmail, &op.ResultRef, &op.ErrorCode, &op.CreatedAt, &op.UpdatedAt,
+			&op.OperationID, &op.PrincipalKind, &op.PrincipalID, &op.OperationKind, &op.IdempotencyKey, &op.RequestHash, &op.State, &op.CandidateEmail, &op.ResultRef, &op.ErrorCode, &op.ResultSource, &op.CreatedAt, &op.UpdatedAt,
 		)
 
 		if err == nil {
@@ -150,11 +150,11 @@ func (s *Store) ClaimInventoryAlias(
 				_ = tx.Rollback()
 				var existingOp Operation
 				qErr := s.db.QueryRowContext(ctx, `
-					SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, COALESCE(candidate_email, ''), COALESCE(result_ref, ''), COALESCE(error_code, ''), created_at, updated_at
+					SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, COALESCE(candidate_email, ''), COALESCE(result_ref, ''), COALESCE(error_code, ''), COALESCE(result_source, 'pool'), created_at, updated_at
 					FROM operations
 					WHERE operation_id = ?
 				`, opID).Scan(
-					&existingOp.OperationID, &existingOp.PrincipalKind, &existingOp.PrincipalID, &existingOp.OperationKind, &existingOp.IdempotencyKey, &existingOp.RequestHash, &existingOp.State, &existingOp.CandidateEmail, &existingOp.ResultRef, &existingOp.ErrorCode, &existingOp.CreatedAt, &existingOp.UpdatedAt,
+					&existingOp.OperationID, &existingOp.PrincipalKind, &existingOp.PrincipalID, &existingOp.OperationKind, &existingOp.IdempotencyKey, &existingOp.RequestHash, &existingOp.State, &existingOp.CandidateEmail, &existingOp.ResultRef, &existingOp.ErrorCode, &existingOp.ResultSource, &existingOp.CreatedAt, &existingOp.UpdatedAt,
 				)
 				if qErr != nil {
 					return nil, nil, fmt.Errorf("failed to read operation after concurrent retry: %w", qErr)
@@ -196,11 +196,11 @@ func (s *Store) ClaimInventoryAlias(
 					// 并发重入，释放事务后可靠查询既有操作
 					var existingOp Operation
 					qErr := s.db.QueryRowContext(ctx, `
-						SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, COALESCE(candidate_email, ''), COALESCE(result_ref, ''), COALESCE(error_code, ''), created_at, updated_at
+						SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, COALESCE(candidate_email, ''), COALESCE(result_ref, ''), COALESCE(error_code, ''), COALESCE(result_source, 'pool'), created_at, updated_at
 						FROM operations
 						WHERE principal_kind = ? AND principal_id = ? AND operation_kind = ? AND idempotency_key = ?
 					`, principalKind, principalID, operationKind, idempKey).Scan(
-						&existingOp.OperationID, &existingOp.PrincipalKind, &existingOp.PrincipalID, &existingOp.OperationKind, &existingOp.IdempotencyKey, &existingOp.RequestHash, &existingOp.State, &existingOp.CandidateEmail, &existingOp.ResultRef, &existingOp.ErrorCode, &existingOp.CreatedAt, &existingOp.UpdatedAt,
+						&existingOp.OperationID, &existingOp.PrincipalKind, &existingOp.PrincipalID, &existingOp.OperationKind, &existingOp.IdempotencyKey, &existingOp.RequestHash, &existingOp.State, &existingOp.CandidateEmail, &existingOp.ResultRef, &existingOp.ErrorCode, &existingOp.ResultSource, &existingOp.CreatedAt, &existingOp.UpdatedAt,
 					)
 					if qErr != nil {
 						return nil, nil, fmt.Errorf("failed to read existing operation after unique conflict: %w", qErr)
@@ -250,6 +250,7 @@ func (s *Store) ClaimInventoryAlias(
 				IdempotencyKey: idempKey,
 				RequestHash:    currentHash,
 				State:          "pending",
+				ResultSource:   "pool",
 				CreatedAt:      now,
 				UpdatedAt:      now,
 			}
@@ -262,6 +263,7 @@ func (s *Store) ClaimInventoryAlias(
 			OperationKind: operationKind,
 			RequestHash:   currentHash,
 			State:         "succeeded",
+			ResultSource:  "pool",
 			CreatedAt:     now,
 			UpdatedAt:     now,
 		}
@@ -409,7 +411,7 @@ func (s *Store) ClaimInventoryAlias(
 	if idempKey != "" {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE operations
-			SET state = 'succeeded', result_ref = ?, candidate_email = ?, error_code = '', updated_at = ?
+			SET state = 'succeeded', result_ref = ?, candidate_email = ?, result_source = 'pool', error_code = '', updated_at = ?
 			WHERE operation_id = ?
 		`, allocID, candEmail, now, opID)
 		if err != nil {
@@ -635,11 +637,11 @@ func (s *Store) IsEmailOwnedByToken(ctx context.Context, email, tokenID string) 
 func (s *Store) GetOperation(ctx context.Context, operationID, principalKind, principalID string) (*Operation, error) {
 	var op Operation
 	err := s.db.QueryRowContext(ctx, `
-		SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, COALESCE(candidate_email, ''), COALESCE(result_ref, ''), COALESCE(error_code, ''), created_at, updated_at
+		SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, COALESCE(candidate_email, ''), COALESCE(result_ref, ''), COALESCE(error_code, ''), COALESCE(result_source, 'pool'), created_at, updated_at
 		FROM operations
 		WHERE operation_id = ? AND principal_kind = ? AND principal_id = ?
 	`, operationID, principalKind, principalID).Scan(
-		&op.OperationID, &op.PrincipalKind, &op.PrincipalID, &op.OperationKind, &op.IdempotencyKey, &op.RequestHash, &op.State, &op.CandidateEmail, &op.ResultRef, &op.ErrorCode, &op.CreatedAt, &op.UpdatedAt,
+		&op.OperationID, &op.PrincipalKind, &op.PrincipalID, &op.OperationKind, &op.IdempotencyKey, &op.RequestHash, &op.State, &op.CandidateEmail, &op.ResultRef, &op.ErrorCode, &op.ResultSource, &op.CreatedAt, &op.UpdatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -659,12 +661,20 @@ func (s *Store) MarkOperationOutcomeUnknown(ctx context.Context, opID, candidate
 	defer s.mu.Unlock()
 	now := time.Now().Format(time.RFC3339)
 	candidateEmail = strings.TrimSpace(strings.ToLower(candidateEmail))
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 		UPDATE operations
 		SET state = 'outcome_unknown', candidate_email = ?, error_code = ?, updated_at = ?
-		WHERE operation_id = ?
-	`, candidateEmail, errorCode, now, opID)
-	return err
+		WHERE operation_id = ? AND state IN ('pending', 'outcome_unknown')
+		  AND (candidate_email = '' OR candidate_email = ?)
+	`, candidateEmail, errorCode, now, opID, candidateEmail)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil || rows != 1 {
+		return fmt.Errorf("mark operation outcome unknown: rows=%d, error=%v", rows, err)
+	}
+	return nil
 }
 
 // ReconciliationOutcome 表示核对结果类型 (F03)
@@ -698,17 +708,20 @@ func (s *Store) ReconcileUnknownOperation(
 
 	var op Operation
 	err = tx.QueryRowContext(ctx, `
-		SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, COALESCE(candidate_email, ''), COALESCE(result_ref, ''), COALESCE(error_code, ''), created_at, updated_at
+		SELECT operation_id, principal_kind, principal_id, operation_kind, idempotency_key, request_hash, state, COALESCE(candidate_email, ''), COALESCE(result_ref, ''), COALESCE(error_code, ''), COALESCE(business_tag, ''), COALESCE(token_name, ''), COALESCE(result_source, 'pool'), created_at, updated_at
 		FROM operations
 		WHERE operation_id = ?
 	`, opID).Scan(
-		&op.OperationID, &op.PrincipalKind, &op.PrincipalID, &op.OperationKind, &op.IdempotencyKey, &op.RequestHash, &op.State, &op.CandidateEmail, &op.ResultRef, &op.ErrorCode, &op.CreatedAt, &op.UpdatedAt,
+		&op.OperationID, &op.PrincipalKind, &op.PrincipalID, &op.OperationKind, &op.IdempotencyKey, &op.RequestHash, &op.State, &op.CandidateEmail, &op.ResultRef, &op.ErrorCode, &op.BusinessTag, &op.TokenName, &op.ResultSource, &op.CreatedAt, &op.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	now := time.Now().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339)
+	if op.State == "succeeded" && outcome != ReconciliationFound {
+		return nil, fmt.Errorf("cannot change succeeded operation %s", opID)
+	}
 
 	switch outcome {
 	case ReconciliationInconclusiveNotFound:
@@ -739,8 +752,69 @@ func (s *Store) ReconcileUnknownOperation(
 
 	case ReconciliationFound:
 		confirmedEmail = strings.TrimSpace(strings.ToLower(confirmedEmail))
+		if confirmedEmail == "" || accountID == "" {
+			return nil, errors.New("confirmed email and account ID are required")
+		}
+		if op.PrincipalKind != ownerKind || op.PrincipalID != ownerID {
+			return nil, fmt.Errorf("reconciliation principal mismatch for operation %s", opID)
+		}
+		if op.BusinessTag != "" && op.BusinessTag != tag {
+			return nil, fmt.Errorf("reconciliation business tag mismatch for operation %s", opID)
+		}
+		if op.BusinessTag != "" {
+			tag = op.BusinessTag
+		}
+		if op.TokenName != "" {
+			tokenName = op.TokenName
+		}
 		if op.CandidateEmail != "" && !strings.EqualFold(op.CandidateEmail, confirmedEmail) {
 			return nil, fmt.Errorf("reconciliation candidate mismatch: original candidate was %s but confirmed %s (second candidate strictly forbidden)", op.CandidateEmail, confirmedEmail)
+		}
+		if op.State == "succeeded" {
+			var existing AliasAllocation
+			err = tx.QueryRowContext(ctx, `SELECT allocation_id, alias_email, account_id, owner_kind, owner_id, business_tag, allocated_at, status
+				FROM alias_allocations WHERE allocation_id = ?`, op.ResultRef).Scan(
+				&existing.AllocationID, &existing.AliasEmail, &existing.AccountID, &existing.OwnerKind,
+				&existing.OwnerID, &existing.BusinessTag, &existing.AllocatedAt, &existing.Status)
+			if err != nil || !strings.EqualFold(existing.AliasEmail, confirmedEmail) {
+				return nil, fmt.Errorf("inconsistent succeeded operation %s: %v", opID, err)
+			}
+			return &existing, nil
+		}
+		if op.State != "pending" && op.State != "outcome_unknown" {
+			return nil, fmt.Errorf("operation %s is not recoverable from state %s", opID, op.State)
+		}
+
+		var intentID, intentAccount, intentCandidate, intentState string
+		intentErr := tx.QueryRowContext(ctx, `SELECT intent_id, account_id, candidate_email, state
+			FROM hme_reserve_intents WHERE operation_id = ? ORDER BY rowid DESC LIMIT 1`, opID).Scan(
+			&intentID, &intentAccount, &intentCandidate, &intentState)
+		if intentErr != nil && !errors.Is(intentErr, sql.ErrNoRows) {
+			return nil, intentErr
+		}
+		if intentErr == nil {
+			if intentAccount != accountID || !strings.EqualFold(intentCandidate, confirmedEmail) || intentState == IntentStateConfirmedFailed {
+				return nil, fmt.Errorf("reconciliation intent does not match confirmed alias for operation %s", opID)
+			}
+		}
+
+		var inventoryAccount, inventoryState string
+		invErr := tx.QueryRowContext(ctx, `SELECT account_id, allocation_state FROM alias_inventory WHERE email = ?`, confirmedEmail).Scan(&inventoryAccount, &inventoryState)
+		if errors.Is(invErr, sql.ErrNoRows) {
+			_, err = tx.ExecContext(ctx, `INSERT INTO alias_inventory
+				(email, account_id, remote_state, allocation_state, source_type, last_verified_at)
+				VALUES (?, ?, 'active', 'allocated', 'created', ?)`, confirmedEmail, accountID, now)
+		} else if invErr != nil {
+			return nil, invErr
+		} else if inventoryAccount != accountID || (inventoryState != "unknown" && inventoryState != "available" && inventoryState != "quarantined") {
+			return nil, fmt.Errorf("inventory alias %s belongs to another account or allocation", confirmedEmail)
+		} else {
+			_, err = tx.ExecContext(ctx, `UPDATE alias_inventory
+				SET remote_state = 'active', allocation_state = 'allocated', source_type = 'created', last_verified_at = ?
+				WHERE email = ? AND account_id = ?`, now, confirmedEmail, accountID)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reconciliation update inventory failed: %w", err)
 		}
 
 		allocID := NewOpaqueID("alloc_")
@@ -764,19 +838,41 @@ func (s *Store) ReconcileUnknownOperation(
 			return nil, fmt.Errorf("reconciliation insert alias_allocations failed: %w", err)
 		}
 
-		_, _ = tx.ExecContext(ctx, `
-			INSERT INTO lease_records (
-				lease_id, alias_email, account_id, business_tag, leased_at, token_name
-			) VALUES (?, ?, ?, ?, ?, ?)
-		`, allocID, confirmedEmail, accountID, tag, now, tokenName)
-
 		_, err = tx.ExecContext(ctx, `
+			INSERT INTO lease_records (
+				id, email, account_id, tag, status, allocated_at, completed_at, token_name
+			) VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)
+		`, allocID, confirmedEmail, accountID, tag, now, now, tokenName)
+		if err != nil {
+			return nil, fmt.Errorf("reconciliation insert lease_records failed: %w", err)
+		}
+		res, routeErr := tx.ExecContext(ctx, `INSERT INTO alias_routes (email, account_id, updated_at)
+			VALUES (?, ?, ?) ON CONFLICT(email) DO UPDATE SET updated_at = excluded.updated_at
+			WHERE alias_routes.account_id = excluded.account_id`, confirmedEmail, accountID, now)
+		if routeErr != nil {
+			return nil, routeErr
+		}
+		routeRows, routeErr := res.RowsAffected()
+		if routeErr != nil || routeRows != 1 {
+			return nil, fmt.Errorf("reconciliation alias route conflict: rows=%d, error=%v", routeRows, routeErr)
+		}
+		if intentID != "" {
+			if _, err := tx.ExecContext(ctx, `UPDATE hme_reserve_intents SET state = 'succeeded', result_ref = ?, updated_at = ? WHERE intent_id = ?`, allocID, now, intentID); err != nil {
+				return nil, err
+			}
+		}
+
+		res, err = tx.ExecContext(ctx, `
 			UPDATE operations
-			SET state = 'succeeded', result_ref = ?, candidate_email = ?, error_code = '', updated_at = ?
-			WHERE operation_id = ?
+			SET state = 'succeeded', result_ref = ?, candidate_email = ?, result_source = 'created', error_code = '', updated_at = ?
+			WHERE operation_id = ? AND state IN ('pending', 'outcome_unknown')
 		`, allocID, confirmedEmail, now, opID)
 		if err != nil {
 			return nil, fmt.Errorf("reconciliation update operations failed: %w", err)
+		}
+		updated, err := res.RowsAffected()
+		if err != nil || updated != 1 {
+			return nil, fmt.Errorf("reconciliation operation state changed: rows=%d, error=%v", updated, err)
 		}
 
 		if err := tx.Commit(); err != nil {

@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -173,15 +174,16 @@ func TestExternalAllocateAndVerifyRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	createdCount := 0
 	f := &fakeBackend{
 		accounts: []account.Summary{
 			{ID: "acc_steam", Status: "active", HasCookies: true, Tags: []string{"steam"}},
 			{ID: "acc_chatgpt", Status: "active", HasCookies: true, Tags: []string{"chatgpt"}},
 			{ID: "acc_general", Status: "active", HasCookies: true},
 		},
-		created: &hme.CreateResult{
-			Email: "chatgpt-alias@icloud.com",
-			Label: "chatgpt-reg",
+		onCreateAlias: func(accountID, label string) (*hme.CreateResult, error) {
+			createdCount++
+			return &hme.CreateResult{Email: fmt.Sprintf("chatgpt-alias-%d@icloud.com", createdCount), Label: label}, nil
 		},
 	}
 	cfg := Config{

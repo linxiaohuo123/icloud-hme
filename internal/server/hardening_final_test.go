@@ -748,8 +748,10 @@ func TestP1C_ReplenishPersistenceFailurePropagatesError(t *testing.T) {
 	srv := newWithBackendAndStore(fb, cfg, st)
 	defer srv.Close()
 
-	// 提前关闭 store，制造 AddInventoryAlias 数据库持久化失败
-	_ = st.Close()
+	// 精准注入库存落库失败，保留调度配置可读以覆盖补货入库路径。
+	if _, err := st.DB().Exec(`CREATE TRIGGER fail_replenish_inventory BEFORE INSERT ON alias_inventory BEGIN SELECT RAISE(FAIL, 'injected inventory failure'); END`); err != nil {
+		t.Fatal(err)
+	}
 
 	// 触发调度器执行补货：RunAllNow 遍历所有账号并执行补货
 	created, failed := srv.scheduler.RunAllNow(1)

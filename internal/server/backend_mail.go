@@ -381,11 +381,11 @@ func (b *managerBackend) GetMessageContext(ctx context.Context, accountID string
 
 	if imapErr != nil {
 		msg := imapErr.Error()
-		if strings.Contains(msg, "不存在") {
-			return nil, &BackendError{Status: http.StatusNotFound, Code: "MESSAGE_NOT_FOUND", Message: "邮件不存在"}
-		}
 		if strings.Contains(msg, "账号不存在") || strings.Contains(msg, "未设置") {
 			return nil, mapAccountErr(imapErr)
+		}
+		if strings.Contains(msg, "不存在") {
+			return nil, &BackendError{Status: http.StatusNotFound, Code: "MESSAGE_NOT_FOUND", Message: "邮件不存在"}
 		}
 	}
 	return nil, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "读取邮件详情失败"}
@@ -502,7 +502,7 @@ func (b *managerBackend) GetMessagesContext(ctx context.Context, accountID strin
 
 	for _, wr := range webMailRefs {
 		if wr.ThreadID != "" {
-			if m, err := b.GetMessageContext(ctx, accountID, wr.ThreadID); err == nil && m != nil {
+			if m, err := b.GetMessageContext(ctx, accountID, wr.Encode()); err == nil && m != nil {
 				allMessages = append(allMessages, m)
 			}
 		}

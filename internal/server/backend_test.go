@@ -215,6 +215,10 @@ func (f *fakeBackend) CreateAliasContext(ctx context.Context, accountID, label s
 	return f.created, nil
 }
 
+func (f *fakeBackend) CreateAliasForAllocationContext(ctx context.Context, accountID, label, _ string) (*hme.CreateResult, error) {
+	return f.CreateAliasContext(ctx, accountID, label)
+}
+
 func (f *fakeBackend) ListAliases(accountID string) ([]hme.Alias, error) {
 	return f.ListAliasesContext(context.Background(), accountID)
 }
@@ -961,7 +965,7 @@ func TestCreateAliasKeepsSuccessWhenSessionChangesAfterReserve(t *testing.T) {
 	if reserveCalls.Load() != 1 {
 		t.Fatalf("reserve calls = %d, want 1", reserveCalls.Load())
 	}
-	if remaining := st.RemainingQuota(accountID); remaining != 4 {
+	if remaining, err := st.RemainingQuota(accountID); err != nil || remaining != 4 {
 		t.Fatalf("successful reserve released quota: remaining=%d", remaining)
 	}
 	if acc, ok := mgr.GetAccount(accountID); !ok || acc.AliasTotal != 1 {
@@ -1141,7 +1145,14 @@ func TestConcurrentAliasCreationRespectsAccountLimit(t *testing.T) {
 		second <- result{alias, err}
 	}()
 	deadline := time.After(5 * time.Second)
-	for st.RemainingQuota(sum.ID) != 3 {
+	for {
+		remaining, err := st.RemainingQuota(sum.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if remaining == 3 {
+			break
+		}
 		select {
 		case <-deadline:
 			t.Fatal("second request did not reserve quota")
@@ -1157,8 +1168,12 @@ func TestConcurrentAliasCreationRespectsAccountLimit(t *testing.T) {
 	if b.alias != nil || !errors.As(b.err, &backendErr) || backendErr.Code != "ALIAS_LIMIT_REACHED" {
 		t.Fatalf("second creation passed account limit: %+v", b)
 	}
-	if reserveCalls.Load() != 1 || st.RemainingQuota(sum.ID) != 4 {
-		t.Fatalf("unexpected reserve or quota state: reserves=%d remaining=%d", reserveCalls.Load(), st.RemainingQuota(sum.ID))
+	remaining, err := st.RemainingQuota(sum.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reserveCalls.Load() != 1 || remaining != 4 {
+		t.Fatalf("unexpected reserve or quota state: reserves=%d remaining=%d", reserveCalls.Load(), remaining)
 	}
 }
 

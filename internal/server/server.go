@@ -91,20 +91,23 @@ type Server struct {
 
 // New 创建 Server。mgr 为账号管理器,st 为持久化存储(可为 nil),cfg 为安全配置。
 func New(mgr *account.Manager, st *store.Store, cfg Config) (*Server, error) {
-	if _, err := auth.NewManager(auth.Options{
-		Password: cfg.AdminPassword,
-		TTL:      cfg.SessionTTL,
-	}); err != nil {
-		return nil, err
+	if cfg.AdminPassword == "" {
+		return nil, fmt.Errorf("管理员密码长度不能少于 8 个字符")
 	}
+	createdStore := false
 	if st == nil {
 		var err error
 		st, err = store.NewStore(cfg.DataDir)
 		if err != nil {
 			return nil, err
 		}
+		createdStore = true
 	}
-	return newWithBackendAndStoreWithError(&managerBackend{mgr: mgr, store: st}, cfg, st)
+	srv, err := newWithBackendAndStoreWithError(&managerBackend{mgr: mgr, store: st}, cfg, st)
+	if err != nil && createdStore {
+		_ = st.Close()
+	}
+	return srv, err
 }
 
 // newWithBackend 创建 Server 并注入 Backend(测试使用内存 fake)。
@@ -124,6 +127,22 @@ func newWithBackendAndStore(be Backend, cfg Config, st *store.Store) *Server {
 }
 
 func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*Server, error) {
+	var revocations auth.RevocationStore
+	if st != nil {
+		revocations = st
+	}
+	var authManager *auth.Manager
+	if cfg.AdminPassword != "" {
+		var err error
+		authManager, err = auth.NewManager(auth.Options{
+			Password:    cfg.AdminPassword,
+			TTL:         cfg.SessionTTL,
+			Revocations: revocations,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
 	if !cfg.Debug {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -202,6 +221,13 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 			log.Printf("[Server] 启动恢复: 扫描处理 %d 个未决 HME reserve 意图", len(list))
 		}
 	}
+	if st != nil {
+		if recovered, err := st.RecoverRemoteAllocationOperations(context.Background()); err != nil {
+			log.Printf("[Server] 恢复未完成出号失败: %v", err)
+		} else if recovered > 0 {
+			log.Printf("[Server] 恢复 %d 个已确认创建的出号操作", recovered)
+		}
+	}
 	// 生产后端拉取到别名列表时自动登记「别名 → 母号」路由，
 	// 使存量别名(未入出号流水表的)也能被定向拉信，而不必依赖有上限的盲扫。
 	if mb, ok := be.(*managerBackend); ok {
@@ -218,15 +244,7 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 			syncWorker.RegisterAliasAccounts(accountID, emails)
 		}
 	}
-	var revocations auth.RevocationStore
-	if st != nil {
-		revocations = st
-	}
-	s.auth, _ = auth.NewManager(auth.Options{
-		Password:    cfg.AdminPassword,
-		TTL:         cfg.SessionTTL,
-		Revocations: revocations,
-	})
+	s.auth = authManager
 	hasAuth := cfg.AdminPassword != "" || cfg.APIKey != ""
 	s.r = gin.New()
 	s.r.Use(gin.Logger(), gin.Recovery(), securityHeadersMiddleware(), dnsRebindingMiddleware(hasAuth))

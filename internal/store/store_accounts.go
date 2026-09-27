@@ -376,7 +376,10 @@ func (s *Store) decryptAccountRecord(rec *AccountRecord) error {
 
 // GetEncryptedSetting 解密并读取设置项。若未加密或解密失败则 fail closed。
 func (s *Store) GetEncryptedSetting(key string, aad []byte) (string, error) {
-	raw := s.GetSetting(key)
+	raw, err := s.GetSetting(key)
+	if err != nil {
+		return "", fmt.Errorf("read setting %s: %w", key, err)
+	}
 	if raw == "" {
 		return "", nil
 	}

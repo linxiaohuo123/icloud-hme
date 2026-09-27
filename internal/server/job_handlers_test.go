@@ -140,7 +140,10 @@ func TestCreateJobHandlers(t *testing.T) {
 	if respDel.StatusCode != http.StatusOK {
 		t.Fatalf("DELETE job 期望 200, 得到 %d", respDel.StatusCode)
 	}
-	cfgAfterDel := st.GetScheduleConfig("acc_1")
+	cfgAfterDel, err := st.GetScheduleConfig("acc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cfgAfterDel.StartedAt != "" {
 		t.Fatalf("DELETE 后 StartedAt 应清空，实际得到: %s", cfgAfterDel.StartedAt)
 	}

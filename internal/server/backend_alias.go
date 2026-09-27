@@ -65,6 +65,11 @@ func (b *managerBackend) CreateAlias(accountID, label string) (*hme.CreateResult
 
 // CreateAliasContext 支持 Context 贯穿的 HME 别名创建 (PR-05 F10)。
 func (b *managerBackend) CreateAliasContext(ctx context.Context, accountID, label string) (*hme.CreateResult, error) {
+	return b.CreateAliasForAllocationContext(ctx, accountID, label, "")
+}
+
+// CreateAliasForAllocationContext binds a Reserve intent to the allocation operation when one exists.
+func (b *managerBackend) CreateAliasForAllocationContext(ctx context.Context, accountID, label, operationID string) (*hme.CreateResult, error) {
 	// 1. 检查别名上限熔断 (总数或活跃数达到上限)
 	if acc, ok := b.mgr.GetAccount(accountID); ok && (acc.AliasTotal >= account.MaxAliasesPerAccount || acc.AliasActive >= account.MaxAliasesPerAccount) {
 		return nil, &BackendError{
@@ -76,7 +81,10 @@ func (b *managerBackend) CreateAliasContext(ctx context.Context, accountID, labe
 
 	// 2. 扣减本地小时配额
 	if b.store != nil {
-		allowed, rem := b.store.TryReserveQuota(accountID, 1)
+		allowed, rem, quotaErr := b.store.TryReserveQuota(accountID, 1)
+		if quotaErr != nil {
+			return nil, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_ERROR", Message: fmt.Sprintf("查询账号 %s 创建配额失败: %v", accountID, quotaErr)}
+		}
 		if !allowed {
 			return nil, &BackendError{
 				Status:  http.StatusTooManyRequests,
@@ -88,7 +96,7 @@ func (b *managerBackend) CreateAliasContext(ctx context.Context, accountID, labe
 
 	var result *hme.CreateResult
 	err := b.mgr.WithHMEClientContext(ctx, accountID, func(client *hme.Client) error {
-		res, cerr := b.durableCreateAlias(ctx, client, accountID, label, 5)
+		res, cerr := b.durableCreateAlias(ctx, client, accountID, label, operationID, 5)
 		if cerr != nil {
 			return cerr
 		}
@@ -104,7 +112,9 @@ func (b *managerBackend) CreateAliasContext(ctx context.Context, accountID, labe
 	}
 	if err != nil {
 		if !errors.Is(err, hme.ErrOutcomeUnknown) && b.store != nil {
-			b.store.ReleaseQuota(accountID, 1)
+			if releaseErr := b.store.ReleaseQuota(accountID, 1); releaseErr != nil {
+				return nil, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_ERROR", Message: fmt.Sprintf("创建失败后释放账号 %s 配额失败: %v (原错误: %v)", accountID, releaseErr, err)}
+			}
 		}
 		if errors.Is(err, account.ErrHMEClientUnavailable) {
 			return nil, mapAccountErr(err)
@@ -160,6 +170,11 @@ func (b *managerBackend) reconcileIntentsWithClient(ctx context.Context, client 
 			if err := b.store.UpdateReserveIntentState(ctx, it.IntentID, store.IntentStateSucceeded, found.AnonymousID, "", ""); err != nil {
 				return fmt.Errorf("保存别名核对结果 %s: %w", it.IntentID, err)
 			}
+			if it.OperationID != "" {
+				if _, err := b.store.RecoverRemoteAllocationOperation(ctx, it.OperationID); err != nil {
+					return fmt.Errorf("恢复出号操作 %s: %w", it.OperationID, err)
+				}
+			}
 			intents[i].State = store.IntentStateSucceeded
 			intents[i].AnonymousID = found.AnonymousID
 		} else {
@@ -181,7 +196,7 @@ func (b *managerBackend) reconcileIntentsWithClient(ctx context.Context, client 
 //  3. 标记状态为 reserve_sent 并 Commit SQLite
 //  4. 才向网络发送 Reserve(A)
 //  5. 成功 -> succeeded; 明确失败 -> confirmed_failed 并允许重试下一候选; 未知异常 -> outcome_unknown 并坚决阻断重试
-func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Client, accountID, label string, maxRetries int) (*hme.CreateResult, error) {
+func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Client, accountID, label, operationID string, maxRetries int) (*hme.CreateResult, error) {
 	// 针对单账号串行化写操作与未决门禁检查，避免并发 check empty -> Generate 穿透窗口
 	lock := b.getAccountMutationLock(accountID)
 	lock.Lock()
@@ -247,7 +262,7 @@ func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Cli
 		// 2. 持久化 intent(A, prepared) 并 Commit SQLite (必须在 Reserve 发送之前完成)
 		var intentID string
 		if b.store != nil {
-			intent, iErr := b.store.CreateReserveIntent(ctx, accountID, cand, label)
+			intent, iErr := b.store.CreateReserveIntentForOperation(ctx, operationID, accountID, cand, label)
 			if iErr != nil {
 				return nil, fmt.Errorf("持久化 reserve intent 失败: %w", iErr)
 			}
@@ -256,7 +271,9 @@ func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Cli
 
 		// 3. 标记状态为 reserve_sent (即将向网络发出写请求)
 		if b.store != nil && intentID != "" {
-			_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateReserveSent, "", "", "")
+			if err := b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateReserveSent, "", "", ""); err != nil {
+				return nil, fmt.Errorf("持久化 reserve_sent 失败: %w", err)
+			}
 		}
 
 		// 4. 发送写请求 Reserve(A)
@@ -265,7 +282,9 @@ func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Cli
 			lastErr = rErr
 			if errors.Is(rErr, hme.ErrAuthFailed) {
 				if b.store != nil && intentID != "" {
-					_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateConfirmedFailed, "", "", rErr.Error())
+					if err := b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateConfirmedFailed, "", "", rErr.Error()); err != nil {
+						return nil, fmt.Errorf("保存 reserve 失败状态: %w", err)
+					}
 				}
 				return nil, rErr
 			}
@@ -273,14 +292,18 @@ func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Cli
 			// 5. 结果未知: 标记 outcome_unknown，铁律阻断重试生成候选 B！
 			if errors.Is(rErr, hme.ErrOutcomeUnknown) {
 				if b.store != nil && intentID != "" {
-					_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateOutcomeUnknown, "", "", rErr.Error())
+					if err := b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateOutcomeUnknown, "", "", rErr.Error()); err != nil {
+						return nil, fmt.Errorf("保存 reserve 未决状态: %w", err)
+					}
 				}
 				return nil, rErr
 			}
 
 			// 明确失败 (confirmed_failed, 如 Apple 显式业务拒绝)
 			if b.store != nil && intentID != "" {
-				_ = b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateConfirmedFailed, "", "", rErr.Error())
+				if err := b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateConfirmedFailed, "", "", rErr.Error()); err != nil {
+					return nil, fmt.Errorf("保存 reserve 失败状态: %w", err)
+				}
 			}
 
 			// 只有确知明确拒绝才允许重试下一候选
@@ -363,7 +386,10 @@ func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID 
 
 	// 2. 扣减本地小时配额
 	if b.store != nil {
-		allowed, rem := b.store.TryReserveQuota(accountID, count)
+		allowed, rem, quotaErr := b.store.TryReserveQuota(accountID, count)
+		if quotaErr != nil {
+			return nil, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_ERROR", Message: fmt.Sprintf("查询账号 %s 创建配额失败: %v", accountID, quotaErr)}
+		}
 		if !allowed {
 			return nil, &BackendError{
 				Status:  http.StatusTooManyRequests,
@@ -387,7 +413,7 @@ func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID 
 			if lbl != "" && count > 1 {
 				lbl = fmt.Sprintf("%s %d", labelPrefix, i+1)
 			}
-			res, createErr := b.durableCreateAlias(ctx, client, accountID, lbl, 3)
+			res, createErr := b.durableCreateAlias(ctx, client, accountID, lbl, "", 3)
 			if createErr != nil {
 				return createErr
 			}
@@ -410,7 +436,12 @@ func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID 
 				toRelease--
 			}
 			if toRelease > 0 {
-				b.store.ReleaseQuota(accountID, toRelease)
+				if releaseErr := b.store.ReleaseQuota(accountID, toRelease); releaseErr != nil {
+					resp.AuditFailed = append(resp.AuditFailed, fmt.Sprintf("释放账号 %s 配额失败: %v", accountID, releaseErr))
+					if resp.CreatedCount == 0 {
+						return nil, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_ERROR", Message: resp.AuditFailed[0]}
+					}
+				}
 			}
 		}
 		if resp.CreatedCount == 0 {
@@ -427,7 +458,12 @@ func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID 
 
 	b.invalidateAliasCache(accountID)
 	if b.store != nil {
-		resp.RemainingThisHour = b.store.RemainingQuota(accountID)
+		remaining, quotaErr := b.store.RemainingQuota(accountID)
+		if quotaErr != nil {
+			resp.AuditFailed = append(resp.AuditFailed, fmt.Sprintf("查询账号 %s 剩余配额失败: %v", accountID, quotaErr))
+		} else {
+			resp.RemainingThisHour = remaining
+		}
 	}
 	return resp, nil
 }

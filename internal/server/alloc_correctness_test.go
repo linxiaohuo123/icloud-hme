@@ -548,7 +548,7 @@ func TestAllocation_NoTaggedAccountsDoesNotFallBackGlobal(t *testing.T) {
 			{ID: "acc_default", Status: "active", HasAppPassword: true, Tags: []string{}},
 		},
 	}
-	cfg := Config{Debug: false, AdminPassword: "admin"}
+	cfg := Config{Debug: false, AdminPassword: "admin-test-password"}
 	s := newWithBackendAndStore(fb, cfg, st)
 	defer s.Close()
 	ts := httptest.NewServer(s.Handler())
@@ -635,7 +635,7 @@ func TestIdempotency_FailedPoolEmptyReplaysSameError(t *testing.T) {
 			{ID: "acc_1", Status: "active", HasAppPassword: true, Tags: []string{}},
 		},
 	}
-	s := newWithBackendAndStore(fb, Config{AdminPassword: "admin"}, st)
+	s := newWithBackendAndStore(fb, Config{AdminPassword: "admin-test-password"}, st)
 	defer s.Close()
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
