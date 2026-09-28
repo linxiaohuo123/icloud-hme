@@ -24,7 +24,10 @@ import (
 //	timeout (可选): 最大等待秒数, 默认 30, 上限 120
 //	auto_delete: 已废弃并明确拒绝 (传入返回 400 UNSUPPORTED_PARAMETER)
 func (s *Server) verifyCodeHandler(c *gin.Context) {
-	email := strings.ToLower(strings.TrimSpace(c.Query("email")))
+	email := strings.ToLower(strings.TrimSpace(c.Param("email")))
+	if email == "" {
+		email = strings.ToLower(strings.TrimSpace(c.Query("email")))
+	}
 	if email == "" {
 		email = strings.ToLower(strings.TrimSpace(c.Query("alias")))
 	}
@@ -89,6 +92,10 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 		// 【C3】精准消费采用的事件 ID，绝不整桶清除更晚到达的其它新事件
 		if item != nil && item.EventID != "" {
 			s.eventBus.ConsumeEvent(email, item.EventID)
+		}
+		if c.Query("raw") == "1" || c.Query("format") == "text" {
+			c.String(http.StatusOK, item.OTP.Code)
+			return
 		}
 		ok(c, gin.H{
 			"email":      email,

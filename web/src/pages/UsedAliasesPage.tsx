@@ -11,6 +11,7 @@ import { ApiError, request } from '../api/client'
 import type { BusinessTag, LeaseListResult, LeaseRecord } from '../api/types'
 import AsyncState from '../components/AsyncState'
 import Select from '../components/Select'
+import DirectLinksDialog from '../components/DirectLinksDialog'
 import { useToast } from '../components/ToastProvider'
 import {
   IconClock,
@@ -21,6 +22,7 @@ import {
   IconInbox,
   IconSearch,
   IconTag,
+  IconZap,
 } from '../components/icons'
 import { copyText } from '../utils/clipboard'
 import { formatDate, formatFullDate, formatRelativeTime, parseDate } from '../utils/date'
@@ -69,6 +71,7 @@ export default function UsedAliasesPage() {
   const [error, setError] = useState('')
   const [retryKey, setRetryKey] = useState(0)
   const { show, showCopyable } = useToast()
+  const [directLinkEmail, setDirectLinkEmail] = useState<string | null>(null)
 
   // 全量口径指标 (不带筛选的 total 与最近一条领用)，供顶部指标卡使用
   const [grandTotal, setGrandTotal] = useState<number | null>(null)
@@ -368,15 +371,27 @@ export default function UsedAliasesPage() {
                           )}
                         </td>
                         <td style={{ textAlign: 'right' }}>
-                          <Link
-                            to={`/workspace/${encodeURIComponent(r.account_id)}?tab=inbox&alias=${encodeURIComponent(r.email)}`}
-                            className="btn btn-xs btn-primary-soft"
-                            title="前往收件箱查看验证码"
-                            style={{ display: 'inline-flex', alignItems: 'center', gap: 4, textDecoration: 'none' }}
-                          >
-                            <IconInbox size={12} />
-                            <span>收件箱</span>
-                          </Link>
+                          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4, justifyContent: 'flex-end' }}>
+                            <button
+                              type="button"
+                              className="btn btn-xs btn-ghost"
+                              onClick={() => setDirectLinkEmail(r.email)}
+                              title="获取此别名的对外直出链接 (取码/查信/正文)"
+                              style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}
+                            >
+                              <IconZap size={11} style={{ color: '#38bdf8' }} />
+                              <span>直链</span>
+                            </button>
+                            <Link
+                              to={`/workspace/${encodeURIComponent(r.account_id)}?tab=inbox&alias=${encodeURIComponent(r.email)}`}
+                              className="btn btn-xs btn-primary-soft"
+                              title="前往收件箱查看验证码"
+                              style={{ display: 'inline-flex', alignItems: 'center', gap: 4, textDecoration: 'none' }}
+                            >
+                              <IconInbox size={12} />
+                              <span>收件箱</span>
+                            </Link>
+                          </div>
                         </td>
                       </tr>
                     )
@@ -425,6 +440,14 @@ export default function UsedAliasesPage() {
           </div>
         </AsyncState>
       </div>
+
+      {directLinkEmail && (
+        <DirectLinksDialog
+          open={Boolean(directLinkEmail)}
+          email={directLinkEmail}
+          onClose={() => setDirectLinkEmail(null)}
+        />
+      )}
     </div>
   )
 }

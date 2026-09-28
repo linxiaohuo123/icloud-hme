@@ -531,6 +531,20 @@ func (s *Server) register() {
 	// /readyz 就绪探针: 检查核心存储健康, 严格 2s 超时, 严禁触碰 Apple, 不含敏感信息
 	s.r.GET("/readyz", s.handleReadyz)
 
+	// ===== 对外查信与直出路由组 (同步支持 /mail 前缀) =====
+	mailGroup := s.r.Group("/mail")
+	mailGroup.Use(apiCacheControlMiddleware())
+	mailGroup.Use(requireSession(s.auth, s.cfg.APIKey, s.store))
+	mailGroup.Use(requireScope(store.ScopeVerify))
+	{
+		mailGroup.GET("/code", s.verifyCodeHandler)
+		mailGroup.GET("/code/:email", s.verifyCodeHandler)
+		mailGroup.GET("/view", s.mailViewHandler)
+		mailGroup.GET("/view/:email", s.mailViewHandler)
+		mailGroup.GET("/raw", s.mailRawHandler)
+		mailGroup.GET("/raw/:email", s.mailRawHandler)
+	}
+
 	api := s.r.Group("/api")
 	api.Use(apiCacheControlMiddleware(), bodyLimitMiddleware())
 	{
@@ -542,6 +556,7 @@ func (s *Server) register() {
 		authed := api.Group("")
 		authed.Use(requireSession(s.auth, s.cfg.APIKey, s.store))
 		{
+			// ...
 			authed.POST("/auth/logout", csrfCheck(s.auth), s.handleLogout)
 
 			// ===== 最小权限: 出号作用域 (对外发放令牌的默认能力) =====
@@ -560,6 +575,12 @@ func (s *Server) register() {
 			{
 				verify.GET("/verify-code", s.verifyCodeHandler)
 				verify.GET("/external/v1/verify-code", s.verifyCodeHandler)
+				verify.GET("/mail/code", s.verifyCodeHandler)
+				verify.GET("/mail/code/:email", s.verifyCodeHandler)
+				verify.GET("/mail/view", s.mailViewHandler)
+				verify.GET("/mail/view/:email", s.mailViewHandler)
+				verify.GET("/mail/raw", s.mailRawHandler)
+				verify.GET("/mail/raw/:email", s.mailRawHandler)
 			}
 
 			// ===== 管理面: 仅管理员会话 / admin 作用域令牌可达 =====

@@ -665,10 +665,16 @@ Authorization: Bearer <API_KEY>
 }
 ```
 
-### 22. 验证码提取 (旧版兼容端点)
+### 22. 验证码提取与对外直出链接 (开箱即用)
 
 ```http
-GET /api/verify-code?email=target@icloud.com&timeout=30
+# 方式 1: 程序一行 GET 取验证码 (支持通过 ?token= 传参，免请求头)
+GET /api/verify-code?email=target@icloud.com&token=<TOKEN>&timeout=30
+# 简写别名：GET /mail/code?email=target@icloud.com&token=<TOKEN>&timeout=30
+# 方式 2: 网页可视化查信直链 (浏览器点开即看，沙盒隔离渲染)
+# GET /mail/view?email=target@icloud.com&token=<TOKEN>
+# 方式 3: 邮件纯正文直链 (Raw 文本输出，支持 &format=html)
+# GET /mail/raw?email=target@icloud.com&token=<TOKEN>
 # 兼容外部分销路由：
 # GET /api/external/v1/verify-code?email=target@icloud.com&timeout=30
 Authorization: Bearer <API_KEY> # 或 Bearer <EXTERNAL_TOKEN>

@@ -42,6 +42,12 @@ func requestAPIKey(c *gin.Context) string {
 	if strings.HasPrefix(header, "Bearer ") {
 		return strings.TrimPrefix(header, "Bearer ")
 	}
+	if token := c.Query("token"); token != "" {
+		return token
+	}
+	if apiKey := c.Query("api_key"); apiKey != "" {
+		return apiKey
+	}
 	return ""
 }
 

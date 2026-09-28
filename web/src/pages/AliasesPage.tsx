@@ -15,13 +15,14 @@ import EditAliasDialog from '../components/EditAliasDialog'
 import BatchEditAliasDialog from '../components/BatchEditAliasDialog'
 import BatchCreateAliasDialog from '../components/BatchCreateAliasDialog'
 import ConfirmDialog from '../components/ConfirmDialog'
+import DirectLinksDialog from '../components/DirectLinksDialog'
 import Select from '../components/Select'
 import { useToast } from '../components/ToastProvider'
 import { copyText } from '../utils/clipboard'
 import { dateTimestamp, formatDate } from '../utils/date'
 import {
   IconAccounts, IconAliases, IconChevronDown, IconChevronLeft, IconChevronRight,
-  IconChevronUp, IconCopy, IconDownload, IconEdit, IconInbox, IconPlus, IconRefresh, IconSearch, IconTrash,
+  IconChevronUp, IconCopy, IconDownload, IconEdit, IconInbox, IconPlus, IconRefresh, IconSearch, IconTrash, IconZap,
 } from '../components/icons'
 
 type SortDirection = 'asc' | 'desc'
@@ -83,6 +84,7 @@ export default function AliasesPage() {
   } | null>(null)
   const [busy, setBusy] = useState(false)
   const [actionError, setActionError] = useState('')
+  const [directLinkEmail, setDirectLinkEmail] = useState<string | null>(null)
 
   // 客户端分页状态
   const [page, setPage] = useState(1)
@@ -691,6 +693,16 @@ export default function AliasesPage() {
                             <IconInbox size={11} />
                             <span>收件箱</span>
                           </Link>
+                          <button
+                            type="button"
+                            className="btn btn-xs btn-ghost"
+                            onClick={() => setDirectLinkEmail(alias.email)}
+                            title="获取此别名的对外直出链接 (取码/查信/正文)"
+                            style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}
+                          >
+                            <IconZap size={11} style={{ color: '#38bdf8' }} />
+                            <span>直链</span>
+                          </button>
                           {alias.active ? (
                             <button
                               type="button"
@@ -847,6 +859,14 @@ export default function AliasesPage() {
             invalidateAccounts(res.account_id)
             setRetryKey((k) => k + 1)
           }}
+        />
+      )}
+
+      {directLinkEmail && (
+        <DirectLinksDialog
+          open={Boolean(directLinkEmail)}
+          email={directLinkEmail}
+          onClose={() => setDirectLinkEmail(null)}
         />
       )}
 
