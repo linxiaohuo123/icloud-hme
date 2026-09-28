@@ -113,7 +113,7 @@ export default function DirectLinksDialog({ open, onClose, email }: DirectLinksD
               </button>
             </div>
             <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 6 }}>
-              长轮询等待邮件到达并在 0.1 秒内出码，脚本无需携带复杂 Header 头。
+              长轮询等待邮件到达并在 0.1 秒内出码，脚本无需携带复杂 Header 头；末尾追加 &raw=1 可直接输出 6 位纯数字文本。
             </div>
             <input
               type="text"
