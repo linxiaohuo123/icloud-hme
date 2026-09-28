@@ -50,11 +50,31 @@ export default function DirectLinksDialog({ open, onClose, email }: DirectLinksD
     }
   }
 
+  const inputStyle: React.CSSProperties = {
+    width: '100%',
+    minHeight: 34,
+    padding: '6px 10px',
+    fontSize: 12,
+    fontFamily: 'var(--font-mono)',
+    background: 'var(--color-bg)',
+    color: 'var(--color-text)',
+    border: '1px solid var(--color-border)',
+    borderRadius: 'var(--radius)',
+    cursor: 'pointer',
+  }
+
+  const cardStyle: React.CSSProperties = {
+    padding: 12,
+    background: 'var(--color-bg-subtle)',
+    border: '1px solid var(--color-border)',
+    borderRadius: 'var(--radius)',
+  }
+
   return (
     <Dialog open={open} onClose={onClose} title="对外直出链接 (开箱即用)">
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-        <div style={{ fontSize: 13, color: 'var(--text-secondary, #94a3b8)', lineHeight: 1.6 }}>
-          针对邮箱 <strong style={{ color: 'var(--text-primary, #f1f5f9)' }}>{email}</strong> 生成可供外部自动化脚本调用的开箱即用直链。
+        <div style={{ fontSize: 13, color: 'var(--color-text-secondary)', lineHeight: 1.6 }}>
+          针对邮箱 <strong style={{ color: 'var(--color-primary)' }}>{email}</strong> 生成可供外部自动化脚本调用的开箱即用直链。
         </div>
 
         <div className="form-field" style={{ margin: 0 }}>
@@ -69,17 +89,17 @@ export default function DirectLinksDialog({ open, onClose, email }: DirectLinksD
             placeholder="填写在「业务标识」中生成的 Token (可选，会自动存入本机浏览器)"
             style={{ width: '100%', fontSize: 13 }}
           />
-          <span style={{ fontSize: 12, color: 'var(--text-muted, #64748b)', marginTop: 4 }}>
+          <span style={{ fontSize: 12, color: 'var(--color-text-tertiary)', marginTop: 4 }}>
             💡 当前浏览器已登录管理员会话时，网页查信直链无需 Token 也可直接点开；给外部脚本或客户使用时请填入 Token。
           </span>
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginTop: 4 }}>
           {/* 1. 程序取码 (JSON) */}
-          <div className="card" style={{ padding: 12, background: 'var(--bg-subtle, rgba(255,255,255,0.02))', border: '1px solid var(--border-color, #334155)', borderRadius: 8 }}>
+          <div className="card" style={cardStyle}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, fontSize: 13, color: 'var(--text-primary, #f8fafc)' }}>
-                <IconTerminal size={14} style={{ color: '#38bdf8' }} />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, fontSize: 13, color: 'var(--color-text)' }}>
+                <IconTerminal size={14} style={{ color: 'var(--color-primary)' }} />
                 <span>1. 程序一行 GET 取验证码 (JSON)</span>
               </div>
               <button
@@ -92,7 +112,7 @@ export default function DirectLinksDialog({ open, onClose, email }: DirectLinksD
                 <span>复制链接</span>
               </button>
             </div>
-            <div style={{ fontSize: 12, color: 'var(--text-secondary, #94a3b8)', marginBottom: 6 }}>
+            <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 6 }}>
               长轮询等待邮件到达并在 0.1 秒内出码，脚本无需携带复杂 Header 头。
             </div>
             <input
@@ -100,15 +120,15 @@ export default function DirectLinksDialog({ open, onClose, email }: DirectLinksD
               readOnly
               value={jsonUrl}
               onClick={(e) => (e.target as HTMLInputElement).select()}
-              style={{ width: '100%', fontSize: 12, fontFamily: 'monospace', background: 'var(--bg-input, #0f172a)', border: '1px solid var(--border-subtle, #1e293b)' }}
+              style={inputStyle}
             />
           </div>
 
           {/* 2. 网页查信 (HTML) */}
-          <div className="card" style={{ padding: 12, background: 'var(--bg-subtle, rgba(255,255,255,0.02))', border: '1px solid var(--border-color, #334155)', borderRadius: 8 }}>
+          <div className="card" style={cardStyle}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, fontSize: 13, color: 'var(--text-primary, #f8fafc)' }}>
-                <IconGlobe size={14} style={{ color: '#34d399' }} />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, fontSize: 13, color: 'var(--color-text)' }}>
+                <IconGlobe size={14} style={{ color: 'var(--color-success)' }} />
                 <span>2. 网页可视化查信 (HTML)</span>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -133,7 +153,7 @@ export default function DirectLinksDialog({ open, onClose, email }: DirectLinksD
                 </button>
               </div>
             </div>
-            <div style={{ fontSize: 12, color: 'var(--text-secondary, #94a3b8)', marginBottom: 6 }}>
+            <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 6 }}>
               在浏览器中直接查看可视化邮件并醒目展示提取到的验证码，安全沙盒渲染。
             </div>
             <input
@@ -141,15 +161,15 @@ export default function DirectLinksDialog({ open, onClose, email }: DirectLinksD
               readOnly
               value={viewUrl}
               onClick={(e) => (e.target as HTMLInputElement).select()}
-              style={{ width: '100%', fontSize: 12, fontFamily: 'monospace', background: 'var(--bg-input, #0f172a)', border: '1px solid var(--border-subtle, #1e293b)' }}
+              style={inputStyle}
             />
           </div>
 
           {/* 3. 纯正文 (Raw) */}
-          <div className="card" style={{ padding: 12, background: 'var(--bg-subtle, rgba(255,255,255,0.02))', border: '1px solid var(--border-color, #334155)', borderRadius: 8 }}>
+          <div className="card" style={cardStyle}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, fontSize: 13, color: 'var(--text-primary, #f8fafc)' }}>
-                <IconFileText size={14} style={{ color: '#fbbf24' }} />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, fontSize: 13, color: 'var(--color-text)' }}>
+                <IconFileText size={14} style={{ color: 'var(--color-warning)' }} />
                 <span>3. 邮件纯正文 (Raw Text)</span>
               </div>
               <button
@@ -162,7 +182,7 @@ export default function DirectLinksDialog({ open, onClose, email }: DirectLinksD
                 <span>复制链接</span>
               </button>
             </div>
-            <div style={{ fontSize: 12, color: 'var(--text-secondary, #94a3b8)', marginBottom: 6 }}>
+            <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 6 }}>
               直接输出未经 JSON 转义的邮件纯正文文本，方便爬虫使用正则提取长链接。
             </div>
             <input
@@ -170,7 +190,7 @@ export default function DirectLinksDialog({ open, onClose, email }: DirectLinksD
               readOnly
               value={rawUrl}
               onClick={(e) => (e.target as HTMLInputElement).select()}
-              style={{ width: '100%', fontSize: 12, fontFamily: 'monospace', background: 'var(--bg-input, #0f172a)', border: '1px solid var(--border-subtle, #1e293b)' }}
+              style={inputStyle}
             />
           </div>
         </div>
