@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 database/sql, modernc.org/sqlite, os, path/filepath, sync, time, encoding/hex, crypto/rand
  * [OUTPUT]: 对外提供 Store 结构定义、NewStore、Close 引擎生命周期与 initSchema SQLite 数据库与 DDL 初始化
- * [POS]: internal/store 的核心存储引擎，基于纯 Go 嵌入式 SQLite 驱动与 WAL 模式维护底层数据流与生命周期
+ * [POS]: internal/store 的核心存储引擎，维护 WAL 连接生命周期与事务化版本迁移，v6 补齐流水实际时间索引
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -379,6 +379,24 @@ func (s *Store) initSchema(dbExistedBefore bool) error {
 			}
 			if err := tx.Commit(); err != nil {
 				return fmt.Errorf("commit migration v4 to v5 tx failed: %w", err)
+			}
+		case 5:
+			tx, err := s.db.Begin()
+			if err != nil {
+				return fmt.Errorf("begin migration v5 to v6 tx failed: %w", err)
+			}
+			// Match the timezone-aware ordering used by lease queries. Keep the
+			// original timestamp text intact for historical records and API clients.
+			if _, err := tx.Exec(`
+				CREATE INDEX IF NOT EXISTS idx_leases_allocated_time ON lease_records (julianday(allocated_at) DESC, id DESC);
+				CREATE INDEX IF NOT EXISTS idx_leases_email_time ON lease_records (LOWER(email), julianday(allocated_at) DESC, id DESC);
+				PRAGMA user_version = 6;
+			`); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migrate v5 to v6 failed: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit migration v5 to v6 tx failed: %w", err)
 			}
 		default:
 			return fmt.Errorf("unsupported migration path from version %d", currentV)

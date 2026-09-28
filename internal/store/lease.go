@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 database/sql, errors, fmt, log, strings, sync/atomic, time, icloud-hme/internal/store (Store)
  * [OUTPUT]: 对外提供 LeaseRecord 类型, UpsertAliasRoutes, FindAliasRoute, CountAliasRoutes, DeleteAliasRoutesForAccount, FindLeaseAccount, CountLeases, PruneLeases, ListLeases, RecordLease, UpdateLeaseStatus, CountConsumedPoolAliases
- * [POS]: internal/store 的别名认领与出号流水审计领域，维护 alias_routes 路由表与 lease_records 审计日志
+ * [POS]: internal/store 的别名认领与出号流水审计领域，流水排序与保留期按实际时间比较，兼容历史时区偏移
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -140,7 +140,7 @@ func (s *Store) FindLeaseAccount(email string) (string, bool) {
 	}
 	var accountID string
 	err := s.db.QueryRow(
-		`SELECT account_id FROM lease_records WHERE LOWER(email) = ? AND account_id != '' ORDER BY allocated_at DESC LIMIT 1`,
+		`SELECT account_id FROM lease_records WHERE LOWER(email) = ? AND account_id != '' ORDER BY julianday(allocated_at) DESC, id DESC LIMIT 1`,
 		email,
 	).Scan(&accountID)
 	if err != nil || accountID == "" {
@@ -163,8 +163,8 @@ func (s *Store) PruneLeases(cutoff time.Time, batch int) (int, error) {
 	}
 	res, err := s.db.Exec(`
 		DELETE FROM lease_records WHERE id IN (
-			SELECT id FROM lease_records WHERE allocated_at < ? ORDER BY allocated_at ASC LIMIT ?
-		)`, cutoff.Format(time.RFC3339), batch)
+			SELECT id FROM lease_records WHERE julianday(allocated_at) < julianday(?) ORDER BY julianday(allocated_at) ASC, id ASC LIMIT ?
+		)`, cutoff.UTC().Format(time.RFC3339Nano), batch)
 	if err != nil {
 		return 0, err
 	}
@@ -209,7 +209,7 @@ func (s *Store) ListLeases(aliasQuery, tagQuery, statusQuery string, limit, offs
 	if limit <= 0 {
 		limit = 50
 	}
-	query := fmt.Sprintf("SELECT id, email, account_id, tag, status, allocated_at, COALESCE(completed_at, ''), COALESCE(token_name, '') FROM lease_records WHERE %s ORDER BY allocated_at DESC LIMIT ? OFFSET ?", whereSQL)
+	query := fmt.Sprintf("SELECT id, email, account_id, tag, status, allocated_at, COALESCE(completed_at, ''), COALESCE(token_name, '') FROM lease_records WHERE %s ORDER BY julianday(allocated_at) DESC, id DESC LIMIT ? OFFSET ?", whereSQL)
 	queryArgs := append(args, limit, offset)
 
 	rows, err := s.db.Query(query, queryArgs...)
@@ -237,7 +237,7 @@ func (s *Store) RecordLease(rec LeaseRecord) error {
 		rec.ID = NewOpaqueID("lease_")
 	}
 	if rec.AllocatedAt == "" {
-		rec.AllocatedAt = time.Now().Format(time.RFC3339)
+		rec.AllocatedAt = time.Now().UTC().Format(time.RFC3339)
 	}
 	if rec.Status == "" {
 		rec.Status = "completed"

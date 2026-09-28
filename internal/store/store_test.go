@@ -76,7 +76,7 @@ func TestV3AccountsWithoutAppleDSIDUpgrade(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	backups, err := filepath.Glob(filepath.Join(dir, "backups", "pre-migrate-v3-to-v5-*.db"))
+	backups, err := filepath.Glob(filepath.Join(dir, "backups", fmt.Sprintf("pre-migrate-v3-to-v%d-*.db", CurrentSchemaVersion)))
 	if err != nil || len(backups) != 1 {
 		t.Fatalf("expected one pre-migration backup, got %v: %v", backups, err)
 	}
@@ -131,7 +131,7 @@ func TestV4RemoteAllocationColumnsUpgrade(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	backups, err := filepath.Glob(filepath.Join(dir, "backups", "pre-migrate-v4-to-v5-*.db"))
+	backups, err := filepath.Glob(filepath.Join(dir, "backups", fmt.Sprintf("pre-migrate-v4-to-v%d-*.db", CurrentSchemaVersion)))
 	if err != nil || len(backups) != 1 {
 		t.Fatalf("expected one pre-migration backup, got %v: %v", backups, err)
 	}

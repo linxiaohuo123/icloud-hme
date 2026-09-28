@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, database/sql, fmt, io, os, path/filepath, strings, time, icloud-hme/internal/security, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 CreateBackup, CreateDatabaseBackup 与 package-level RestoreDatabase / RestoreDatabaseWithCipher 离线恢复能力及 quickCheck 探针
- * [POS]: internal/store 的一致性快照生成与离线恢复容灾层 (PR-09)
+ * [POS]: internal/store 的一致性快照生成与离线恢复容灾层，恢复时校验并替换同一份包含源 WAL 数据的快照
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -253,19 +253,33 @@ func RestoreDatabaseWithCipher(ctx context.Context, dataDir string, backupPath s
 		return fmt.Errorf("backup path is a directory: %s", backupPath)
 	}
 
-	// 2. 以 SQLite 只读方式打开备份
-	bakDB, err := sql.Open("sqlite", fmt.Sprintf("%s?mode=ro", filepath.ToSlash(backupPath)))
+	// 2. 通过 SQLite 捕获源库的一致性快照，不能裸复制可能尚有 committed WAL 的主文件。
+	// 后续版本校验与实际替换都使用这个快照，避免校验后源库发生变化。
+	restoreTmp := filepath.Join(dataDir, "icloud_hme.db.restore."+NewOpaqueID("tmp_"))
+	defer func() { _ = os.Remove(restoreTmp) }()
+	sourceDB, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(5000)", filepath.ToSlash(backupPath)))
+	if err != nil {
+		return fmt.Errorf("open backup failed: %w", err)
+	}
+	if err := quickCheck(sourceDB); err != nil {
+		_ = sourceDB.Close()
+		return fmt.Errorf("backup integrity check failed: %w", err)
+	}
+	snapshotErr := createOnlineBackup(ctx, sourceDB, restoreTmp)
+	closeErr := sourceDB.Close()
+	if snapshotErr != nil {
+		return fmt.Errorf("backup integrity snapshot failed: %w", snapshotErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close backup source failed: %w", closeErr)
+	}
+	bakDB, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro", filepath.ToSlash(restoreTmp)))
 	if err != nil {
 		return fmt.Errorf("open backup failed: %w", err)
 	}
 
-	// 3. PRAGMA quick_check 必须为 ok
-	if err := quickCheck(bakDB); err != nil {
-		_ = bakDB.Close()
-		return fmt.Errorf("backup integrity check failed: %w", err)
-	}
-
-	// 4. 检查 user_version：backup version <= CurrentSchemaVersion, future version 拒绝恢复
+	// 3. 快照已通过 createOnlineBackup 的 quick_check；检查同一快照的 user_version。
+	// backup version <= CurrentSchemaVersion，future version 拒绝恢复。
 	var backupVersion int
 	if err := bakDB.QueryRowContext(ctx, "PRAGMA user_version;").Scan(&backupVersion); err != nil {
 		_ = bakDB.Close()
@@ -326,26 +340,10 @@ func RestoreDatabaseWithCipher(ctx context.Context, dataDir string, backupPath s
 		preRestorePath = targetPath
 	}
 
-	// 6. 将 restore source 复制到 icloud_hme.db.restore.tmp，权限 0600
-	restoreTmp := filepath.Join(dataDir, "icloud_hme.db.restore.tmp")
-	defer func() {
-		_ = os.Remove(restoreTmp)
-	}()
-
-	srcFile, err := os.Open(backupPath)
+	// 6. 将已校验的一致性快照同步到磁盘，再替换 live 数据库。
+	tmpFile, err := os.OpenFile(restoreTmp, os.O_RDWR, 0600)
 	if err != nil {
-		return fmt.Errorf("open backup file for reading failed: %w", err)
-	}
-	defer srcFile.Close()
-
-	tmpFile, err := os.OpenFile(restoreTmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
-	if err != nil {
-		return fmt.Errorf("create restore tmp file failed: %w", err)
-	}
-
-	if _, err := io.Copy(tmpFile, srcFile); err != nil {
-		_ = tmpFile.Close()
-		return fmt.Errorf("copy backup to tmp failed: %w", err)
+		return fmt.Errorf("open restore snapshot for sync failed: %w", err)
 	}
 
 	// 7. fsync / close

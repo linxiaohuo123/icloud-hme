@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 database/sql, fmt, strings, time, sync
  * [OUTPUT]: 对外提供 CurrentSchemaVersion, schemaExecutor 接口, migrateV0ToV1, validateSchema, SetBeforeMigrationStepHookForTest
- * [POS]: internal/store 的版本化架构演进与元数据校验层 (PR-06 Baseline)
+ * [POS]: internal/store 的版本化架构演进与元数据校验层，唯一性契约要求覆盖整张表
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -16,7 +16,7 @@ import (
 )
 
 // CurrentSchemaVersion 数据库正式版本基线
-const CurrentSchemaVersion = 5
+const CurrentSchemaVersion = 6
 
 type schemaExecutor interface {
 	Exec(query string, args ...any) (sql.Result, error)
@@ -110,7 +110,7 @@ func hasUniqueConstraint(exec schemaExecutor, table string, columns []string) (b
 		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
 			return false, fmt.Errorf("scan index_list for %s failed: %w", table, err)
 		}
-		if unique == 1 {
+		if unique == 1 && partial == 0 {
 			uniqueIndexes = append(uniqueIndexes, name)
 		}
 	}
@@ -762,6 +762,9 @@ func validateSchemaVersion(db *sql.DB, expectedVersion int) error {
 		"idx_vreq_email",
 		"idx_hme_intents_unresolved",
 		"idx_api_tokens_hash",
+	}
+	if expectedVersion >= 6 {
+		requiredIndexes = append(requiredIndexes, "idx_leases_allocated_time", "idx_leases_email_time")
 	}
 	for _, idx := range requiredIndexes {
 		var count int
