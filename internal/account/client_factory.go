@@ -9,6 +9,7 @@ package account
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -45,7 +46,7 @@ func (m *Manager) HMEClient(id string, verbose bool) (*hme.Client, error) {
 }
 
 // HMEClientWithPassword 为指定账号创建一个新的 HME 客户端,使用账号密码登录。
-// 登录成功后会自动获取 Cookie 并保存到账号配置。
+// 支持两阶段 2FA 认证挂起与恢复；登录成功后会自动获取 Cookie 并保存到账号配置。
 func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTPProvider) (*hme.Client, error) {
 	entry := m.hmePool.acquire(id)
 	entry.mu.Lock()
@@ -61,29 +62,78 @@ func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTP
 		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
 
-	email := snap.ICloudEmail
-	if email == "" {
-		email = snap.RealEmail
-	}
-	if email == "" {
-		return nil, fmt.Errorf("账号未设置邮箱地址")
+	var client *hme.Client
+	keepClient := false
+
+	m.mu.Lock()
+	// 清理已超过 5 分钟的过期挂起登录
+	for k, pl := range m.pendingLogins {
+		if time.Since(pl.createdAt) > 5*time.Minute {
+			pl.client.Close()
+			delete(m.pendingLogins, k)
+		}
 	}
 
-	// verbose 必须为 false:该模式会把 Cookie 请求头明文打进 stdout(进程日志),
-	// 密码登录路径必然携带 X-APPLE-WEBAUTH-* 会话凭据。
-	client, err := hme.NewClient(nil, snap.Host, snap.Proxy, false)
-	if err != nil {
-		return nil, err
+	pl, hasPending := m.pendingLogins[id]
+	if hasPending {
+		if otpProvider != nil && time.Since(pl.createdAt) < 5*time.Minute {
+			client = pl.client
+		} else {
+			delete(m.pendingLogins, id)
+			pl.client.Close()
+		}
 	}
-	keepClient := false
+	m.mu.Unlock()
+
 	defer func() {
-		if !keepClient {
+		if !keepClient && client != nil {
 			client.Close()
 		}
 	}()
 
-	if err := client.Login(email, password, otpProvider); err != nil {
-		return nil, err
+	if client != nil {
+		// 复用挂起的会话提交 2FA 验证码
+		otp, err := otpProvider()
+		if err != nil {
+			return nil, fmt.Errorf("获取 2FA 验证码失败: %w", err)
+		}
+		if err := client.SubmitOTP(otp); err != nil {
+			// 输错验证码时保留挂起会话，不关闭 client，允许用户修正验证码后在同一会话中重试
+			keepClient = true
+			return nil, err
+		}
+		// 验证成功，从挂起池中移除
+		m.mu.Lock()
+		delete(m.pendingLogins, id)
+		m.mu.Unlock()
+	} else {
+		// 全新登录握手
+		email := snap.ICloudEmail
+		if email == "" {
+			email = snap.RealEmail
+		}
+		if email == "" {
+			return nil, fmt.Errorf("账号未设置邮箱地址")
+		}
+
+		c, err := hme.NewClient(nil, snap.Host, snap.Proxy, false)
+		if err != nil {
+			return nil, err
+		}
+		client = c
+
+		if err := client.Login(email, password, otpProvider); err != nil {
+			if errors.Is(err, hme.ErrOTPRequired) || strings.Contains(err.Error(), "需要提供 OTP") {
+				m.mu.Lock()
+				if old, exists := m.pendingLogins[id]; exists {
+					old.client.Close()
+				}
+				m.pendingLogins[id] = &pendingLogin{client: client, createdAt: time.Now()}
+				m.mu.Unlock()
+				keepClient = true // 挂起等待验证码，不在此次 defer 中关闭
+			}
+			return nil, err
+		}
 	}
 
 	if err := client.ValidateSession(); err != nil {

@@ -17,6 +17,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -28,6 +29,9 @@ import (
 	http "github.com/bogdanfinn/fhttp"
 	"icloud-hme/internal/srp"
 )
+
+// ErrOTPRequired 表示 Apple ID 启用了双重认证,需要提供 6 位验证码。
+var ErrOTPRequired = errors.New("账号启用了双重认证,需要提供 OTP")
 
 // AuthEndpoints iCloud 认证 API 端点
 const (
@@ -117,26 +121,13 @@ func (c *Client) Login(username, password string, otpProvider OTPProvider) error
 
 	// 8. 提交 SRP 响应 (可能触发 2FA)
 	if err := c.authComplete(state, base64.StdEncoding.EncodeToString(srpClient.M1), base64.StdEncoding.EncodeToString(srpClient.M2), otpProvider); err != nil {
+		if errors.Is(err, ErrOTPRequired) {
+			return err
+		}
 		return fmt.Errorf("auth complete: %w", err)
 	}
 
-	// 9. 信任设备
-	if err := c.getTrust(state); err != nil {
-		return fmt.Errorf("get trust: %w", err)
-	}
-
-	// 10. 获取 iCloud Web 服务 Cookie
-	if err := c.authenticateWeb(state); err != nil {
-		return fmt.Errorf("authenticate web: %w", err)
-	}
-
-	// 11. 保存 Cookie 到 Client
-	cookies := c.extractSessionCookies()
-	c.cookieMu.Lock()
-	c.Cookies = cookies
-	c.cookieMu.Unlock()
-	c.log("登录成功,获取到 %d 个 Cookie", len(cookies))
-	return nil
+	return c.finishAuth(state)
 }
 
 // --- 认证流程的各步骤 ---
@@ -309,7 +300,10 @@ func (c *Client) handleTwoFactor(state *authState, signinResp *http.Response, ot
 	state.scnt = signinResp.Header.Get("scnt")
 
 	if otpProvider == nil {
-		return fmt.Errorf("账号启用了双重认证,需要提供 OTP")
+		c.stateMu.Lock()
+		c.pendingAuth = state
+		c.stateMu.Unlock()
+		return ErrOTPRequired
 	}
 
 	otp, err := otpProvider()
@@ -317,12 +311,19 @@ func (c *Client) handleTwoFactor(state *authState, signinResp *http.Response, ot
 		return fmt.Errorf("获取 2FA 验证码失败: %w", err)
 	}
 
-	// 提交 2FA 验证码
+	return c.verifySecurityCode(state, otp)
+}
+
+// verifySecurityCode 向 Apple 提交 2FA 验证码
+func (c *Client) verifySecurityCode(state *authState, otp string) error {
 	reqBody := map[string]interface{}{
 		"securityCode": map[string]string{"code": otp},
 	}
 
-	data, _ := json.Marshal(reqBody)
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
 	req, err := http.NewRequest("POST", fmt.Sprintf(submitSecurity, "trusteddevice"), bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -443,6 +444,58 @@ func (c *Client) extractSessionCookies() map[string]string {
 		}
 	}
 	return cookies
+}
+
+// finishAuth 在密码或 2FA 认证通过后，获取 trustToken 与 iCloud Web 服务 Cookie
+func (c *Client) finishAuth(state *authState) error {
+	// 9. 信任设备
+	if err := c.getTrust(state); err != nil {
+		return fmt.Errorf("get trust: %w", err)
+	}
+
+	// 10. 获取 iCloud Web 服务 Cookie
+	if err := c.authenticateWeb(state); err != nil {
+		return fmt.Errorf("authenticate web: %w", err)
+	}
+
+	// 11. 保存 Cookie 到 Client
+	cookies := c.extractSessionCookies()
+	c.cookieMu.Lock()
+	c.Cookies = cookies
+	c.cookieMu.Unlock()
+	c.log("登录成功,获取到 %d 个 Cookie", len(cookies))
+	return nil
+}
+
+// SubmitOTP 提交 2FA 验证码并完成后续登录授权（信任设备与 Web 鉴权）。
+func (c *Client) SubmitOTP(otp string) error {
+	c.stateMu.Lock()
+	state := c.pendingAuth
+	c.stateMu.Unlock()
+
+	if state == nil {
+		return fmt.Errorf("无等待中的 2FA 认证会话")
+	}
+
+	if err := c.verifySecurityCode(state, otp); err != nil {
+		return err
+	}
+
+	if err := c.finishAuth(state); err != nil {
+		return err
+	}
+
+	c.stateMu.Lock()
+	c.pendingAuth = nil
+	c.stateMu.Unlock()
+	return nil
+}
+
+// HasPending2FA 查询当前 Client 是否有等待验证码的会话。
+func (c *Client) HasPending2FA() bool {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.pendingAuth != nil
 }
 
 // updateAuthHeaders 更新认证请求所需的头部

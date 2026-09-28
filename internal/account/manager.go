@@ -66,15 +66,22 @@ type MailboxConfig struct {
 	Password string `json:"password,omitempty"`
 }
 
+// pendingLogin 保存正在等待 2FA 验证码的挂起登录会话
+type pendingLogin struct {
+	client    *hme.Client
+	createdAt time.Time
+}
+
 // Manager 管理多个 iCloud 账号,线程安全。
 type Manager struct {
-	mu       sync.RWMutex
-	accounts map[string]*Account
-	dataDir  string
-	dataFile string
-	store    *store.Store // SQLite 持久化后端
-	imapPool *mail.Pool   // IMAP 长连接池
-	hmePool  *hmeClientPool
+	mu            sync.RWMutex
+	accounts      map[string]*Account
+	pendingLogins map[string]*pendingLogin
+	dataDir       string
+	dataFile      string
+	store         *store.Store // SQLite 持久化后端
+	imapPool      *mail.Pool   // IMAP 长连接池
+	hmePool       *hmeClientPool
 }
 
 // NewManager 创建管理器。st 为 SQLite 持久化后端，dataDir 用于存放 IMAP 等资源。
@@ -83,12 +90,13 @@ func NewManager(dataDir string, st *store.Store) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{
-		accounts: make(map[string]*Account),
-		dataDir:  dataDir,
-		dataFile: filepath.Join(dataDir, "accounts.json"),
-		store:    st,
-		imapPool: mail.NewPool(),
-		hmePool:  newHMEClientPool(),
+		accounts:      make(map[string]*Account),
+		pendingLogins: make(map[string]*pendingLogin),
+		dataDir:       dataDir,
+		dataFile:      filepath.Join(dataDir, "accounts.json"),
+		store:         st,
+		imapPool:      mail.NewPool(),
+		hmePool:       newHMEClientPool(),
 	}
 	if err := m.load(); err != nil {
 		return nil, err
@@ -98,6 +106,12 @@ func NewManager(dataDir string, st *store.Store) (*Manager, error) {
 
 // Close 释放 IMAP 连接池与 HME 客户端池等资源。
 func (m *Manager) Close() {
+	m.mu.Lock()
+	for id, pl := range m.pendingLogins {
+		pl.client.Close()
+		delete(m.pendingLogins, id)
+	}
+	m.mu.Unlock()
 	if m.imapPool != nil {
 		m.imapPool.Close()
 	}
@@ -362,6 +376,10 @@ func (m *Manager) UpdateProxy(id, proxy string) (Summary, error) {
 // 幽灵账号并被调度器继续选中发号。
 func (m *Manager) RemoveAccount(id string) bool {
 	m.mu.Lock()
+	if pl, ok := m.pendingLogins[id]; ok {
+		pl.client.Close()
+		delete(m.pendingLogins, id)
+	}
 	acc, ok := m.accounts[id]
 	if !ok {
 		m.mu.Unlock()

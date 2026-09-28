@@ -84,6 +84,7 @@ type Client struct {
 	dsid            string // 从 validate 响应提取
 	clientID        string // UUID,每次会话生成
 	accountInfo     *AccountInfo
+	pendingAuth     *authState
 	PreReserveHook  func(ctx context.Context, candidate string) error
 	PostReserveHook func(ctx context.Context, candidate, anonymousID string, err error)
 }
@@ -565,6 +566,9 @@ func (c *Client) EnsureServiceWithContext(ctx context.Context) error { return c.
 //
 // 供账号级客户端池在条目被淘汰/账号删除时调用；Client 本身不可再用于后续请求。
 func (c *Client) Close() {
+	c.stateMu.Lock()
+	c.pendingAuth = nil
+	c.stateMu.Unlock()
 	if c.httpc != nil {
 		c.httpc.CloseIdleConnections()
 	}

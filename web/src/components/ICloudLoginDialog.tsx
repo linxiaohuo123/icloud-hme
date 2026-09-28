@@ -60,17 +60,19 @@ export default function ICloudLoginDialog({
     }
   }
 
+  function handleClose() {
+    setPassword('')
+    setOtp('')
+    setOtpRequired(false)
+    setError('')
+    onClose()
+  }
+
   return (
     <Dialog
       title="Apple ID 账号授权登录"
       open={open}
-      onClose={() => {
-        setPassword('')
-        setOtp('')
-        setOtpRequired(false)
-        setError('')
-        onClose()
-      }}
+      onClose={handleClose}
     >
       {accountEmail && (
         <div className="alert-info" style={{ marginBottom: 12 }}>
@@ -95,6 +97,7 @@ export default function ICloudLoginDialog({
             placeholder="请输入该 Apple ID 的官方密码"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') void handleSubmit() }}
           />
           <span className="field-hint" style={{ fontSize: 12, color: 'var(--color-text-secondary, #64748b)', marginTop: 4 }}>
             说明：系统将通过 SRP 安全握手向 Apple 服务器申请会话凭据。
@@ -111,12 +114,13 @@ export default function ICloudLoginDialog({
             maxLength={6}
             value={otp}
             onChange={(e) => setOtp(e.target.value.replace(/\D/g, ''))}
+            onKeyDown={(e) => { if (e.key === 'Enter') void handleSubmit() }}
             autoComplete="one-time-code"
           />
         </div>
       )}
       <div className="form-actions">
-        <button type="button" onClick={onClose}>取消</button>
+        <button type="button" onClick={handleClose}>取消</button>
         <button type="button" className="primary" onClick={() => void handleSubmit()} disabled={submitting}>
           {submitting ? '登录中…' : otpRequired ? '验证' : '登录'}
         </button>
