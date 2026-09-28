@@ -53,6 +53,7 @@ type Message struct {
 	Subject     string `json:"subject"`
 	Date        string `json:"date"`
 	Preview     string `json:"preview"`
+	Body        string `json:"body,omitempty"`
 	Unread      *bool  `json:"unread,omitempty"`
 	Provider    string `json:"provider,omitempty"`     // "imap" 或 "webmail"
 	UIDValidity uint32 `json:"uid_validity,omitempty"` // IMAP 邮箱 UIDVALIDITY

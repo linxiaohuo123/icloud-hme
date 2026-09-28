@@ -603,7 +603,11 @@ func (w *MailSyncWorker) fetchAndPublishLegacyBatch(ctx context.Context, account
 	found := make(map[string]bool, len(aliases))
 	process := func(messages []mail.Message) error {
 		for _, msg := range messages {
-			otp := mail.ExtractOTP(msg.Subject, msg.Preview)
+			bodyText := msg.Preview
+			if bodyText == "" {
+				bodyText = msg.Body
+			}
+			otp := mail.ExtractOTP(msg.Subject, bodyText)
 			if otp == nil {
 				continue
 			}

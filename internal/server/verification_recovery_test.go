@@ -900,6 +900,58 @@ func TestPR04B_LegacySubscriberStillWorksWithoutPersistentRequest(t *testing.T) 
 	}
 }
 
+// TestPR04B_LegacySubscriberFallbackToBodyWhenPreviewEmpty
+// 验证当 Preview 为空但 Body 存在验证码时，fetchAndPublishLegacyBatch 能正确回退使用 Body 提取并广播。
+func TestPR04B_LegacySubscriberFallbackToBodyWhenPreviewEmpty(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	legacyEmail := "empty_preview@icloud.com"
+
+	messages := []mail.Message{
+		{
+			ID:          "202",
+			AccountID:   "acc_legacy_empty_preview",
+			Folder:      "inbox",
+			UIDValidity: 1,
+			UID:         202,
+			Provider:    "imap",
+			To:          legacyEmail,
+			Subject:     "Login Verification",
+			Preview:     "",
+			Body:        "Your verification code is: 778899",
+		},
+	}
+	fb := newScanTestBackend("acc_legacy_empty_preview", messages, 205)
+	fb.onListInboxContext = func(ctx context.Context, q InboxQuery) (InboxResult, error) {
+		return InboxResult{Messages: messages, Count: len(messages)}, nil
+	}
+
+	eventBus := mail.NewEventBus(5 * time.Minute)
+	worker := NewMailSyncWorker(fb, st, eventBus, 1*time.Second)
+
+	subID, ch := eventBus.Subscribe(legacyEmail)
+	defer eventBus.Unsubscribe(legacyEmail, subID)
+
+	matched := worker.fetchAndPublishBatch(ctx, "acc_legacy_empty_preview", []string{legacyEmail})
+	if !matched {
+		t.Fatal("fetchAndPublishBatch 应匹配成功")
+	}
+
+	select {
+	case evt := <-ch:
+		if evt.OTP.Code != "778899" {
+			t.Fatalf("验证码不符: %+v", evt)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("legacy 别名超时未收到事件")
+	}
+}
+
 // TestPR04B_ConcurrentCompletionHasSingleWinner
 // 验证多个并发流程同时调用 CompleteVerificationRequestResult 时，只有一个胜出（won=true），其他返回 won=false 并拿到权威终态。
 func TestPR04B_ConcurrentCompletionHasSingleWinner(t *testing.T) {

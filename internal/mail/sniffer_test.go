@@ -198,6 +198,42 @@ func TestExtractOTP(t *testing.T) {
 			body:         "<style>.security-code { width: 480219px; color: #582910; }</style><p>Your code is: 123456</p>",
 			expectedCode: "123456",
 		},
+		{
+			name:         "泰文验证码及系词提取",
+			subject:      "รหัสยืนยัน",
+			body:         "รหัสยืนยันของคุณคือ 481920 กรุณากรอกภายใน 10 นาที",
+			expectedCode: "481920",
+		},
+		{
+			name:         "印尼语验证码及系词提取",
+			subject:      "Kode Verifikasi",
+			body:         "Kode verifikasi akun Anda adalah 592813.",
+			expectedCode: "592813",
+		},
+		{
+			name:         "波兰语验证码提取",
+			subject:      "Weryfikacja konta",
+			body:         "Twój kod weryfikacyjny: 839104",
+			expectedCode: "839104",
+		},
+		{
+			name:         "OpenAI鉴权平台关键词提取",
+			subject:      "Your OpenAI verification code",
+			body:         "491028 is your OpenAI verification code.",
+			expectedCode: "491028",
+		},
+		{
+			name:         "泰文独立密码代码词元提取",
+			subject:      "เข้าสู่ระบบ",
+			body:         "รหัส: 481920",
+			expectedCode: "481920",
+		},
+		{
+			name:         "ChatGPT冒号直接跟随验证码",
+			subject:      "ChatGPT login",
+			body:         "ChatGPT: 582910",
+			expectedCode: "582910",
+		},
 	}
 
 	for _, tt := range tests {
@@ -235,6 +271,12 @@ func TestExtractOTPFalsePositiveImmunity(t *testing.T) {
 	hotpotMail := "Welcome to Hotpot restaurant! Bill: 883921"
 	if res := ExtractOTP("Dining", hotpotMail); res != nil && res.Code != "" {
 		t.Fatalf("hotpot 单词不应被当作 otp 提取验证码，实际得到: %q", res.Code)
+	}
+
+	// 科技资讯/周报中提及 ChatGPT/OpenAI 时，不应误将统计数或用户数当成验证码
+	newsMail := "Over 123456 people love ChatGPT today!"
+	if res := ExtractOTP("News", newsMail); res != nil && res.Code != "" {
+		t.Fatalf("提及 ChatGPT 的普通新闻不应误判验证码，实际得到: %q", res.Code)
 	}
 }
 

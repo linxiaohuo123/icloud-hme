@@ -42,21 +42,29 @@ const (
 		`codigo\s*de\s*verificacao|código|codigo|clave|` +
 		// 法语
 		`code\s*de\s*vérification|code\s*de\s*sécurité|code\s*de\s*confirmation|code\s*d'activation|` +
-		// 德语
-		`bestätigungscode|bestaetigungscode|sicherheitscode|aktivierungscode|einmalpasswort|bestätigung|` +
+		// 德语 / 荷兰语
+		`verifizierungscode|bestätigungscode|bestaetigungscode|sicherheitscode|aktivierungscode|einmalpasswort|verificatiecode|beveiligingscode|bestätigung|` +
 		// 意大利语
 		`codice\s*di\s*verifica|codice\s*di\s*sicurezza|codice\s*di\s*conferma|codice|` +
+		// 波兰语
+		`kod\s*weryfikacyjny|\bkod\b|` +
 		// 越南语
 		`mã\s*xác\s*thực|mã\s*xác\s*nhận|mã\s*bảo\s*mật|mã\s*otp|\bmã\b|` +
 		// 土耳其语
 		`doğrulama\s*kodu|dogrulama\s*kodu|güvenlik\s*kodu|onay\s*kodu|\bkod\b|\bkodu\b|doğrulama|` +
+		// 泰文 (Thai)
+		`รหัส\s*ยืนยัน|รหัส\s*ชั่วคราว|รหัส\s*ความปลอดภัย|รหัส\s*ผ่าน\s*ชั่วคราว|รหัส|ยืนยัน|` +
+		// 印尼语 / 马来语 (Indonesian / Malay)
+		`kode\s*verifikasi|kode\s*keamanan|kode\s*konfirmasi|\bkode\b|` +
 		// 阿拉伯语
-		`رمز\s*التحقق|رمز\s*الأمان|رمز\s*التأكيد|\bرمز\b` +
+		`رمز\s*التحقق|رمز\s*الأمان|رمز\s*التأكيد|\bرمز\b|` +
+		// 核心服务与鉴权平台 (ChatGPT / OpenAI)
+		`\b(?:chatgpt|openai)\b(?:\s*(?:verification|auth|security|login|access)?\s*(?:code|otp|pin|passcode)|\s*(?:\bis\b|[:：=\-]))` +
 		`)`
 )
 
 var (
-	copulaPattern      = `(?:\bis\b|为|是|\best\b|\bes\b|\bist\b|\blautet\b|è|la|является|para|[:：=])`
+	copulaPattern      = `(?:\bis\b|为|是|\best\b|\bes\b|\bist\b|\blautet\b|è|la|является|para|คือ|adalah|[:：=])`
 	keywordRegex       = regexp.MustCompile(`(?i)` + multiLangKeywordPattern)
 	forwardCodeContext = regexp.MustCompile(`(?i)` + multiLangKeywordPattern + `[^\r\n]{0,64}?` + copulaPattern + `[\s:：=\-{"“『「【(<]*$`)
 	directCodeContext  = regexp.MustCompile(`(?i)` + multiLangKeywordPattern + `[\s:：=\-{"“『「【(<]+$`)
