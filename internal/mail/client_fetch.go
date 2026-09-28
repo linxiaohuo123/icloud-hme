@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 fmt, net/mail, sort, strings, time, github.com/emersion/go-imap
  * [OUTPUT]: 对外提供 (*Client).GetFull, (*Client).GetFullInFolder, (*Client).GetFullInFolderWithValidity, (*Client).GetFullBatchInFolder, (*Client).GetFullBatchInFolderWithValidity, (*Client).GetMailboxBoundary, (*Client).Delete, (*Client).DeleteInFolder
- * [POS]: internal/mail 的邮件正文提取与邮箱管理逻辑，支持单封/批量完整内容拉取、UIDVALIDITY 严格校验与邮件物理删除
+ * [POS]: internal/mail 的邮件正文提取与邮箱管理逻辑，保留结构化收件人、严格校验 UIDVALIDITY，读取或解析失败不返回完整正文
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -68,7 +68,10 @@ func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, 
 				msg = m
 			}
 		}
-		if err := <-done; err == nil && msg != nil {
+		if err := <-done; err != nil {
+			return nil, fmt.Errorf("fetch message body: %w", err)
+		}
+		if msg != nil {
 			msgModel := toMessage(msg, name)
 			msgModel.UIDValidity = status.UidValidity
 			msgModel.UID = uid
@@ -82,18 +85,15 @@ func (c *Client) GetFullInFolderWithValidity(folder string, uidValidity uint32, 
 			msgModel.MessageRef = ref.Encode()
 
 			full = &FullMessage{
-				Message:      msgModel,
-				BodyComplete: true,
-				Provider:     "imap",
-				Method:       "imap",
+				Message:  msgModel,
+				Provider: "imap",
+				Method:   "imap",
 			}
-			if r := msg.GetBody(section); r != nil {
+			if msg.GetBody(section) != nil {
 				bodyReceived++
-				if em, err := mail.ReadMessage(r); err == nil {
-					body, _ := readBody(em)
-					full.Body = strings.TrimSpace(body)
-					full.ContentType = em.Header.Get("Content-Type")
-				}
+			}
+			if err := decodeFullMessageBody(full, msg, section); err != nil {
+				return nil, err
 			}
 			return full, nil
 		}
@@ -146,6 +146,7 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 		done <- c.cli.UidFetch(seqset, items, messages)
 	}()
 
+	var bodyErr error
 	for msg := range messages {
 		if msg == nil {
 			continue
@@ -166,29 +167,53 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 		message.MessageRef = ref.Encode()
 
 		full := &FullMessage{
-			Message:      message,
-			BodyComplete: true,
-			Provider:     "imap",
-			Method:       "imap",
+			Message:  message,
+			Provider: "imap",
+			Method:   "imap",
 		}
-		if r := msg.GetBody(section); r != nil {
-			if em, err := mail.ReadMessage(r); err == nil {
-				if body, err := readBody(em); err == nil {
-					full.Body = strings.TrimSpace(body)
-					full.Preview = full.Body
-				}
-				full.ContentType = em.Header.Get("Content-Type")
+		if err := decodeFullMessageBody(full, msg, section); err != nil {
+			if bodyErr == nil {
+				bodyErr = err
 			}
+			// Drain FETCH before returning so the pooled connection stays usable.
+			continue
 		}
+		full.Preview = full.Body
 		out = append(out, full)
 	}
 	if err := <-done; err != nil {
 		return nil, err
 	}
+	if bodyErr != nil {
+		return nil, bodyErr
+	}
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].Date > out[j].Date
 	})
 	return out, nil
+}
+
+// decodeFullMessageBody only marks a message complete after its body was read
+// and decoded. An unreadable message must not advance the verification cursor.
+func decodeFullMessageBody(full *FullMessage, msg *imap.Message, section *imap.BodySectionName) error {
+	r := msg.GetBody(section)
+	if r == nil {
+		return fmt.Errorf("missing message body (uid=%d)", msg.Uid)
+	}
+	em, err := mail.ReadMessage(r)
+	if err != nil {
+		// net/mail errors may embed the offending header, including private data.
+		return fmt.Errorf("parse message headers (uid=%d): invalid or unreadable headers", msg.Uid)
+	}
+	body, err := readBody(em)
+	if err != nil {
+		return fmt.Errorf("decode message body (uid=%d): %w", msg.Uid, err)
+	}
+	full.match = strings.Join(extractStructuralRecipients(full.To, em.Header), "\n")
+	full.Body = strings.TrimSpace(body)
+	full.ContentType = em.Header.Get("Content-Type")
+	full.BodyComplete = true
+	return nil
 }
 
 // GetMailboxBoundary 获取指定邮箱的 UIDVALIDITY 与 UIDNEXT 基线边界 (PR-06 Section 9.2)。

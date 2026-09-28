@@ -52,7 +52,7 @@ chmod +x icloud-hme_linux_amd64
 ```
 
 > ⚠️ **Master Key 生命周期核心契约**：
-> Master Key 用于认证加密 Apple Cookies、App 专用密码与通知 Secret。必须**生成一次 → 安全保存 → 所有后续启动继续使用同一把 Key**。严禁每次启动重新运行 `openssl rand`，否则已有 V2 数据库将无法解密！
+> Master Key 用于认证加密 Apple Cookies、App 专用密码与通知 Secret。必须**生成一次 → 安全保存 → 所有后续启动继续使用同一把 Key**。严禁每次启动重新运行 `openssl rand`，否则已有数据库将无法解密！
 
 #### 方式二：Docker
 
@@ -92,14 +92,14 @@ go build -o icloud-hme .
 
 ### 2. 安全配置（必读）
 
-管理界面与 API 均需要管理员登录，升级后所有 API 都必须先通过 `POST /api/auth/login` 获取会话：
+管理界面使用管理员会话；自动化接口也支持 API Key 或带作用域的 Bearer Token。升级后请按 [API.md](API.md) 选择鉴权方式：
 
 | 环境变量 | 说明 | 默认 |
 |---|---|---|
 | `ICLOUD_HME_ADMIN_PASSWORD` | 管理员密码，**必填**，至少 8 字符，且不得使用仓库模板里的占位值 | 无（缺失时拒绝启动） |
 | `ICLOUD_HME_MASTER_KEY` | 凭据根密钥，**必填**，严格 32 字节 Base64 编码，用于加密凭据 | 无（缺失时拒绝启动） |
 | `ICLOUD_HME_MASTER_KEY_FILE` | 凭据根密钥文件路径（支持 Docker Secret / systemd credentials） | 无 |
-| `ICLOUD_HME_API_KEY` | 自动化 API Key，**等同管理员权限**，请勿下发给第三方 | 无（不启用） |
+| `ICLOUD_HME_API_KEY` | 自动化 API Key，**等同管理员权限**，请勿下发给第三方；对外调用请使用作用域令牌 | 无（不启用） |
 | `ICLOUD_HME_ADDR` | HTTP 监听地址 | `127.0.0.1:8081`（仅本机） |
 | `ICLOUD_HME_SESSION_TTL` | 会话有效期 | `12h`（范围 `15m`–`168h`） |
 | `ICLOUD_HME_SECURE_COOKIE` | 通过 TLS 反向代理部署时设为 `true` | `false` |
@@ -116,7 +116,7 @@ go build -o icloud-hme .
 > **上线前四条硬性安全检查**
 >
 > 1. **口令必须替换**。`your_strong_password_here`、`admin123456` 等模板占位值会被启动校验直接拒绝。
-> 2. **Master Key 必须安全备份**。V2 SQLite 中：Apple Cookies、App Password、Mailbox credentials、Proxy credential、Notify secrets 使用 AES-256-GCM 认证加密存储；API Token 只保存不可逆哈希；Master Key 独立于数据库保存。**Master Key 丢失后将无法恢复任何已加密凭据！**
+> 2. **Master Key 必须安全备份**。当前 SQLite 中：Apple Cookies、App Password、Mailbox credentials、Proxy credential、Notify secrets 使用 AES-256-GCM 认证加密存储；API Token 只保存不可逆哈希；Master Key 独立于数据库保存。**Master Key 丢失后将无法恢复任何已加密凭据！**
 > 3. **历史备份安全处置**。pre-V2 / pre-migration 的历史备份文件可能包含明文凭据，必须安全保管，生产升级稳定确认无误后加密归档或安全销毁。
 > 4. **必须由 TLS 反代暴露**。程序自身不提供 HTTPS；直接以 HTTP 暴露到公网时，管理员口令与会话 Cookie 均为明文传输。
 >    建议保持 `ICLOUD_HME_ADDR=127.0.0.1:8081` 并用 Nginx/Caddy 终止 TLS，同时设置 `ICLOUD_HME_SECURE_COOKIE=true`。
@@ -170,11 +170,11 @@ export ICLOUD_HME_MASTER_KEY='your-32-byte-base64-master-key'
 ./icloud-hme_linux_amd64 -h
 ```
 
-服务默认监听 `:8081`。浏览器打开 `http://localhost:8081` 进入管理界面（账号 / 别名 / 收件箱）。完整 API 契约见 [API.md](API.md)。
+服务默认监听 `127.0.0.1:8081`。浏览器打开 `http://localhost:8081` 进入管理界面（账号 / 别名 / 收件箱）。完整 API 契约见 [API.md](API.md)。
 
 ## API 接口
 
-> **认证**：除 `POST /api/auth/login` 与 `GET /api/auth/session` 外，所有 `/api` 接口都需要管理员会话 Cookie（`hme_session`）；非 GET/HEAD/OPTIONS 请求还需携带 `X-CSRF-Token` 请求头。完整契约与 curl 示例见 [API.md](API.md)。
+> **认证**：管理面使用管理员会话 Cookie（`hme_session`），浏览器写请求还需 `X-CSRF-Token`；自动化接口可使用 `ICLOUD_HME_API_KEY` 或作用域 Bearer Token。`allocate` / `verify` 令牌只能访问对应受控端点，不能读取管理面邮件。完整契约与 curl 示例见 [API.md](API.md)。
 
 ### 核心接口
 
@@ -652,7 +652,7 @@ chmod +x icloud-hme_linux_amd64
 ```
 
 > ⚠️ **Master Key Lifecycle Contract**:
-> The Master Key is used to encrypt Apple Cookies, App Passwords, and notification secrets. It must be **generated once → stored safely → reused across all subsequent runs**. Never regenerate the Master Key on each start, or existing encrypted credentials in the V2 database will become permanently undecryptable!
+> The Master Key is used to encrypt Apple Cookies, App Passwords, and notification secrets. It must be **generated once → stored safely → reused across all subsequent runs**. Never regenerate the Master Key on each start, or existing encrypted credentials will become permanently undecryptable!
 
 #### Option 2: Docker
 
@@ -696,6 +696,6 @@ go build -o icloud-hme .
 | `ICLOUD_HME_SECURE_COOKIE` | Set `true` when deployed behind TLS | `false` |
 | `ICLOUD_HME_COOKIE_MONITOR_INTERVAL` | Cookie health monitor interval | `30m` (range `5m`–`24h`) |
 
-> **Breaking change (v0.3+)**: without `ICLOUD_HME_ADMIN_PASSWORD` or `ICLOUD_HME_MASTER_KEY` the server refuses to start; all API endpoints now require login (`401 AUTH_REQUIRED`). Admin sessions are in-memory only and are lost on restart.
+> **Breaking change (v0.3+)**: without `ICLOUD_HME_ADMIN_PASSWORD` or `ICLOUD_HME_MASTER_KEY` the server refuses to start. Management endpoints use admin sessions; automated allocation and verification endpoints can use scoped Bearer tokens. Admin sessions are in-memory only and are lost on restart.
 
-Create `data/accounts.json` (see `accounts.json.template`) and start the server (default port `:8081`). Open `http://localhost:8081` to use the management UI. Full API contract: [API.md](API.md).
+Create `data/accounts.json` (see `accounts.json.template`) and start the server (default address `127.0.0.1:8081`). Open `http://localhost:8081` to use the management UI. Full API contract: [API.md](API.md).

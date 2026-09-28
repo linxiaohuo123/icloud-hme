@@ -1,15 +1,18 @@
 /**
- * [INPUT]: 依赖 regexp, strings 标准库与 preview.go stripHTML
+ * [INPUT]: 依赖 net/url, regexp, strings, unicode, unicode/utf8 标准库与 preview.go stripHTML
  * [OUTPUT]: 对外提供 OTPResult, ExtractOTP
- * [POS]: internal/mail 的验证码与激活链接嗅探器，供 server/verify_handler 消费；支持全球主流语言全语境、HTML 盒式空格码、Steam Guard 混合码、标题闭合符号强标注与防负向词穿透
+ * [POS]: internal/mail 的验证码与激活链接嗅探器，供 server/verify_handler 消费；完整候选提取、上下文筛选、歧义拒绝与独立 URL 解析
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 package mail
 
 import (
+	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // OTPResult 包含从邮件中提取的验证信息。
@@ -25,9 +28,9 @@ const (
 		`验证码|校验码|动态码|确认码|安全码|动态口令|口令|验证|激活|确认|` +
 		`驗證碼|校驗碼|動態碼|確認碼|安全碼|動態口令|驗證|確認|` +
 		// 英文与通用缩写
-		`one-time\s*password|temporary\s*password|verification(?:\s*code)?|security(?:\s*code)?|verify(?:\s*code)?|` +
+		`\b(?:one-time\s*password|temporary\s*password|verification(?:\s*code)?|security(?:\s*code)?|verify(?:\s*code)?|` +
 		`auth\s*code|confirmation(?:\s*code)?|login\s*code|access\s*code|passcode|\bcode\b|\botp\b|\bpin\b|\bpassword\b|` +
-		`steam\s*guard(?:\s*code)?|2fa(?:\s*code)?|\bmfa\b|two-factor(?:\s*auth(?:entication)?)?(?:\s*code)?|` +
+		`steam\s*guard(?:\s*code)?|2fa(?:\s*code)?|\bmfa\b|two-factor(?:\s*auth(?:entication)?)?(?:\s*code)?)\b|` +
 		// 韩文
 		`인증\s*코드|인증\s*번호|인증번호|임시\s*코드|확인\s*코드|보안\s*코드|패스코드|비밀번호|인증|코드|확인|보안|임시|` +
 		// 日文
@@ -53,131 +56,163 @@ const (
 )
 
 var (
-	// copulaPattern 包含各类语言的主谓系动词与强分隔符
-	copulaPattern = `(?:is|为|是|est|es|ist|lautet|è|la|является|para|[:：=])`
-
-	// contextCopulaCodeRegex 匹配带修饰状语/介词短语的系词验证码
-	// 例: "Your verification code for order #839201 is 492019", "您的订单 123456 验证码是 492019"
-	contextCopulaCodeRegex = regexp.MustCompile(`(?i)(` + multiLangKeywordPattern + `)[^\r\n]{0,64}?(?:` + copulaPattern + `)\s*[:：\s-]*\b([0-9]{4,8})\b`)
-
-	// contextDirectCodeRegex 匹配紧随关键词的验证码 (中间无系词，例: "security code 9283", "code: 482019")
-	contextDirectCodeRegex = regexp.MustCompile(`(?i)(` + multiLangKeywordPattern + `)\s*[:：\s-]+\b([0-9]{4,8})\b`)
-
-	// contextSpacedCodeRegex 匹配 HTML 盒式布局下按单个空格拆分的数字 (例: "5 7 6 9 3 2")
-	contextSpacedCodeRegex = regexp.MustCompile(`(?i)(` + multiLangKeywordPattern + `)[^\r\n]{0,64}?(?:` + copulaPattern + `|\s)[:：\s-]*\b([0-9](?:\s+[0-9]){3,7})\b`)
-
-	// contextHyphenCodeRegex 匹配带关键词的连字号/双段验证码 (例: "code: 123-456", "123 456")
-	contextHyphenCodeRegex = regexp.MustCompile(`(?i)(` + multiLangKeywordPattern + `)[^\r\n]{0,64}?(?:` + copulaPattern + `|\s)[:：\s-]*\b([0-9]{3,4}[-\s][0-9]{3,4})\b`)
-
-	// reverseContextCodeRegex 匹配数字在前、关键词在后的倒装语序 (例: "123456 is your code", "839201 为确认码")
-	reverseContextCodeRegex = regexp.MustCompile(`(?i)\b([0-9]{4,8})\b[^\r\n\d]{0,24}?(?:is(?:\s+(?:your|the|a|an))?|为(?:您(?:的)?)?|是(?:你(?:的)?)?|为本次|作为|입니다|입력|est|es|ist|è|la|является|para)?[^\r\n\d]{0,24}?` + multiLangKeywordPattern)
-
-	// steamGuardRegex 匹配 Steam Guard 5 位混合码，严格锚定冒号、换行或系词，杜绝 English 动词/介词干扰
-	steamGuardRegex = regexp.MustCompile(`(?i)(?:steam\s*guard|guard\s*code)[^\r\n]{0,50}?(?:` + copulaPattern + `|\n)\s*([A-Z0-9]{5})\b`)
-
-	// bracketCodeRegex 匹配闭合符号强标注的验证码 (支持 [ ] ( ) 【 】 「 」 『 』 { } < > « » “ ”)
-	bracketCodeRegex = regexp.MustCompile(`(?:\[|\(|【|「|“|"|\{|<|«|『)\s*([0-9]{4,8})\s*(?:\]|\)|】|」|”|"|\}|>|»|』)`)
-
-	// spacedDigitsRegex 兜底匹配盒式单个空格分隔的数字串
-	spacedDigitsRegex = regexp.MustCompile(`\b([0-9](?:\s+[0-9]){3,7})\b`)
-
-	// standaloneDigitRegex 兜底匹配独立的 4-8 位纯数字
-	standaloneDigitRegex = regexp.MustCompile(`\b([0-9]{4,8})\b`)
-
-	// negativePrefixRegex 匹配紧贴在数字前的负向业务词 (限制在同单行内)
-	negativePrefixRegex = regexp.MustCompile(`(?i)(?:order|tracking|invoice|receipt|bill|barcode|ticket|account\s*(?:number|no|id)|phone|tel|fax|订单|发票|账单|快递|运单|账号|编号)[^\r\n\d]{0,10}#?\s*$`)
-
-	// negativeSuffixRegex 匹配紧贴在数字后的负向业务词 (限制在同单行内)
-	negativeSuffixRegex = regexp.MustCompile(`(?i)^[^\r\n\d]{0,10}(?:order|tracking|invoice|receipt|bill|ticket|account\s*(?:number|no|id)|phone|tel|订单|发票|账单|快递|运单|账号|编号)`)
-
-	// magicLinkRegex 匹配常见的激活/确认链接
-	magicLinkRegex = regexp.MustCompile(`https?://[^\s"'<>]+(?:verify|confirm|activate|validation|token=)[^\s"'<>]*`)
+	copulaPattern      = `(?:\bis\b|为|是|\best\b|\bes\b|\bist\b|\blautet\b|è|la|является|para|[:：=])`
+	keywordRegex       = regexp.MustCompile(`(?i)` + multiLangKeywordPattern)
+	forwardCodeContext = regexp.MustCompile(`(?i)` + multiLangKeywordPattern + `[^\r\n]{0,64}?` + copulaPattern + `[\s:：=\-{"“『「【(<]*$`)
+	directCodeContext  = regexp.MustCompile(`(?i)` + multiLangKeywordPattern + `[\s:：=\-{"“『「【(<]+$`)
+	reverseCodeContext = regexp.MustCompile(`(?i)^[^\r\n\d]{0,48}?` + multiLangKeywordPattern)
+	// Consume the whole numeric run first, including overlong/invalid groups.
+	digitRunRegex       = regexp.MustCompile(`[0-9]+(?:[\s-]+[0-9]+)*`)
+	negativePrefixRegex = regexp.MustCompile(`(?i)(?:\b(?:order|tracking|invoice|receipt|bill|barcode|ticket|account\s*(?:number|no|id)|phone|tel|fax|reference)\b|订单|发票|账单|快递|运单|账号|编号)[^\r\n\d]{0,10}$`)
+	negativeSuffixRegex = regexp.MustCompile(`(?i)^[^\r\n\d]{0,10}(?:\b(?:order|tracking|invoice|receipt|bill|ticket|account\s*(?:number|no|id)|phone|tel)\b|订单|发票|账单|快递|运单|账号|编号)`)
+	steamGuardRegex     = regexp.MustCompile(`(?i)(?:steam\s*guard|guard\s*code)[^\r\n]{0,80}?(?:` + copulaPattern + `|\n)\s*([A-Z0-9]{5})\b`)
+	urlRegex            = regexp.MustCompile(`(?i)https?://[^\s"'<>]+`)
 )
 
-// ExtractOTP 从邮件标题和正文中提取验证码与激活链接 (全链路清洗 + 盒式重组 + 防穿透)。
+// ExtractOTP selects a unique strongest candidate. Conflicting candidates never
+// complete a verification request, even if the message also contains a link.
 func ExtractOTP(subject, body string) *OTPResult {
-	cleanSub := toHalfWidth(subject)
-	cleanBdy := cleanEmailText(body)
-	text := cleanSub + "\n" + cleanBdy
-	if strings.TrimSpace(text) == "" {
-		return nil
-	}
-
-	res := &OTPResult{}
-
-	// 1. 标题中的闭合符号强特征优先捕获 (例: [849201], 『576932』, {492019})
-	if match := bracketCodeRegex.FindStringSubmatchIndex(cleanSub); len(match) >= 4 {
-		c := cleanSub[match[2]:match[3]]
-		if !isYear(c) && !isDummyCode(c) {
-			res.Code = c
+	subject = toHalfWidth(subject)
+	body = cleanEmailText(body)
+	link := extractMagicLink(subject + "\n" + body)
+	subject = urlRegex.ReplaceAllString(subject, " ")
+	body = urlRegex.ReplaceAllString(body, " ")
+	text := subject + "\n" + body
+	bestRank := 0
+	candidates := map[string]bool{}
+	add := func(code string, rank int) {
+		if rank > bestRank {
+			bestRank = rank
+			clear(candidates)
+		}
+		if rank == bestRank {
+			candidates[code] = true
 		}
 	}
-
-	// 2. 正向多语言上下文匹配 (支持连续数字、盒式空格码、连字号，阻断中介负向词穿透)
-	if res.Code == "" {
-		res.Code = extractContextCode(text)
-	}
-
-	// 3. 反向倒装语序匹配 (例: "123456 is your code", "839201 为确认码")
-	if res.Code == "" {
-		if match := reverseContextCodeRegex.FindStringSubmatchIndex(text); len(match) >= 4 {
-			c := text[match[2]:match[3]]
-			if !isYear(c) && !isDummyCode(c) && !isNegativeContext(text, match[2], match[3]) {
-				res.Code = c
+	for _, field := range []string{subject, body} {
+		for _, loc := range digitRunRegex.FindAllStringIndex(field, -1) {
+			start, end := loc[0], loc[1]
+			if !numericBoundary(field, start, end) {
+				continue
+			}
+			code := normalizedDigitRun(field[start:end])
+			if code == "" {
+				continue
+			}
+			before, after := contextAround(field, start, end)
+			if len(code) == 4 && strings.HasPrefix(after, "年") {
+				continue
+			}
+			if negativePrefixRegex.MatchString(before) || negativeSuffixRegex.MatchString(after) {
+				continue
+			}
+			if forwardCodeContext.MatchString(before) || directCodeContext.MatchString(before) || reverseCodeContext.MatchString(after) {
+				add(code, 2)
+			} else if keywordRegex.MatchString(subject) && !isYear(code) && !isDummyCode(code) {
+				add(code, 1)
 			}
 		}
 	}
-
-	// 4. Steam Guard 5 位大写字母数字混合码
-	if res.Code == "" {
-		if match := steamGuardRegex.FindStringSubmatch(text); len(match) > 1 {
-			c := strings.ToUpper(strings.TrimSpace(match[1]))
-			if isAlphanumericOTP(c) && !isYear(c) && !isDummyCode(c) {
-				res.Code = c
-			}
+	for _, m := range steamGuardRegex.FindAllStringSubmatch(text, -1) {
+		code := strings.ToUpper(m[1])
+		if isAlphanumericOTP(code) {
+			add(code, 2)
 		}
 	}
-
-	// 5. 兜底策略：在确认为验证类邮件时，提取最佳独立数字 (含盒式空格码)
-	if res.Code == "" && (isVerificationEmail(text) || isSubjectVerification(cleanSub)) {
-		res.Code = findBestDigitCode(text)
-	}
-
-	// 6. 激活链接嗅探
-	if link := magicLinkRegex.FindString(text); link != "" {
-		res.MagicLink = link
-	}
-
-	if res.Code == "" && res.MagicLink == "" {
+	if len(candidates) > 1 {
 		return nil
 	}
-	return res
+	result := &OTPResult{MagicLink: link}
+	for code := range candidates {
+		result.Code = code
+	}
+	if result.Code == "" && result.MagicLink == "" {
+		return nil
+	}
+	return result
 }
 
-// extractContextCode 正向扫描上下文，严格阻断 "verification code for order #839201 is 492019" 类型的穿透干扰
-func extractContextCode(text string) string {
-	for _, re := range []*regexp.Regexp{contextCopulaCodeRegex, contextDirectCodeRegex, contextSpacedCodeRegex, contextHyphenCodeRegex} {
-		matches := re.FindAllStringSubmatchIndex(text, -1)
-		for _, m := range matches {
-			if len(m) < 6 {
-				continue
-			}
-			codeStart, codeEnd := m[4], m[5]
-			rawCode := text[codeStart:codeEnd]
-			code := cleanCode(rawCode)
-			if isYear(code) || isDummyCode(code) {
-				continue
-			}
-			if isNegativeContext(text, codeStart, codeEnd) {
-				continue
-			}
-			return code
+func normalizedDigitRun(raw string) string {
+	groups := strings.FieldsFunc(raw, func(r rune) bool { return unicode.IsSpace(r) || r == '-' })
+	code := strings.Join(groups, "")
+	if len(code) < 4 || len(code) > 8 {
+		return ""
+	}
+	if len(groups) == 1 {
+		return code
+	}
+	if len(groups) == 2 && len(groups[0]) >= 3 && len(groups[0]) <= 4 && len(groups[1]) >= 3 && len(groups[1]) <= 4 {
+		return code
+	}
+	for _, group := range groups {
+		if len(group) != 1 {
+			return ""
 		}
+	}
+	return code
+}
+
+func numericBoundary(text string, start, end int) bool {
+	// ASCII letters/digits/underscore indicate an identifier rather than an OTP.
+	word := func(r rune) bool {
+		return r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r == '_'
+	}
+	if start > 0 {
+		r, _ := utf8.DecodeLastRuneInString(text[:start])
+		if word(r) {
+			return false
+		}
+	}
+	if end < len(text) {
+		r, _ := utf8.DecodeRuneInString(text[end:])
+		if word(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func contextAround(text string, start, end int) (string, string) {
+	left, right := start, end
+	for n := 0; n < 96 && left > 0; n++ {
+		_, size := utf8.DecodeLastRuneInString(text[:left])
+		left -= size
+	}
+	for n := 0; n < 64 && right < len(text); n++ {
+		_, size := utf8.DecodeRuneInString(text[right:])
+		right += size
+	}
+	return text[left:start], text[end:right]
+}
+
+func extractMagicLink(text string) string {
+	links := map[string]bool{}
+	for _, raw := range urlRegex.FindAllString(text, -1) {
+		raw = strings.TrimRight(raw, ".,;!，。；！)")
+		u, err := url.Parse(raw)
+		if err != nil || u.Hostname() == "" || u.User != nil {
+			continue
+		}
+		path := strings.ToLower(u.Path)
+		matched := strings.Contains(path, "verify") || strings.Contains(path, "confirm") || strings.Contains(path, "activate") || strings.Contains(path, "validation")
+		for key := range u.Query() {
+			if strings.EqualFold(key, "token") {
+				matched = true
+			}
+		}
+		if matched {
+			links[raw] = true
+		}
+	}
+	if len(links) != 1 {
+		return ""
+	}
+	for link := range links {
+		return link
 	}
 	return ""
 }
 
-// cleanEmailText 剥除 HTML、CSS 与标签，保留纯净文本
 func cleanEmailText(s string) string {
 	if strings.Contains(s, "<") && strings.Contains(s, ">") {
 		s = stripHTML(s)
@@ -185,7 +220,6 @@ func cleanEmailText(s string) string {
 	return toHalfWidth(s)
 }
 
-// toHalfWidth 全角数字转半角，剔除零宽字符与特殊空格
 func toHalfWidth(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -223,84 +257,6 @@ func isDummyCode(s string) bool {
 	return allSame
 }
 
-func isSubjectVerification(subject string) bool {
-	if subject == "" {
-		return false
-	}
-	return bracketCodeRegex.MatchString(subject) || isVerificationEmail(subject)
-}
-
-func cleanCode(s string) string {
-	s = strings.ReplaceAll(s, "-", "")
-	s = strings.ReplaceAll(s, " ", "")
-	return strings.TrimSpace(s)
-}
-
-// isVerificationEmail 判定邮件是否属于验证类邮件 (全球主流语言通杀)
-func isVerificationEmail(text string) bool {
-	lower := strings.ToLower(text)
-	keywords := []string{
-		// 中文 (简/繁)
-		"验证码", "校验码", "动态码", "确认码", "安全码", "动态口令", "口令", "验证", "激活", "确认",
-		"驗證碼", "校驗碼", "動態碼", "確認碼", "安全碼", "動態口令", "驗證", "確認",
-		// 英语
-		"code", "verification", "verify", "security", "pin", "otp", "passcode", "password", "auth", "confirm", "confirmation", "login", "access", "temporary", "one-time", "steam guard", "2fa", "mfa",
-		// 韩语
-		"인증", "코드", "확인", "보안", "임시", "인증번호", "임시코드", "비밀번호",
-		// 日语
-		"認証", "コード", "確認", "セキュリティ", "ワンタイム", "パスコード",
-		// 俄语
-		"код", "проверочный", "подтверждение", "подтвердить", "пароль", "одноразовый", "авторизация",
-		// 西班牙语 / 葡萄牙语
-		"código", "codigo", "verificación", "verificacao", "verificar", "seguridad", "seguranca", "clave", "confirmar", "confirmación", "confirmacao",
-		// 法语
-		"vérification", "sécurité", "confirmer", "confirmation",
-		// 德语
-		"bestätigung", "bestätigen", "sicherheit", "sicherheitscode", "bestätigungscode", "einmalpasswort", "verifizierung",
-		// 意大利语
-		"codice", "verifica", "sicurezza", "conferma",
-		// 越南语
-		"mã", "xác thực", "xác nhận", "bảo mật",
-		// 土耳其语
-		"doğrulama", "güvenlik", "onay", "şifre",
-		// 阿拉伯语
-		"رمز", "تحقق", "تأكيد", "أمان",
-	}
-	for _, kw := range keywords {
-		if strings.Contains(lower, kw) {
-			return true
-		}
-	}
-	return false
-}
-
-// isNegativeContext 判定数字前后是否有订单/账单/发票等负向修饰词紧密绑定 (严格限定在单行内)
-func isNegativeContext(text string, start, end int) bool {
-	pStart := start - 15
-	if pStart < 0 {
-		pStart = 0
-	}
-	if lineStart := strings.LastIndex(text[:start], "\n"); lineStart != -1 && lineStart >= pStart {
-		pStart = lineStart + 1
-	}
-	if negativePrefixRegex.MatchString(text[pStart:start]) {
-		return true
-	}
-
-	sEnd := end + 15
-	if sEnd > len(text) {
-		sEnd = len(text)
-	}
-	if lineEnd := strings.Index(text[end:], "\n"); lineEnd != -1 && end+lineEnd < sEnd {
-		sEnd = end + lineEnd
-	}
-	if negativeSuffixRegex.MatchString(text[end:sEnd]) {
-		return true
-	}
-	return false
-}
-
-// isAlphanumericOTP 判定是否为合法 5 位混合码 (如 Steam Guard)，杜绝普通英文单词 (如 allow, enter)
 func isAlphanumericOTP(s string) bool {
 	if len(s) != 5 {
 		return false
@@ -327,41 +283,4 @@ func isAlphanumericOTP(s string) bool {
 		}
 	}
 	return true
-}
-
-// findBestDigitCode 提取最可能是验证码的纯数字串 (排除年份、虚拟占位符与负向业务词)
-func findBestDigitCode(text string) string {
-	// 优先检查盒式空格拆分码 (例: "5 7 6 9 3 2")
-	for _, m := range spacedDigitsRegex.FindAllStringSubmatchIndex(text, -1) {
-		if len(m) >= 4 {
-			c := cleanCode(text[m[2]:m[3]])
-			if len(c) >= 4 && len(c) <= 8 && !isYear(c) && !isDummyCode(c) && !isNegativeContext(text, m[2], m[3]) {
-				return c
-			}
-		}
-	}
-
-	matches := standaloneDigitRegex.FindAllStringIndex(text, -1)
-	var candidates []string
-	for _, loc := range matches {
-		start, end := loc[0], loc[1]
-		m := text[start:end]
-		if isYear(m) || isDummyCode(m) || isNegativeContext(text, start, end) {
-			continue
-		}
-		candidates = append(candidates, m)
-		// 6 位纯数字优先直接命中
-		if len(m) == 6 {
-			return m
-		}
-	}
-	for _, c := range candidates {
-		if len(c) == 4 {
-			return c
-		}
-	}
-	if len(candidates) > 0 {
-		return candidates[0]
-	}
-	return ""
 }

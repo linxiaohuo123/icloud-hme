@@ -527,13 +527,19 @@ func (s *MailReadService) GetMessageDetail(ctx context.Context, accountID, rawID
 		return nil, "", "", false, &BackendError{Status: 403, Code: "FORBIDDEN", Message: "跨账号邮件读取被拒绝"}
 	}
 
+	// Legacy folder:uid / bare UID references do not contain UIDVALIDITY. Never
+	// use their weak cache key, otherwise a recreated mailbox can return an old
+	// message with the same UID.
+	legacyRef := ref.Provider == "imap" && ref.UIDValidity == 0
 	cacheKey := ref.CacheKey()
-	s.cacheMu.RLock()
-	entry, hit := s.cache[cacheKey]
-	s.cacheMu.RUnlock()
+	if !legacyRef {
+		s.cacheMu.RLock()
+		entry, hit := s.cache[cacheKey]
+		s.cacheMu.RUnlock()
 
-	if hit && time.Now().Before(entry.expiresAt) {
-		return entry.msg, entry.provider, entry.method, true, nil
+		if hit && time.Now().Before(entry.expiresAt) {
+			return entry.msg, entry.provider, entry.method, true, nil
+		}
 	}
 
 	startGen := s.getAccountGen(accountID)
@@ -561,6 +567,11 @@ func (s *MailReadService) GetMessageDetail(ctx context.Context, accountID, rawID
 	}
 	message.Method = method
 
+	// Always cache under the canonical ref returned by the provider, which
+	// includes the current UIDVALIDITY for IMAP messages.
+	if legacyRef && provider == "imap" {
+		cacheKey = (mail.MessageRef{Provider: "imap", AccountID: accountID, Mailbox: message.Folder, UIDValidity: message.UIDValidity, UID: message.UID}).CacheKey()
+	}
 	s.commitMessageCache(cacheKey, accountID, startGen, message, provider, method)
 	return message, provider, method, false, nil
 }
@@ -645,6 +656,7 @@ func (s *MailReadService) getMessagesBatchIMAPJoin(ctx context.Context, accountI
 		} else {
 			refErr = errors.New("missing message_ref or uid")
 		}
+		legacyRef := refObj.Provider == "imap" && refObj.UIDValidity == 0
 
 		if refErr != nil {
 			results[i] = BatchItemResult{
@@ -659,7 +671,7 @@ func (s *MailReadService) getMessagesBatchIMAPJoin(ctx context.Context, accountI
 		entry, hit := s.cache[cacheKey]
 		s.cacheMu.RUnlock()
 
-		if hit && now.Before(entry.expiresAt) {
+		if !legacyRef && hit && now.Before(entry.expiresAt) {
 			results[i] = BatchItemResult{
 				RequestedRef: rawRef,
 				Message:      entry.msg,
@@ -760,6 +772,18 @@ func (s *MailReadService) getMessagesBatchIMAPJoin(ctx context.Context, accountI
 			var commitItems []batchCommitItem
 			for _, pi := range pendingIMAP {
 				matched := idMap[pi.refObj.CacheKey()]
+				if matched == nil && pi.refObj.UIDValidity == 0 {
+					// Legacy UID requests are resolved against the current FETCH
+					// result, then cached only under its canonical generation key.
+					for key, candidate := range idMap {
+						parsed, parseErr := mail.ParseMessageRef(candidate.MessageRef, accountID)
+						if parseErr == nil && parsed.Provider == "imap" &&
+							strings.EqualFold(parsed.Mailbox, pi.refObj.Mailbox) && parsed.UID == pi.refObj.UID {
+							matched = idMap[key]
+							break
+						}
+					}
+				}
 				if matched != nil {
 					provider := matched.Provider
 					if provider == "" {
@@ -772,8 +796,14 @@ func (s *MailReadService) getMessagesBatchIMAPJoin(ctx context.Context, accountI
 					matched.Provider = provider
 					matched.Method = method
 
+					canonicalKey := pi.refObj.CacheKey()
+					if pi.refObj.UIDValidity == 0 {
+						if parsed, parseErr := mail.ParseMessageRef(matched.MessageRef, accountID); parseErr == nil {
+							canonicalKey = parsed.CacheKey()
+						}
+					}
 					commitItems = append(commitItems, batchCommitItem{
-						Key:      pi.refObj.CacheKey(),
+						Key:      canonicalKey,
 						Msg:      matched,
 						Provider: provider,
 						Method:   method,

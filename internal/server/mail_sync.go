@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, sync, time, icloud-hme/internal/account, mail, store
  * [OUTPUT]: 对外提供 MailSyncWorker, NewMailSyncWorker, ForgetAccount
- * [POS]: server 的后台邮件同步器，实现同账号增量 UID 分页扫描、未知别名有界并发轮转探测、旧版多别名截满时定向补查与取码持久化
+ * [POS]: server 的后台邮件同步器，实现增量 UID 扫描、别名归属探测与取码持久化，空邮箱也校验代际并清理旧基线
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -695,11 +695,6 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 	if provider != "imap" || uidValidity == 0 {
 		return false, fmt.Errorf("账号 %s 的邮箱边界不可用于 IMAP 扫描", accountID)
 	}
-	if uidNext <= 1 {
-		return false, nil
-	}
-	scanUpperUID := uidNext - 1
-
 	// 2. Resumable checkpoint 决策与跨代际失效清理 (必须在 UIDVALIDITY 确定后立即清理旧代际 checkpoint)
 	cpKey := checkpointKey{
 		accountID:   accountID,
@@ -759,6 +754,13 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 			return false, nil
 		}
 	}
+
+	// Even an empty recreated mailbox must invalidate old-generation requests
+	// and checkpoints before we skip scanning its empty UID range.
+	if uidNext <= 1 {
+		return false, nil
+	}
+	scanUpperUID := uidNext - 1
 
 	w.mu.Lock()
 	cursor := cp.NextUID

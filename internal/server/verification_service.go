@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, fmt, time, errors, sync, icloud-hme/internal/auth, icloud-hme/internal/mail, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 VerificationService, NewVerificationService, VerificationResult
- * [POS]: internal/server 的取码与基线状态机应用服务 (PR-06 & PR-08 §11.2 & PR-05 F09/F10)，封装边界准备、准入预检、进程内槽位与单租约互斥门禁、冲突仲裁、事件总线唤醒与单事件精准消费
+ * [POS]: internal/server 的取码与基线状态机应用服务，封装基线准备、原子完成、返回前令牌复查，状态查询失败显式报错
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -298,7 +298,7 @@ func (s *VerificationService) CreateVerificationRequest(ctx context.Context, p a
 }
 
 // GetVerificationResult 读取验证码（支持超时长轮询与边界唤醒）
-func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.Principal, requestID string, timeoutSec int) (*VerificationResult, error) {
+func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.Principal, requestID string, timeoutSec int) (result *VerificationResult, retErr error) {
 	if !p.CanVerify() {
 		return nil, ErrScopeDenied
 	}
@@ -316,11 +316,37 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		if tokErr != nil || tok == nil {
 			return nil, ErrTokenRevoked
 		}
+		// Cover every result path, including durable DB results returned after
+		// subscription or timeout. Event delivery is not the only wake-up path.
+		defer func() {
+			if retErr != nil || result == nil {
+				return
+			}
+			if tok, err := s.store.GetToken(ctx, p.ID); err != nil || tok == nil {
+				result, retErr = nil, ErrTokenRevoked
+			}
+		}()
 	}
 
-	vreq, err := s.store.GetVerificationRequest(ctx, requestID, string(p.Kind), p.ID)
-	if err != nil || vreq == nil {
-		return nil, ErrVReqNotFound
+	readRequest := func() (*store.VerificationRequest, error) {
+		req, err := s.store.GetVerificationRequest(ctx, requestID, string(p.Kind), p.ID)
+		if err != nil {
+			if errors.Is(err, store.ErrVerificationRequestNotFound) {
+				return nil, ErrVReqNotFound
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, &BackendError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "读取取码任务状态失败: " + err.Error()}
+		}
+		if req == nil {
+			return nil, ErrVReqNotFound
+		}
+		return req, nil
+	}
+	vreq, err := readRequest()
+	if err != nil {
+		return nil, err
 	}
 
 	// 1. 计算受限等待窗口 (PR-06 §9.3, Issue 8: 等待时间严格受限于 expires_at)
@@ -374,10 +400,10 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 	// Blocker 3 修复: Post-subscribe DB recheck (PR-04B)
 	// 订阅建立并触发 worker 后立即复查数据库。若任务已被后台 worker 或并发流程落库为终态
 	// (succeeded / expired / invalidated)，直接返回权威结果，不依赖 EventBus 内存唤醒，消除 subscribe race。
-	if freshReq, ferr := s.store.GetVerificationRequest(ctx, requestID, string(p.Kind), p.ID); ferr == nil && freshReq != nil {
-		if freshReq.Status == "succeeded" || freshReq.Status == "expired" || freshReq.Status == "invalidated" {
-			return mapVerificationRecordToResult(freshReq)
-		}
+	if freshReq, ferr := readRequest(); ferr != nil {
+		return nil, ferr
+	} else if freshReq.Status == "succeeded" || freshReq.Status == "expired" || freshReq.Status == "invalidated" {
+		return mapVerificationRecordToResult(freshReq)
 	}
 
 	handleItem := func(item *mail.CachedOTP) (*VerificationResult, error) {
@@ -447,10 +473,10 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		case item := <-ch:
 			return handleItem(item)
 		default:
-			if freshReq, ferr := s.store.GetVerificationRequest(ctx, requestID, string(p.Kind), p.ID); ferr == nil && freshReq != nil {
-				if freshReq.Status == "succeeded" || freshReq.Status == "expired" || freshReq.Status == "invalidated" {
-					return mapVerificationRecordToResult(freshReq)
-				}
+			if freshReq, ferr := readRequest(); ferr != nil {
+				return nil, ferr
+			} else if freshReq.Status == "succeeded" || freshReq.Status == "expired" || freshReq.Status == "invalidated" {
+				return mapVerificationRecordToResult(freshReq)
 			}
 			return &VerificationResult{
 				RequestID:  vreq.RequestID,
@@ -489,10 +515,10 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 			}
 		}
 		// 即使未到 ExpiresAt，定时器触发后核查 DB 是否已产生并发落地的真实终态 (统一 handleItem 终态映射)
-		if freshReq, ferr := s.store.GetVerificationRequest(ctx, requestID, string(p.Kind), p.ID); ferr == nil && freshReq != nil {
-			if freshReq.Status == "succeeded" || freshReq.Status == "expired" || freshReq.Status == "invalidated" {
-				return mapVerificationRecordToResult(freshReq)
-			}
+		if freshReq, ferr := readRequest(); ferr != nil {
+			return nil, ferr
+		} else if freshReq.Status == "succeeded" || freshReq.Status == "expired" || freshReq.Status == "invalidated" {
+			return mapVerificationRecordToResult(freshReq)
 		}
 		return &VerificationResult{
 			RequestID:  vreq.RequestID,

@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 bytes, encoding/base64, fmt, io, mime, mime/multipart, mime/quotedprintable, net/mail, strings, time, github.com/emersion/go-imap, github.com/emersion/go-message/charset
  * [OUTPUT]: 对外提供 toMessage, toMessageWithBody, toMessageWithHeaderOnly, readBody, decodeHeader, decodeAppleRelay, folderRole, folderSortRank
- * [POS]: internal/mail 的 MIME 多级解析与字符集转码中心，负责将原始邮件协议流清洗为高层结构体
+ * [POS]: internal/mail 的 MIME 多级解析与字符集转码中心，正文读取、截断与 multipart 解析失败显式返回错误
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -360,7 +360,7 @@ func isKnownTLD(tld string) bool {
 // ============================================================================
 
 // decodeTransferData 还原 base64 或 quoted-printable 编码的字节数据。
-func decodeTransferData(data []byte, encoding string) []byte {
+func decodeTransferData(data []byte, encoding string) ([]byte, error) {
 	enc := strings.ToLower(strings.TrimSpace(encoding))
 	if strings.Contains(enc, "base64") {
 		cleaned := strings.Map(func(r rune) rune {
@@ -370,39 +370,43 @@ func decodeTransferData(data []byte, encoding string) []byte {
 			return r
 		}, string(data))
 		if decoded, err := base64.StdEncoding.DecodeString(cleaned); err == nil {
-			return decoded
+			return decoded, nil
 		}
-		if decoded, err := base64.RawStdEncoding.DecodeString(cleaned); err == nil {
-			return decoded
+		decoded, err := base64.RawStdEncoding.DecodeString(cleaned)
+		if err != nil {
+			return nil, fmt.Errorf("decode base64 body: %w", err)
 		}
+		return decoded, nil
 	} else if strings.Contains(enc, "quoted-printable") {
 		r := quotedprintable.NewReader(bytes.NewReader(data))
-		if decoded, err := io.ReadAll(r); err == nil {
-			return decoded
+		decoded, err := io.ReadAll(r)
+		if err != nil {
+			return nil, fmt.Errorf("decode quoted-printable body: %w", err)
 		}
+		return decoded, nil
 	}
-	return data
+	return data, nil
 }
 
 // decodeBodyCharset 根据 Content-Type 里的 charset 参数将字节流转换为标准 UTF-8 字符串
-func decodeBodyCharset(raw []byte, contentType string) string {
+func decodeBodyCharset(raw []byte, contentType string) (string, error) {
 	_, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
-		return string(raw)
+		return string(raw), nil
 	}
 	name := params["charset"]
 	if name == "" || strings.EqualFold(name, "utf-8") || strings.EqualFold(name, "us-ascii") {
-		return string(raw)
+		return string(raw), nil
 	}
 	reader, err := charset.Reader(name, bytes.NewReader(raw))
 	if err != nil {
-		return string(raw)
+		return "", fmt.Errorf("decode body charset: %w", err)
 	}
 	decoded, err := io.ReadAll(reader)
 	if err != nil {
-		return string(raw)
+		return "", fmt.Errorf("read decoded body: %w", err)
 	}
-	return string(decoded)
+	return string(decoded), nil
 }
 
 // readBody 读取邮件正文, 支持 multipart 分块(含嵌套)、base64 与 quoted-printable 编码。
@@ -413,12 +417,19 @@ func readBody(msg *mail.Message) (string, error) {
 		mediaType = "text/plain"
 	}
 
-	const maxBodyRead = 512 * 1024 // 512KB 单块正文读取上限，防御超大垃圾附件阻塞 IMAP
-
+	raw, err := readBoundedBody(msg.Body)
+	if err != nil {
+		return "", err
+	}
+	decoded, err := decodeTransferData(raw, msg.Header.Get("Content-Transfer-Encoding"))
+	if err != nil {
+		return "", err
+	}
 	if strings.HasPrefix(mediaType, "multipart/") {
-		raw, _ := io.ReadAll(io.LimitReader(msg.Body, maxBodyRead))
-		decoded := decodeTransferData(raw, msg.Header.Get("Content-Transfer-Encoding"))
-		plainText, htmlText := readMultipartBody(decoded, params["boundary"], 0)
+		plainText, htmlText, err := readMultipartBody(decoded, params["boundary"], 0)
+		if err != nil {
+			return "", err
+		}
 		if plainText != "" && htmlText != "" {
 			if strings.TrimSpace(plainText) == strings.TrimSpace(htmlText) {
 				return plainText, nil
@@ -435,31 +446,48 @@ func readBody(msg *mail.Message) (string, error) {
 	}
 
 	// 单部分邮件
-	raw, err := io.ReadAll(io.LimitReader(msg.Body, maxBodyRead))
+	content, err := decodeBodyCharset(decoded, ct)
 	if err != nil {
 		return "", err
 	}
-	enc := msg.Header.Get("Content-Transfer-Encoding")
-	decoded := decodeTransferData(raw, enc)
-	content := decodeBodyCharset(decoded, ct)
 	if strings.EqualFold(mediaType, "text/html") {
 		return sanitizePreview(content), nil
 	}
 	return sanitizePlainPreview(content), nil
 }
 
+// readBoundedBody preserves the existing size limit without reporting a truncated body as complete.
+func readBoundedBody(r io.Reader) ([]byte, error) {
+	const maxBodyRead = 512 * 1024
+	raw, err := io.ReadAll(io.LimitReader(r, maxBodyRead+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxBodyRead {
+		return nil, fmt.Errorf("message body exceeds %d byte limit", maxBodyRead)
+	}
+	return raw, nil
+}
+
 // readMultipartBody 遍历 multipart 各部件: 文本部件取预览, 嵌套 multipart(如 mixed 套 alternative)递归展开,
 // 否则带附件验证邮件的真实正文会被静默丢成空串。显式排除 Content-Disposition: attachment 避免附件污染。
-func readMultipartBody(body []byte, boundary string, depth int) (string, string) {
-	if boundary == "" || depth >= 5 {
-		return "", ""
+func readMultipartBody(body []byte, boundary string, depth int) (string, string, error) {
+	if boundary == "" {
+		return "", "", fmt.Errorf("missing multipart boundary")
+	}
+	if depth >= 5 {
+		return "", "", fmt.Errorf("multipart nesting exceeds limit")
 	}
 	mr := multipart.NewReader(bytes.NewReader(body), boundary)
 	var plainText, htmlText string
 	for {
 		p, err := mr.NextPart()
-		if err != nil {
+		if err == io.EOF {
 			break
+		}
+		if err != nil {
+			// multipart errors may contain raw headers; keep those out of sync logs.
+			return "", "", fmt.Errorf("read multipart: invalid structure or truncated body")
 		}
 		disposition, _, _ := mime.ParseMediaType(p.Header.Get("Content-Disposition"))
 		if strings.EqualFold(disposition, "attachment") {
@@ -469,10 +497,19 @@ func readMultipartBody(body []byte, boundary string, depth int) (string, string)
 
 		partCT := p.Header.Get("Content-Type")
 		partEnc := p.Header.Get("Content-Transfer-Encoding")
-		partData, _ := io.ReadAll(io.LimitReader(p, 512*1024))
-		decoded := decodeTransferData(partData, partEnc)
+		partData, err := readBoundedBody(p)
+		if err != nil {
+			return "", "", fmt.Errorf("read multipart part: %w", err)
+		}
+		decoded, err := decodeTransferData(partData, partEnc)
+		if err != nil {
+			return "", "", err
+		}
 
-		plain, html := readMultipartPart(decoded, partCT, depth)
+		plain, html, err := readMultipartPart(decoded, partCT, depth)
+		if err != nil {
+			return "", "", err
+		}
 		if plainText == "" {
 			plainText = plain
 		}
@@ -480,11 +517,11 @@ func readMultipartBody(body []byte, boundary string, depth int) (string, string)
 			htmlText = html
 		}
 	}
-	return plainText, htmlText
+	return plainText, htmlText, nil
 }
 
 // readMultipartPart 把单个部件转为 (纯文本预览, HTML 预览); 部件本身是嵌套 multipart 时继续下钻。
-func readMultipartPart(data []byte, partCT string, depth int) (string, string) {
+func readMultipartPart(data []byte, partCT string, depth int) (string, string, error) {
 	mediaType, params, err := mime.ParseMediaType(partCT)
 	if err != nil {
 		mediaType = "text/plain"
@@ -495,10 +532,12 @@ func readMultipartPart(data []byte, partCT string, depth int) (string, string) {
 	}
 
 	if strings.EqualFold(mediaType, "text/plain") {
-		return sanitizePlainPreview(decodeBodyCharset(data, partCT)), ""
+		content, err := decodeBodyCharset(data, partCT)
+		return sanitizePlainPreview(content), "", err
 	}
 	if strings.EqualFold(mediaType, "text/html") {
-		return "", sanitizePreview(decodeBodyCharset(data, partCT))
+		content, err := decodeBodyCharset(data, partCT)
+		return "", sanitizePreview(content), err
 	}
-	return "", ""
+	return "", "", nil
 }

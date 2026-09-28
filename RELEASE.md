@@ -1,5 +1,7 @@
 # iCloud HME 发布与升级手册 (Release Runbook)
 
+> **文档范围说明**：本文是 V1–V4 历史迁移与回滚记录，不是当前版本的完整发布手册。当前数据库迁移、Schema 版本、Docker Compose 部署和就绪检查以 [docs/remediation/MIGRATION.md](docs/remediation/MIGRATION.md)、[docs/remediation/RELEASE.md](docs/remediation/RELEASE.md) 和 [README.md](README.md) 为准。不要把本文中的 `user_version = 2`、V2/V4 作为当前数据库版本判断。
+
 ## V3 → V4 升级
 
 V4 启动时会为缺少 `accounts.apple_dsid` 的历史数据库补列，保留现有账号记录。升级前程序会在 `data/backups/` 自动创建一致性备份；继续使用原有 `ICLOUD_HME_MASTER_KEY`，不要删除或重建 `data` 目录。Docker Compose 部署更新后，用 `docker compose logs --tail=100 icloud-hme` 和 `curl -fsS http://127.0.0.1:8081/readyz` 确认启动成功。
