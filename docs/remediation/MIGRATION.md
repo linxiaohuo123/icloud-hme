@@ -81,3 +81,7 @@
    - `verification_requests` 自愈补充基线五要素字段与匹配引用；
    - 幂等建立覆盖索引 (`idx_alias_inv_acc_alloc`, `idx_alias_alloc_owner`, `idx_operations_lookup` 等)，确保全量查询走索引。
 
+## 6. v4 到 v5 升级
+
+历史 v4 库可能缺少 `hme_reserve_intents.operation_id`，以及 `operations.business_tag`、`token_name`、`result_source`。启动时先为已有库生成一致性备份，再在单个事务中按需补列并写入 `user_version=5`；失败时回滚并阻止服务启动。`result_source` 对旧记录默认为 `pool`，其余新增字段默认为空字符串。终态校验必须检查这些列，避免恢复查询在服务启动后才报错。
+

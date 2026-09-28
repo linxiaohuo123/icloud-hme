@@ -357,6 +357,29 @@ func (s *Store) initSchema(dbExistedBefore bool) error {
 			if err := tx.Commit(); err != nil {
 				return fmt.Errorf("commit migration v3 to v4 tx failed: %w", err)
 			}
+		case 4:
+			tx, err := s.db.Begin()
+			if err != nil {
+				return fmt.Errorf("begin migration v4 to v5 tx failed: %w", err)
+			}
+			for _, col := range []struct{ table, name, def string }{
+				{"hme_reserve_intents", "operation_id", "TEXT DEFAULT ''"},
+				{"operations", "business_tag", "TEXT DEFAULT ''"},
+				{"operations", "token_name", "TEXT DEFAULT ''"},
+				{"operations", "result_source", "TEXT NOT NULL DEFAULT 'pool'"},
+			} {
+				if err := ensureColumn(tx, col.table, col.name, col.def); err != nil {
+					_ = tx.Rollback()
+					return fmt.Errorf("migrate v4 to v5 failed: %w", err)
+				}
+			}
+			if _, err := tx.Exec("PRAGMA user_version = 5;"); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("set schema version 5 failed: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit migration v4 to v5 tx failed: %w", err)
+			}
 		default:
 			return fmt.Errorf("unsupported migration path from version %d", currentV)
 		}

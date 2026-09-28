@@ -8,6 +8,7 @@
 package store
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"os"
@@ -75,7 +76,62 @@ func TestV3AccountsWithoutAppleDSIDUpgrade(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	backups, err := filepath.Glob(filepath.Join(dir, "backups", "pre-migrate-v3-to-v4-*.db"))
+	backups, err := filepath.Glob(filepath.Join(dir, "backups", "pre-migrate-v3-to-v5-*.db"))
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("expected one pre-migration backup, got %v: %v", backups, err)
+	}
+}
+
+func TestV4RemoteAllocationColumnsUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().Exec(`
+		INSERT INTO hme_reserve_intents (intent_id, account_id, candidate_email, state, created_at, updated_at)
+		VALUES ('intent_legacy', 'acc_legacy', 'legacy@icloud.com', 'succeeded', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z');
+		INSERT INTO operations (operation_id, principal_kind, principal_id, operation_kind, idempotency_key, state, created_at, updated_at)
+		VALUES ('op_legacy', 'token', 'tok_legacy', 'allocate', 'key_legacy', 'failed', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z');
+		ALTER TABLE hme_reserve_intents DROP COLUMN operation_id;
+		ALTER TABLE operations DROP COLUMN business_tag;
+		ALTER TABLE operations DROP COLUMN token_name;
+		ALTER TABLE operations DROP COLUMN result_source;
+		PRAGMA user_version = 4;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		upgraded, err := NewStore(dir)
+		if err != nil {
+			t.Fatalf("upgrade attempt %d failed: %v", attempt+1, err)
+		}
+		if err := validateSchema(upgraded.DB()); err != nil {
+			t.Fatal(err)
+		}
+		intent, err := upgraded.GetReserveIntent(context.Background(), "intent_legacy")
+		if err != nil || intent.CandidateEmail != "legacy@icloud.com" || intent.OperationID != "" {
+			t.Fatalf("legacy intent changed: intent=%+v err=%v", intent, err)
+		}
+		op, err := upgraded.GetRemoteAllocationOperation(context.Background(), "op_legacy")
+		if err != nil || op.State != "failed" || op.ResultSource != "pool" {
+			t.Fatalf("legacy operation changed: operation=%+v err=%v", op, err)
+		}
+		if _, err := upgraded.ListUnresolvedReserveIntents(context.Background(), ""); err != nil {
+			t.Fatalf("reserve recovery query failed: %v", err)
+		}
+		if _, err := upgraded.ListRemoteAllocationRecoveries(context.Background()); err != nil {
+			t.Fatalf("allocation recovery query failed: %v", err)
+		}
+		if err := upgraded.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backups, err := filepath.Glob(filepath.Join(dir, "backups", "pre-migrate-v4-to-v5-*.db"))
 	if err != nil || len(backups) != 1 {
 		t.Fatalf("expected one pre-migration backup, got %v: %v", backups, err)
 	}

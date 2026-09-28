@@ -16,7 +16,7 @@ import (
 )
 
 // CurrentSchemaVersion 数据库正式版本基线
-const CurrentSchemaVersion = 4
+const CurrentSchemaVersion = 5
 
 type schemaExecutor interface {
 	Exec(query string, args ...any) (sql.Result, error)
@@ -717,6 +717,14 @@ func validateSchemaVersion(db *sql.DB, expectedVersion int) error {
 	}
 	if expectedVersion >= 4 {
 		requiredCols = append(requiredCols, struct{ table, col string }{"accounts", "apple_dsid"})
+	}
+	if expectedVersion >= 5 {
+		requiredCols = append(requiredCols,
+			struct{ table, col string }{"hme_reserve_intents", "operation_id"},
+			struct{ table, col string }{"operations", "business_tag"},
+			struct{ table, col string }{"operations", "token_name"},
+			struct{ table, col string }{"operations", "result_source"},
+		)
 	}
 	for _, rc := range requiredCols {
 		has, err := tableHasColumn(db, rc.table, rc.col)
