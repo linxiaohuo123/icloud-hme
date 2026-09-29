@@ -47,20 +47,30 @@ func verifyAppleIdentity(acc *Account, info *hme.AccountInfo) error {
 
 // UpdateCookies 更新指定账号的 Cookie,并自动校验会话有效性。
 func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
-	return m.updateCookies(id, cookies, true, "")
+	return m.updateCookies(id, cookies, true, "", nil)
 }
 
 // UpdateCookiesIfValid 仅在新 Cookie 通过校验时替换原有凭据，供自动登录使用。
 func (m *Manager) UpdateCookiesIfValid(id string, cookies map[string]string) error {
-	return m.updateCookies(id, cookies, false, "")
+	return m.updateCookies(id, cookies, false, "", nil)
 }
 
 // UpdateCookiesIfValidForHost 将代理实际登录的区域和通过校验的 Cookie 一起保存。
 func (m *Manager) UpdateCookiesIfValidForHost(id string, cookies map[string]string, host string) error {
-	return m.updateCookies(id, cookies, false, host)
+	return m.updateCookies(id, cookies, false, host, nil)
 }
 
-func (m *Manager) updateCookies(id string, cookies map[string]string, saveInvalid bool, host string) error {
+func (m *Manager) UpdateBrowserSession(id string, session *hme.BrowserSession) error {
+	if session == nil {
+		return fmt.Errorf("missing browser session")
+	}
+	if err := session.Validate(session.Host); err != nil {
+		return err
+	}
+	return m.updateCookies(id, session.CookieMap(), false, session.Host, session)
+}
+
+func (m *Manager) updateCookies(id string, cookies map[string]string, saveInvalid bool, host string, session *hme.BrowserSession) error {
 	if len(cookies) == 0 {
 		return fmt.Errorf("cookies 不能为空")
 	}
@@ -87,6 +97,7 @@ func (m *Manager) updateCookies(id string, cookies map[string]string, saveInvali
 
 	// 自动校验 Cookie 是否有效(锁外对快照操作)
 	snap.Cookies = cookies
+	snap.Session = session.Clone()
 	originalHost := snap.Host
 	if host != "" {
 		snap.Host = host
@@ -95,7 +106,7 @@ func (m *Manager) updateCookies(id string, cookies map[string]string, saveInvali
 	}
 	aliasesFetched := false
 	var validateErr error
-	client, err := hme.NewClient(cookies, snap.Host, snap.Proxy, false)
+	client, err := hme.NewClientWithSession(cookies, snap.Session, snap.Host, snap.Proxy, false)
 	if err != nil {
 		snap.Status = "error"
 		snap.LastError = "创建客户端失败: " + err.Error()
@@ -105,6 +116,7 @@ func (m *Manager) updateCookies(id string, cookies map[string]string, saveInvali
 			validateErr = err
 			// validate 即使失败也可能通过 Set-Cookie 刷新部分会话状态。
 			snap.Cookies = client.CookieSnapshot()
+			snap.Session = client.SessionSnapshot()
 			snap.Status = "error"
 			snap.LastError = "Cookie 校验失败: " + err.Error()
 		} else {
@@ -121,7 +133,7 @@ func (m *Manager) updateCookies(id string, cookies map[string]string, saveInvali
 					snap.ICloudEmail = deriveICloudEmail(info)
 				}
 			}
-			if aliases, errList := client.ListAliases(); errList == nil {
+			if aliases, errList := listAliasesForSession(context.Background(), client); errList == nil {
 				aliasesFetched = true
 				snap.AliasTotal = len(aliases)
 				snap.AliasActive = 0
@@ -130,9 +142,14 @@ func (m *Manager) updateCookies(id string, cookies map[string]string, saveInvali
 						snap.AliasActive++
 					}
 				}
+			} else if session != nil || errors.Is(errList, hme.ErrAuthFailed) || errors.Is(errList, hme.ErrOTPRequired) || errors.Is(errList, hme.ErrSessionIdentity) {
+				validateErr = errList
+				snap.Status = "error"
+				snap.LastError = "HME 会话验证失败"
 			}
 			// ListAliases 之后再快照，避免丢掉列表阶段的 Set-Cookie
 			snap.Cookies = client.CookieSnapshot()
+			snap.Session = client.SessionSnapshot()
 		}
 	}
 	if validationErr := errors.Join(err, validateErr); validationErr != nil && !saveInvalid {
@@ -157,6 +174,7 @@ func (m *Manager) updateCookies(id string, cookies map[string]string, saveInvali
 	}
 	old := *cur
 	cur.Cookies = snap.Cookies
+	cur.Session = snap.Session
 	if host != "" {
 		cur.Host = snap.Host
 	}
@@ -197,7 +215,7 @@ func (m *Manager) ValidateAccount(id string) error {
 // ValidateAccountWithContext 支持 Context 贯穿的账号会话校验 (PR-05 F10)。
 //
 // 成功: 状态回 active、刷新 LastValidated 与别名计数，并保存 validate 响应刷新的
-// Cookie(等效一次会话保活)。
+// Cookie；新版会话在明确认证失败时执行一次受控恢复，不保证延期。
 // 凭据级失败(401/403): 账号标记 error 并返回包装 ErrCookieExpired 的错误，
 // 调度器与预热池会随之跳过该账号。
 // 瞬时失败(网络抖动、超时): 不改变账号状态，返回原始错误由调用方记录。
@@ -208,7 +226,7 @@ func (m *Manager) ValidateAccountWithContext(ctx context.Context, id string) err
 		m.mu.RUnlock()
 		return fmt.Errorf("账号不存在: %s", id)
 	}
-	if len(acc.Cookies) == 0 {
+	if len(acc.Cookies) == 0 && acc.Session == nil {
 		m.mu.RUnlock()
 		return fmt.Errorf("账号 %s 未配置 Cookie", id)
 	}
@@ -218,36 +236,32 @@ func (m *Manager) ValidateAccountWithContext(ctx context.Context, id string) err
 	// 走账号级客户端池: 本函数由 Cookie 监控器对每个账号每轮调用一次，
 	// 若每次新建客户端就要为全部账号反复构造 Chrome TLS 指纹并重新握手。
 	var (
-		refreshedCookies map[string]string
-		serviceURL       string
-		accountInfo      *hme.AccountInfo
-		aliases          []hme.Alias
+		serviceURL  string
+		accountInfo *hme.AccountInfo
+		aliases     []hme.Alias
 	)
 	err := m.WithHMEClientContext(ctx, id, func(client *hme.Client) error {
-		if err := client.ValidateSessionWithContext(ctx); err != nil {
+		if err := client.ValidateSessionWithRecovery(ctx); err != nil {
 			return err
 		}
 		serviceURL = client.ServiceURL()
 		accountInfo = client.AccountInfo()
 		// 顺带刷新别名计数，让配额水位始终有近 30 分钟内的真实值
-		if list, listErr := client.ListAliasesWithContext(ctx); listErr == nil {
+		if list, listErr := listAliasesForSession(ctx, client); listErr == nil {
 			aliases = list
+		} else if client.SessionSnapshot() != nil || errors.Is(listErr, hme.ErrAuthFailed) || errors.Is(listErr, hme.ErrOTPRequired) || errors.Is(listErr, hme.ErrSessionIdentity) {
+			return listErr
 		}
-		// 必须在 ListAliases 之后克隆: 列表接口也可能 Set-Cookie。
-		// 若在 validate 后立刻快照，WithHMEClient 回写的是新 Cookie，
-		// 本函数再用旧快照覆盖，会把池条目指纹打成脏值、下一轮拆掉长连接。
-		// client 会原地写自己的 Cookies map，若直接共享引用，
-		// 遍历(save 序列化/copyAccount)与写并发会触发 fatal error 杀死进程。
-		refreshedCookies = client.CookieSnapshot()
+		// 会话由账号池持锁原子保存，不在释放锁后重复回写旧快照。
 		return nil
 	})
 	if err != nil {
 		if errors.Is(err, ErrSessionChanged) {
 			return err
 		}
-		if errors.Is(err, ErrAccountIdentityMismatch) {
+		if errors.Is(err, ErrAccountIdentityMismatch) || errors.Is(err, hme.ErrSessionIdentity) {
 			m.markAccountError(id, epoch, err.Error())
-			return err
+			return errors.Join(ErrAccountIdentityMismatch, err)
 		}
 		m.mu.RLock()
 		current, exists := m.accounts[id]
@@ -260,7 +274,7 @@ func (m *Manager) ValidateAccountWithContext(ctx context.Context, id string) err
 			m.markAccountError(id, epoch, "创建客户端失败")
 			return fmt.Errorf("%w: %v", ErrCookieExpired, err)
 		}
-		if isAuthFailure(err.Error()) {
+		if errors.Is(err, hme.ErrAuthFailed) || errors.Is(err, hme.ErrOTPRequired) {
 			m.markAccountError(id, epoch, "Cookie 已失效")
 			return fmt.Errorf("%w: %v", ErrCookieExpired, err)
 		}
@@ -284,9 +298,6 @@ func (m *Manager) ValidateAccountWithContext(ctx context.Context, id string) err
 		return identityErr
 	}
 	old := *cur
-	if refreshedCookies != nil {
-		cur.Cookies = refreshedCookies
-	}
 	cur.Status = "active"
 	cur.LastValidated = time.Now().Format(time.RFC3339)
 	cur.LastError = ""

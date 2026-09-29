@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"icloud-hme/internal/hme"
 	"icloud-hme/internal/store"
 )
 
@@ -38,6 +39,7 @@ func copyAccount(acc *Account) *Account {
 	}
 	cp := *acc
 	cp.Cookies = cloneCookies(acc.Cookies)
+	cp.Session = acc.Session.Clone()
 	return &cp
 }
 
@@ -49,11 +51,15 @@ func (m *Manager) load() error {
 			return fmt.Errorf("从 SQLite 加载账号失败: %w", err)
 		}
 		if len(recs) > 0 {
-			m.accounts = make(map[string]*Account, len(recs))
+			loaded := make(map[string]*Account, len(recs))
 			for _, rec := range recs {
-				acc := recordToAccount(rec)
-				m.accounts[acc.ID] = acc
+				acc, err := recordToAccount(rec)
+				if err != nil {
+					return fmt.Errorf("decode account session: %w", err)
+				}
+				loaded[acc.ID] = acc
 			}
+			m.accounts = loaded
 			return nil
 		}
 		// SQLite 表为空 → 尝试从 JSON 迁移（首次升级场景）
@@ -293,6 +299,11 @@ func (m *Manager) deleteAccountFromStore(id string) error {
 
 // saveJSON 旧式 JSON 全量写入（回退路径）。
 func (m *Manager) saveJSON() error {
+	for _, acc := range m.accounts {
+		if acc.Session != nil {
+			return fmt.Errorf("browser sessions require encrypted SQLite storage")
+		}
+	}
 	wrapper := struct {
 		Accounts  map[string]*Account `json:"accounts"`
 		UpdatedAt string              `json:"updated_at"`
@@ -334,7 +345,7 @@ func accountToRecord(acc *Account) *store.AccountRecord {
 		RealEmail:     acc.RealEmail,
 		AppleDSID:     acc.AppleDSID,
 		ICloudEmail:   acc.ICloudEmail,
-		CookiesJSON:   store.MarshalCookies(acc.Cookies),
+		CookiesJSON:   hme.EncodeSession(acc.Cookies, acc.Session),
 		Host:          acc.Host,
 		ServiceURL:    acc.ServiceURL,
 		Proxy:         acc.Proxy,
@@ -351,7 +362,11 @@ func accountToRecord(acc *Account) *store.AccountRecord {
 	}
 }
 
-func recordToAccount(rec *store.AccountRecord) *Account {
+func recordToAccount(rec *store.AccountRecord) (*Account, error) {
+	cookies, session, err := hme.DecodeSession(rec.CookiesJSON, rec.Host)
+	if err != nil {
+		return nil, err
+	}
 	var mb *MailboxConfig
 	if rec.MailboxJSON != "" {
 		mb = &MailboxConfig{}
@@ -365,7 +380,8 @@ func recordToAccount(rec *store.AccountRecord) *Account {
 		RealEmail:     rec.RealEmail,
 		AppleDSID:     rec.AppleDSID,
 		ICloudEmail:   rec.ICloudEmail,
-		Cookies:       store.UnmarshalCookies(rec.CookiesJSON),
+		Cookies:       cookies,
+		Session:       session,
 		Host:          rec.Host,
 		ServiceURL:    rec.ServiceURL,
 		Proxy:         rec.Proxy,
@@ -378,7 +394,7 @@ func recordToAccount(rec *store.AccountRecord) *Account {
 		LastError:     rec.LastError,
 		CreatedAt:     rec.CreatedAt,
 		Tags:          store.UnmarshalTags(rec.TagsJSON),
-	}
+	}, nil
 }
 
 // ParseCookieInput 解析 Cookie 输入,支持全格式智能自适应:

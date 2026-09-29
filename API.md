@@ -1410,3 +1410,10 @@ if result.get("success"):
     - **列表自愈**：任何一次拉取到账号别名列表（启动预热、GUI 浏览、手动刷新）都会批量登记该账号全部别名；
     - **一次性回填**：升级后首次启动会用历史出号流水回填路由表（带标记，不会重复全表扫描）。
     已登记别名通过路由表定向查找；只有在 Apple 侧手工创建、本系统从未见过的别名才会轮转探测可用账号。未知别名探测每轮总计最多发起 20 次账号查询，最多 5 个并发；监听仍活跃时，后续轮次继续探测，不缓存未命中结果。
+
+
+### 浏览器会话诊断字段
+
+账号 Summary 的可选 `session` 对象仅用于脱敏诊断：`trusted`、`captured_at`（Unix 秒）、`recovery_available`、`recovery_blocked`、`recovery_after`（Unix 秒）和 `token_expires_at`（Unix 秒或 null）。`token_expires_at` 仅统计适用于当前区域 setup 请求的未过期核心 Cookie；任一适用 Cookie 期限未知或无适用 Cookie 时返回 null，不混用其他域或路径的期限。旧 Cookie 导入账号不包含此对象。`trusted` 是最近确认的状态，`recovery_available` 只表示存在恢复材料；二者都不保证未来有效性。接口不会返回 Cookie 列表或认证 token。
+
+自动恢复被临时冷却时返回 `SESSION_RECOVERY_DEFERRED`（503）；Apple 要求重新验证时返回 `SESSION_REAUTH_REQUIRED`（401），需要重新发起登录。恢复不会自动重放写操作。更新主服务时必须同步更新 Camoufox Agent；旧 Agent 缺少完整会话时会明确报错。

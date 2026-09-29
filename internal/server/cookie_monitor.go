@@ -7,10 +7,10 @@
 
 // Package server - Cookie 健康监控器。
 //
-// iCloud Web Cookie 约 24 小时必然过期，而 IMAP 读信(App Password)不受影响，
-// 系统表面存活、出号已死，是最典型的静默降级。本监控器每周期用现有 Cookie
+// iCloud Web 会话期限由 Apple 决定，Cookie 到期属性不是服务端有效期保证。
+// 本监控器每周期用现有 Cookie
 // 轻量调一次 HME 校验接口：
-//   - 校验通过     → 状态回 active、刷新 LastValidated 与别名计数(等效会话保活)
+//   - 校验通过     → 状态回 active、刷新 LastValidated 与别名计数(接收上游实际下发的更新)
 //   - 401/403     → 账号标记 error(调度器/预热池自动跳过，管理台可见)
 //   - 瞬时网络错误 → 保留原状态，仅记录日志
 //

@@ -16,7 +16,7 @@ import (
 )
 
 // CurrentSchemaVersion 数据库正式版本基线
-const CurrentSchemaVersion = 7
+const CurrentSchemaVersion = 8
 
 type schemaExecutor interface {
 	Exec(query string, args ...any) (sql.Result, error)

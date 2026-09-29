@@ -3,6 +3,7 @@ import logging
 import os
 import secrets
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager, suppress
 from typing import Dict, Optional
@@ -24,6 +25,10 @@ logger = logging.getLogger("camoufox-agent")
 def _safe_login_error(exc: BaseException) -> str:
     """将浏览器内部错误映射为不含页面原文或凭据的稳定提示。"""
     message = str(exc).lower()
+    if "分区认证 cookie" in message:
+        return "当前登录包含不支持的分区认证 Cookie"
+    if "完整的保持登录会话" in message:
+        return "未捕获完整的保持登录会话，请重新登录并确认保持登录和信任浏览器"
     if "代理地址格式无效" in message or "代理协议不支持认证" in message:
         return "Camoufox 代理配置无效"
     if "proxy" in message.lower() or "代理连接" in message:
@@ -96,6 +101,9 @@ class TaskState:
         self.status = "initializing"  # initializing, entering_credentials, otp_required, verifying, success, failed
         self.error_message: Optional[str] = None
         self.cookies: Optional[Dict[str, str]] = None
+        self.web_session_url: Optional[str] = None
+        self.web_login_request = None
+        self.session = None
         self.otp_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
         self.worker: Optional[asyncio.Task] = None
 
@@ -152,12 +160,72 @@ async def js_click_by_text(frame, *texts: str) -> bool:
     except Exception:
         return False
 
-async def check_login_success_and_sync(task: TaskState, context) -> bool:
-    """检查浏览器 Cookies 是否已包含核心凭据。"""
+def observe_account_login_request(task: TaskState, request) -> None:
+    """新握手发出时立即撤销旧就绪状态，响应只能提交当前请求的结果。"""
+    parsed = urlsplit(request.url)
+    if (parsed.scheme != "https" or
+            parsed.hostname not in ("setup.icloud.com", "setup.icloud.com.cn") or
+            parsed.path != "/setup/ws/1/accountLogin" or
+            request.method != "POST"):
+        return
+    task.web_login_request = request
+    task.web_session_url = None
+    task.session = None
+
+
+async def observe_account_login(task: TaskState, response) -> None:
+    """等待浏览器完成 iCloud Web 握手，不把认证中途的 Cookie 当作最终会话。"""
+    if response.request is not task.web_login_request:
+        return
+    parsed = urlsplit(response.url)
     try:
-        raw_cookies = await context.cookies()
+        if response.status != 200:
+            return
+        request_data = response.request.post_data_json
+        if not isinstance(request_data, dict) or request_data.get("extended_login") is not True:
+            logger.warning("[%s] iCloud accountLogin 未启用保持登录", task.task_id)
+            return
+        # json() 等待完整响应体；不要仅根据 response 事件（响应头已到达）判定成功。
+        payload = await response.json()
+        headers = await response.all_headers()
+        if response.request is not task.web_login_request:
+            return
+        if (not isinstance(payload, dict) or
+                not isinstance(payload.get("dsInfo"), dict) or
+                not payload["dsInfo"].get("dsid") or
+                payload.get("hsaChallengeRequired") is True or
+                payload.get("hsaTrustedBrowser") is not True):
+            return
+        task.session = {
+            "version": 1, "host": parsed.hostname.removeprefix("setup."),
+            "dsid": str(payload["dsInfo"]["dsid"]), "trusted": True,
+            "captured_at": int(time.time()), "cookies": [],
+            "auth": {
+                "session_token": headers.get("x-apple-session-token") or request_data.get("dsWebAuthToken", ""),
+                "trust_token": headers.get("x-apple-twosv-trust-token") or request_data.get("trustToken", ""),
+                "account_country": headers.get("x-apple-id-account-country") or request_data.get("accountCountryCode", ""),
+            },
+        }
+        task.web_session_url = urlunsplit(("https", parsed.hostname, "/setup/ws/1/validate", "", ""))
+        task.req.host = parsed.hostname.removeprefix("setup.")
+        logger.info("[%s] iCloud Web 保持登录握手完成 (host=%s)", task.task_id, task.req.host)
+    except Exception as exc:
+        logger.debug("[%s] iCloud Web 握手未完成 (%s)", task.task_id, type(exc).__name__)
+
+
+async def check_login_success_and_sync(task: TaskState, context) -> bool:
+    """仅导出已完成保持登录握手、适用于最终区域 validate 端点的 Cookie。"""
+    if not task.web_session_url or task.session is None:
+        return False
+    session_url = task.web_session_url
+    login_request = task.web_login_request
+    try:
+        raw_cookies = await context.cookies(session_url)
+        all_cookies = await context.cookies()
+        if task.web_session_url != session_url or task.web_login_request is not login_request:
+            return False
         cookies_map = {}
-        for c in raw_cookies:
+        for c in sorted(raw_cookies, key=lambda item: len(item.get("path", "/")), reverse=True):
             name = c.get("name")
             val = c.get("value")
             if name and val is not None:
@@ -165,20 +233,39 @@ async def check_login_success_and_sync(task: TaskState, context) -> bool:
                 # 针对 X-APPLE-WEBAUTH-TOKEN 等关键字段，若带最外层双引号则进行标准化剥离，确保符合 RFC 规范
                 if len(val_str) >= 2 and val_str.startswith('"') and val_str.endswith('"') and name in ("X-APPLE-WEBAUTH-TOKEN", "X-APPLE-DS-WEB-SESSION-TOKEN"):
                     val_str = val_str[1:-1]
-                cookies_map[name] = val_str
+                # 兼容 map 仅作旧协议投影；完整会话保留每个域/路径的同名 Cookie。
+                if name not in cookies_map:
+                    cookies_map[name] = val_str
 
         # 真正代表认证最终成功的核心凭据
-        has_trust = "X-APPLE-WEBAUTH-HSA-TRUST" in cookies_map
-        has_token = "X-APPLE-WEBAUTH-TOKEN" in cookies_map
-        has_web_id = "X-APPLE-WEB-ID" in cookies_map
+        has_trust = bool(cookies_map.get("X-APPLE-WEBAUTH-HSA-TRUST"))
+        has_token = bool(cookies_map.get("X-APPLE-WEBAUTH-TOKEN"))
+        has_web_id = bool(cookies_map.get("X-APPLE-WEB-ID"))
         # USER 可能在 2FA 完成前出现；最终仍由主服务验证 Apple 会话。
         is_success = has_token and (has_trust or has_web_id)
         if is_success:
+            if task.session is not None:
+                allowed = []
+                for cookie in all_cookies:
+                    domain = cookie.get("domain", "").lstrip(".")
+                    if (domain in ("icloud.com", "icloud.com.cn", "idmsa.apple.com", "appleid.apple.com") or
+                            domain.endswith(".icloud.com") or domain.endswith(".icloud.com.cn")):
+                        if cookie.get("partitionKey"):
+                            raise RuntimeError("不支持分区认证 Cookie")
+                        allowed.append(cookie)
+                task.session["cookies"] = allowed
+                token_expiries = [c.get("expires", -1) for c in raw_cookies if c.get("name") == "X-APPLE-WEBAUTH-TOKEN"]
+                ttl = min(token_expiries) - time.time() if token_expiries and min(token_expiries) > 0 else None
+                logger.info("[%s] 会话属性: trusted=true, token_ttl_seconds=%s, recovery_material=%s",
+                            task.task_id, int(ttl) if ttl is not None else "unknown",
+                            bool(task.session["auth"].get("session_token")))
             task.cookies = cookies_map
             task.status = "success"
             logger.info(f"[{task.task_id}] 登录成功！共提取到 {len(cookies_map)} 个 Cookie (含核心凭据: trust={has_trust}, token={has_token}, web_id={has_web_id})")
             return True
     except Exception as e:
+        if "不支持分区认证 Cookie" in str(e):
+            raise
         logger.debug("[%s] Cookie 检查异常 (%s)", task.task_id, type(e).__name__)
     return False
 
@@ -197,8 +284,6 @@ async def handle_redirect_and_trust(page, context, task: TaskState) -> bool:
     """处理中国区跳转 (icloud.com.cn) 与受信任浏览器弹窗，提取 Cookie"""
     if await visible_otp_inputs(page) is not None:
         return False
-    if await check_login_success_and_sync(task, context):
-        return True
 
     # 1. 检查是否存在中国区重定向提示 (Good evening. To sign in with this Apple Account, go to iCloud.com.cn.)
     redirected = False
@@ -215,6 +300,8 @@ async def handle_redirect_and_trust(page, context, task: TaskState) -> bool:
         logger.debug("[%s] 中国区跳转按钮不可用 (%s)", task.task_id, type(exc).__name__)
 
     if redirected:
+        task.web_session_url = None
+        task.web_login_request = None
         task.req.host = "icloud.com.cn"
         if "icloud.com.cn" not in page.url:
             await page.goto("https://www.icloud.com.cn/", wait_until="domcontentloaded", timeout=25000)
@@ -232,13 +319,15 @@ async def handle_redirect_and_trust(page, context, task: TaskState) -> bool:
         '[role="button"]:text-is("Trust")',
     ]
     clicked_trust = False
+    trust_prompt_visible = False
     for f in page.frames:
         for sel in trust_selectors:
             try:
                 btn = f.locator(sel)
                 if await btn.count() > 0 and await btn.first.is_visible():
                     txt = (await btn.first.inner_text()).strip()
-                    if "不" not in txt and "don't" not in txt.lower():
+                    if txt.casefold() in ("信任", "trust"):
+                        trust_prompt_visible = True
                         await btn.first.click(timeout=2000)
                         logger.info(f"[{task.task_id}] 已精准点击【信任此浏览器】(选择器: {sel}, 文本: '{txt}')")
                         clicked_trust = True
@@ -255,6 +344,9 @@ async def handle_redirect_and_trust(page, context, task: TaskState) -> bool:
         except Exception:
             pass
 
+    if trust_prompt_visible and not clicked_trust:
+        return False
+
     if clicked_trust:
         logger.info(f"[{task.task_id}] 已点击【信任】，等待登录 iframe 完成并让主页面建立长效会话...")
         try:
@@ -263,14 +355,8 @@ async def handle_redirect_and_trust(page, context, task: TaskState) -> bool:
             logger.info(f"[{task.task_id}] 登录 iframe 已顺利销毁，正在加载主页面长效凭据...")
         except Exception:
             pass
-        # 轮询等待主页加载长效凭据 (优先等待 X-APPLE-WEB-ID 或完整长效 TOKEN)
-        for _ in range(8):
-            await asyncio.sleep(1)
-            raw = await context.cookies()
-            names = {c.get("name") for c in raw if c.get("name")}
-            if "X-APPLE-WEB-ID" in names or ("X-APPLE-WEBAUTH-TOKEN" in names and "X-APPLE-WEBAUTH-HSA-TRUST" in names):
-                logger.info(f"[{task.task_id}] 已成功捕获主页长效凭据 (含 X-APPLE-WEB-ID: {'X-APPLE-WEB-ID' in names})")
-                break
+        # 交回外层状态机，等待实际 accountLogin 响应；Cookie 名称不能证明长效会话成立。
+        return False
 
     return await check_login_success_and_sync(task, context)
 
@@ -353,6 +439,11 @@ async def _submit_credentials_to_page(task: TaskState, page) -> None:
     logger.info(f"[{task.task_id}] 已正式提交密码，进入状态机判定...")
 
 async def _execute_login(task: TaskState, context, page) -> None:
+    async def on_response(response):
+        await observe_account_login(task, response)
+
+    context.on("request", lambda request: observe_account_login_request(task, request))
+    context.on("response", on_response)
     host_str = (task.req.host or "icloud.com").strip().lower()
     is_china = "icloud.com.cn" in host_str or "china" in host_str
     start_url = "https://www.icloud.com.cn/" if is_china else "https://www.icloud.com/"
@@ -386,6 +477,8 @@ async def _execute_login(task: TaskState, context, page) -> None:
             if "can't sign in to icloud.com" in page_text.lower() or "前往 icloud.com.cn" in page_text:
                 logger.info(f"[{task.task_id}] 发现该账号属于云上贵州(中国区)，自动切换至 https://www.icloud.com.cn/ 执行原生登录...")
                 task.req.host = "icloud.com.cn"
+                task.web_session_url = None
+                task.web_login_request = None
                 await page.goto("https://www.icloud.com.cn/", wait_until="domcontentloaded", timeout=25000)
                 await _submit_credentials_to_page(task, page)
                 deadline = asyncio.get_event_loop().time() + 40
@@ -493,9 +586,9 @@ async def _execute_login(task: TaskState, context, page) -> None:
 
         await asyncio.sleep(1)
 
-    # 最终保底：尝试读取全域 Cookies
+    # 最终检查仍必须满足 Web 握手条件，不能降级导出中间态 Cookie。
     if not await handle_redirect_and_trust(page, context, task):
-        raise Exception("Apple ID 认证未能完成，未提取到有效登录态 Cookie")
+        raise Exception("未捕获完整的保持登录会话")
 
 
 def camoufox_proxy_settings(proxy_url: str) -> Dict[str, str]:
@@ -671,6 +764,7 @@ async def get_task_status(task_id: str):
     if task.status == "success" and task.cookies:
         res["cookie_count"] = len(task.cookies)
         res["cookies"] = task.cookies
+        res["session"] = task.session
     return res
 
 @app.delete("/tasks/{task_id}", dependencies=[Depends(require_token)])

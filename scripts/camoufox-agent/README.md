@@ -1,6 +1,10 @@
 # Camoufox 登录代理
 
-该服务按请求启动独立浏览器，取得 Apple Cookie 后由 Go 主服务写入并校验账号身份。最多同时运行 2 个登录任务；每个任务最长 8 分钟，结果保留 2 分钟。Go 首阶段最多等待 210 秒，留出慢页面及中国区重新登录时间。
+该服务按请求启动独立浏览器，取得 Apple Cookie 后由 Go 主服务校验会话和账号身份，通过后才替换并保存凭据。最多同时运行 2 个登录任务；每个任务最长 8 分钟，结果保留 2 分钟。Go 首阶段最多等待 210 秒，留出慢页面及中国区重新登录时间。
+
+登录代理先处理验证码、区域跳转与“信任此浏览器”，再确认浏览器的 `accountLogin` 请求启用了 `extended_login: true`、响应已完成且返回账号身份、无需继续双重认证且 `hsaTrustedBrowser: true`，最后提取 Apple 会话 Cookie。仅出现 TOKEN、WEB-ID 或 TRUST Cookie 不代表最终会话已经建立；缺少完整握手时会报错，不导出中间态凭据。新版结构保留 Cookie 的域、路径、有效期、安全属性及同名 Cookie；分区 Cookie 暂不支持，遇到时明确拒绝导出。保持登录不保证固定有效期，Apple 仍可撤销会话。
+
+新登录握手发出或切换区域时会立即清除旧就绪状态；旧请求的迟到响应不能恢复它，读取 Cookie 期间发生新握手也不会导出旧结果。“信任”按钮可见但点击失败时继续等待，不跳过信任步骤。
 
 ## Docker Compose
 
@@ -28,3 +32,21 @@ docker compose logs --tail=50 camoufox-agent
 `/health`、`/login`、`/submit-otp`、`/tasks/{task_id}` 均要求 `X-Camoufox-Token` 请求头。任务状态返回实际登录的 `host`；Go 主服务负责轮询任务、提交 OTP，并在校验成功后一起保存 Cookie 与登录区域。用户关闭 OTP 弹窗时会取消任务，`DELETE /tasks/{task_id}` 会终止对应浏览器。不要将令牌或成功任务返回的 Cookie 写入日志。
 
 主服务只持久化账号 ID、任务 ID、代理地址和创建时间。重启后会取消旧任务；代理暂时不可达时保留记录，后续登录或停机时重试。已配置代理但探活失败会直接报错，不会静默回退至 SRP。
+
+## 会话保存与恢复（数据库 v8）
+
+主服务和 Agent 必须一起更新。Agent 成功响应新增 `session`：版本、DSID、登录区域、受信任状态、捕获时间、结构化 Cookie 列表，以及对应 `dsWebAuthToken`、`trustToken`、`accountCountryCode` 的恢复材料。认证材料优先采用当前成功响应的 Session/Trust Token 和 Account-Country 响应头，缺失时沿用当前请求值；旧请求的迟到响应头不能覆盖它们。Cookie map 仅供兼容投影，不能表示所有作用域。
+
+主服务对新版会话用标准 Cookie 作用域规则发送，避免跨域灌入及同名覆盖；旧手动 Cookie 导入保持原行为。完整会话作为版本化 JSON 保存在原有 `accounts.cookies` 加密列，继续使用现有 Master Key 和账号 AAD。升级到 v8 不改写旧 Cookie 数据，启动前自动备份；旧程序不能打开 v8 数据库。降级必须使用升级前备份并保留原 Master Key，不要手工降低 `user_version`。新版认证材料不允许写入历史明文 JSON 回退存储。
+
+后台校验及失败后下一次借出前的校验，可以使用保存的认证材料执行一次 `accountLogin`，之后重新检查 DSID、信任状态及 HME 端点。只读列表在认证恢复成功后最多重试一次；创建、保留、删除等业务操作不会因恢复而自动重放。临时失败冷却 5 分钟，明确拒绝或要求验证码时禁止继续自动恢复，需人工重新登录；恢复限制也持久化。认证校验通过并核对账号身份后立即保存会话检查点；后续业务失败只保存恢复限制，不用失败响应的 Cookie 覆盖该检查点。缺失或错误类型的信任/身份字段按协议错误处理，不作为明确 MFA 永久阻断恢复。人工更新 Cookie 会清除旧认证材料。代理变更要求重新校验，已有浏览器会话不允许直接改写登录区域。
+
+新版会话收到普通 HTTP 403（没有明确的 `AUTHENTICATION_FAILED` 错误码）时，报告访问被拒绝，不直接判定 Cookie 过期或触发自动恢复，避免将访问环境问题误当成认证失效。
+
+公开账号响应新增脱敏 `session` 属性，包含 `trusted`（最后一次确认的信任状态）、`captured_at`、`recovery_available`（有恢复材料，不代表保证成功）、`recovery_blocked`、`recovery_after` 和 `token_expires_at`（当前 setup 请求可用核心 Cookie 的最早已知期限；任一适用 Cookie 为会话型、或无适用 Cookie 时为 null）。日志只记录到期秒数、是否有恢复材料和状态，不记录 Cookie 或 token 值。会话型 Cookie 不被伪造固定有效期；短效 Cookie 允许导入但保留真实到期属性，不宣称长效。观察真实 Apple 登录 24/72 小时后的可用性仍需部署后验证。
+
+## 请求发送与认证错误边界
+
+手动导入的 Cookie 字符串没有域/路径元数据，继续使用原有 map 兼容发送，但仅由该 map 构造一次请求头，不再让 Cookie jar 追加第二份。原生 SRP 登录在握手期间使用 jar，成功提取 Cookie 后交给 map；Camoufox 结构化会话始终由作用域 jar 发送。`Set-Cookie` 删除的旧值不能由另一份缓存重新附加。
+
+HTTP 200 正文中的明确 `AUTHENTICATION_FAILED`（顶层 errorCode 或 error.errorCode/error.code）同样归类为认证失败。只读校验可以进入既有恢复流程，写操作不因此重放。恢复 accountLogin 遇到 429 时，冷却时间至少 5 分钟；有效 Retry-After 更长时采用上游时间，并沿用现有恢复状态持久化。

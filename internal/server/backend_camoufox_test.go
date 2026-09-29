@@ -210,6 +210,30 @@ func TestConfiguredCamoufoxFailureDoesNotFallBack(t *testing.T) {
 	}
 }
 
+func TestCamoufoxIncompleteSessionReportsActionableError(t *testing.T) {
+	t.Setenv("ICLOUD_HME_CAMOUFOX_TOKEN", "test-token")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodDelete {
+			_, _ = w.Write([]byte(`{"success":true}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"task_id":"task-1","status":"failed","error_message":"未捕获完整的保持登录会话"}`))
+	}))
+	defer server.Close()
+	be := &managerBackend{}
+	be.reserveCamoufoxTask("account-1", server.URL)
+	be.setCamoufoxTask("account-1", "task-1")
+	_, err := be.pollCamoufoxTask("account-1", "task-1", server.URL, time.Second, false)
+	backendErr, ok := err.(*BackendError)
+	if !ok || backendErr.Code != "APPLE_AUTH_REJECTED" || backendErr.Message != "未捕获完整的保持登录会话，请重新登录并确认保持登录和信任浏览器" {
+		t.Fatalf("incomplete session must have an actionable error: %v", err)
+	}
+	if _, ok := be.getCamoufoxTask("account-1"); ok {
+		t.Fatal("failed task retained in backend")
+	}
+}
+
 func TestCamoufoxClientDoesNotForwardTokenOnRedirect(t *testing.T) {
 	t.Setenv("ICLOUD_HME_CAMOUFOX_TOKEN", "test-token")
 	var forwarded atomic.Bool

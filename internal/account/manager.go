@@ -37,24 +37,25 @@ var ErrMailConfigPersistence = errors.New("邮箱配置保存失败")
 // Account 描述一个 iCloud 账号。
 type Account struct {
 	credentialEpoch uint64
-	ID              string            `json:"id"`
-	Name            string            `json:"name"`
-	RealEmail       string            `json:"real_email"`
-	AppleDSID       string            `json:"apple_dsid,omitempty"`
-	ICloudEmail     string            `json:"icloud_email"`
-	Cookies         map[string]string `json:"cookies"`
-	Host            string            `json:"host"`
-	ServiceURL      string            `json:"service_url,omitempty"` // 已解析的 HME 服务端点
-	Proxy           string            `json:"proxy,omitempty"`       // HTTP/SOCKS5 代理
-	AppPassword     string            `json:"app_password,omitempty"`
-	Mailbox         *MailboxConfig    `json:"mailbox,omitempty"`
-	Status          string            `json:"status"` // active / error
-	AliasTotal      int               `json:"alias_total"`
-	AliasActive     int               `json:"alias_active"`
-	LastValidated   string            `json:"last_validated"`
-	LastError       string            `json:"last_error,omitempty"`
-	CreatedAt       string            `json:"created_at"`
-	Tags            []string          `json:"tags,omitempty"`
+	ID              string              `json:"id"`
+	Name            string              `json:"name"`
+	RealEmail       string              `json:"real_email"`
+	AppleDSID       string              `json:"apple_dsid,omitempty"`
+	ICloudEmail     string              `json:"icloud_email"`
+	Cookies         map[string]string   `json:"cookies"`
+	Session         *hme.BrowserSession `json:"-"`
+	Host            string              `json:"host"`
+	ServiceURL      string              `json:"service_url,omitempty"` // 已解析的 HME 服务端点
+	Proxy           string              `json:"proxy,omitempty"`       // HTTP/SOCKS5 代理
+	AppPassword     string              `json:"app_password,omitempty"`
+	Mailbox         *MailboxConfig      `json:"mailbox,omitempty"`
+	Status          string              `json:"status"` // active / error
+	AliasTotal      int                 `json:"alias_total"`
+	AliasActive     int                 `json:"alias_active"`
+	LastValidated   string              `json:"last_validated"`
+	LastError       string              `json:"last_error,omitempty"`
+	CreatedAt       string              `json:"created_at"`
+	Tags            []string            `json:"tags,omitempty"`
 }
 
 // MailboxConfig describes an external mailbox used to receive forwarded mail.
@@ -99,6 +100,7 @@ func NewManager(dataDir string, st *store.Store) (*Manager, error) {
 		hmePool:       newHMEClientPool(),
 	}
 	if err := m.load(); err != nil {
+		m.Close()
 		return nil, err
 	}
 	return m, nil
@@ -337,6 +339,9 @@ func (m *Manager) UpdateMetadata(id string, input UpdateAccountInput) (Summary, 
 		updated.ICloudEmail = *email
 	}
 	if host != nil {
+		if updated.Session != nil && *host != updated.Host {
+			return Summary{}, fmt.Errorf("浏览器会话不能直接切换区域，请重新登录")
+		}
 		updated.Host = *host
 	}
 	if input.Tags != nil {
@@ -363,6 +368,11 @@ func (m *Manager) UpdateProxy(id, proxy string) (Summary, error) {
 	}
 	updated := copyAccount(acc)
 	updated.Proxy = proxy
+	if updated.Session != nil && proxy != acc.Proxy {
+		updated.credentialEpoch++
+		updated.Status = "error"
+		updated.LastError = "代理已变更，需要重新校验会话"
+	}
 	if err := m.saveAccount(updated); err != nil {
 		return Summary{}, err
 	}
@@ -424,6 +434,7 @@ func (m *Manager) ListAccounts() []*Account {
 		}
 		cp := copyAccount(acc)
 		cp.Cookies = nil
+		cp.Session = nil
 		cp.AppPassword = ""
 		if acc.Mailbox != nil {
 			mailbox := *acc.Mailbox
@@ -688,15 +699,17 @@ func (m *Manager) SaveSession(id string, cookies map[string]string, serviceURL s
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
-	oldCookies, oldServiceURL := acc.Cookies, acc.ServiceURL
+	oldCookies, oldServiceURL, oldSession := acc.Cookies, acc.ServiceURL, acc.Session
 	if cookies != nil {
 		acc.Cookies = cloneCookies(cookies)
+		acc.Session = nil
 	}
 	if serviceURL != "" {
 		acc.ServiceURL = serviceURL
 	}
 	if err := m.saveAccount(acc); err != nil {
 		acc.Cookies, acc.ServiceURL = oldCookies, oldServiceURL
+		acc.Session = oldSession
 		return err
 	}
 	acc.credentialEpoch++
@@ -704,7 +717,7 @@ func (m *Manager) SaveSession(id string, cookies map[string]string, serviceURL s
 }
 
 // saveSessionIfCurrent 只接受借出客户端时对应的凭据代际。
-func (m *Manager) saveSessionIfCurrent(id string, epoch uint64, host, proxy string, cookies map[string]string, serviceURL string, replaceCredentials bool) (bool, error) {
+func (m *Manager) saveSessionIfCurrent(id string, epoch uint64, host, proxy string, cookies map[string]string, serviceURL string, replaceCredentials bool, session *hme.BrowserSession) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	acc, ok := m.accounts[id]
@@ -714,7 +727,8 @@ func (m *Manager) saveSessionIfCurrent(id string, epoch uint64, host, proxy stri
 	if acc.credentialEpoch != epoch || acc.Host != host || acc.Proxy != proxy {
 		return false, nil
 	}
-	oldCookies, oldServiceURL := acc.Cookies, acc.ServiceURL
+	oldCookies, oldServiceURL, oldSession := acc.Cookies, acc.ServiceURL, acc.Session
+	acc.Session = session.Clone()
 	acc.Cookies = cloneCookies(cookies)
 	if replaceCredentials {
 		acc.ServiceURL = ""
@@ -723,7 +737,7 @@ func (m *Manager) saveSessionIfCurrent(id string, epoch uint64, host, proxy stri
 		acc.ServiceURL = serviceURL
 	}
 	if err := m.saveAccount(acc); err != nil {
-		acc.Cookies, acc.ServiceURL = oldCookies, oldServiceURL
+		acc.Cookies, acc.ServiceURL, acc.Session = oldCookies, oldServiceURL, oldSession
 		return false, err
 	}
 	if replaceCredentials {

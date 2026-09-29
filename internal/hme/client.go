@@ -69,13 +69,15 @@ type Client struct {
 	// 一个 Client 会被 BatchUpdateAliases 的多个 worker 共享；若不串行化，
 	// 并发首次调用会同时触发多次 ValidateSession 并交错写入这三个字段
 	// (数据竞争 + 重复的 Apple validate 风控暴露)。
-	stateMu     sync.Mutex
-	Cookies     map[string]string
-	Host        string // "icloud.com" or "icloud.com.cn"
-	Proxy       string // HTTP/SOCKS5 代理
-	Username    string // iCloud 账号 (用于登录)
-	Password    string // iCloud 密码 (用于登录)
-	Verbose     bool
+	stateMu         sync.Mutex
+	Cookies         map[string]string
+	session         *BrowserSession
+	scopedJar       *sessionJar
+	Host            string // "icloud.com" or "icloud.com.cn"
+	Proxy           string // HTTP/SOCKS5 代理
+	Username        string // iCloud 账号 (用于登录)
+	Password        string // iCloud 密码 (用于登录)
+	Verbose         bool
 	httpc           tls_client.HttpClient
 	setupURL        string
 	serviceURL      string
@@ -86,6 +88,9 @@ type Client struct {
 	pendingAuth     *authState
 	PreReserveHook  func(ctx context.Context, candidate string) error
 	PostReserveHook func(ctx context.Context, candidate, anonymousID string, err error)
+	// SessionValidated persists an identity-checked checkpoint before subsequent
+	// business requests can fail or invalidate cookies. Must not reenter Client.
+	SessionValidated func(*BrowserSession, *AccountInfo, string) error
 }
 
 // NewClient 创建一个新的 HME 客户端,底层使用 Chrome TLS 指纹。
@@ -100,11 +105,10 @@ func NewClient(cookies map[string]string, host, proxy string, verbose bool) (*Cl
 	if cookies == nil {
 		cookies = make(map[string]string)
 	}
-	jar := tls_client.NewCookieJar()
 	options := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(30),
 		tls_client.WithClientProfile(profiles.Chrome_146),
-		tls_client.WithCookieJar(jar),
+		tls_client.WithCookieJar(nil),
 		tls_client.WithNotFollowRedirects(),
 	}
 
@@ -127,37 +131,8 @@ func NewClient(cookies map[string]string, host, proxy string, verbose bool) (*Cl
 		clientID: uuid.New().String(),
 	}
 
-	// 把传入的 Cookie 灌入 jar,后续请求自动携带。
-	if len(cookies) > 0 {
-		// 设置 Cookie 到所有可能的域名
-		domains := []string{
-			"https://www.icloud.com",
-			"https://www.icloud.com.cn",
-			"https://setup.icloud.com",
-			"https://setup.icloud.com.cn",
-			"https://" + c.Host,
-		}
-
-		// 添加 serviceURL 的域名（如果已知）
-		if c.serviceURL != "" {
-			if u, err := url.Parse(c.serviceURL); err == nil {
-				domains = append(domains, u.Scheme+"://"+u.Host)
-			}
-		}
-
-		for _, domain := range domains {
-			u, _ := url.Parse(domain)
-			httpCookies := make([]*http.Cookie, 0, len(cookies))
-			for k, v := range cookies {
-				httpCookies = append(httpCookies, &http.Cookie{
-					Name:  k,
-					Value: v,
-					Path:  "/",
-				})
-			}
-			jar.SetCookies(u, httpCookies)
-		}
-	}
+	// Legacy header imports have no scope metadata. Their map is the only
+	// request-cookie source; an additional jar would append stale duplicates.
 	return c, nil
 }
 
@@ -338,7 +313,7 @@ func (c *Client) RequestWithContext(ctx context.Context, method, rawURL string, 
 		// 手动添加 Cookie 头（确保跨域也能传递）
 		var cookieHeader string
 		c.cookieMu.RLock()
-		if len(c.Cookies) > 0 {
+		if c.scopedJar == nil && len(c.Cookies) > 0 {
 			cookieParts := make([]string, 0, len(c.Cookies))
 			for k, v := range c.Cookies {
 				if strings.HasPrefix(v, `"`) {
@@ -396,8 +371,27 @@ func (c *Client) RequestWithContext(ctx context.Context, method, rawURL string, 
 			return "", lastErr
 		}
 
+		// HTTP success does not imply application-level authentication success.
+		// Inspect only explicit error fields, never arbitrary strings in payloads.
+		authError := gjson.ValidBytes(text) && firstNonEmpty(gjson.GetBytes(text, "errorCode").String(), gjson.GetBytes(text, "error.errorCode").String(), gjson.GetBytes(text, "error.code").String()) == "AUTHENTICATION_FAILED"
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 && authError {
+			return "", ErrAuthFailed
+		}
+		if c.scopedJar != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && hostName == "setup."+c.Host {
+			c.cookieMu.Lock()
+			if token := resp.Header.Get("X-Apple-Session-Token"); token != "" {
+				c.session.Auth.SessionToken = token
+			}
+			if token := resp.Header.Get("X-Apple-TwoSV-Trust-Token"); token != "" {
+				c.session.Auth.TrustToken = token
+			}
+			if country := resp.Header.Get("X-Apple-ID-Account-Country"); country != "" {
+				c.session.Auth.AccountCountry = country
+			}
+			c.cookieMu.Unlock()
+		}
 		respCookies := resp.Cookies()
-		if len(respCookies) > 0 {
+		if c.scopedJar == nil && len(respCookies) > 0 {
 			now := time.Now()
 			c.cookieMu.Lock()
 			if c.Cookies == nil {
@@ -414,7 +408,15 @@ func (c *Client) RequestWithContext(ctx context.Context, method, rawURL string, 
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			if c.scopedJar != nil && resp.StatusCode == http.StatusForbidden {
+				if !authError {
+					return "", ErrAccessDenied
+				}
+			}
 			snippet := string(text)
+			if c.scopedJar != nil || strings.Contains(rawURL, "/accountLogin") {
+				snippet = "authentication exchange rejected"
+			}
 			if len(snippet) > 200 {
 				snippet = snippet[:200]
 			}
@@ -426,6 +428,15 @@ func (c *Client) RequestWithContext(ctx context.Context, method, rawURL string, 
 				lastErr = fmt.Errorf("%w: HTTP 429: %s", ErrRateLimited, snippet)
 				idx := min(attempt-1, len(retryDelays)-1)
 				retryDelay := parseRetryAfter(resp.Header.Get("Retry-After"), retryDelays[idx])
+				if c.scopedJar != nil && hostName == "setup."+c.Host {
+					if u, parseErr := url.Parse(rawURL); parseErr == nil && u.Path == "/setup/ws/1/accountLogin" {
+						c.cookieMu.Lock()
+						if deadline := time.Now().Add(retryDelay).Unix(); deadline > c.session.RecoveryAfter {
+							c.session.RecoveryAfter = deadline
+						}
+						c.cookieMu.Unlock()
+					}
+				}
 				if attempt < maxAttempts {
 					if sleepErr := c.sleepDuration(ctx, retryDelay); sleepErr != nil {
 						return "", sleepErr
@@ -499,7 +510,7 @@ func (c *Client) sleepRetry(ctx context.Context, attempt int) error {
 // 调用方须持有 stateMu（或确认独占），内部走无锁内核避免自死锁。
 func (c *Client) validationURLs() []string {
 	primary := c.setupURLLocked() + "/validate"
-	if c.Host != "icloud.com.cn" {
+	if c.Host != "icloud.com.cn" || c.scopedJar != nil {
 		return []string{primary}
 	}
 	global := "https://setup.icloud.com/setup/ws/1/validate"
@@ -575,6 +586,9 @@ func (c *Client) Close() {
 
 // CookieSnapshot 返回当前 Cookies 的并发安全快照副本。
 func (c *Client) CookieSnapshot() map[string]string {
+	if c.scopedJar != nil {
+		return c.SessionSnapshot().CookieMap()
+	}
 	c.cookieMu.RLock()
 	defer c.cookieMu.RUnlock()
 	snap := make(map[string]string, len(c.Cookies))
@@ -620,7 +634,12 @@ func (c *Client) validateSessionLocked(ctx context.Context) error {
 		var candidate string
 		candidate, err = c.RequestWithContext(ctx, "POST", validationURL, nil, 15*time.Second, 1)
 		if err == nil && !gjson.Valid(candidate) {
-			err = fmt.Errorf("invalid JSON response")
+			err = fmt.Errorf("%w: invalid validate JSON", ErrInvalidResponseSchema)
+		}
+		if err == nil && c.session != nil {
+			if identityErr := checkSessionIdentity(candidate, c.session.DSID); identityErr != nil {
+				return identityErr
+			}
 		}
 		if err == nil && gjson.Get(candidate, "webservices.premiummailsettings.url").String() == "" {
 			err = fmt.Errorf("validate 响应缺少 Hide My Email 服务端点")
@@ -640,27 +659,6 @@ func (c *Client) validateSessionLocked(ctx context.Context) error {
 	data := gjson.Parse(body)
 	serviceURL := data.Get("webservices.premiummailsettings.url").String()
 	c.serviceURLLocked(serviceURL)
-
-	// 获取 serviceURL 后，再次设置 Cookie 到该域名
-	c.cookieMu.RLock()
-	cookieCount := len(c.Cookies)
-	var httpCookies []*http.Cookie
-	if cookieCount > 0 {
-		httpCookies = make([]*http.Cookie, 0, cookieCount)
-		for k, v := range c.Cookies {
-			httpCookies = append(httpCookies, &http.Cookie{
-				Name:  k,
-				Value: v,
-				Path:  "/",
-			})
-		}
-	}
-	c.cookieMu.RUnlock()
-	if len(httpCookies) > 0 && c.serviceURL != "" {
-		if u, err := url.Parse(c.serviceURL); err == nil && u.Host != "" {
-			c.httpc.SetCookies(u, httpCookies)
-		}
-	}
 
 	dsInfo := data.Get("dsInfo")
 	c.dsid = dsInfo.Get("dsid").String()
@@ -682,6 +680,11 @@ func (c *Client) validateSessionLocked(ctx context.Context) error {
 		c.cookieMu.RUnlock()
 	}
 	c.accountInfo = info
+	if c.session != nil && c.SessionValidated != nil {
+		if err := c.SessionValidated(c.SessionSnapshot(), info, c.serviceURL); err != nil {
+			return err
+		}
+	}
 	c.log("会话有效 → %s", nonEmpty(info.AppleID, "未知账号"))
 	return nil
 }

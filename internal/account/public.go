@@ -36,6 +36,17 @@ type Summary struct {
 	StatusMessage  string          `json:"status_message,omitempty"`
 	CreatedAt      string          `json:"created_at"`
 	Tags           []string        `json:"tags,omitempty"`
+	Session        *SessionSummary `json:"session,omitempty"`
+}
+
+// SessionSummary contains only diagnostics, never cookies or authentication tokens.
+type SessionSummary struct {
+	Trusted           bool     `json:"trusted"`
+	CapturedAt        int64    `json:"captured_at"`
+	RecoveryAvailable bool     `json:"recovery_available"`
+	RecoveryBlocked   bool     `json:"recovery_blocked"`
+	RecoveryAfter     int64    `json:"recovery_after,omitempty"`
+	TokenExpiresAt    *float64 `json:"token_expires_at"`
 }
 
 // Summary 返回账号的安全快照,忽略内部 LastError。
@@ -52,7 +63,7 @@ func (a *Account) Summary() Summary {
 		Status:         a.Status,
 		AliasTotal:     a.AliasTotal,
 		AliasActive:    a.AliasActive,
-		HasCookies:     len(a.Cookies) > 0,
+		HasCookies:     len(a.Cookies) > 0 || a.Session != nil,
 		HasAppPassword: a.AppPassword != "",
 		HasProxy:       a.Proxy != "",
 		LastValidated:  a.LastValidated,
@@ -61,6 +72,11 @@ func (a *Account) Summary() Summary {
 	}
 	if a.Mailbox != nil {
 		s.Mailbox = &MailboxSummary{Provider: a.Mailbox.Provider, Email: a.Mailbox.Email, IMAPHost: a.Mailbox.IMAPHost, IMAPPort: a.Mailbox.IMAPPort}
+	}
+	if a.Session != nil {
+		bs := a.Session
+		s.Session = &SessionSummary{Trusted: bs.Trusted, CapturedAt: bs.CapturedAt, RecoveryAvailable: bs.Auth.SessionToken != "" && !bs.RecoveryBlocked, RecoveryBlocked: bs.RecoveryBlocked, RecoveryAfter: bs.RecoveryAfter}
+		s.Session.TokenExpiresAt = bs.TokenExpiresAt()
 	}
 	switch a.Status {
 	case "pending":

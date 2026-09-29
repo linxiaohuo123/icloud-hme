@@ -32,10 +32,10 @@ func (m *Manager) HMEClient(id string, verbose bool) (*hme.Client, error) {
 	if !ok {
 		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
-	if len(snap.Cookies) == 0 {
+	if len(snap.Cookies) == 0 && snap.Session == nil {
 		return nil, fmt.Errorf("账号未配置 Cookie，无法使用 HME 功能")
 	}
-	c, err := hme.NewClient(snap.Cookies, snap.Host, snap.Proxy, verbose)
+	c, err := hme.NewClientWithSession(snap.Cookies, snap.Session, snap.Host, snap.Proxy, verbose)
 	if err != nil {
 		return nil, err
 	}
@@ -160,6 +160,7 @@ func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTP
 	}
 	old := *cur
 	cur.Cookies = client.CookieSnapshot()
+	cur.Session = client.SessionSnapshot()
 	cur.ServiceURL = client.ServiceURL()
 	cur.Status = "active"
 	cur.LastValidated = time.Now().Format(time.RFC3339)

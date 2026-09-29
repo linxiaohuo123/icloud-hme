@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -48,6 +49,7 @@ type hmeClientEntry struct {
 	fingerprint     string
 	credentialEpoch uint64
 	client          *hme.Client
+	needsValidation bool
 	lastUsed        atomic.Int64 // UnixNano
 }
 
@@ -214,6 +216,10 @@ func hmeFingerprint(acc *Account) string {
 	sort.Strings(keys)
 
 	h := sha256.New()
+	if acc.Session != nil {
+		raw, _ := json.Marshal(acc.Session)
+		h.Write(raw)
+	}
 	h.Write([]byte(acc.Host))
 	h.Write([]byte{0})
 	h.Write([]byte(acc.Proxy))
@@ -281,7 +287,7 @@ func (m *Manager) WithHMEClientContextSession(ctx context.Context, id string, fn
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrHMEClientUnavailable, err)
 	}
-	if len(snap.Cookies) == 0 {
+	if len(snap.Cookies) == 0 && snap.Session == nil {
 		return fmt.Errorf("%w: 账号未配置 Cookie，无法使用 HME 功能", ErrHMEClientUnavailable)
 	}
 
@@ -291,7 +297,7 @@ func (m *Manager) WithHMEClientContextSession(ctx context.Context, id string, fn
 			entry.client.Close()
 			entry.client = nil
 		}
-		client, cerr := hme.NewClient(snap.Cookies, snap.Host, snap.Proxy, false)
+		client, cerr := hme.NewClientWithSession(snap.Cookies, snap.Session, snap.Host, snap.Proxy, false)
 		if cerr != nil {
 			entry.fingerprint = ""
 			return fmt.Errorf("%w: %v", ErrHMEClientUnavailable, cerr)
@@ -303,38 +309,73 @@ func (m *Manager) WithHMEClientContextSession(ctx context.Context, id string, fn
 		entry.fingerprint = fp
 		entry.credentialEpoch = snap.credentialEpoch
 	}
-	if snap.Status == "error" && (snap.AppleDSID != "" || snap.LastValidated != "" || snap.AliasTotal > 0) {
-		if err := entry.client.ValidateSessionWithContext(ctx); err != nil {
+	// Commit verified authentication separately from business success. A later
+	// failed response must not erase this checkpoint or resurrect older tokens.
+	client := entry.client
+	client.SessionValidated = func(session *hme.BrowserSession, info *hme.AccountInfo, serviceURL string) error {
+		if err := verifyAppleIdentity(snap, info); err != nil {
 			return err
 		}
+		cookies := session.CookieMap()
+		saved, err := m.saveSessionIfCurrent(id, snap.credentialEpoch, snap.Host, snap.Proxy, cookies, serviceURL, false, session)
+		if err != nil {
+			return err
+		}
+		if !saved {
+			return ErrSessionChanged
+		}
+		snap.Session, snap.Cookies, snap.ServiceURL = session.Clone(), cookies, serviceURL
+		return nil
+	}
+	defer func() { client.SessionValidated = nil }()
+	if entry.needsValidation || entry.client.SessionNeedsValidation() || (snap.Status == "error" && (snap.AppleDSID != "" || snap.LastValidated != "" || snap.AliasTotal > 0)) {
+		if err := entry.client.ValidateSessionWithRecovery(ctx); err != nil {
+			saveErr := m.saveRecoveryProgress(id, snap, entry.client.SessionSnapshot())
+			entry.client.Close()
+			entry.client = nil
+			return errors.Join(err, saveErr)
+		}
+		entry.needsValidation = false
 		if err := verifyAppleIdentity(snap, entry.client.AccountInfo()); err != nil {
 			return err
 		}
 	}
 
 	runErr := fn(entry.client, snap.credentialEpoch)
-
-	// 仅当业务调用成功时才回写刷新后的会话（防止业务报错时由于上游 Set-Cookie: Max-Age=0 将残缺 Cookie 脏写回库）
-	if runErr == nil {
-		newCookies := entry.client.CookieSnapshot()
-		newServiceURL := entry.client.ServiceURL()
-		saved, saveErr := m.saveSessionIfCurrent(id, snap.credentialEpoch, snap.Host, snap.Proxy, newCookies, newServiceURL, false)
-		if saveErr != nil {
-			return saveErr
+	if errors.Is(runErr, hme.ErrAuthFailed) || errors.Is(runErr, hme.ErrOTPRequired) || errors.Is(runErr, hme.ErrSessionIdentity) {
+		entry.needsValidation = true
+	}
+	if runErr != nil {
+		saveErr := m.saveRecoveryProgress(id, snap, entry.client.SessionSnapshot())
+		if snap.Session != nil {
+			entry.client.Close()
+			entry.client = nil
 		}
-		if !saved {
-			entry.fingerprint = ""
-			return ErrSessionChanged
-		}
-		// 同步条目指纹，避免下次借出时因正常会话刷新被误判为凭据变更而摧毁长连接
-		snap.Cookies = newCookies
-		if newServiceURL != "" {
-			snap.ServiceURL = newServiceURL
-		}
-		entry.fingerprint = hmeFingerprint(snap)
+		return errors.Join(runErr, saveErr)
 	}
 
-	return runErr
+	// 仅当业务调用成功时才回写刷新后的会话（防止业务报错时由于上游 Set-Cookie: Max-Age=0 将残缺 Cookie 脏写回库）
+	newCookies := entry.client.CookieSnapshot()
+	newServiceURL := entry.client.ServiceURL()
+	saved, saveErr := m.saveSessionIfCurrent(id, snap.credentialEpoch, snap.Host, snap.Proxy, newCookies, newServiceURL, false, entry.client.SessionSnapshot())
+	if saveErr != nil {
+		entry.client.Close()
+		entry.client = nil
+		return saveErr
+	}
+	if !saved {
+		entry.fingerprint = ""
+		return ErrSessionChanged
+	}
+	// 同步条目指纹，避免下次借出时因正常会话刷新被误判为凭据变更而摧毁长连接
+	snap.Cookies = newCookies
+	snap.Session = entry.client.SessionSnapshot()
+	if newServiceURL != "" {
+		snap.ServiceURL = newServiceURL
+	}
+	entry.fingerprint = hmeFingerprint(snap)
+
+	return nil
 }
 
 // WithHMEClient 借出账号级 HME 客户端执行 fn (兼容保留包装)。

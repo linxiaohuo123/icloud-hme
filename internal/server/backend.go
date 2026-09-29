@@ -842,11 +842,12 @@ func (b *managerBackend) pollCamoufoxTask(accountID, taskID, camoufoxBase string
 			return account.Summary{}, camoufoxHTTPError("查询登录任务", status)
 		}
 		var task struct {
-			TaskID       string            `json:"task_id"`
-			Status       string            `json:"status"`
-			Host         string            `json:"host"`
-			ErrorMessage string            `json:"error_message"`
-			Cookies      map[string]string `json:"cookies"`
+			TaskID       string              `json:"task_id"`
+			Status       string              `json:"status"`
+			Host         string              `json:"host"`
+			ErrorMessage string              `json:"error_message"`
+			Cookies      map[string]string   `json:"cookies"`
+			Session      *hme.BrowserSession `json:"session"`
 		}
 		err = json.NewDecoder(resp.Body).Decode(&task)
 		resp.Body.Close()
@@ -877,6 +878,9 @@ func (b *managerBackend) pollCamoufoxTask(accountID, taskID, camoufoxBase string
 		case "failed":
 			_ = b.cancelAndClearCamoufoxTask(accountID, taskID, camoufoxBase)
 			errMsg := task.ErrorMessage
+			if strings.Contains(errMsg, "完整的保持登录会话") {
+				return account.Summary{}, &BackendError{Status: http.StatusUnauthorized, Code: "APPLE_AUTH_REJECTED", Message: "未捕获完整的保持登录会话，请重新登录并确认保持登录和信任浏览器"}
+			}
 			if strings.Contains(errMsg, "验证码输入失败") {
 				return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "OTP_INPUT_FAILED", Message: "Camoufox 未能填入双重认证验证码，请重新登录"}
 			}
@@ -895,7 +899,10 @@ func (b *managerBackend) pollCamoufoxTask(accountID, taskID, camoufoxBase string
 			if len(task.Cookies) == 0 {
 				return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "Camoufox 登录成功但未返回 Cookie"}
 			}
-			if err := b.mgr.UpdateCookiesIfValidForHost(accountID, task.Cookies, task.Host); err != nil {
+			if task.Session == nil || task.Session.Host != task.Host {
+				return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "Camoufox 未返回完整会话，请更新登录代理后重新登录"}
+			}
+			if err := b.mgr.UpdateBrowserSession(accountID, task.Session); err != nil {
 				return account.Summary{}, mapAccountErr(err)
 			}
 			b.invalidateAliasCache(accountID)
@@ -1068,6 +1075,12 @@ func (b *managerBackend) ValidateAccountContext(ctx context.Context, id string) 
 
 // mapAccountErr 把账号管理器错误映射为稳定错误。
 func mapAccountErr(err error) *BackendError {
+	if errors.Is(err, hme.ErrRecoveryDeferred) {
+		return &BackendError{Status: http.StatusServiceUnavailable, Code: "SESSION_RECOVERY_DEFERRED", Message: "会话恢复暂缓，请稍后重试"}
+	}
+	if errors.Is(err, hme.ErrOTPRequired) {
+		return &BackendError{Status: http.StatusUnauthorized, Code: "SESSION_REAUTH_REQUIRED", Message: "Apple 要求重新验证，请重新登录"}
+	}
 	if errors.Is(err, account.ErrAccountIdentityMismatch) {
 		return &BackendError{Status: http.StatusConflict, Code: "ACCOUNT_IDENTITY_MISMATCH", Message: err.Error()}
 	}
@@ -1091,6 +1104,15 @@ func mapAccountErr(err error) *BackendError {
 func classifyUpstreamErr(fixedMsg string, err error) *BackendError {
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, hme.ErrRecoveryDeferred) || errors.Is(err, hme.ErrOTPRequired) {
+		return mapAccountErr(err)
+	}
+	if errors.Is(err, hme.ErrAccessDenied) {
+		return &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_ACCESS_DENIED", Message: "Apple 拒绝访问，尚不能判定会话过期，请检查访问环境"}
+	}
+	if errors.Is(err, hme.ErrSessionIdentity) {
+		return &BackendError{Status: http.StatusConflict, Code: "ACCOUNT_IDENTITY_MISMATCH", Message: "Apple 会话身份不一致，请重新登录"}
 	}
 	if errors.Is(err, account.ErrAccountIdentityMismatch) {
 		return mapAccountErr(err)

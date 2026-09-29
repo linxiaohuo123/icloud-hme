@@ -52,9 +52,10 @@ func (c *Client) ListAliasesWithContext(ctx context.Context) ([]Alias, error) {
 		// 若已缓存的 serviceURL 失效，清空并重新走一次 ValidateSession 自愈
 		if c.ServiceURL() != "" {
 			c.ResetServiceEndpoint()
-			if resolveErr := c.resolveService(ctx); resolveErr == nil {
-				body, err = c.RequestWithContext(ctx, "GET", c.ServiceURL()+"/v2/hme/list", nil, 0, MaxRetries)
+			if resolveErr := c.resolveService(ctx); resolveErr != nil {
+				return nil, resolveErr
 			}
+			body, err = c.RequestWithContext(ctx, "GET", c.ServiceURL()+"/v2/hme/list", nil, 0, MaxRetries)
 		}
 		if err != nil {
 			return nil, err

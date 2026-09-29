@@ -420,6 +420,13 @@ func (s *Store) initSchema(dbExistedBefore bool) error {
 			if err := tx.Commit(); err != nil {
 				return fmt.Errorf("commit migration v6 to v7 tx failed: %w", err)
 			}
+		case 7:
+			// v8 stores a versioned browser session in the existing encrypted
+			// cookies column. Legacy maps remain readable; old binaries must not
+			// open and silently discard the richer credential format.
+			if _, err := s.db.Exec(`PRAGMA user_version = 8;`); err != nil {
+				return fmt.Errorf("migrate v7 to v8 failed: %w", err)
+			}
 		default:
 			return fmt.Errorf("unsupported migration path from version %d", currentV)
 		}

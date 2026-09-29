@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 crypto/sha256, golang.org/x/crypto/pbkdf2, bogdanfinn/fhttp, icloud-hme/internal/srp
+ * [INPUT]: 依赖 crypto/sha256, golang.org/x/crypto/pbkdf2, bogdanfinn/fhttp, bogdanfinn/tls-client, icloud-hme/internal/srp
  * [OUTPUT]: 对外提供 Login, OTPProvider, Validate 等 iCloud SRP 认证与会话提取能力
  * [POS]: internal/hme 的身份认证与会话握手层
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -27,6 +27,7 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 
 	http "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
 	"icloud-hme/internal/srp"
 )
 
@@ -71,6 +72,11 @@ type authState struct {
 // 登录成功后,可以通过 client.GetCookies() 获取 Cookie。
 // 启用 2FA 时,会调用 otpProvider 获取验证码。
 func (c *Client) Login(username, password string, otpProvider OTPProvider) error {
+	// Authentication uses a jar until finishAuth hands the cookies to the
+	// legacy protocol map. Re-login after a previous handoff needs a fresh jar.
+	if c.httpc.GetCookieJar() == nil {
+		c.httpc.SetCookieJar(tls_client.NewCookieJar())
+	}
 	state := &authState{
 		username: username,
 		password: password,
@@ -476,6 +482,11 @@ func (c *Client) finishAuth(state *authState) error {
 	c.cookieMu.Lock()
 	c.Cookies = cookies
 	c.cookieMu.Unlock()
+	// Protocol requests send the map explicitly; retaining the login jar would
+	// append duplicate cookies and resurrect values deleted by later responses.
+	if c.scopedJar == nil {
+		c.httpc.SetCookieJar(nil)
+	}
 	c.log("登录成功,获取到 %d 个 Cookie", len(cookies))
 	return nil
 }
