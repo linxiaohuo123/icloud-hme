@@ -228,6 +228,9 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 			log.Printf("[Server] 恢复 %d 个已确认创建的出号操作", recovered)
 		}
 	}
+	if mb, ok := be.(*managerBackend); ok {
+		mb.recoverCamoufoxTasks()
+	}
 	// 生产后端拉取到别名列表时自动登记「别名 → 母号」路由，
 	// 使存量别名(未入出号流水表的)也能被定向拉信，而不必依赖有上限的盲扫。
 	if mb, ok := be.(*managerBackend); ok {
@@ -609,6 +612,7 @@ func (s *Server) register() {
 				adm.PUT("/accounts/:id/mailbox", csrfCheck(s.auth), s.setMailboxHandler)
 				adm.DELETE("/accounts/:id/mailbox", csrfCheck(s.auth), s.removeMailboxHandler)
 				adm.POST("/accounts/:id/login", csrfCheck(s.auth), s.loginAccountHandler)
+				adm.POST("/accounts/:id/login/cancel", csrfCheck(s.auth), s.cancelCamoufoxLoginHandler)
 				adm.DELETE("/accounts/:id", csrfCheck(s.auth), s.removeAccountHandler)
 
 				// ===== 自动化作业编排 =====
@@ -659,6 +663,10 @@ func (s *Server) register() {
 				adm.PUT("/settings/notify", csrfCheck(s.auth), s.updateNotifySettingsHandler)
 				adm.PATCH("/settings/notify", csrfCheck(s.auth), s.updateNotifySettingsHandler)
 				adm.POST("/settings/notify/test", csrfCheck(s.auth), s.testNotifyHandler)
+
+				// ===== 系统设置: Camoufox 代理 =====
+				adm.GET("/settings/camoufox", s.getCamoufoxSettingsHandler)
+				adm.POST("/settings/camoufox/test", csrfCheck(s.auth), s.testCamoufoxHandler)
 
 				// ===== 系统 =====
 				adm.POST("/reload", csrfCheck(s.auth), s.reloadConfigHandler)

@@ -168,6 +168,34 @@ func TestUpdateCookiesReturnsValidationFailure(t *testing.T) {
 	}
 }
 
+func TestUpdateCookiesIfValidPreservesExistingCredentials(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "proxy denied", http.StatusForbidden)
+	}))
+	defer proxy.Close()
+
+	m, err := NewManager(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	acc, err := m.AddAccount("test", "", "icloud.com", proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UpdateCookies(acc.ID, map[string]string{"session": "old"}); !errors.Is(err, ErrCookiesSavedInvalid) {
+		t.Fatalf("manual update should retain its existing save-on-failure behavior: %v", err)
+	}
+	before, _ := m.GetAccount(acc.ID)
+	if err := m.UpdateCookiesIfValid(acc.ID, map[string]string{"session": "new"}); !errors.Is(err, ErrCookiesRejectedInvalid) {
+		t.Fatalf("automatic update should reject invalid cookies: %v", err)
+	}
+	after, _ := m.GetAccount(acc.ID)
+	if after.Cookies["session"] != "old" || after.Status != before.Status || after.LastError != before.LastError || after.credentialEpoch != before.credentialEpoch {
+		t.Fatalf("rejected cookies changed account state: before=%+v after=%+v", before, after)
+	}
+}
+
 func TestUpdateCookiesRestoresMemoryOnPersistenceFailure(t *testing.T) {
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "proxy denied", http.StatusForbidden)

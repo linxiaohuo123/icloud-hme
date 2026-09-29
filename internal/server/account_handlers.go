@@ -282,8 +282,18 @@ type loginAccountReq struct {
 func (s *Server) loginAccountHandler(c *gin.Context) {
 	id := c.Param("id")
 	var req loginAccountReq
-	if err := c.ShouldBindJSON(&req); err != nil || (req.Password == "" && req.OTPCode == "") {
-		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: password 必填")
+	if err := c.ShouldBindJSON(&req); err != nil {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "请求体必须是 JSON")
+		return
+	}
+	hasPassword := req.Password != ""
+	hasOTP := req.OTPCode != ""
+	if hasPassword == hasOTP {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "password 与 otp_code 必须二选一")
+		return
+	}
+	if hasOTP && !isValidOTPCode(req.OTPCode) {
+		failCode(c, http.StatusBadRequest, "OTP_INVALID", "otp_code 必须是 6 位数字")
 		return
 	}
 	sum, err := s.be.LoginAccount(id, req.Password, req.OTPCode)
@@ -295,6 +305,22 @@ func (s *Server) loginAccountHandler(c *gin.Context) {
 		s.mailReadService.InvalidateAccount(id)
 	}
 	ok(c, sum)
+}
+
+func (s *Server) cancelCamoufoxLoginHandler(c *gin.Context) {
+	var req struct {
+		TaskID string `json:"task_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "task_id 必填")
+		return
+	}
+	cancelled, err := s.be.CancelCamoufoxLogin(c.Param("id"), req.TaskID)
+	if err != nil {
+		backendFail(c, err)
+		return
+	}
+	ok(c, gin.H{"cancelled": cancelled})
 }
 
 // removeAccountHandler 处理 DELETE /api/accounts/:id。

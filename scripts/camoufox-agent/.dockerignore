@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+*.log
+test*.py
+captured_cookies.json
+diagnostics/

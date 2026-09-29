@@ -184,6 +184,8 @@ func (f *fakeBackend) LoginAccount(id, password, otp string) (account.Summary, e
 	return f.accounts[0], nil
 }
 
+func (f *fakeBackend) CancelCamoufoxLogin(string, string) (bool, error) { return false, nil }
+
 func (f *fakeBackend) RemoveAccount(id string) bool {
 	f.removedID = id
 	return f.removedOK

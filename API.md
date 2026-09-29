@@ -33,10 +33,17 @@ HTTP JSON API，所有接口均采用标准 JSON 格式交互。
 | `ACCOUNT_NOT_FOUND` | 404 | 指定的 iCloud 账号不存在 |
 | `ACCOUNT_IDENTITY_MISMATCH` | 409 | 新 Cookie 或密码登录对应另一 Apple 账号，原账号和库存保持不变 |
 | `COOKIE_SAVED_INVALID` | 422 | 新 Cookie 已保存，但 Apple 会话校验失败；账号状态已更新，需刷新状态 |
+| `COOKIE_VALIDATION_FAILED` | 422 | 自动登录所得 Cookie 未通过 Apple 校验，原有凭据未改变 |
 | `VALIDATION_ERROR` | 400 | 请求体或 Query 参数校验失败 |
 | `ALIAS_LIMIT_REACHED` | 400 | 单账号活跃别名已达 Apple 750 上限，网关层自动熔断拦截 |
 | `OTP_REQUIRED` | 409 | iCloud 账号登录需要双重认证 (2FA) 验证码 |
-| `OTP_INVALID` | 401 | 提交的 2FA 验证码错误或已过期 |
+| `OTP_INVALID` | 400 | 2FA 验证码必须是 6 位数字 |
+| `OTP_EXPIRED` | 400 | 2FA 登录任务已失效或超时 |
+| `AUTH_TASK_EXPIRED` | 502 | Camoufox 登录任务已在代理端失效 |
+| `CAMOUFOX_TRANSPORT_INVALID` | 503 | 跨主机 Camoufox 通信未使用 HTTPS |
+| `CAMOUFOX_UNAVAILABLE` | 503 | 已配置的 Camoufox 代理未通过连通性或浏览器探活检查 |
+| `CAMOUFOX_AUTH_FAILED` | 502 | Camoufox 通信令牌无效或无权访问代理 |
+| `OTP_REJECTED` | 401 | Apple 拒绝了提交的 2FA 验证码 |
 | `RATE_LIMITED` | 429 | 触发安全流控或账号配额超限 (响应含 `Retry-After` 头) |
 | `VERIFY_TIMEOUT` | 408 | 验证码长轮询等待超时 (指定时间内未收到目标邮件) |
 | `UPSTREAM_UNAUTHORIZED` | 401 | iCloud 上传凭据 (Cookie/Token) 已被 Apple 吊销或失效 |
@@ -291,7 +298,21 @@ Content-Type: application/json
   "otp_code": "123456"
 }
 ```
-- 若 Apple 要求双重认证，接口返回 `409 OTP_REQUIRED`；客户端输入收到的 6 位验证码重新提交带有 `otp_code` 的请求即可。
+- 请求体必须在 `password` 与 `otp_code` 中二选一；`otp_code` 必须是 6 位数字。若 Apple 要求双重认证，接口返回 `409 OTP_REQUIRED`；Camoufox 模式下响应的 `data.task_id` 标识本次登录任务。客户端输入收到的 6 位验证码后，仅提交带有 `otp_code` 的请求即可。
+- 未配置 Camoufox URL 和令牌时使用原生 SRP；已配置代理但不可用时返回 `503 CAMOUFOX_UNAVAILABLE`，不会自动切换登录方式。主服务重启后旧 Camoufox 验证码返回 `OTP_EXPIRED`。
+- 自动登录所得 Cookie 通过 Apple 会话校验后才会替换账号原有凭据；校验失败返回 `422 COOKIE_VALIDATION_FAILED`。
+
+取消 Camoufox 双重认证任务时，使用 `OTP_REQUIRED` 响应中的任务 ID：
+
+```http
+POST /api/accounts/:id/login/cancel
+Authorization: Bearer <API_KEY>
+Content-Type: application/json
+
+{"task_id":"task_..."}
+```
+
+响应 `data.cancelled` 表示该任务的取消请求已被代理接受；若代理不可达，接口返回错误并保留任务以供重试。
 
 ### 12. 删除账号
 

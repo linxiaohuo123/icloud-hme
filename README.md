@@ -311,8 +311,12 @@ POST /api/accounts/:id/login
 
 # 请求体
 {
-  "password": "用户的常规iCloud密码",  # 不是 App Password
-  "otp_code": "123456"                  # 可选,2FA 验证码
+  "password": "用户的常规iCloud密码"     # 首次登录提交 password
+}
+
+# 收到 OTP_REQUIRED 后，第二次请求只提交验证码
+{
+  "otp_code": "123456"
 }
 
 # 响应
@@ -320,10 +324,11 @@ POST /api/accounts/:id/login
   "success": true,
   "data": {
     "id": "acc_1",
-    "cookies": {
-      "x-apple-session-token": "...",
-      "X-APPLE-WEBAUTH-TOKEN": "..."
-    }
+    "name": "主号",
+    "status": "active",
+    "has_cookies": true,
+    "has_app_password": true,
+    "has_proxy": false
   }
 }
 ```

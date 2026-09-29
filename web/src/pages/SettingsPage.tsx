@@ -41,6 +41,24 @@ export default function SettingsPage() {
   const [error, setError] = useState('')
   const [testResults, setTestResults] = useState<NotifyChannelResult[] | null>(null)
 
+  // Camoufox 代理连通性状态
+  const [camoufoxInfo, setCamoufoxInfo] = useState<{
+    url: string
+    available: boolean
+    ready: boolean
+    latency_ms: number
+    status_text: string
+    error?: string
+  } | null>(null)
+  const [camoufoxTesting, setCamoufoxTesting] = useState(false)
+  const [camoufoxTestResult, setCamoufoxTestResult] = useState<{
+    success: boolean
+    url: string
+    latency_ms: number
+    camoufox_ready?: boolean
+    message: string
+  } | null>(null)
+
   // 渠道 Secret 输入与清除状态 (输入框初始均为空，绝不以脱敏掩码作为输入值)
   const [feishuInput, setFeishuInput] = useState('')
   const [clearFeishu, setClearFeishu] = useState(false)
@@ -76,10 +94,70 @@ export default function SettingsPage() {
       .finally(() => {
         if (!unmounted) setLoading(false)
       })
+
+    // 读取 Camoufox 状态
+    request<{
+      url: string
+      available: boolean
+      ready: boolean
+      latency_ms: number
+      status_text: string
+      error?: string
+    }>('/api/settings/camoufox')
+      .then((data) => {
+        if (!unmounted) setCamoufoxInfo(data)
+      })
+      .catch(() => {})
+
     return () => {
       unmounted = true
     }
   }, [show])
+
+  async function handleTestCamoufox() {
+    if (camoufoxTesting) return
+    setCamoufoxTesting(true)
+    setCamoufoxTestResult(null)
+    try {
+      const res = await request<{
+        success: boolean
+        url: string
+        latency_ms: number
+        camoufox_ready?: boolean
+        message: string
+      }>('/api/settings/camoufox/test', {
+        method: 'POST',
+      })
+      setCamoufoxTestResult(res)
+      if (res.success) {
+        show(`Camoufox 连通成功！延迟 ${res.latency_ms}ms`)
+        setCamoufoxInfo((prev) =>
+          prev
+            ? {
+                ...prev,
+                available: true,
+                ready: !!res.camoufox_ready,
+                status_text: '在线就绪',
+                latency_ms: res.latency_ms,
+              }
+            : null
+        )
+      } else {
+        show(res.message || '连接失败')
+      }
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : '连接异常'
+      setCamoufoxTestResult({
+        success: false,
+        url: camoufoxInfo?.url || 'http://127.0.0.1:8089',
+        latency_ms: 0,
+        message: msg,
+      })
+      show(msg)
+    } finally {
+      setCamoufoxTesting(false)
+    }
+  }
 
   function eventEnabled(key: string): boolean {
     return eventKinds[key] ?? true
@@ -458,6 +536,70 @@ export default function SettingsPage() {
               </div>
               <span className="hint">设为 0 表示关闭。活跃别名数首次越过阈值时推送告警 (每个账号每天最多提醒一次)</span>
             </div>
+          </div>
+        </div>
+
+        {/* 卡片 3: Camoufox 自动化上号代理 */}
+        <div className="card">
+          <div className="card-header">
+            <h2 className="card-title">
+              <IconShield size={16} />
+              Camoufox 自动化上号代理
+            </h2>
+            {camoufoxInfo?.available ? (
+              <span className="badge badge-active">● 在线就绪 ({camoufoxInfo.latency_ms}ms)</span>
+            ) : (
+              <span className="badge badge-error">○ 离线 / 未连接</span>
+            )}
+          </div>
+          <div className="card-body">
+            <div className="form-field">
+              <label htmlFor="camoufox-agent-url">代理服务地址</label>
+              <input
+                id="camoufox-agent-url"
+                className="input"
+                type="text"
+                readOnly
+                value={camoufoxInfo?.url || 'http://127.0.0.1:8089'}
+                style={{ backgroundColor: 'var(--color-bg-secondary, #f8fafc)', cursor: 'default' }}
+              />
+              <span className="hint">
+                说明：可通过环境变量 <code>ICLOUD_HME_CAMOUFOX_URL</code> 自定义服务地址；在账号管理中进行 Apple ID 授权登录时将自动由该环境驱动。
+              </span>
+            </div>
+
+            <div style={{ marginTop: 12 }}>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => void handleTestCamoufox()}
+                disabled={camoufoxTesting}
+              >
+                <IconZap size={14} />
+                {camoufoxTesting ? '正在检测连通性…' : '测试代理连通性'}
+              </button>
+            </div>
+
+            {camoufoxTestResult && (
+              <div style={{ marginTop: 12 }} className={`notify-test-row ${camoufoxTestResult.success ? 'ok' : 'fail'}`}>
+                <span className="channel-badge">Camoufox Agent</span>
+                <span className="notify-test-status">
+                  {camoufoxTestResult.success ? (
+                    <>
+                      <IconCheck size={14} /> 连通成功 (延迟 {camoufoxTestResult.latency_ms}ms, 内核就绪: {camoufoxTestResult.camoufox_ready ? '是' : '否'})
+                    </>
+                  ) : (
+                    <>{camoufoxTestResult.message}</>
+                  )}
+                </span>
+              </div>
+            )}
+
+            {!camoufoxInfo?.available && !camoufoxTestResult?.success && (
+              <div className="alert-info" style={{ marginTop: 12, fontSize: 13 }}>
+                💡 <strong>提示</strong>：在项目根目录配置 <code>ICLOUD_HME_CAMOUFOX_TOKEN</code> 后运行 <code>docker compose up -d --build</code>；本地 Windows 可运行 <code>scripts\camoufox-agent\start_agent.bat</code>。
+              </div>
+            )}
           </div>
         </div>
 

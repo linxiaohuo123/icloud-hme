@@ -16,7 +16,7 @@ import (
 )
 
 // CurrentSchemaVersion 数据库正式版本基线
-const CurrentSchemaVersion = 6
+const CurrentSchemaVersion = 7
 
 type schemaExecutor interface {
 	Exec(query string, args ...any) (sql.Result, error)
@@ -669,6 +669,9 @@ func validateSchemaVersion(db *sql.DB, expectedVersion int) error {
 	if expectedVersion >= 3 {
 		requiredTables = append(requiredTables, "revoked_sessions")
 	}
+	if expectedVersion >= 7 {
+		requiredTables = append(requiredTables, "camoufox_tasks")
+	}
 	for _, tbl := range requiredTables {
 		var count int
 		err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", tbl).Scan(&count)
@@ -726,6 +729,15 @@ func validateSchemaVersion(db *sql.DB, expectedVersion int) error {
 			struct{ table, col string }{"operations", "result_source"},
 		)
 	}
+	if expectedVersion >= 7 {
+		requiredCols = append(requiredCols,
+			struct{ table, col string }{"camoufox_tasks", "account_id"},
+			struct{ table, col string }{"camoufox_tasks", "task_id"},
+			struct{ table, col string }{"camoufox_tasks", "base_url"},
+			struct{ table, col string }{"camoufox_tasks", "created_at"},
+			struct{ table, col string }{"camoufox_tasks", "updated_at"},
+		)
+	}
 	for _, rc := range requiredCols {
 		has, err := tableHasColumn(db, rc.table, rc.col)
 		if err != nil || !has {
@@ -766,6 +778,9 @@ func validateSchemaVersion(db *sql.DB, expectedVersion int) error {
 	if expectedVersion >= 6 {
 		requiredIndexes = append(requiredIndexes, "idx_leases_allocated_time", "idx_leases_email_time")
 	}
+	if expectedVersion >= 7 {
+		requiredIndexes = append(requiredIndexes, "idx_camoufox_tasks_task")
+	}
 	for _, idx := range requiredIndexes {
 		var count int
 		err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?", idx).Scan(&count)
@@ -788,6 +803,12 @@ func validateSchemaVersion(db *sql.DB, expectedVersion int) error {
 		{"hme_reserve_intents", []string{"intent_id"}},
 		{"alias_allocations", []string{"allocation_id"}},
 		{"operations", []string{"operation_id"}},
+	}
+	if expectedVersion >= 7 {
+		criticalUniques = append(criticalUniques, struct {
+			table   string
+			columns []string
+		}{"camoufox_tasks", []string{"task_id"}})
 	}
 	for _, cu := range criticalUniques {
 		has, err := hasUniqueConstraint(db, cu.table, cu.columns)

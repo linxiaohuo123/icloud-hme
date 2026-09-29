@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 errors, fmt, strings, time, unicode/utf8, icloud-hme/internal/hme
- * [OUTPUT]: 对外提供 ErrCookieExpired, ErrAccountIdentityMismatch, ErrCookiesSavedInvalid, (*Manager).UpdateCookies, (*Manager).ValidateAccount, (*Manager).markAccountError；校验账号身份与凭据代际
+ * [OUTPUT]: 对外提供 Cookie 校验错误、(*Manager).UpdateCookies/UpdateCookiesIfValid、会话校验与凭据代际保护
  * [POS]: internal/account 的账号会话校验、健康巡检状态机与凭据失效判定
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -23,6 +23,7 @@ import (
 var ErrCookieExpired = errors.New("cookie expired")
 var ErrAccountIdentityMismatch = errors.New("Apple 账号身份与当前母账号不一致，请新建账号")
 var ErrCookiesSavedInvalid = errors.New("Cookie 已保存，但校验未通过")
+var ErrCookiesRejectedInvalid = errors.New("Cookie 校验未通过，原有凭据未改变")
 
 func verifyAppleIdentity(acc *Account, info *hme.AccountInfo) error {
 	if acc.AppleDSID != "" {
@@ -46,6 +47,15 @@ func verifyAppleIdentity(acc *Account, info *hme.AccountInfo) error {
 
 // UpdateCookies 更新指定账号的 Cookie,并自动校验会话有效性。
 func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
+	return m.updateCookies(id, cookies, true)
+}
+
+// UpdateCookiesIfValid 仅在新 Cookie 通过校验时替换原有凭据，供自动登录使用。
+func (m *Manager) UpdateCookiesIfValid(id string, cookies map[string]string) error {
+	return m.updateCookies(id, cookies, false)
+}
+
+func (m *Manager) updateCookies(id string, cookies map[string]string, saveInvalid bool) error {
 	if len(cookies) == 0 {
 		return fmt.Errorf("cookies 不能为空")
 	}
@@ -110,6 +120,9 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 			// ListAliases 之后再快照，避免丢掉列表阶段的 Set-Cookie
 			snap.Cookies = client.CookieSnapshot()
 		}
+	}
+	if validationErr := errors.Join(err, validateErr); validationErr != nil && !saveInvalid {
+		return fmt.Errorf("%w: %v", ErrCookiesRejectedInvalid, validationErr)
 	}
 
 	m.mu.Lock()

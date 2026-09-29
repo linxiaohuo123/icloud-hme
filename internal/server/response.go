@@ -35,5 +35,5 @@ func failCode(c *gin.Context, status int, code, message string) {
 // backendFail 把 Backend 错误映射为统一失败响应。
 func backendFail(c *gin.Context, err error) {
 	be := asBackendError(err)
-	failCode(c, be.Status, be.Code, be.Message)
+	c.AbortWithStatusJSON(be.Status, apiResp{Success: false, Code: be.Code, Message: be.Message, Data: be.Data})
 }

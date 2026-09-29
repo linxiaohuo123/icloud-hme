@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 database/sql, modernc.org/sqlite, os, path/filepath, sync, time, encoding/hex, crypto/rand
  * [OUTPUT]: 对外提供 Store 结构定义、NewStore、Close 引擎生命周期与 initSchema SQLite 数据库与 DDL 初始化
- * [POS]: internal/store 的核心存储引擎，维护 WAL 连接生命周期与事务化版本迁移，v6 补齐流水实际时间索引
+ * [POS]: internal/store 的核心存储引擎，维护 WAL 连接生命周期与事务化版本迁移，v7 持久化 Camoufox 任务元数据
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -397,6 +397,28 @@ func (s *Store) initSchema(dbExistedBefore bool) error {
 			}
 			if err := tx.Commit(); err != nil {
 				return fmt.Errorf("commit migration v5 to v6 tx failed: %w", err)
+			}
+		case 6:
+			tx, err := s.db.Begin()
+			if err != nil {
+				return fmt.Errorf("begin migration v6 to v7 tx failed: %w", err)
+			}
+			if _, err := tx.Exec(`
+				CREATE TABLE IF NOT EXISTS camoufox_tasks (
+					account_id TEXT PRIMARY KEY,
+					task_id TEXT NOT NULL UNIQUE,
+					base_url TEXT NOT NULL,
+					created_at TEXT NOT NULL,
+					updated_at TEXT NOT NULL
+				);
+				CREATE INDEX IF NOT EXISTS idx_camoufox_tasks_task ON camoufox_tasks (task_id);
+				PRAGMA user_version = 7;
+			`); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migrate v6 to v7 failed: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit migration v6 to v7 tx failed: %w", err)
 			}
 		default:
 			return fmt.Errorf("unsupported migration path from version %d", currentV)

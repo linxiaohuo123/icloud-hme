@@ -27,12 +27,14 @@ export function setCSRFToken(token: string | null): void {
 export class ApiError extends Error {
   readonly status: number
   readonly code: string
+  readonly data: unknown
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, data?: unknown) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
+    this.data = data
   }
 }
 
@@ -100,6 +102,7 @@ export async function request<T>(
       resp.status,
       payload.code ?? 'INTERNAL_ERROR',
       payload.message ?? '请求失败',
+      payload.data,
     )
   }
   return payload.data as T

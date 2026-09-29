@@ -30,8 +30,10 @@ export default function ICloudLoginDialog({
   const [password, setPassword] = useState('')
   const [otp, setOtp] = useState('')
   const [otpRequired, setOtpRequired] = useState(false)
+  const [camoufoxTaskId, setCamoufoxTaskId] = useState<string | null>(null)
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
 
   async function handleSubmit() {
     if (submitting) return
@@ -40,17 +42,21 @@ export default function ICloudLoginDialog({
     try {
       await request(`/api/accounts/${accountId}/login`, {
         method: 'POST',
-        body: JSON.stringify({
-          password,
-          ...(otpRequired ? { otp_code: otp } : {}),
-        }),
+        body: JSON.stringify(otpRequired ? { otp_code: otp } : { password }),
       })
       setPassword('')
       setOtp('')
       setOtpRequired(false)
+      setCamoufoxTaskId(null)
       onSaved()
     } catch (err) {
       if (err instanceof ApiError && err.code === 'OTP_REQUIRED') {
+        const data = err.data
+        setCamoufoxTaskId(
+          data && typeof data === 'object' && 'task_id' in data && typeof data.task_id === 'string'
+            ? data.task_id
+            : null,
+        )
         setOtpRequired(true)
       } else {
         setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
@@ -60,10 +66,26 @@ export default function ICloudLoginDialog({
     }
   }
 
-  function handleClose() {
+  async function handleClose() {
+    if (submitting || cancelling) return
+    if (camoufoxTaskId) {
+      setCancelling(true)
+      try {
+        await request(`/api/accounts/${accountId}/login/cancel`, {
+          method: 'POST',
+          body: { task_id: camoufoxTaskId },
+        })
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : '取消登录失败，请重试')
+        setCancelling(false)
+        return
+      }
+      setCancelling(false)
+    }
     setPassword('')
     setOtp('')
     setOtpRequired(false)
+    setCamoufoxTaskId(null)
     setError('')
     onClose()
   }
@@ -72,7 +94,7 @@ export default function ICloudLoginDialog({
     <Dialog
       title="Apple ID 账号授权登录"
       open={open}
-      onClose={handleClose}
+      onClose={() => void handleClose()}
     >
       {accountEmail && (
         <div className="alert-info" style={{ marginBottom: 12 }}>
@@ -99,8 +121,8 @@ export default function ICloudLoginDialog({
             onChange={(e) => setPassword(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') void handleSubmit() }}
           />
-          <span className="field-hint" style={{ fontSize: 12, color: 'var(--color-text-secondary, #64748b)', marginTop: 4 }}>
-            说明：系统将通过 SRP 安全握手向 Apple 服务器申请会话凭据。
+          <span className="field-hint" style={{ fontSize: 12, color: 'var(--color-text-secondary, #64748b)', marginTop: 4, lineHeight: 1.5, display: 'block' }}>
+            系统将向 Apple 申请登录凭据。如登录受阻，可通过【更新 Cookie】使用浏览器 Cookie 激活。
           </span>
         </div>
       )}
@@ -119,10 +141,15 @@ export default function ICloudLoginDialog({
           />
         </div>
       )}
+      {(submitting || cancelling) && (
+        <div className="alert-info" style={{ marginTop: 12 }}>
+          {cancelling ? '正在取消登录…' : '正在完成 Apple 账号验证，请稍候…'}
+        </div>
+      )}
       <div className="form-actions">
-        <button type="button" onClick={handleClose}>取消</button>
-        <button type="button" className="primary" onClick={() => void handleSubmit()} disabled={submitting}>
-          {submitting ? '登录中…' : otpRequired ? '验证' : '登录'}
+        <button type="button" onClick={() => void handleClose()} disabled={submitting || cancelling}>取消</button>
+        <button type="button" className="primary" onClick={() => void handleSubmit()} disabled={submitting || cancelling}>
+          {cancelling ? '取消中…' : submitting ? '登录中…' : otpRequired ? '验证' : '登录'}
         </button>
       </div>
     </Dialog>

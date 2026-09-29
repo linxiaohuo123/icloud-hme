@@ -34,6 +34,9 @@ services:
       - ICLOUD_HME_IMAP_DIRECT=${ICLOUD_HME_IMAP_DIRECT:-}
       # IMAP 链路延迟诊断日志 ([MailPerf])，默认关闭，仅临时性能诊断时开启
       - ICLOUD_HME_MAIL_PERF_LOG=${ICLOUD_HME_MAIL_PERF_LOG:-}
+      # Camoufox 自动化上号代理服务通信地址
+      - ICLOUD_HME_CAMOUFOX_URL=${ICLOUD_HME_CAMOUFOX_URL:-http://camoufox-agent:8089}
+      - ICLOUD_HME_CAMOUFOX_TOKEN=${ICLOUD_HME_CAMOUFOX_TOKEN:?请在 .env 中设置 Camoufox 通信令牌}
       # 时区设置
       - TZ=${TZ:-Asia/Shanghai}
     volumes:
@@ -47,3 +50,29 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    depends_on:
+      camoufox-agent:
+        condition: service_healthy
+
+  # Camoufox 自动化上号反检测无头浏览器服务
+  camoufox-agent:
+    build:
+      context: ./scripts/camoufox-agent
+      dockerfile: Dockerfile
+    image: icloud-camoufox-agent:latest
+    container_name: icloud-camoufox-agent
+    restart: unless-stopped
+    environment:
+      - CAMOUFOX_HEADLESS=true
+      - CAMOUFOX_AGENT_HOST=0.0.0.0
+      - ICLOUD_HME_CAMOUFOX_TOKEN=${ICLOUD_HME_CAMOUFOX_TOKEN:?请在 .env 中设置 Camoufox 通信令牌}
+      - PORT=8089
+      - TZ=${TZ:-Asia/Shanghai}
+    # 扩大共享内存，避免浏览器在容器内因内存耗尽崩溃
+    shm_size: '2gb'
+    healthcheck:
+      test: ["CMD", "python3", "healthcheck.py"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 60s

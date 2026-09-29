@@ -258,6 +258,9 @@ func TestAccountHandlerValidation(t *testing.T) {
 		{"非法代理", "POST", "/api/accounts", `{"name":"主号","icloud_email":"a@icloud.com","proxy":"ftp://x"}`, 400, "VALIDATION_ERROR"},
 		{"PATCH 空更新", "PATCH", "/api/accounts/acc_1", `{}`, 400, "VALIDATION_ERROR"},
 		{"PUT 非法代理", "PUT", "/api/accounts/acc_1/proxy", `{"proxy":"ftp://x"}`, 400, "VALIDATION_ERROR"},
+		{"登录空凭据", "POST", "/api/accounts/acc_1/login", `{}`, 400, "VALIDATION_ERROR"},
+		{"登录同时提交密码和 OTP", "POST", "/api/accounts/acc_1/login", `{"password":"secret","otp_code":"123456"}`, 400, "VALIDATION_ERROR"},
+		{"登录非法 OTP", "POST", "/api/accounts/acc_1/login", `{"otp_code":"12ab56"}`, 400, "OTP_INVALID"},
 	}
 	for _, tc := range cases {
 		req := authedReq(t, ts, tc.method, tc.path, tc.body)

@@ -35,6 +35,21 @@ describe('api client', () => {
     })
   })
 
+  it('OTP_REQUIRED 错误保留本次登录任务 ID', async () => {
+    server.use(
+      http.post('/api/accounts/acc_1/login', () =>
+        HttpResponse.json(
+          { success: false, code: 'OTP_REQUIRED', message: '请输入验证码', data: { task_id: 'task-1' } },
+          { status: 409 },
+        ),
+      ),
+    )
+    await expect(request('/api/accounts/acc_1/login', { method: 'POST' })).rejects.toMatchObject({
+      code: 'OTP_REQUIRED',
+      data: { task_id: 'task-1' },
+    })
+  })
+
   it('非 JSON 响应抛出网络错误', async () => {
     server.use(
       http.get('/api/accounts', () =>

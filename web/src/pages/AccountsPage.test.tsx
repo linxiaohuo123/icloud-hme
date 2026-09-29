@@ -189,6 +189,34 @@ describe('AccountsPage', () => {
     await waitFor(() => expect(calls).toBe(2))
   })
 
+  it('关闭 OTP 弹窗时取消 Camoufox 登录任务', async () => {
+    let cancelled = false
+    let cancelledTaskId = ''
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.post('/api/accounts/:id/login', () => HttpResponse.json(
+        { success: false, code: 'OTP_REQUIRED', message: '需要提供 OTP 验证码', data: { task_id: 'task-1' } },
+        { status: 409 },
+      )),
+      http.post('/api/accounts/:id/login/cancel', async ({ request }) => {
+        cancelledTaskId = (await request.json() as { task_id: string }).task_id
+        cancelled = true
+        return HttpResponse.json({ success: true, data: { cancelled: true } })
+      }),
+    )
+    renderPage()
+    await screen.findByText('活跃号')
+    const user = userEvent.setup()
+    await user.click(screen.getAllByRole('button', { name: /更多操作/ })[0])
+    await user.click(screen.getByRole('button', { name: /iCloud 登录/ }))
+    await user.type(screen.getByLabelText(/密码/), 'p@ssw0rd')
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /登录/ }))
+    await screen.findByLabelText(/验证码/)
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /取消/ }))
+    await waitFor(() => expect(cancelled).toBe(true))
+    expect(cancelledTaskId).toBe('task-1')
+  })
+
   it('App Password 提交后清空', async () => {
     let pwdBody = ''
     server.use(
@@ -294,4 +322,3 @@ describe('AccountsPage', () => {
     await waitFor(() => expect(patchedBody.name).toBe('活跃号-修改后'))
   })
 })
-

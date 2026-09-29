@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"icloud-hme/internal/notify"
@@ -265,3 +266,84 @@ type notifyConfigError struct{ msg string }
 func (e *notifyConfigError) Error() string { return e.msg }
 
 func errNotify(msg string) error { return &notifyConfigError{msg: msg} }
+
+// camoufoxHealth 检查受保护的代理健康端点与浏览器内核状态。
+func camoufoxHealth(baseURL string, timeout time.Duration) (bool, int64, error) {
+	req, err := newCamoufoxRequest(http.MethodGet, baseURL+"/health", nil)
+	if err != nil {
+		return false, 0, err
+	}
+	start := time.Now()
+	client, err := newCamoufoxHTTPClient(timeout)
+	if err != nil {
+		return false, 0, err
+	}
+	resp, err := client.Do(req)
+	latencyMs := time.Since(start).Milliseconds()
+	if err != nil {
+		return false, latencyMs, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, latencyMs, fmt.Errorf("端点返回 HTTP %d", resp.StatusCode)
+	}
+	var health struct {
+		CamoufoxReady bool `json:"camoufox_ready"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		return false, latencyMs, err
+	}
+	if !health.CamoufoxReady {
+		return false, latencyMs, fmt.Errorf("Camoufox 浏览器内核未就绪")
+	}
+	return true, latencyMs, nil
+}
+
+// getCamoufoxSettingsHandler 处理 GET /api/settings/camoufox。
+func (s *Server) getCamoufoxSettingsHandler(c *gin.Context) {
+	baseURL := getCamoufoxURL()
+	ready, latencyMs, err := camoufoxHealth(baseURL, 10*time.Second)
+	if err != nil {
+		ok(c, gin.H{
+			"url":         baseURL,
+			"available":   false,
+			"ready":       false,
+			"latency_ms":  latencyMs,
+			"status_text": "未连接 / 离线",
+			"error":       err.Error(),
+		})
+		return
+	}
+
+	ok(c, gin.H{
+		"url":            baseURL,
+		"available":      ready,
+		"ready":          ready,
+		"latency_ms":     latencyMs,
+		"status_text":    "在线就绪",
+		"camoufox_ready": ready,
+	})
+}
+
+// testCamoufoxHandler 处理 POST /api/settings/camoufox/test。
+func (s *Server) testCamoufoxHandler(c *gin.Context) {
+	baseURL := getCamoufoxURL()
+	ready, latencyMs, err := camoufoxHealth(baseURL, 10*time.Second)
+	if err != nil {
+		ok(c, gin.H{
+			"success":    false,
+			"url":        baseURL,
+			"latency_ms": latencyMs,
+			"message":    fmt.Sprintf("连接失败: %v", err),
+		})
+		return
+	}
+
+	ok(c, gin.H{
+		"success":        ready,
+		"url":            baseURL,
+		"latency_ms":     latencyMs,
+		"camoufox_ready": ready,
+		"message":        "Camoufox 自动化上号代理服务已连通并就绪！",
+	})
+}

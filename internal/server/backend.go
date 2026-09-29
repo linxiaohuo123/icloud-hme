@@ -11,11 +11,19 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +42,7 @@ type BackendError struct {
 	Status  int
 	Code    string
 	Message string
+	Data    any
 }
 
 func (e *BackendError) Error() string { return e.Message }
@@ -56,6 +65,7 @@ type Backend interface {
 	SetMailboxContext(context.Context, string, account.MailboxConfig) (account.Summary, error)
 	RemoveMailbox(string) (account.Summary, error)
 	LoginAccount(string, string, string) (account.Summary, error)
+	CancelCamoufoxLogin(string, string) (bool, error)
 	RemoveAccount(string) bool
 	CreateAlias(string, string) (*hme.CreateResult, error)
 	CreateAliasContext(context.Context, string, string) (*hme.CreateResult, error)
@@ -112,6 +122,16 @@ type managerBackend struct {
 
 	// accountMutations 存储每个账号的互斥锁 (*sync.Mutex)，用于串行化单账号的 HME 写操作生命周期与未决门禁
 	accountMutations sync.Map
+
+	camoufoxMu    sync.Mutex
+	camoufoxTasks map[string]*camoufoxPendingTask
+}
+
+type camoufoxPendingTask struct {
+	taskID    string
+	baseURL   string
+	createdAt time.Time
+	recovered bool
 }
 
 // summaryCacheTTL 是 ListAccounts 快照的有效期。
@@ -307,8 +327,622 @@ func (b *managerBackend) RemoveMailbox(id string) (account.Summary, error) {
 	return sum.Summary(), nil
 }
 
+func getCamoufoxURL() string {
+	if u := os.Getenv("ICLOUD_HME_CAMOUFOX_URL"); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	return "http://127.0.0.1:8089"
+}
+
+func camoufoxConfigured() bool {
+	return strings.TrimSpace(os.Getenv("ICLOUD_HME_CAMOUFOX_URL")) != "" || strings.TrimSpace(os.Getenv("ICLOUD_HME_CAMOUFOX_TOKEN")) != ""
+}
+
+// validateCamoufoxURL 约束代理服务的传输边界。HTTP 只允许回环地址和 Compose
+// 内部服务名；跨主机必须使用 HTTPS。若部署在已加密的专用 VPN 上，可显式设置
+// ICLOUD_HME_CAMOUFOX_ALLOW_INSECURE=true，作为运维侧的网络安全承诺。
+func validateCamoufoxURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("Camoufox URL 无效")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("Camoufox URL 必须使用 http 或 https")
+	}
+	if u.Scheme == "http" && !isLocalCamoufoxHost(u.Hostname()) && os.Getenv("ICLOUD_HME_CAMOUFOX_ALLOW_INSECURE") != "true" {
+		return fmt.Errorf("跨主机 Camoufox 通信必须使用 HTTPS；仅受控 VPN 可显式设置 ICLOUD_HME_CAMOUFOX_ALLOW_INSECURE=true")
+	}
+	return nil
+}
+
+func isLocalCamoufoxHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "localhost" || host == "camoufox-agent" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+func isValidOTPCode(code string) bool {
+	if len(code) != 6 {
+		return false
+	}
+	for i := 0; i < len(code); i++ {
+		if code[i] < '0' || code[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// newCamoufoxHTTPClient 构造代理通信客户端，并支持 HTTPS 自定义 CA 与 mTLS。
+func newCamoufoxHTTPClient(timeout time.Duration) (*http.Client, error) {
+	transport := &http.Transport{Proxy: func(req *http.Request) (*url.URL, error) {
+		if isLocalCamoufoxHost(req.URL.Hostname()) {
+			return nil, nil
+		}
+		return http.ProxyFromEnvironment(req)
+	}}
+	caFile := strings.TrimSpace(os.Getenv("ICLOUD_HME_CAMOUFOX_CA_FILE"))
+	certFile := strings.TrimSpace(os.Getenv("ICLOUD_HME_CAMOUFOX_CLIENT_CERT_FILE"))
+	keyFile := strings.TrimSpace(os.Getenv("ICLOUD_HME_CAMOUFOX_CLIENT_KEY_FILE"))
+	if (certFile == "") != (keyFile == "") {
+		return nil, errors.New("Camoufox mTLS 必须同时配置客户端证书和私钥")
+	}
+	if caFile != "" || certFile != "" {
+		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+		if caFile != "" {
+			pem, err := os.ReadFile(caFile)
+			if err != nil {
+				return nil, fmt.Errorf("读取 Camoufox CA 文件失败: %w", err)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(pem) {
+				return nil, errors.New("Camoufox CA 文件不包含有效证书")
+			}
+			tlsConfig.RootCAs = pool
+		}
+		if certFile != "" {
+			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+			if err != nil {
+				return nil, fmt.Errorf("读取 Camoufox mTLS 客户端证书失败: %w", err)
+			}
+			tlsConfig.Certificates = []tls.Certificate{cert}
+		}
+		transport.TLSClientConfig = tlsConfig
+	}
+	return &http.Client{
+		Timeout: timeout, Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}, nil
+}
+
+func newCamoufoxRequest(method, url string, body io.Reader) (*http.Request, error) {
+	if err := validateCamoufoxURL(url); err != nil {
+		return nil, err
+	}
+	token := os.Getenv("ICLOUD_HME_CAMOUFOX_TOKEN")
+	if token == "" {
+		return nil, errors.New("未配置 ICLOUD_HME_CAMOUFOX_TOKEN")
+	}
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Camoufox-Token", token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req, nil
+}
+
+func (b *managerBackend) getCamoufoxTask(accountID string) (camoufoxPendingTask, bool) {
+	b.camoufoxMu.Lock()
+	defer b.camoufoxMu.Unlock()
+	t, ok := b.camoufoxTasks[accountID]
+	if !ok {
+		return camoufoxPendingTask{}, false
+	}
+	return *t, true
+}
+
+func (b *managerBackend) reserveCamoufoxTask(accountID, baseURL string) bool {
+	b.camoufoxMu.Lock()
+	defer b.camoufoxMu.Unlock()
+	if b.camoufoxTasks == nil {
+		b.camoufoxTasks = make(map[string]*camoufoxPendingTask)
+	}
+	if _, exists := b.camoufoxTasks[accountID]; exists {
+		return false
+	}
+	b.camoufoxTasks[accountID] = &camoufoxPendingTask{baseURL: baseURL, createdAt: time.Now()}
+	return true
+}
+
+func (b *managerBackend) persistCamoufoxTask(task camoufoxPendingTask, accountID string) error {
+	if b.store == nil {
+		return nil
+	}
+	return b.store.SaveCamoufoxTask(store.CamoufoxTask{
+		AccountID: accountID,
+		TaskID:    task.taskID,
+		BaseURL:   task.baseURL,
+		CreatedAt: task.createdAt,
+	})
+}
+
+func (b *managerBackend) deletePersistedCamoufoxTask(accountID, taskID string) {
+	if b.store == nil {
+		return
+	}
+	if err := b.store.DeleteCamoufoxTask(accountID, taskID); err != nil {
+		log.Printf("[Camoufox] 清理任务持久化记录失败 account=%s task=%s: %v", accountID, taskID, err)
+	}
+}
+
+func (b *managerBackend) setCamoufoxTask(accountID, taskID string) error {
+	b.camoufoxMu.Lock()
+	defer b.camoufoxMu.Unlock()
+	if task := b.camoufoxTasks[accountID]; task != nil {
+		task.taskID = taskID
+		return b.persistCamoufoxTask(*task, accountID)
+	}
+	return errors.New("Camoufox 登录任务不存在")
+}
+
+func (b *managerBackend) markCamoufoxOTP(accountID, taskID string) error {
+	b.camoufoxMu.Lock()
+	if task := b.camoufoxTasks[accountID]; task != nil && task.taskID == taskID {
+		task.createdAt = time.Now()
+		pending := *task
+		baseURL := task.baseURL
+		if err := b.persistCamoufoxTask(pending, accountID); err != nil {
+			b.camoufoxMu.Unlock()
+			return err
+		}
+		b.camoufoxMu.Unlock()
+		time.AfterFunc(3*time.Minute, func() {
+			b.camoufoxMu.Lock()
+			pending := b.camoufoxTasks[accountID]
+			expired := pending != nil && pending.taskID == taskID && time.Since(pending.createdAt) >= 3*time.Minute
+			b.camoufoxMu.Unlock()
+			if expired {
+				if err := b.cancelAndClearCamoufoxTask(accountID, taskID, baseURL); err != nil && !errors.Is(err, errCamoufoxTaskMissing) {
+					log.Printf("[Camoufox] OTP 超时取消任务失败 account=%s task=%s: %v", accountID, taskID, err)
+				}
+			}
+		})
+		return nil
+	}
+	b.camoufoxMu.Unlock()
+	return errors.New("Camoufox 登录任务不存在")
+}
+
+func (b *managerBackend) clearCamoufoxTask(accountID, taskID string) {
+	b.camoufoxMu.Lock()
+	defer b.camoufoxMu.Unlock()
+	if task := b.camoufoxTasks[accountID]; task != nil && task.taskID == taskID {
+		delete(b.camoufoxTasks, accountID)
+	}
+	if taskID != "" {
+		b.deletePersistedCamoufoxTask(accountID, taskID)
+	}
+}
+
+func camoufoxHTTPError(action string, status int) *BackendError {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return &BackendError{Status: http.StatusBadGateway, Code: "CAMOUFOX_AUTH_FAILED", Message: "Camoufox 通信令牌无效或无权访问代理"}
+	case http.StatusNotFound:
+		return &BackendError{Status: http.StatusBadGateway, Code: "CAMOUFOX_ENDPOINT_NOT_FOUND", Message: "Camoufox 代理端点不存在"}
+	case http.StatusTooManyRequests:
+		return &BackendError{Status: http.StatusTooManyRequests, Code: "AUTH_BUSY", Message: "Camoufox 登录任务已达并发上限，请稍后重试"}
+	case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout:
+		return &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: fmt.Sprintf("Camoufox %s失败，代理返回 HTTP %d", action, status)}
+	default:
+		return &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: fmt.Sprintf("Camoufox %s失败，代理返回 HTTP %d", action, status)}
+	}
+}
+
+var errCamoufoxTaskMissing = errors.New("Camoufox 任务不存在")
+
+func cancelCamoufoxTask(baseURL, taskID string) error {
+	req, err := newCamoufoxRequest(http.MethodDelete, baseURL+"/tasks/"+taskID, nil)
+	if err != nil {
+		return err
+	}
+	client, err := newCamoufoxHTTPClient(3 * time.Second)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return errCamoufoxTaskMissing
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Camoufox 取消请求返回 HTTP %d", resp.StatusCode)
+	}
+	var result struct {
+		Success bool `json:"success"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("Camoufox 取消响应无效: %w", err)
+	}
+	if !result.Success {
+		return errCamoufoxTaskMissing
+	}
+	return nil
+}
+
+// cancelAndClearCamoufoxTask 仅在代理确认终止或任务已不存在时清理本地元数据。
+func (b *managerBackend) cancelAndClearCamoufoxTask(accountID, taskID, baseURL string) error {
+	err := cancelCamoufoxTask(baseURL, taskID)
+	if err == nil || errors.Is(err, errCamoufoxTaskMissing) {
+		b.clearCamoufoxTask(accountID, taskID)
+	} else {
+		b.camoufoxMu.Lock()
+		if pending := b.camoufoxTasks[accountID]; pending != nil && pending.taskID == taskID {
+			pending.recovered = true
+		}
+		b.camoufoxMu.Unlock()
+	}
+	return err
+}
+
+func (b *managerBackend) CancelCamoufoxLogin(accountID, taskID string) (bool, error) {
+	pending, ok := b.getCamoufoxTask(accountID)
+	if !ok || taskID == "" || pending.taskID != taskID {
+		return false, nil
+	}
+	if err := b.cancelAndClearCamoufoxTask(accountID, taskID, pending.baseURL); err != nil {
+		if errors.Is(err, errCamoufoxTaskMissing) {
+			return false, nil
+		}
+		return false, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "取消 Camoufox 登录任务失败: " + err.Error()}
+	}
+	return true, nil
+}
+
+// recoverCamoufoxTasks 在主服务重启后回收代理端仍可能存在的旧浏览器任务。
+// 取消失败时保留任务元数据，后续登录继续尝试回收，不把未知状态当成成功。
+func (b *managerBackend) recoverCamoufoxTasks() {
+	if b.store == nil {
+		return
+	}
+	tasks, err := b.store.ListCamoufoxTasks()
+	if err != nil {
+		log.Printf("[Camoufox] 读取待回收任务失败: %v", err)
+		return
+	}
+	for _, task := range tasks {
+		err := cancelCamoufoxTask(task.BaseURL, task.TaskID)
+		if err != nil && !errors.Is(err, errCamoufoxTaskMissing) {
+			log.Printf("[Camoufox] 启动恢复时取消旧任务失败 account=%s task=%s: %v", task.AccountID, task.TaskID, err)
+		} else {
+			b.deletePersistedCamoufoxTask(task.AccountID, task.TaskID)
+		}
+		b.camoufoxMu.Lock()
+		if b.camoufoxTasks == nil {
+			b.camoufoxTasks = make(map[string]*camoufoxPendingTask)
+		}
+		b.camoufoxTasks[task.AccountID] = &camoufoxPendingTask{
+			taskID: task.TaskID, baseURL: task.BaseURL, createdAt: task.CreatedAt, recovered: true,
+		}
+		b.camoufoxMu.Unlock()
+	}
+}
+
+func (b *managerBackend) cancelAllCamoufoxTasks() {
+	b.camoufoxMu.Lock()
+	tasks := make([]camoufoxPendingTask, 0, len(b.camoufoxTasks))
+	accounts := make([]string, 0, len(b.camoufoxTasks))
+	for accountID, task := range b.camoufoxTasks {
+		if task != nil {
+			tasks = append(tasks, *task)
+			accounts = append(accounts, accountID)
+		}
+	}
+	b.camoufoxTasks = nil
+	b.camoufoxMu.Unlock()
+	for i, task := range tasks {
+		if task.taskID != "" {
+			if err := b.cancelAndClearCamoufoxTask(accounts[i], task.taskID, task.baseURL); err != nil && !errors.Is(err, errCamoufoxTaskMissing) {
+				log.Printf("[Camoufox] 停机取消任务失败 account=%s task=%s: %v", accounts[i], task.taskID, err)
+			}
+		}
+	}
+	if b.store != nil {
+		// 处理 map 尚未加载但已落库的记录，避免停机时遗漏恢复任务。
+		if persisted, err := b.store.ListCamoufoxTasks(); err == nil {
+			for _, task := range persisted {
+				if err := b.cancelAndClearCamoufoxTask(task.AccountID, task.TaskID, task.BaseURL); err != nil && !errors.Is(err, errCamoufoxTaskMissing) {
+					log.Printf("[Camoufox] 停机取消持久化任务失败 account=%s task=%s: %v", task.AccountID, task.TaskID, err)
+				}
+			}
+		}
+	}
+}
+
+func (b *managerBackend) loginWithCamoufox(id, password, otpCode, camoufoxBase string) (account.Summary, error) {
+	acc, ok := b.mgr.GetAccount(id)
+	if !ok {
+		return account.Summary{}, &BackendError{Status: http.StatusNotFound, Code: "ACCOUNT_NOT_FOUND", Message: "账号不存在"}
+	}
+
+	email := acc.ICloudEmail
+	if email == "" {
+		email = acc.RealEmail
+	}
+	if email == "" {
+		return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "账号未配置邮箱地址"}
+	}
+
+	httpClient, err := newCamoufoxHTTPClient(70 * time.Second)
+	if err != nil {
+		return account.Summary{}, &BackendError{Status: http.StatusServiceUnavailable, Code: "CAMOUFOX_CONFIG_ERROR", Message: err.Error()}
+	}
+
+	if otpCode != "" {
+		// 阶段 2: 提交 2FA 验证码
+		pending, hasPending := b.getCamoufoxTask(id)
+		if hasPending {
+			camoufoxBase = pending.baseURL
+		}
+		if !hasPending || pending.taskID == "" || time.Since(pending.createdAt) > 3*time.Minute {
+			if hasPending && pending.taskID != "" {
+				_ = b.cancelAndClearCamoufoxTask(id, pending.taskID, camoufoxBase)
+			}
+			return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "OTP_EXPIRED", Message: "2FA 验证会话已超时，请重新登录"}
+		}
+
+		submitPayload := map[string]string{
+			"task_id":  pending.taskID,
+			"otp_code": otpCode,
+		}
+		data, err := json.Marshal(submitPayload)
+		if err != nil {
+			return account.Summary{}, &BackendError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: err.Error()}
+		}
+
+		req, err := newCamoufoxRequest(http.MethodPost, camoufoxBase+"/submit-otp", bytes.NewReader(data))
+		if err != nil {
+			return account.Summary{}, &BackendError{Status: http.StatusServiceUnavailable, Code: "CAMOUFOX_CONFIG_ERROR", Message: err.Error()}
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "提交验证码失败: " + err.Error()}
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
+			b.clearCamoufoxTask(id, pending.taskID)
+			return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "OTP_EXPIRED", Message: "2FA 验证会话已失效，请重新登录"}
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return account.Summary{}, camoufoxHTTPError("提交验证码", resp.StatusCode)
+		}
+		var submitRes struct {
+			Success bool `json:"success"`
+		}
+		decodeErr := json.NewDecoder(resp.Body).Decode(&submitRes)
+		resp.Body.Close()
+		if decodeErr != nil || !submitRes.Success {
+			return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "Camoufox 未接受验证码提交"}
+		}
+
+		return b.pollCamoufoxTask(id, pending.taskID, camoufoxBase, 55*time.Second, true)
+	}
+
+	// 阶段 1: 发起全新无头登录
+	if !b.reserveCamoufoxTask(id, camoufoxBase) {
+		return account.Summary{}, &BackendError{Status: http.StatusConflict, Code: "AUTH_IN_PROGRESS", Message: "该账号已有进行中的登录任务"}
+	}
+	started := false
+	defer func() {
+		if !started {
+			b.clearCamoufoxTask(id, "")
+		}
+	}()
+	loginPayload := map[string]string{
+		"account_id": id,
+		"username":   email,
+		"password":   password,
+		"proxy":      acc.Proxy,
+		"host":       acc.Host,
+	}
+	data, err := json.Marshal(loginPayload)
+	if err != nil {
+		return account.Summary{}, &BackendError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: err.Error()}
+	}
+
+	req, err := newCamoufoxRequest(http.MethodPost, camoufoxBase+"/login", bytes.NewReader(data))
+	if err != nil {
+		return account.Summary{}, &BackendError{Status: http.StatusServiceUnavailable, Code: "CAMOUFOX_CONFIG_ERROR", Message: err.Error()}
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "启动 Camoufox 任务失败: " + err.Error()}
+	}
+	var loginRes struct {
+		Success bool   `json:"success"`
+		TaskID  string `json:"task_id"`
+		Status  string `json:"status"`
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return account.Summary{}, &BackendError{Status: http.StatusTooManyRequests, Code: "AUTH_BUSY", Message: "Camoufox 登录任务已达并发上限，请稍后重试"}
+		}
+		return account.Summary{}, camoufoxHTTPError("启动登录任务", resp.StatusCode)
+	}
+	decodeErr := json.NewDecoder(resp.Body).Decode(&loginRes)
+	resp.Body.Close()
+	if decodeErr != nil || !loginRes.Success || loginRes.TaskID == "" {
+		return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "Camoufox 任务创建异常"}
+	}
+
+	if err := b.setCamoufoxTask(id, loginRes.TaskID); err != nil {
+		if cancelErr := b.cancelAndClearCamoufoxTask(id, loginRes.TaskID, camoufoxBase); cancelErr != nil && !errors.Is(cancelErr, errCamoufoxTaskMissing) {
+			log.Printf("[Camoufox] 持久化失败后取消任务失败 account=%s task=%s: %v", id, loginRes.TaskID, cancelErr)
+		}
+		return account.Summary{}, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_FAILURE", Message: "Camoufox 登录任务持久化失败"}
+	}
+	started = true
+	return b.pollCamoufoxTask(id, loginRes.TaskID, camoufoxBase, 60*time.Second, false)
+}
+
+func (b *managerBackend) pollCamoufoxTask(accountID, taskID, camoufoxBase string, timeout time.Duration, isOTPPhase bool) (account.Summary, error) {
+	deadline := time.Now().Add(timeout)
+	httpClient, err := newCamoufoxHTTPClient(5 * time.Second)
+	if err != nil {
+		return account.Summary{}, &BackendError{Status: http.StatusServiceUnavailable, Code: "CAMOUFOX_CONFIG_ERROR", Message: err.Error()}
+	}
+	firstPoll := true
+
+	for time.Now().Before(deadline) {
+		if !firstPoll {
+			time.Sleep(1 * time.Second)
+		}
+		firstPoll = false
+
+		req, err := newCamoufoxRequest(http.MethodGet, fmt.Sprintf("%s/tasks/%s", camoufoxBase, taskID), nil)
+		if err != nil {
+			return account.Summary{}, &BackendError{Status: http.StatusServiceUnavailable, Code: "CAMOUFOX_CONFIG_ERROR", Message: err.Error()}
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			_ = b.cancelAndClearCamoufoxTask(accountID, taskID, camoufoxBase)
+			return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "查询 Camoufox 登录任务失败: " + err.Error()}
+		}
+		if resp.StatusCode != http.StatusOK {
+			status := resp.StatusCode
+			resp.Body.Close()
+			if status == http.StatusNotFound {
+				b.clearCamoufoxTask(accountID, taskID)
+				if isOTPPhase {
+					return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "OTP_EXPIRED", Message: "2FA 验证会话已失效，请重新登录"}
+				}
+				return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "AUTH_TASK_EXPIRED", Message: "Camoufox 登录任务已失效，请重新登录"}
+			}
+			_ = b.cancelAndClearCamoufoxTask(accountID, taskID, camoufoxBase)
+			return account.Summary{}, camoufoxHTTPError("查询登录任务", status)
+		}
+		var task struct {
+			TaskID       string            `json:"task_id"`
+			Status       string            `json:"status"`
+			ErrorMessage string            `json:"error_message"`
+			Cookies      map[string]string `json:"cookies"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&task)
+		resp.Body.Close()
+		if err != nil {
+			_ = b.cancelAndClearCamoufoxTask(accountID, taskID, camoufoxBase)
+			return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "Camoufox 任务响应格式无效"}
+		}
+		if task.TaskID != "" && task.TaskID != taskID {
+			_ = b.cancelAndClearCamoufoxTask(accountID, taskID, camoufoxBase)
+			return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "Camoufox 返回了不匹配的任务"}
+		}
+
+		switch task.Status {
+		case "otp_required":
+			if !isOTPPhase {
+				if err := b.markCamoufoxOTP(accountID, taskID); err != nil {
+					_ = b.cancelAndClearCamoufoxTask(accountID, taskID, camoufoxBase)
+					return account.Summary{}, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_FAILURE", Message: "Camoufox 验证任务持久化失败"}
+				}
+				return account.Summary{}, &BackendError{
+					Status:  http.StatusConflict,
+					Code:    "OTP_REQUIRED",
+					Message: "该 Apple ID 已启用双重认证，请输入 6 位验证码",
+					Data:    map[string]string{"task_id": taskID},
+				}
+			}
+			// 若当前为验证码提交阶段，继续等待后端状态流转至 verifying / success / failed
+		case "failed":
+			_ = b.cancelAndClearCamoufoxTask(accountID, taskID, camoufoxBase)
+			errMsg := task.ErrorMessage
+			if strings.Contains(errMsg, "密码错误") || strings.Contains(errMsg, "incorrect") {
+				return account.Summary{}, &BackendError{Status: http.StatusUnauthorized, Code: "INVALID_CREDENTIALS", Message: "Apple ID 账号或密码错误"}
+			}
+			if strings.Contains(errMsg, "验证码") || strings.Contains(strings.ToLower(errMsg), "verification") {
+				return account.Summary{}, &BackendError{Status: http.StatusUnauthorized, Code: "OTP_REJECTED", Message: "Apple ID 双重认证验证码无效"}
+			}
+			return account.Summary{}, &BackendError{Status: http.StatusUnauthorized, Code: "APPLE_AUTH_REJECTED", Message: "Apple ID 登录失败，请稍后重试"}
+		case "success":
+			defer func() { _ = b.cancelAndClearCamoufoxTask(accountID, taskID, camoufoxBase) }()
+			if len(task.Cookies) == 0 {
+				return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "Camoufox 登录成功但未返回 Cookie"}
+			}
+			if err := b.mgr.UpdateCookiesIfValid(accountID, task.Cookies); err != nil {
+				return account.Summary{}, mapAccountErr(err)
+			}
+			b.invalidateAliasCache(accountID)
+			b.invalidateSummaryCache()
+			acc, ok := b.mgr.GetAccount(accountID)
+			if !ok {
+				return account.Summary{}, &BackendError{Status: http.StatusNotFound, Code: "ACCOUNT_NOT_FOUND", Message: "账号不存在"}
+			}
+			return acc.Summary(), nil
+		case "initializing", "entering_credentials", "verifying":
+			// 任务仍在进行，下一轮继续查询。
+		default:
+			_ = b.cancelAndClearCamoufoxTask(accountID, taskID, camoufoxBase)
+			return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "Camoufox 返回了未知任务状态"}
+		}
+	}
+
+	_ = b.cancelAndClearCamoufoxTask(accountID, taskID, camoufoxBase)
+	return account.Summary{}, &BackendError{
+		Status:  http.StatusGatewayTimeout,
+		Code:    "AUTH_TIMEOUT",
+		Message: "Apple ID 认证超时，请稍后重试",
+	}
+}
+
 // LoginAccount 使用 iCloud 密码登录账号,成功只返回 Summary,绝不返回 Cookies。
+// 未配置 Camoufox 时使用原生 SRP；已配置的代理失败会明确返回错误。
 func (b *managerBackend) LoginAccount(id, password, otpCode string) (account.Summary, error) {
+	if (password == "") == (otpCode == "") {
+		return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "password 与 otp_code 必须二选一"}
+	}
+	if otpCode != "" && !isValidOTPCode(otpCode) {
+		return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "OTP_INVALID", Message: "otp_code 必须是 6 位数字"}
+	}
+	camoufoxBase := getCamoufoxURL()
+	pending, hasCamoufoxPending := b.getCamoufoxTask(id)
+	if hasCamoufoxPending && pending.recovered {
+		err := b.cancelAndClearCamoufoxTask(id, pending.taskID, pending.baseURL)
+		if err != nil && !errors.Is(err, errCamoufoxTaskMissing) {
+			return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "回收旧 Camoufox 登录任务失败: " + err.Error()}
+		}
+		if otpCode != "" {
+			return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "OTP_EXPIRED", Message: "2FA 验证会话已失效，请重新登录"}
+		}
+		hasCamoufoxPending = false
+	}
+	if hasCamoufoxPending || camoufoxConfigured() {
+		if otpCode != "" && !hasCamoufoxPending {
+			return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "OTP_EXPIRED", Message: "2FA 验证会话已失效，请重新登录"}
+		}
+		if err := validateCamoufoxURL(camoufoxBase); err != nil {
+			return account.Summary{}, &BackendError{Status: http.StatusServiceUnavailable, Code: "CAMOUFOX_TRANSPORT_INVALID", Message: err.Error()}
+		}
+		if !hasCamoufoxPending {
+			if _, _, err := camoufoxHealth(camoufoxBase, 10*time.Second); err != nil {
+				return account.Summary{}, &BackendError{Status: http.StatusServiceUnavailable, Code: "CAMOUFOX_UNAVAILABLE", Message: "Camoufox 代理不可用: " + err.Error()}
+			}
+		}
+		return b.loginWithCamoufox(id, password, otpCode, camoufoxBase)
+	}
+
 	var otpProvider hme.OTPProvider
 	if otpCode != "" {
 		otp := otpCode
@@ -359,6 +993,26 @@ func classifyLoginErr(err error) *BackendError {
 
 // RemoveAccount 删除账号并彻底驱逐关联的内存别名缓存。
 func (b *managerBackend) RemoveAccount(id string) bool {
+	hadPending := false
+	if pending, ok := b.getCamoufoxTask(id); ok && pending.taskID != "" {
+		hadPending = true
+		if err := b.cancelAndClearCamoufoxTask(id, pending.taskID, pending.baseURL); err != nil && !errors.Is(err, errCamoufoxTaskMissing) {
+			log.Printf("[Camoufox] 删除账号时取消登录任务失败 account=%s task=%s: %v", id, pending.taskID, err)
+		}
+	}
+	if !hadPending && b.store != nil {
+		if tasks, err := b.store.ListCamoufoxTasks(); err != nil {
+			log.Printf("[Camoufox] 删除账号时读取待回收任务失败 account=%s: %v", id, err)
+		} else {
+			for _, task := range tasks {
+				if task.AccountID == id {
+					if err := b.cancelAndClearCamoufoxTask(id, task.TaskID, task.BaseURL); err != nil && !errors.Is(err, errCamoufoxTaskMissing) {
+						log.Printf("[Camoufox] 删除账号时取消持久化任务失败 account=%s task=%s: %v", id, task.TaskID, err)
+					}
+				}
+			}
+		}
+	}
 	ok := b.mgr.RemoveAccount(id)
 	if ok {
 		b.invalidateAliasCache(id)
@@ -395,6 +1049,9 @@ func (b *managerBackend) ValidateAccountContext(ctx context.Context, id string) 
 func mapAccountErr(err error) *BackendError {
 	if errors.Is(err, account.ErrAccountIdentityMismatch) {
 		return &BackendError{Status: http.StatusConflict, Code: "ACCOUNT_IDENTITY_MISMATCH", Message: err.Error()}
+	}
+	if errors.Is(err, account.ErrCookiesRejectedInvalid) {
+		return &BackendError{Status: http.StatusUnprocessableEntity, Code: "COOKIE_VALIDATION_FAILED", Message: "自动登录 Cookie 未通过 Apple 校验，原有凭据未改变"}
 	}
 	if errors.Is(err, account.ErrCookiesSavedInvalid) {
 		return &BackendError{Status: http.StatusUnprocessableEntity, Code: "COOKIE_SAVED_INVALID", Message: "Cookie 已保存，但 Apple 校验未通过，请检查凭据或网络"}
@@ -514,6 +1171,7 @@ func (b *managerBackend) CheckProxy(proxyURL string) (bool, int64, string, error
 
 // Close 释放底层 Manager 的长连接池与客户端池 (PR-07 §10.4)。
 func (b *managerBackend) Close() {
+	b.cancelAllCamoufoxTasks()
 	if b.mgr != nil {
 		b.mgr.Close()
 	}

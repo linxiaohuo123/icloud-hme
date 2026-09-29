@@ -50,3 +50,14 @@ CLAUDE.md
 /scratch_check.js
 reverse_task/
 cookies.txt
+
+# Python artifacts & Camoufox agent runtime
+__pycache__/
+*.py[cod]
+.venv/
+**/__pycache__/
+scripts/camoufox-agent/.venv/
+scripts/camoufox-agent/captured_cookies.json
+scripts/camoufox-agent/live_login.log
+scripts/camoufox-agent/diagnostics/
+*.log
