@@ -92,7 +92,7 @@ export default function AccountWorkspace() {
       setAliasLoading(true)
 
       try {
-        // ── 第一阶段: 单账号精准载入 (毫秒级，按需获取) ──
+        // ── 第一阶段: 单账号精准载入 (按需获取) ──
         const found = await request<AccountSummary>(
           `/api/accounts/${encodeURIComponent(requestedId)}`,
           { signal: accountCtrl.signal },

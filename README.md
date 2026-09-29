@@ -127,7 +127,7 @@ go build -o icloud-hme .
 
 ### 3. 配置账号
 
-在程序 `data/` 目录下创建 `accounts.json`（参考仓库内 `accounts.json.template`）：
+在程序 `data/` 目录下创建 `accounts.json`（可根据仓库内 `accounts.json.template` 模板创建）：
 
 ```json
 {
@@ -502,7 +502,7 @@ icloud-hme/
 ├── main.go                 # 入口: 读取安全配置、加载账号、启动服务
 ├── web/                    # 前端工程 (React + TypeScript + Vite)
 │   └── src/                #   管理界面源码
-├── accounts.json           # 账号配置文件 (自动生成)
+├── accounts.json.template  # 账号配置模板 (实际配置位于 data/accounts.json)
 ├── go.mod
 └── internal/
     ├── account/
@@ -541,7 +541,7 @@ icloud-hme/
 - **Go 1.26+** / **Gin** — HTTP 框架
 - **React 19 + TypeScript + Vite 8** — 管理界面
 - **go-imap** — IMAP 协议实现
-- **tls-client** — TLS 指纹模拟 (绕过 iCloud 反爬)
+- **tls-client** — TLS 指纹模拟 (规避 iCloud 风控拦截)
 
 ## 常见问题
 

@@ -130,7 +130,7 @@ func (c *Client) reserveInternalWithContext(ctx context.Context, hme, label stri
 	payload := map[string]string{
 		"hme":   hme,
 		"label": label,
-		"note":  "Created by icloud_hme tool",
+		"note":  "",
 	}
 
 	reconcile := func(triggerErr error) (string, string, error) {

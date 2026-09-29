@@ -1,0 +1,17 @@
+name: icloud-camoufox-smoke
+
+services:
+  icloud-hme:
+    image: icloud-hme:camoufox-smoke
+    container_name: icloud-hme-camoufox-smoke
+    ports: !override
+      - "127.0.0.1:18081:8081"
+    volumes: !override
+      - camoufox-smoke-data:/app/data
+
+  camoufox-agent:
+    image: icloud-camoufox-agent:camoufox-smoke
+    container_name: icloud-camoufox-agent-smoke
+
+volumes:
+  camoufox-smoke-data:

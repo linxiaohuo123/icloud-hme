@@ -314,27 +314,25 @@ func (m *Manager) WithHMEClientContextSession(ctx context.Context, id string, fn
 
 	runErr := fn(entry.client, snap.credentialEpoch)
 
-	// 回写刷新后的会话；仅当业务本身成功时才把回写失败上抛
-	newCookies := entry.client.CookieSnapshot()
-	newServiceURL := entry.client.ServiceURL()
-	saved, saveErr := m.saveSessionIfCurrent(id, snap.credentialEpoch, snap.Host, snap.Proxy, newCookies, newServiceURL, false)
-	if saveErr != nil && runErr == nil {
-		return saveErr
-	}
-	if !saved {
-		entry.fingerprint = ""
-		if runErr == nil {
+	// 仅当业务调用成功时才回写刷新后的会话（防止业务报错时由于上游 Set-Cookie: Max-Age=0 将残缺 Cookie 脏写回库）
+	if runErr == nil {
+		newCookies := entry.client.CookieSnapshot()
+		newServiceURL := entry.client.ServiceURL()
+		saved, saveErr := m.saveSessionIfCurrent(id, snap.credentialEpoch, snap.Host, snap.Proxy, newCookies, newServiceURL, false)
+		if saveErr != nil {
+			return saveErr
+		}
+		if !saved {
+			entry.fingerprint = ""
 			return ErrSessionChanged
 		}
-		return runErr
+		// 同步条目指纹，避免下次借出时因正常会话刷新被误判为凭据变更而摧毁长连接
+		snap.Cookies = newCookies
+		if newServiceURL != "" {
+			snap.ServiceURL = newServiceURL
+		}
+		entry.fingerprint = hmeFingerprint(snap)
 	}
-
-	// 同步条目指纹，避免下次借出时因正常会话刷新被误判为凭据变更而摧毁长连接
-	snap.Cookies = newCookies
-	if newServiceURL != "" {
-		snap.ServiceURL = newServiceURL
-	}
-	entry.fingerprint = hmeFingerprint(snap)
 
 	return runErr
 }

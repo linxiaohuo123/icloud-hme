@@ -78,11 +78,12 @@ export default function DirectLinksDialog({ open, onClose, email }: DirectLinksD
         </div>
 
         <div className="form-field" style={{ margin: 0 }}>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+          <label htmlFor="direct-links-token" style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
             <IconKey size={14} />
             <span>外部访问令牌 (Token)</span>
           </label>
           <input
+            id="direct-links-token"
             type="text"
             value={token}
             onChange={(e) => setToken(e.target.value)}

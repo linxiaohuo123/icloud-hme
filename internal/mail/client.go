@@ -7,8 +7,8 @@
 
 // Package mail 实现 iCloud 邮件 IMAP 读取客户端。
 //
-// 通过 Apple 应用专用密码连接 imap.mail.me.com:993,
-// 拉取隐私邮箱别名收到的邮件。对应原 Python 项目 icloud_mail.py。
+// 通过 Apple 应用专用密码连接 imap.mail.me.com:993，
+// 拉取隐私邮箱别名收到的邮件。
 package mail
 
 import (
@@ -415,7 +415,7 @@ func (c *Client) ListMailboxes() ([]Folder, error) {
 	return folders, nil
 }
 
-// ListInbox 拉取收件箱最近 limit 封邮件摘要 (默认不拉正文，毫秒级响应)。
+// ListInbox 拉取收件箱最近 limit 封邮件摘要 (默认不拉正文，仅获取元数据)。
 func (c *Client) ListInbox(limit int, days int) ([]Message, error) {
 	return c.ListFolder("inbox", limit, days)
 }
@@ -794,7 +794,7 @@ func (c *Client) forEachByRecipientInMailbox(recipient string, folder string, li
 
 	// 1) 服务端按 Header 检索并 Union 去重
 	// QQ/网易等国产邮箱服务端不支持 Delivered-To 等非标 Header，强行搜索会导致全箱扫描并返回数千 UID 造成网络浪费与延迟。
-	// 因此对国产邮箱仅搜索标准 To 标头，未命中时秒级穿透至本地快速比对。
+	// 因此对国产邮箱仅搜索标准 To 标头，未命中时回退至本地快速比对。
 	headers := []string{"To"}
 	lowerServer := strings.ToLower(c.server)
 	isDomestic := strings.Contains(lowerServer, "qq.com") ||

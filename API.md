@@ -81,7 +81,7 @@ HTTP JSON API，所有接口均采用标准 JSON 格式交互。
    - 会话 Cookie 属性：`Path=/; HttpOnly; SameSite=Strict`；启用 TLS 时自动置为 `Secure`。
    - 浏览器写操作（POST / PUT / PATCH / DELETE）必须在请求头回传 `X-CSRF-Token`。
 5. **秘密零外泄原则**：
-   - 任何接口响应**绝对不回显** `cookies`、`app_password`、`proxy` 密文字符串，仅向客户端暴露 `has_cookies`、`has_app_password`、`has_proxy` 等健康布尔标记。
+   - 任何接口响应**均不回显** `cookies`、`app_password`、`proxy` 密文字符串，仅向客户端暴露 `has_cookies`、`has_app_password`、`has_proxy` 等健康布尔标记。
    - `GET /api/tokens` **只回显令牌掩码**（如 `am_1a2b****(35位)`），令牌本体仅在创建响应中出现一次，避免管理台被读取后批量收割令牌。
 6. **DNS Rebinding 与本地环回安全默认配置**：
    - 默认绑定 `127.0.0.1:8081`。当监听未授权的外部 IP 时，网关层强制拦截非法公网 Host 探测，防止恶意网站发起 DNS 重绑定内部穿透。
@@ -380,12 +380,12 @@ Content-Type: application/json
   - `"create"`：管理员强制实时建号。绕过预存号池，直接调用 Apple 上游 API 创建全新别名（受账号小时配额限制）。
 
 **出号机制与核心优势：**
-- **零延迟提取 (~1ms)**：后台定时任务（Schedules/Jobs）在平时按 Apple 5个/小时限制平稳囤号，注册机高峰期直接从号池原子提取，彻底打破 5个/小时的瞬时瓶颈。
-- **无需指定 `account_id`**：底层自动化调度引擎结合号池优先策略与 Round-Robin 算法秒级分配。
+- **本地号池预存提取**：后台定时任务（Schedules/Jobs）在平时按 Apple 单账号约 5 个/小时限制平稳补货，注册机高峰期直接从本地号池认领可用库存，有效平抑突发建号瓶颈。
+- **无需指定 `account_id`**：底层调度引擎结合号池优先策略与 Round-Robin 算法自动轮询分配。
 - **业务标签亲和隔离 (`tag`)**：优先分配打上指定业务标签的专属母号；若无则自动匹配通用号池，严禁跨业务串号。
 - **并发原子防重**：底层 `ClaimInventoryAlias` 在 SQLite 事务中认领库存并写入分配与流水，阻止同一别名重复出号。
 - **自动审计与流水落库**：使用外部接入令牌发起调用时，自动记录该 Token、分配的别名、出号来源 (`pool`/`created`)、业务标签至数据库。
-- **突破 750 别名上限**：单号达到 750 限制后虽无法新建，但其存量预置别名仍可自由划入号池被注册机认领。
+- **存量资产充分复用**：单号达到 750 上限后虽无法新建，但其存量预置别名仍可划入号池供外部业务认领。
 
 **响应：**
 ```json
@@ -401,7 +401,7 @@ Content-Type: application/json
   }
 }
 ```
-- `source`: 出号来源，`"pool"`（从预存号池秒级认领）或 `"created"`（触发 Apple 上游即时创建）。
+- `source`: 出号来源，`"pool"`（从本地预存号池认领）或 `"created"`（触发 Apple 上游即时创建）。
 
 ### 15. 批量创建别名
 
@@ -613,7 +613,7 @@ Authorization: Bearer <API_KEY>
 }
 ```
 
-#### 方式 B：Prime 包裹风格
+#### 方式 B：嵌套包裹风格
 ```http
 GET /api/messages/1042?account_id=acc_1
 # 也支持复合格式：GET /api/messages/INBOX:1042?account_id=acc_1
@@ -915,7 +915,7 @@ Content-Type: application/json
 }
 ```
 
-### 29. 彻底删除别名
+### 29. 物理删除别名
 
 ```http
 DELETE /api/aliases/:id
@@ -1093,7 +1093,7 @@ POST /api/reload
 Authorization: Bearer <API_KEY>
 ```
 - 重新解析加载磁盘上的 `data/accounts.json`。
-- 自动重置 IMAP 连接池与别名内存缓存，支持外部脚本修改 JSON 文件后零停机生效。
+- 自动重置 IMAP 连接池与别名内存缓存，支持外部脚本修改 JSON 文件后热重载生效。
 
 ### 39. 运行时可观测性水位 (System Stats)
 
@@ -1151,15 +1151,15 @@ Authorization: Bearer <API_KEY>
 | `alias_pool.apple_quota_remaining` | 距离 Apple 单母号 750 物理上限剩余可现场新建额度（已自动排除私人大号） |
 | `goroutines` | 数千为正常；持续数万说明有泄漏（派生 goroutine 未退出） |
 | `heap_alloc_bytes` | 主要来自别名缓存（账号数 × 别名数）。2000×200 约 150–200 MB |
-| `store.leases` | 未配置 `ICLOUD_HME_LEASE_RETENTION` 时会无限增长 |
+| `store.leases` | 未配置 `ICLOUD_HME_LEASE_RETENTION` 时会持续累积增长 |
 | `store.alias_routes` | 应接近别名总量；明显偏低说明路由自愈尚未覆盖全部账号 |
 | `message_cache_entries` | 上限 1000，接近上限说明详情缓存正在被填满 |
 
 ---
 
-## 客户端极速接入示例
+## 客户端接入示例
 
-### 场景一：注册机极速闭环脚本 (v2 规范化链路，推荐标准方案)
+### 场景一：注册机接入脚本 (v2 规范化链路，推荐标准方案)
 
 ```bash
 #!/usr/bin/env bash
@@ -1167,7 +1167,7 @@ BASE="http://127.0.0.1:8081"
 TOKEN="your_external_token_here"
 IDEMP_KEY="task_$(date +%s)_$RANDOM"
 
-# 1. 规范化出号认领 (显式幂等键，秒级从号池获取就绪资产)
+# 1. 规范化出号认领 (显式幂等键，直接从号池认领就绪资产)
 ALLOC=$(curl -s -X POST "$BASE/api/external/v2/allocate" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Idempotency-Key: $IDEMP_KEY" \
@@ -1190,7 +1190,7 @@ echo "已建立取码任务: $VREQ_ID (基线就绪)"
 # 3. 调用目标网站发起注册 / 请求发送验证码...
 # curl -X POST "https://example.com/register" -d "email=$EMAIL"
 
-# 4. 毫秒级长轮询验证码 (基于基线严格等待新邮件，无历史旧邮件串扰)
+# 4. 长轮询等待验证码 (基于基线等待新邮件到达，无历史旧邮件串扰)
 echo "等待验证码到达..."
 RESULT=$(curl -s "$BASE/api/external/v2/verification-requests/$VREQ_ID?timeout=60" \
   -H "Authorization: Bearer $TOKEN")
@@ -1204,7 +1204,7 @@ echo "捕获验证码: $CODE, 激活链接: $MAGIC"
 
 ## 外部自动化 API (v2 规范化契约)
 
-专为外部自动化注册机与多主体调用设计的工业级规范接口：
+专为外部自动化客户端与多主体调用设计的规范化接口：
 
 ### 1. 幂等出号: `POST /api/external/v2/allocate`
 - **请求头**：
@@ -1279,7 +1279,7 @@ echo "捕获验证码: $CODE, 激活链接: $MAGIC"
   }
   ```
 
-### 场景二：Python 极速自动化封装 (v2 健壮规范示例)
+### 场景二：Python 自动化封装示例 (v2 规范化链路)
 
 ```python
 import uuid
@@ -1355,7 +1355,7 @@ if result.get("success"):
 
 ### 1. 存活探针: `GET /livez`
 - **认证**：无需认证，公开访问
-- **职责**：仅报告进程存活状态，0 I/O，不访问底层存储，严禁触碰外部 Apple 接口
+- **职责**：仅报告进程存活状态，无存储与磁盘 I/O，不访问底层数据库，严禁触碰外部 Apple 接口
 - **成功响应** (200 OK)：
   ```json
   {"status": "ok"}
@@ -1387,7 +1387,7 @@ if result.get("success"):
 1. **RFC 6265 Set-Cookie 吊销与去重机制**：
    严格遵循 Cookie 标准，识别 `Max-Age<=0` 时自动从内存与存储中淘汰旧会话，防止 Apple WAF 判定 Cookie 冲突重放封禁。
 2. **拟人化步长调度 (Human-like Pacing)**：
-   自动计划任务通过动态计算当小时剩余时间与剩余额度，将创建请求随机平摊在 8–12 分钟间隔，彻底杜绝整点突发请求的机器特征。
+   自动计划任务通过动态计算当小时剩余时间与剩余额度，将创建请求随机平摊在 8–12 分钟间隔，避免整点突发请求暴露机器特征。
 3. **750 别名硬顶熔断保护**：
    项目内置常量 `MaxAliasesPerAccount`（750）为本系统依据逆向观测与平台行为设定的安全防护阈值（非 Apple 官方 SLA 承诺）。网关层在出号与调度时实时核验，触顶时自动故障转移（Failover）至下一个健康账号，并在达到时返回 `400 ALIAS_LIMIT_REACHED`，严禁触碰 Apple 上游错误风控。
 4. **SQLite WAL 原子配额仲裁锁**：

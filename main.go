@@ -61,7 +61,7 @@ func main() {
 	debug := flag.Bool("debug", false, "调试模式 (启用 Gin 调试日志)")
 	passwordFlag := flag.String("password", "", "管理员密码 (至少 8 字符,也可通过 ICLOUD_HME_ADMIN_PASSWORD 设置)")
 	apiKeyFlag := flag.String("api-key", "", "自动化 API Key (也可通过 ICLOUD_HME_API_KEY 设置)")
-	apiTokenFlag := flag.String("api-token", "", "兼容参考项目的 API Token 参数 (也可通过 ICLOUD_PRIME_API_TOKEN 设置)")
+	apiTokenFlag := flag.String("api-token", "", "API Token 参数 (也可通过 ICLOUD_PRIME_API_TOKEN 设置)")
 	backupFlag := flag.String("backup", "", "一致性备份目标文件路径")
 	restoreFlag := flag.String("restore", "", "一致性恢复源备份文件路径")
 	rotateCredentialsFlag := flag.Bool("rotate-credentials", false, "执行 Master Key 离线凭据轮换 (不启动服务)")

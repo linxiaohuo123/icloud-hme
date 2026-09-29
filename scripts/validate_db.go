@@ -446,7 +446,7 @@ func RunValidation(srcPath string) (bool, error) {
 		return false, nil
 	}
 
-	fmt.Println("🎉 验收结论: VALIDATION_PASSED (副本迁移完全成功，数据一致性无瑕疵)")
+	fmt.Println("验收结论: VALIDATION_PASSED (副本迁移完成，数据一致性校验通过)")
 	return true, nil
 }
 

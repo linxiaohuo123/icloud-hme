@@ -33,7 +33,7 @@ export interface InboxTableViewProps {
   onCountChange?: (count: number) => void
 }
 
-// 模块级单例缓存：生命周期超越组件挂载/卸载，保证工作台 Tab 切换 0ms 瞬间恢复
+// 模块级单例缓存：生命周期超越组件挂载/卸载，支持工作台 Tab 切换即时恢复已有邮件详情
 const moduleMessageCache = new Map<string, FullMessage>()
 const MAX_MODULE_MSG_CACHE = 1000
 
@@ -48,7 +48,7 @@ function setModuleMessageCache(key: string, msg: FullMessage) {
   moduleMessageCache.set(key, msg)
 }
 
-// 模块级单例列表快照缓存：支持工作台 Tab 切换、筛选恢复 0ms 瞬间呈现 (后台默默 revalidate)
+// 模块级单例列表快照缓存：支持工作台 Tab 切换、筛选恢复优先展示本地快照 (后台异步 revalidate)
 interface InboxSnapshotEntry {
   result: InboxResult
   cachedAt: number
@@ -370,7 +370,7 @@ export default function InboxTableView({
     return () => clearInterval(timer)
   }, [autoRefreshInterval, accountId])
 
-  // 1. 初始化账号列表（若父级已直传 accountSummary 且 fixedAccount 则 0ms 消费，消灭冗余 I/O）
+  // 1. 初始化账号列表（若父级已直传 accountSummary 且 fixedAccount 则直接复用，避免冗余 I/O）
   useEffect(() => {
     if (fixedAccount && accountSummary) {
       setAccountCapabilityReady(true)
@@ -433,7 +433,7 @@ export default function InboxTableView({
     }
   }, [fixedAccount, accountSummary, retryKey, searchParams, setSearchParams])
 
-  // 2. 账号变化时拉取别名列表 (若父级已直传 externalAliases 则 0ms 消费，消灭重复网络请求)
+  // 2. 账号变化时拉取别名列表 (若父级已直传 externalAliases 则直接复用，避免重复网络请求)
   useEffect(() => {
     if (externalAliases !== undefined) {
       setAliases(externalAliases)

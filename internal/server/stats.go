@@ -47,7 +47,7 @@ func (s *Server) systemStatsHandler(c *gin.Context) {
 			"db_size_bytes": s.dbSizeBytes(),
 		}
 
-		// 号池资产水位 (实时透出可用别名存量，供外部注册机/集群调度器秒级感知是否需要补仓)
+		// 号池资产水位 (透出可用别名存量，供外部注册机/集群调度器感知是否需要补仓)
 		totalActiveAliases := 0
 		appleQuotaRemaining := 0
 		if s.be != nil {

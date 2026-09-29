@@ -7,7 +7,7 @@
 
 // Package account 实现多账号管理器。
 //
-// 负责账号 CRUD、状态机管理、与持久化存储配合。对应原 Python 项目 account_manager.py。
+// 负责账号 CRUD、状态机管理、与持久化存储配合。
 package account
 
 import (

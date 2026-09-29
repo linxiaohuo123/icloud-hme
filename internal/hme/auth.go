@@ -7,8 +7,8 @@
 
 // Package hme - iCloud 认证模块
 //
-// 基于 Go-iClient 项目实现完整的 SRP (Secure Remote Password) 登录流程,
-// 支持双重认证 (2FA),登录成功后提取 session token Cookie。
+// 实现完整的 SRP (Secure Remote Password) 登录流程，
+// 支持双重认证 (2FA)，登录成功后提取 session token Cookie。
 package hme
 
 import (
@@ -285,7 +285,20 @@ func (c *Client) authComplete(state *authState, m1, m2 string, otpProvider OTPPr
 	case 409:
 		// 需要 2FA
 		return c.handleTwoFactor(state, resp, otpProvider)
-	case 403:
+	case 401, 403:
+		var errResp struct {
+			ServiceErrors []struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"serviceErrors"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&errResp); err == nil && len(errResp.ServiceErrors) > 0 {
+			msg := errResp.ServiceErrors[0].Message
+			if errResp.ServiceErrors[0].Code == "-20283" || strings.Contains(strings.ToLower(msg), "account information") {
+				return fmt.Errorf("用户名或密码错误")
+			}
+			return fmt.Errorf("Apple 认证失败: %s", msg)
+		}
 		return fmt.Errorf("用户名或密码错误")
 	case 412:
 		return fmt.Errorf("需要先在 appleid.apple.com 同意隐私条款")

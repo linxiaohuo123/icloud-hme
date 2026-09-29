@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 react 的 Component, ReactNode, ErrorInfo
  * [OUTPUT]: 对外提供 ErrorBoundary 错误边界组件，拦截子组件未捕获异常
- * [POS]: web/src/components 的稳定性屏障，彻底终结白屏问题
+ * [POS]: web/src/components 的错误边界组件，拦截未捕获异常并降级渲染，防止整页白屏崩溃
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 

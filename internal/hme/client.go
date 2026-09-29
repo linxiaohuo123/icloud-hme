@@ -7,8 +7,7 @@
 
 // Package hme 实现了 iCloud Hide My Email 协议客户端。
 //
-// 基于 Cookie 会话,通过 tls-client 伪装 Chrome TLS 指纹规避 iCloud 风控。
-// 对应原 Python 项目 icloud_hme.py 的 ICloudHME 类。
+// 基于 Cookie 会话，通过 tls-client 伪装 Chrome TLS 指纹规避 iCloud 风控。
 package hme
 
 import (
@@ -419,8 +418,8 @@ func (c *Client) RequestWithContext(ctx context.Context, method, rawURL string, 
 			if len(snippet) > 200 {
 				snippet = snippet[:200]
 			}
-			// 401/403 说明 Cookie 失效,不重试直接返回。
-			if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			// 401/403/421 说明 Cookie 失效,不重试直接返回。
+			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 421 {
 				return "", fmt.Errorf("%w: HTTP %d: %s", ErrAuthFailed, resp.StatusCode, snippet)
 			}
 			if resp.StatusCode == 429 {

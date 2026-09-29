@@ -39,7 +39,7 @@
    - **分配与租约回填**：
      扫描 `lease_records` 中已领用的别名。针对每条历史流水：
      - 若 `token_name` 对应全局唯一的非重名 Token，则将 `owner_kind='token'`, `owner_id=tok.ID`；
-     - 若 `token_name` 重名、已删除或为 `scheduler` 定时产出，**强制标记为 `owner_kind='token', owner_id='legacy_unknown'`**，彻底阻断新建同名 Token 越权继承历史别名！
+     - 若 `token_name` 重名、已删除或为 `scheduler` 定时产出，**强制标记为 `owner_kind='token', owner_id='legacy_unknown'`**，阻断新建同名 Token 越权继承历史别名。
      - 更新 `alias_inventory` 的 `allocation_state='allocated'`。
    - **出号路由回填**：
      从 `lease_records` 提取 `(account_id, email)` 并写入 `alias_routes`，消除服务重启后对上游母号的盲扫。
@@ -50,8 +50,8 @@
 
 1. **出号路径完全收口**：
    - `/api/quick-create`, `/api/alias/lease`, `/api/allocate`, `/api/external/v1/allocate`, `/api/external/v2/allocate` 全部统一调用 `AliasAllocationService`；
-   - 外部令牌在号池耗尽时，服务端统一返回 `503 POOL_EMPTY` 并附带 `Retry-After: 60` 响应头，彻底阻断远程隐式现场建号；
-   - 即使手动清理或截断 `lease_records`，所有出号入口依然以 `alias_inventory` 与 `alias_allocations` 为准，历史别名绝对不会被二次重复发放。
+   - 外部令牌在号池耗尽时，服务端统一返回 `503 POOL_EMPTY` 并附带 `Retry-After: 60` 响应头，阻断远程隐式现场建号；
+   - 即使手动清理或截断 `lease_records`，所有出号入口依然以 `alias_inventory` 与 `alias_allocations` 为准，历史别名不会被二次重复发放。
 2. **取码路径统一**：
    - 外部 v2 取码统一使用 `POST /api/external/v2/verification-requests` 采集基线游标，并在 `GET /api/external/v2/verification-requests/:id` 提取验证码；
    - 旧 `GET /api/verify-code` 保留作为兼容只读入口，但受主体归属核验强约束，且显式传 `auto_delete=true` 时返回 400 明确拒绝。
@@ -72,7 +72,7 @@
 
 针对从 PR-04 ~ PR-07 中间态版本升级的数据库：
 1. **精准字段探测 (`ensureColumn`)**：
-   - 彻底废除旧版无保护的 `_, _ = s.db.Exec("ALTER TABLE ...")` 盲吞错模式。
+   - 废除旧版无保护的 `_, _ = s.db.Exec("ALTER TABLE ...")` 盲吞错模式。
    - 使用 `PRAGMA table_info` 预先探测列是否存在，字段已存在时安全跳过；真正执行 ALTER 失败时阻断 Store 初始化，杜绝半迁移静默运行。
 2. **`alias_allocations` 缺失 `account_id` 平滑补列与 Backfill**：
    - 当历史中间态缺少 `account_id` 时，自动补充 `account_id TEXT NOT NULL DEFAULT ''`；

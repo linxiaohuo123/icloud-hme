@@ -91,6 +91,6 @@
 7. **Canonical MessageRef 必须包含 AccountID (P0-7)**：
    - 后端消息规范化无条件赋予主号 `AccountID`；批量读取 Identity Join 严格基于完整 `CacheKey` 匹配，废除弱 key 回退。
 8. **WebMail 首屏 Capability 竞态保护与单次退避 (P0-8)**：
-   - 前端增加能力就绪栅栏，在捕获 `CAPABILITY_UNSUPPORTED` 时自动降级剥离过滤参数并执行至多 1 次退避重试，彻底杜绝无限重试死循环。
+   - 前端增加能力就绪栅栏，在捕获 `CAPABILITY_UNSUPPORTED` 时自动降级剥离过滤参数并执行至多 1 次退避重试，防止重试死循环。
 9. **中间态数据库 Schema 幂等自愈 (P0-9)**：
    - 针对 PR-00 ~ PR-07 迭代期间遗留的中间态 SQLite 库，启动时自动检测并安全补齐 `account_id`、`lease_id`、`op_id` 等关键列与索引，自动从关联表回填历史缺失的 `account_id`。

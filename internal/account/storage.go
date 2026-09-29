@@ -406,6 +406,7 @@ func ParseCookieInput(raw string) (map[string]string, error) {
 		if err := json.Unmarshal([]byte(raw), &cookies); err == nil && cookies != nil {
 			out := make(map[string]string, len(cookies))
 			for k, v := range cookies {
+				v = sanitizeCookieValue(k, v)
 				if v != "" {
 					out[k] = v
 				}
@@ -430,8 +431,9 @@ func ParseCookieInput(raw string) (map[string]string, error) {
 				if n == "" {
 					n = item.Key
 				}
-				if n != "" && item.Value != "" {
-					out[n] = item.Value
+				v := sanitizeCookieValue(n, item.Value)
+				if n != "" && v != "" {
+					out[n] = v
 				}
 			}
 			if len(out) > 0 {
@@ -451,7 +453,7 @@ func ParseCookieInput(raw string) (map[string]string, error) {
 			parts := strings.Split(line, "\t")
 			if len(parts) >= 7 {
 				name := strings.TrimSpace(parts[5])
-				val := strings.TrimSpace(parts[6])
+				val := sanitizeCookieValue(name, parts[6])
 				if name != "" && val != "" {
 					cookies[name] = val
 				}
@@ -479,7 +481,7 @@ func ParseCookieInput(raw string) (map[string]string, error) {
 			continue
 		}
 		name := strings.TrimSpace(part[:idx])
-		value := strings.TrimSpace(part[idx+1:])
+		value := sanitizeCookieValue(name, part[idx+1:])
 		if name != "" && value != "" {
 			cookies[name] = value
 		}
@@ -488,4 +490,15 @@ func ParseCookieInput(raw string) (map[string]string, error) {
 		return nil, fmt.Errorf("无法解析 Cookie 输入,请提供 Header String、JSON 或 Netscape 格式")
 	}
 	return cookies, nil
+}
+
+func sanitizeCookieValue(name, val string) string {
+	val = strings.TrimSpace(val)
+	if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
+		// 针对 TOKEN 等必须裸字符串传输的 Cookie 进行修剪
+		if name == "X-APPLE-WEBAUTH-TOKEN" || name == "X-APPLE-DS-WEB-SESSION-TOKEN" {
+			val = val[1 : len(val)-1]
+		}
+	}
+	return val
 }

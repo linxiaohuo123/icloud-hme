@@ -85,7 +85,7 @@ func (b *AliasBuffer) AcquireContext(ctx context.Context, label string) (*hme.Cr
 	default:
 	}
 
-	// 1. 尝试从缓冲队列秒级弹出 (如有预存)
+	// 1. 尝试从缓冲队列直接弹出 (如有预存)
 	select {
 	case item := <-b.queue:
 		return item.Result, item.AccountID, nil
