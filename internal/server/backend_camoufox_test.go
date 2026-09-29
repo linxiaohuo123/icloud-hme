@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"icloud-hme/internal/account"
 	"icloud-hme/internal/store"
 )
 
@@ -244,6 +245,56 @@ func TestPollCamoufoxTaskFailsFastOnHTTPError(t *testing.T) {
 	backendErr, ok := err.(*BackendError)
 	if !ok || backendErr.Code != "UPSTREAM_FAILURE" {
 		t.Fatalf("unexpected polling error: %v", err)
+	}
+}
+
+func TestPollCamoufoxTaskReportsOTPInputFailure(t *testing.T) {
+	t.Setenv("ICLOUD_HME_CAMOUFOX_TOKEN", "test-token")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodDelete {
+			_, _ = w.Write([]byte(`{"success":true}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"task_id":"task-1","status":"failed","error_message":"Apple ID 双重认证验证码输入失败"}`))
+	}))
+	defer server.Close()
+
+	be := &managerBackend{}
+	_, err := be.pollCamoufoxTask("account-1", "task-1", server.URL, time.Second, true)
+	backendErr, ok := err.(*BackendError)
+	if !ok || backendErr.Code != "OTP_INPUT_FAILED" || backendErr.Status != http.StatusBadGateway {
+		t.Fatalf("OTP automation failure was reported as invalid code: %v", err)
+	}
+}
+
+func TestCamoufoxOTPSubmissionExpiredTask(t *testing.T) {
+	t.Setenv("ICLOUD_HME_CAMOUFOX_TOKEN", "test-token")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusGone)
+	}))
+	defer server.Close()
+	mgr, err := account.NewManager(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+	acc, err := mgr.AddAccountWithInput(account.AddAccountInput{
+		Name: "test", ICloudEmail: "test@example.com", Host: "icloud.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	be := &managerBackend{mgr: mgr}
+	be.reserveCamoufoxTask(acc.ID, server.URL)
+	be.setCamoufoxTask(acc.ID, "task-1")
+	_, err = be.loginWithCamoufox(acc.ID, "", "123456", server.URL)
+	backendErr, ok := err.(*BackendError)
+	if !ok || backendErr.Code != "OTP_EXPIRED" {
+		t.Fatalf("expired OTP task was not reported as expired: %v", err)
+	}
+	if _, ok := be.getCamoufoxTask(acc.ID); ok {
+		t.Fatal("expired OTP task retained after proxy rejected submission")
 	}
 }
 

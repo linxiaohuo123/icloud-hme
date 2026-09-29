@@ -217,6 +217,46 @@ describe('AccountsPage', () => {
     expect(cancelledTaskId).toBe('task-1')
   })
 
+  it('Camoufox OTP 任务过期后回到密码登录', async () => {
+    const bodies: Array<Record<string, string>> = []
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+      http.post('/api/accounts/:id/login', async ({ request }) => {
+        bodies.push(await request.json() as Record<string, string>)
+        if (bodies.length === 1) {
+          return HttpResponse.json(
+            { success: false, code: 'OTP_REQUIRED', message: '需要验证码', data: { task_id: 'task-1' } },
+            { status: 409 },
+          )
+        }
+        if (bodies.length === 2) {
+          return HttpResponse.json(
+            { success: false, code: 'OTP_EXPIRED', message: '验证会话已失效' },
+            { status: 400 },
+          )
+        }
+        return HttpResponse.json({ success: true, data: accounts[0] })
+      }),
+    )
+    renderPage()
+    await screen.findByText('活跃号')
+    const user = userEvent.setup()
+    await user.click(screen.getAllByRole('button', { name: /更多操作/ })[0])
+    await user.click(screen.getByRole('button', { name: /iCloud 登录/ }))
+    await user.type(screen.getByLabelText(/密码/), 'first-password')
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /登录/ }))
+    await user.type(await screen.findByLabelText(/验证码/), '123456')
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /验证/ }))
+    await screen.findByText(/验证会话已失效/)
+    expect(screen.queryByLabelText(/验证码/)).toBeNull()
+    const passwordInput = screen.getByLabelText(/Apple ID 密码/) as HTMLInputElement
+    expect(passwordInput.value).toBe('')
+    await user.type(passwordInput, 'second-password')
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /登录/ }))
+    await waitFor(() => expect(bodies).toHaveLength(3))
+    expect(bodies[2]).toEqual({ password: 'second-password' })
+  })
+
   it('App Password 提交后清空', async () => {
     let pwdBody = ''
     server.use(

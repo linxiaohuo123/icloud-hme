@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 errors, fmt, strings, time, unicode/utf8, icloud-hme/internal/hme
- * [OUTPUT]: 对外提供 Cookie 校验错误、(*Manager).UpdateCookies/UpdateCookiesIfValid、会话校验与凭据代际保护
+ * [OUTPUT]: 对外提供 Cookie 校验错误、Cookie 与登录区域原子更新、会话校验与凭据代际保护
  * [POS]: internal/account 的账号会话校验、健康巡检状态机与凭据失效判定
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -47,17 +47,29 @@ func verifyAppleIdentity(acc *Account, info *hme.AccountInfo) error {
 
 // UpdateCookies 更新指定账号的 Cookie,并自动校验会话有效性。
 func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
-	return m.updateCookies(id, cookies, true)
+	return m.updateCookies(id, cookies, true, "")
 }
 
 // UpdateCookiesIfValid 仅在新 Cookie 通过校验时替换原有凭据，供自动登录使用。
 func (m *Manager) UpdateCookiesIfValid(id string, cookies map[string]string) error {
-	return m.updateCookies(id, cookies, false)
+	return m.updateCookies(id, cookies, false, "")
 }
 
-func (m *Manager) updateCookies(id string, cookies map[string]string, saveInvalid bool) error {
+// UpdateCookiesIfValidForHost 将代理实际登录的区域和通过校验的 Cookie 一起保存。
+func (m *Manager) UpdateCookiesIfValidForHost(id string, cookies map[string]string, host string) error {
+	return m.updateCookies(id, cookies, false, host)
+}
+
+func (m *Manager) updateCookies(id string, cookies map[string]string, saveInvalid bool, host string) error {
 	if len(cookies) == 0 {
 		return fmt.Errorf("cookies 不能为空")
+	}
+	if host != "" {
+		var err error
+		host, err = validateHost(host)
+		if err != nil {
+			return err
+		}
 	}
 	entry := m.hmePool.acquire(id)
 	entry.mu.Lock()
@@ -76,7 +88,9 @@ func (m *Manager) updateCookies(id string, cookies map[string]string, saveInvali
 	// 自动校验 Cookie 是否有效(锁外对快照操作)
 	snap.Cookies = cookies
 	originalHost := snap.Host
-	if snap.Host == "" {
+	if host != "" {
+		snap.Host = host
+	} else if snap.Host == "" {
 		snap.Host = "icloud.com"
 	}
 	aliasesFetched := false
@@ -143,6 +157,9 @@ func (m *Manager) updateCookies(id string, cookies map[string]string, saveInvali
 	}
 	old := *cur
 	cur.Cookies = snap.Cookies
+	if host != "" {
+		cur.Host = snap.Host
+	}
 	cur.ServiceURL = ""
 	cur.Status = snap.Status
 	cur.LastValidated = snap.LastValidated
@@ -327,9 +344,9 @@ func (m *Manager) markAccountError(id string, epoch uint64, reason string) {
 	}
 }
 
-// isAuthFailure 判断上游错误是否为凭据级失效(401/403，hme 客户端不重试直接返回)。
+// isAuthFailure 判断上游错误是否为凭据级失效(401/403/421，hme 客户端不重试直接返回)。
 func isAuthFailure(msg string) bool {
-	return strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "HTTP 403")
+	return strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "HTTP 403") || strings.Contains(msg, "HTTP 421")
 }
 
 // deriveICloudEmail 从账号身份推导 iCloud 邮箱地址(用于 IMAP 登录)。

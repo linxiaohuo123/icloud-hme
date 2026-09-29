@@ -190,9 +190,15 @@ func TestUpdateCookiesIfValidPreservesExistingCredentials(t *testing.T) {
 	if err := m.UpdateCookiesIfValid(acc.ID, map[string]string{"session": "new"}); !errors.Is(err, ErrCookiesRejectedInvalid) {
 		t.Fatalf("automatic update should reject invalid cookies: %v", err)
 	}
+	if err := m.UpdateCookiesIfValidForHost(acc.ID, map[string]string{"session": "new"}, "icloud.com.cn"); !errors.Is(err, ErrCookiesRejectedInvalid) {
+		t.Fatalf("automatic host switch should reject invalid cookies: %v", err)
+	}
 	after, _ := m.GetAccount(acc.ID)
-	if after.Cookies["session"] != "old" || after.Status != before.Status || after.LastError != before.LastError || after.credentialEpoch != before.credentialEpoch {
+	if after.Cookies["session"] != "old" || after.Host != before.Host || after.Status != before.Status || after.LastError != before.LastError || after.credentialEpoch != before.credentialEpoch {
 		t.Fatalf("rejected cookies changed account state: before=%+v after=%+v", before, after)
+	}
+	if err := m.UpdateCookiesIfValidForHost(acc.ID, map[string]string{"session": "new"}, "other.example"); err == nil {
+		t.Fatal("automatic host switch accepted an unsupported host")
 	}
 }
 
@@ -258,6 +264,7 @@ func TestIsAuthFailure(t *testing.T) {
 	cases := map[string]bool{
 		"HTTP 401: unauthorized":         true,
 		"HTTP 403: forbidden":            true,
+		"HTTP 421: misdirected request":  true,
 		"连接失败: dial tcp: i/o timeout":    false,
 		"validate 响应缺少 Hide My Email 端点": false,
 	}

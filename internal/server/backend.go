@@ -549,6 +549,8 @@ func camoufoxHTTPError(action string, status int) *BackendError {
 
 var errCamoufoxTaskMissing = errors.New("Camoufox 任务不存在")
 
+const camoufoxInitialPollTimeout = 210 * time.Second
+
 func cancelCamoufoxTask(baseURL, taskID string) error {
 	req, err := newCamoufoxRequest(http.MethodDelete, baseURL+"/tasks/"+taskID, nil)
 	if err != nil {
@@ -724,6 +726,11 @@ func (b *managerBackend) loginWithCamoufox(id, password, otpCode, camoufoxBase s
 			b.clearCamoufoxTask(id, pending.taskID)
 			return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "OTP_EXPIRED", Message: "2FA 验证会话已失效，请重新登录"}
 		}
+		if resp.StatusCode == http.StatusGone || resp.StatusCode == http.StatusBadRequest {
+			resp.Body.Close()
+			b.clearCamoufoxTask(id, pending.taskID)
+			return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "OTP_EXPIRED", Message: "2FA 验证会话已结束，请重新登录"}
+		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
 			return account.Summary{}, camoufoxHTTPError("提交验证码", resp.StatusCode)
@@ -795,7 +802,7 @@ func (b *managerBackend) loginWithCamoufox(id, password, otpCode, camoufoxBase s
 		return account.Summary{}, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_FAILURE", Message: "Camoufox 登录任务持久化失败"}
 	}
 	started = true
-	return b.pollCamoufoxTask(id, loginRes.TaskID, camoufoxBase, 60*time.Second, false)
+	return b.pollCamoufoxTask(id, loginRes.TaskID, camoufoxBase, camoufoxInitialPollTimeout, false)
 }
 
 func (b *managerBackend) pollCamoufoxTask(accountID, taskID, camoufoxBase string, timeout time.Duration, isOTPPhase bool) (account.Summary, error) {
@@ -837,6 +844,7 @@ func (b *managerBackend) pollCamoufoxTask(accountID, taskID, camoufoxBase string
 		var task struct {
 			TaskID       string            `json:"task_id"`
 			Status       string            `json:"status"`
+			Host         string            `json:"host"`
 			ErrorMessage string            `json:"error_message"`
 			Cookies      map[string]string `json:"cookies"`
 		}
@@ -869,6 +877,12 @@ func (b *managerBackend) pollCamoufoxTask(accountID, taskID, camoufoxBase string
 		case "failed":
 			_ = b.cancelAndClearCamoufoxTask(accountID, taskID, camoufoxBase)
 			errMsg := task.ErrorMessage
+			if strings.Contains(errMsg, "验证码输入失败") {
+				return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "OTP_INPUT_FAILED", Message: "Camoufox 未能填入双重认证验证码，请重新登录"}
+			}
+			if strings.Contains(errMsg, "代理") {
+				return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "CAMOUFOX_PROXY_ERROR", Message: errMsg}
+			}
 			if strings.Contains(errMsg, "密码错误") || strings.Contains(errMsg, "incorrect") {
 				return account.Summary{}, &BackendError{Status: http.StatusUnauthorized, Code: "INVALID_CREDENTIALS", Message: "Apple ID 账号或密码错误"}
 			}
@@ -881,7 +895,7 @@ func (b *managerBackend) pollCamoufoxTask(accountID, taskID, camoufoxBase string
 			if len(task.Cookies) == 0 {
 				return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "Camoufox 登录成功但未返回 Cookie"}
 			}
-			if err := b.mgr.UpdateCookiesIfValid(accountID, task.Cookies); err != nil {
+			if err := b.mgr.UpdateCookiesIfValidForHost(accountID, task.Cookies, task.Host); err != nil {
 				return account.Summary{}, mapAccountErr(err)
 			}
 			b.invalidateAliasCache(accountID)
@@ -984,6 +998,13 @@ func classifyLoginErr(err error) *BackendError {
 	}
 	if strings.Contains(msg, "隐私条款") {
 		return &BackendError{Status: http.StatusForbidden, Code: "TERMS_REQUIRED", Message: "需要先在 appleid.apple.com 同意苹果隐私条款"}
+	}
+	if strings.Contains(msg, "Apple 认证失败:") {
+		cleanMsg := msg
+		if idx := strings.Index(msg, "Apple 认证失败:"); idx >= 0 {
+			cleanMsg = msg[idx:]
+		}
+		return &BackendError{Status: http.StatusUnauthorized, Code: "APPLE_AUTH_REJECTED", Message: cleanMsg}
 	}
 	if isSessionError(msg) || strings.Contains(msg, "auth complete") || strings.Contains(msg, "401") || strings.Contains(msg, "403") {
 		return &BackendError{Status: http.StatusUnauthorized, Code: "APPLE_AUTH_BLOCKED", Message: "Apple 拒绝了模拟密码登录（触发了苹果安全风控），请点击【更新 Cookie】直接粘贴浏览器 Cookie 激活"}
@@ -1092,7 +1113,7 @@ func classifyUpstreamErr(fixedMsg string, err error) *BackendError {
 // isSessionError 判断错误是否由会话失效引起。
 func isSessionError(msg string) bool {
 	m := strings.ToLower(msg)
-	return strings.Contains(m, "401") || strings.Contains(m, "403") ||
+	return strings.Contains(m, "401") || strings.Contains(m, "403") || strings.Contains(m, "421") ||
 		strings.Contains(m, "session") || strings.Contains(m, "cookie") ||
 		strings.Contains(m, "unauthorized") || strings.Contains(m, "认证") ||
 		strings.Contains(m, "会话校验失败")

@@ -4,8 +4,9 @@ import os
 import secrets
 import sys
 import uuid
-import time
+from contextlib import asynccontextmanager, suppress
 from typing import Dict, Optional
+from urllib.parse import unquote, urlsplit, urlunsplit
 from browserforge.fingerprints import Screen
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -23,8 +24,14 @@ logger = logging.getLogger("camoufox-agent")
 def _safe_login_error(exc: BaseException) -> str:
     """将浏览器内部错误映射为不含页面原文或凭据的稳定提示。"""
     message = str(exc).lower()
+    if "代理地址格式无效" in message or "代理协议不支持认证" in message:
+        return "Camoufox 代理配置无效"
+    if "proxy" in message.lower() or "代理连接" in message:
+        return "Camoufox 代理连接失败"
     if any(marker in message for marker in ("账号或密码错误", "incorrect", "not valid", "check the account", "密码错误")):
         return "Apple ID 账号或密码错误"
+    if "验证码输入失败" in message:
+        return "Apple ID 双重认证验证码输入失败"
     if any(marker in message for marker in ("验证码错误", "verification code", "two-factor", "双重认证")):
         return "Apple ID 双重认证验证码无效"
     if "timeout" in message or "超时" in message:
@@ -51,10 +58,24 @@ def ensure_camoufox_browser() -> bool:
 # 服务初始化时尝试确保内核
 camoufox_ready = AsyncCamoufox is not None and ensure_camoufox_browser()
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if camoufox_ready:
+        await refresh_camoufox_runtime_ready()
+    probe_task = asyncio.create_task(refresh_camoufox_runtime_periodically())
+    try:
+        yield
+    finally:
+        probe_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await probe_task
+
+
 app = FastAPI(
     title="iCloud HME Camoufox Authentication Agent",
     description="基于 Camoufox 逆向浏览器环境的自动化 Apple ID 授权登录与 Cookie 提取微服务",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 class LoginRequest(BaseModel):
@@ -81,12 +102,12 @@ class TaskState:
 tasks: Dict[str, TaskState] = {}
 active_tasks: set[str] = set()
 MAX_ACTIVE_TASKS = 2
-MAX_TASK_SECONDS = 300
+MAX_TASK_SECONDS = 480
 TASK_RESULT_SECONDS = 120
-health_probe_lock = asyncio.Lock()
-health_probe_at = 0.0
 health_probe_result = False
-HEALTH_PROBE_CACHE_SECONDS = 10.0
+HEALTH_PROBE_INTERVAL_SECONDS = 120
+HEALTH_PROBE_RETRY_SECONDS = 15
+HEALTH_PROBE_TIMEOUT_SECONDS = 15
 
 def require_token(x_camoufox_token: Optional[str] = Header(None)) -> None:
     expected = os.environ.get("ICLOUD_HME_CAMOUFOX_TOKEN", "")
@@ -150,10 +171,8 @@ async def check_login_success_and_sync(task: TaskState, context) -> bool:
         has_trust = "X-APPLE-WEBAUTH-HSA-TRUST" in cookies_map
         has_token = "X-APPLE-WEBAUTH-TOKEN" in cookies_map
         has_web_id = "X-APPLE-WEB-ID" in cookies_map
-        has_user = "X-APPLE-WEBAUTH-USER" in cookies_map
-
-        # 单独的 WEB-ID 不足以证明认证完成；最终仍由主服务验证 Apple 会话。
-        is_success = has_token and (has_trust or has_web_id or has_user)
+        # USER 可能在 2FA 完成前出现；最终仍由主服务验证 Apple 会话。
+        is_success = has_token and (has_trust or has_web_id)
         if is_success:
             task.cookies = cookies_map
             task.status = "success"
@@ -163,23 +182,44 @@ async def check_login_success_and_sync(task: TaskState, context) -> bool:
         logger.debug("[%s] Cookie 检查异常 (%s)", task.task_id, type(e).__name__)
     return False
 
+OTP_INPUT_SELECTOR = 'input[id^="char"], input[id^="digit"], input[autocomplete="one-time-code"], input[type="tel"], input.security-code'
+
+
+async def visible_otp_inputs(page):
+    for frame in page.frames:
+        digits = frame.locator(OTP_INPUT_SELECTOR)
+        if await digits.count() > 0 and await digits.first.is_visible():
+            return digits
+    return None
+
+
 async def handle_redirect_and_trust(page, context, task: TaskState) -> bool:
     """处理中国区跳转 (icloud.com.cn) 与受信任浏览器弹窗，提取 Cookie"""
+    if await visible_otp_inputs(page) is not None:
+        return False
     if await check_login_success_and_sync(task, context):
         return True
 
     # 1. 检查是否存在中国区重定向提示 (Good evening. To sign in with this Apple Account, go to iCloud.com.cn.)
+    redirected = False
     try:
         redirect_btn = page.locator('a:has-text("iCloud.com.cn"), button:has-text("iCloud.com.cn"), .domain-redirect-page a, [data-test="domain-redirect-button"]')
         if await redirect_btn.count() > 0 and await redirect_btn.first.is_visible():
             logger.info(f"[{task.task_id}] 检测到中国区 Apple ID 专属重定向，点击前往 iCloud.com.cn...")
             await redirect_btn.first.click(timeout=3000)
-            await asyncio.sleep(2)
+            redirected = True
         elif await js_click_by_text(page, "Go to iCloud.com.cn", "前往 iCloud.com.cn", "iCloud.com.cn"):
             logger.info(f"[{task.task_id}] 文本穿透点击了前往 iCloud.com.cn")
-            await asyncio.sleep(2)
-    except Exception:
-        pass
+            redirected = True
+    except Exception as exc:
+        logger.debug("[%s] 中国区跳转按钮不可用 (%s)", task.task_id, type(exc).__name__)
+
+    if redirected:
+        task.req.host = "icloud.com.cn"
+        if "icloud.com.cn" not in page.url:
+            await page.goto("https://www.icloud.com.cn/", wait_until="domcontentloaded", timeout=25000)
+        await _submit_credentials_to_page(task, page)
+        return False
 
     # 2. 检查信任浏览器按钮（注意：必须排除“不信任”/“Don't Trust”，优先点击主要按钮）
     trust_selectors = [
@@ -235,77 +275,16 @@ async def handle_redirect_and_trust(page, context, task: TaskState) -> bool:
     return await check_login_success_and_sync(task, context)
 
 async def _ensure_keep_signed_in(auth_frame, task_id: str = "") -> bool:
-    """确保【保持我的登录状态】复选框处于勾选状态"""
+    """只在存在且未勾选时设置保持登录，不把可选控件当作登录前提。"""
     try:
-        # 1. 尝试直接点击含有“保持我的登录状态”的文本或容器 (使用 get_by_text 精确匹配)
-        target = auth_frame.get_by_text("保持我的登录状态")
-        if await target.count() > 0:
-            try:
-                el = target.first
-                try:
-                    await el.evaluate("el => (el.parentElement || el).style.outline = '3px solid #00ff00'")
-                except Exception:
-                    pass
-                await el.click(force=True, timeout=2000)
-                logger.info(f"[{task_id}] 已通过 get_by_text 精准点击【保持我的登录状态】")
-                return True
-            except Exception:
-                pass
-
-        target_en = auth_frame.get_by_text("Keep me signed in")
-        if await target_en.count() > 0:
-            try:
-                el = target_en.first
-                await el.click(force=True, timeout=2000)
-                logger.info(f"[{task_id}] 已通过 get_by_text 精准点击【Keep me signed in】")
-                return True
-            except Exception:
-                pass
-
-        # 2. 查找 label 元素并点击
-        labels = auth_frame.locator('label:has-text("保持"), label:has-text("Keep me signed in"), .form-choice-label, .si-remember-password')
-        if await labels.count() > 0:
-            try:
-                await labels.first.click(force=True, timeout=2000)
-                logger.info(f"[{task_id}] 点击 label 激活【保持我的登录状态】")
-                return True
-            except Exception:
-                pass
-
-        # 3. 查找原生 checkbox 并强行 check
-        checkboxes = auth_frame.locator('input[type="checkbox"], input#remember-me, input.form-choice-checkbox')
-        if await checkboxes.count() > 0:
-            cb = checkboxes.first
-            try:
-                if not await cb.is_checked():
-                    await cb.check(force=True, timeout=2000)
-                    logger.info(f"[{task_id}] 已通过 force check 勾选【保持我的登录状态】")
-                    return True
-            except Exception:
-                pass
-
-        # 4. JS 穿透探测兜底
-        clicked = await auth_frame.evaluate("""() => {
-            for (const el of document.querySelectorAll('*')) {
-                const txt = (el.innerText || '').trim();
-                if (txt === '保持我的登录状态' || txt === 'Keep me signed in') {
-                    el.click();
-                    return true;
-                }
-            }
-            const cb = document.querySelector('input[type="checkbox"], #remember-me');
-            if (cb) {
-                cb.checked = true;
-                cb.dispatchEvent(new Event('change', { bubbles: true }));
-                return true;
-            }
-            return false;
-        }""")
-        if clicked:
-            logger.info(f"[{task_id}] JS 深度穿透勾选了【保持我的登录状态】")
-            return True
-    except Exception as e:
-        logger.debug("[%s] 检查保持登录状态选项时提示 (%s)", task_id, type(e).__name__)
+        checkbox = auth_frame.locator('input#remember-me, input.form-choice-checkbox').first
+        if await checkbox.count() == 0:
+            return False
+        if not await checkbox.is_checked():
+            await checkbox.check(force=True, timeout=2000)
+        return True
+    except Exception as exc:
+        logger.warning("[%s] 设置保持登录状态失败 (%s)", task_id, type(exc).__name__)
     return False
 
 async def _submit_credentials_to_page(task: TaskState, page) -> None:
@@ -355,27 +334,17 @@ async def _submit_credentials_to_page(task: TaskState, page) -> None:
     continue_btn = auth_frame.locator('button#sign-in').first
     await continue_btn.click()
 
-    # 步骤 3: 等待密码输入框与 #remember-me-label 动态渲染
+    # 步骤 3: 等待密码输入框
     pwd_input = auth_frame.locator('input#password_text_field').first
     await pwd_input.wait_for(state="visible", timeout=15000)
-
-    remember_label = auth_frame.locator('#remember-me-label, .si-remember-password, #remember-me').first
-    await remember_label.wait_for(state="visible", timeout=10000)
 
     # 步骤 4: 输入密码
     logger.info(f"[{task.task_id}] 正在填入密码...")
     await pwd_input.fill(task.req.password)
     await asyncio.sleep(0.5)
 
-    # 步骤 5: 勾选【保持我的登录状态】
-    logger.info(f"[{task.task_id}] 勾选【保持我的登录状态】(#remember-me-label)...")
-    try:
-        await remember_label.click(force=True)
-        cb = auth_frame.locator('input#remember-me').first
-        if not await cb.is_checked():
-            await cb.check(force=True)
-    except Exception as e:
-            logger.warning("[%s] 勾选保持登录提示 (%s)", task.task_id, type(e).__name__)
+    # 步骤 5: 可选的保持登录状态
+    await _ensure_keep_signed_in(auth_frame, task.task_id)
     await asyncio.sleep(1.5)
 
     # 步骤 6: 提交登录
@@ -401,22 +370,26 @@ async def _execute_login(task: TaskState, context, page) -> None:
         await asyncio.sleep(0.5)
 
         # 0. 检查是否已免密登录成功或已触发跳转/信任
+        previous_host = task.req.host
         if await handle_redirect_and_trust(page, context, task):
             return
+        if previous_host != task.req.host:
+            deadline = asyncio.get_event_loop().time() + 40
+            continue
 
         # 0.1 检查是否触发中国区重定向阻断（若此前配置为国际区）
-        try:
-            if "icloud.com.cn" not in page.url:
+        if "icloud.com.cn" not in page.url:
+            try:
                 page_text = await page.content()
-                if "can't sign in to icloud.com" in page_text.lower() or "前往 icloud.com.cn" in page_text:
-                    logger.info(f"[{task.task_id}] 发现该账号属于云上贵州(中国区)，自动切换至 https://www.icloud.com.cn/ 执行原生登录...")
-                    task.req.host = "icloud.com.cn"
-                    await page.goto("https://www.icloud.com.cn/", wait_until="domcontentloaded", timeout=25000)
-                    await _submit_credentials_to_page(task, page)
-                    deadline = asyncio.get_event_loop().time() + 40
-                    continue
-        except Exception:
-            pass
+            except Exception:
+                page_text = ""
+            if "can't sign in to icloud.com" in page_text.lower() or "前往 icloud.com.cn" in page_text:
+                logger.info(f"[{task.task_id}] 发现该账号属于云上贵州(中国区)，自动切换至 https://www.icloud.com.cn/ 执行原生登录...")
+                task.req.host = "icloud.com.cn"
+                await page.goto("https://www.icloud.com.cn/", wait_until="domcontentloaded", timeout=25000)
+                await _submit_credentials_to_page(task, page)
+                deadline = asyncio.get_event_loop().time() + 40
+                continue
 
         # 1. 检查各 frame 中是否存在账号密码错误或拦截提示
         for f in page.frames:
@@ -433,7 +406,7 @@ async def _execute_login(task: TaskState, context, page) -> None:
 
         # 2. 检查是否触发 2FA 验证码输入框
         for f in page.frames:
-            digits = f.locator('input[id^="char"], input[id^="digit"], input[autocomplete="one-time-code"], input[type="tel"], input.security-code')
+            digits = f.locator(OTP_INPUT_SELECTOR)
             if await digits.count() > 0 and await digits.first.is_visible():
                 otp_digits_locator = digits
                 has_otp = True
@@ -483,21 +456,23 @@ async def _execute_login(task: TaskState, context, page) -> None:
             logger.warning("[%s] 键盘流输入验证码出现告警，启用保底逐格填入 (%s)", task.task_id, type(e).__name__)
             try:
                 box_count = await otp_digits_locator.count()
-                for idx in range(min(box_count, len(otp_code))):
-                    await otp_digits_locator.nth(idx).fill(otp_code[idx])
-            except Exception:
-                pass
+                if box_count == 1:
+                    await otp_digits_locator.first.fill(otp_code)
+                elif box_count >= len(otp_code):
+                    for idx, digit in enumerate(otp_code):
+                        await otp_digits_locator.nth(idx).fill(digit)
+                else:
+                    raise RuntimeError("验证码输入框数量不足")
+            except Exception as fallback_exc:
+                if await handle_redirect_and_trust(page, context, task):
+                    return
+                raise RuntimeError("双重认证验证码输入失败") from fallback_exc
 
             logger.info(f"[{task.task_id}] 验证码输入完成，等待后续验证与信任提示...")
             try:
                 await otp_digits_locator.last.press("Enter", timeout=1000)
             except Exception:
                 pass
-        except Exception as e:
-            logger.warning("[%s] 验证码输入过程出现告警，检查是否已跳转 (%s)", task.task_id, type(e).__name__)
-            if await handle_redirect_and_trust(page, context, task):
-                return
-
         await asyncio.sleep(1)
 
     # 4. 检查并处理“信任此浏览器”与最终就绪（最长等 45 秒）
@@ -523,16 +498,36 @@ async def _execute_login(task: TaskState, context, page) -> None:
         raise Exception("Apple ID 认证未能完成，未提取到有效登录态 Cookie")
 
 
+def camoufox_proxy_settings(proxy_url: str) -> Dict[str, str]:
+    try:
+        parsed = urlsplit(proxy_url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("代理地址格式无效") from exc
+    if not parsed.scheme or not hostname or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ValueError("代理地址格式无效")
+    if parsed.scheme in ("socks4", "socks5", "socks5h") and parsed.username is not None:
+        raise ValueError("代理协议不支持认证")
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    server = urlunsplit((parsed.scheme, f"{host}:{port}" if port else host, "", "", ""))
+    settings = {"server": server}
+    if parsed.username is not None:
+        settings["username"] = unquote(parsed.username)
+    if parsed.password is not None:
+        settings["password"] = unquote(parsed.password)
+    return settings
+
+
 async def run_camoufox_worker(task: TaskState):
     if AsyncCamoufox is None:
         task.status = "failed"
         task.error_message = "Camoufox 未安装，请先执行 pip install 'camoufox[geoip]'"
         return
 
-    proxy_cfg = {"server": task.req.proxy} if task.req.proxy else None
-    logger.info("[%s] 启动 Camoufox 实例 (代理已配置: %s)", task.task_id, bool(proxy_cfg))
-
     try:
+        proxy_cfg = camoufox_proxy_settings(task.req.proxy) if task.req.proxy else None
+        logger.info("[%s] 启动 Camoufox 实例 (代理已配置: %s)", task.task_id, bool(proxy_cfg))
         headless_env = os.environ.get("CAMOUFOX_HEADLESS")
         if headless_env is not None:
             is_headless = headless_env.lower() in ("true", "1")
@@ -590,27 +585,33 @@ async def _probe_camoufox_runtime() -> bool:
         return False
 
 
-async def camoufox_runtime_ready() -> bool:
-    """对健康检查做短缓存，避免每次请求都额外占用浏览器进程。"""
-    global health_probe_at, health_probe_result
-    now = time.monotonic()
-    if now - health_probe_at < HEALTH_PROBE_CACHE_SECONDS:
-        return health_probe_result
-    async with health_probe_lock:
-        now = time.monotonic()
-        if now - health_probe_at < HEALTH_PROBE_CACHE_SECONDS:
-            return health_probe_result
-        try:
-            health_probe_result = await asyncio.wait_for(_probe_camoufox_runtime(), timeout=8)
-        except asyncio.TimeoutError:
-            logger.warning("[-] Camoufox 健康探针启动超时")
-            health_probe_result = False
-        health_probe_at = time.monotonic()
-        return health_probe_result
+async def refresh_camoufox_runtime_ready() -> None:
+    global camoufox_ready, health_probe_result
+    if not camoufox_ready and AsyncCamoufox is not None:
+        camoufox_ready = await asyncio.to_thread(ensure_camoufox_browser)
+    if not camoufox_ready:
+        health_probe_result = False
+        return
+    try:
+        health_probe_result = await asyncio.wait_for(
+            _probe_camoufox_runtime(), timeout=HEALTH_PROBE_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[-] Camoufox 健康探针启动超时")
+        health_probe_result = False
+
+
+async def refresh_camoufox_runtime_periodically() -> None:
+    while True:
+        delay = HEALTH_PROBE_INTERVAL_SECONDS if health_probe_result else HEALTH_PROBE_RETRY_SECONDS
+        await asyncio.sleep(delay)
+        while active_tasks:
+            await asyncio.sleep(HEALTH_PROBE_RETRY_SECONDS)
+        await refresh_camoufox_runtime_ready()
 
 @app.post("/login", dependencies=[Depends(require_token)])
 async def start_login(req: LoginRequest):
-    if not await camoufox_runtime_ready():
+    if not health_probe_result:
         raise HTTPException(status_code=503, detail="Camoufox 浏览器内核未就绪")
     if len(active_tasks) >= MAX_ACTIVE_TASKS:
         raise HTTPException(status_code=429, detail="登录任务已达并发上限，请稍后重试")
@@ -632,6 +633,10 @@ async def submit_otp(req: SubmitOTPRequest):
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在或已过期")
 
+    if task.status == "success":
+        return {"success": True, "task_id": req.task_id, "status": "success"}
+    if task.status == "failed":
+        raise HTTPException(status_code=410, detail="登录任务已结束，请重新登录")
     if task.status == "verifying":
         raise HTTPException(status_code=409, detail="验证码正在验证，请等待结果")
     if task.status != "otp_required":
@@ -658,6 +663,7 @@ async def get_task_status(task_id: str):
     res = {
         "task_id": task.task_id,
         "status": task.status,
+        "host": task.req.host,
         "error_message": task.error_message,
         "has_cookies": task.cookies is not None,
         "account_id": task.req.account_id
@@ -676,7 +682,7 @@ async def cancel_task(task_id: str):
 
 @app.get("/health", dependencies=[Depends(require_token)])
 async def health():
-    return {"status": "ok", "camoufox_ready": await camoufox_runtime_ready()}
+    return {"status": "ok", "camoufox_ready": health_probe_result}
 
 if __name__ == "__main__":
     import uvicorn

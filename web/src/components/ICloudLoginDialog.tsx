@@ -59,7 +59,18 @@ export default function ICloudLoginDialog({
         )
         setOtpRequired(true)
       } else {
-        setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
+        const terminalOTP = otpRequired && err instanceof ApiError && [
+          'OTP_EXPIRED', 'OTP_REJECTED', 'OTP_INPUT_FAILED', 'AUTH_TASK_EXPIRED',
+          'AUTH_TIMEOUT', 'APPLE_AUTH_REJECTED',
+        ].includes(err.code)
+        if (terminalOTP) {
+          setOtpRequired(false)
+          setCamoufoxTaskId(null)
+          setOtp('')
+          setPassword('')
+        }
+        const message = err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态'
+        setError(terminalOTP ? `${message}，请重新输入密码发起登录` : message)
       }
     } finally {
       setSubmitting(false)
