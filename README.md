@@ -75,11 +75,17 @@ openssl rand -base64 32
 # 4. 首次启动前确保本地持久化目录属主属于容器用户 (UID 10001)
 mkdir -p ./data && chown -R 10001:10001 ./data
 
-# 5. 首次完整启动双服务
-docker compose up -d --build
+# 5. 首次拉取预构建 Camoufox agent 镜像
+docker compose pull camoufox-agent
+
+# 6. 仅构建主服务并启动双服务
+docker compose build icloud-hme
+docker compose up -d
 ```
 
-> 🚀 **日常增量更新（极速更新，避开庞大的无头浏览器）**：
+> 🚀 **Camoufox 镜像策略**：Camoufox agent 已由 GitHub Actions 按 `scripts/camoufox-agent/**` 变更独立构建并推送到 GHCR。服务器默认直接拉取预构建镜像，不再现场执行 `apt-get` 和 `camoufox fetch`。如果 GHCR 不可达或镜像尚未发布，Compose 仍会使用仓库内的 `build` 配置本地构建作为兜底。
+
+> 🚀 **日常更新主服务（极速更新）**：
 > 平时修改了前端页面或后端接口，**绝不要使用全局 `--build`**，仅需增量构建主服务：
 > ```bash
 > # 1. 拉取最新代码
@@ -87,6 +93,12 @@ docker compose up -d --build
 > # 2. 仅增量构建主服务 (耗时仅 15~20 秒，Camoufox 直接沿用已有镜像)
 > docker compose build icloud-hme
 > # 3. 后台无缝启动替换容器
+> docker compose up -d
+> ```
+
+> 如果本次修改了 `scripts/camoufox-agent/`，先等待 GitHub Actions 的 `Camoufox Agent Image` 成功，再执行：
+> ```bash
+> docker compose pull camoufox-agent
 > docker compose up -d
 > ```
 

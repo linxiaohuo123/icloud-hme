@@ -8,11 +8,22 @@
 
 ## Docker Compose
 
-在项目根目录的现有 `.env` 中新增 `ICLOUD_HME_CAMOUFOX_TOKEN`，值使用独立随机令牌，例如 `openssl rand -hex 32` 的输出。保留已有 Master Key 与数据库文件。然后运行：
+在项目根目录的现有 `.env` 中新增 `ICLOUD_HME_CAMOUFOX_TOKEN`，值使用独立随机令牌，例如 `openssl rand -hex 32` 的输出。保留已有 Master Key 与数据库文件。生产环境首次部署优先拉取 GHCR 预构建镜像，然后运行：
 
 ```bash
-docker compose up -d --build
+docker compose pull camoufox-agent
+docker compose build icloud-hme
+docker compose up -d
 docker compose logs --tail=50 camoufox-agent
+```
+
+Camoufox agent 镜像由 `.github/workflows/camoufox-agent.yml` 独立构建，只有 `scripts/camoufox-agent/` 变化或手动触发时才重新构建。修改主服务代码不会重新安装系统库或下载浏览器内核。
+
+如果 GHCR 不可达、镜像权限未配置或需要本地调试，可显式使用仓库内的 Dockerfile 兜底：
+
+```bash
+docker compose build camoufox-agent
+docker compose up -d camoufox-agent icloud-hme
 ```
 
 主服务与代理通过 Compose 内部网络通信；代理不发布宿主机端口。主服务设置页可以检查代理就绪状态。

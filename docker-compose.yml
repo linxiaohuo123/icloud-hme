@@ -56,10 +56,13 @@ services:
 
   # Camoufox 自动化上号反检测无头浏览器服务
   camoufox-agent:
+    # 默认拉取 GHCR 预构建镜像，避免服务器现场安装系统库和下载浏览器内核。
+    # 保留 build 作为镜像不可用时的本地兜底；生产更新前先执行
+    # `docker compose pull camoufox-agent` 获取最新 agent 镜像。
+    image: ${ICLOUD_HME_CAMOUFOX_IMAGE:-ghcr.io/linxiaohuo123/icloud-hme-camoufox-agent:latest}
     build:
       context: ./scripts/camoufox-agent
       dockerfile: Dockerfile
-    image: icloud-camoufox-agent:latest
     container_name: icloud-camoufox-agent
     restart: unless-stopped
     environment:
