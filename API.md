@@ -593,6 +593,8 @@ Authorization: Bearer <API_KEY>
 
 WebMail 只返回不完整的邮件预览 (`body_complete=false`)。列表命中的邮件详情会缓存 10 分钟；缓存过期后，超过最新 100 封的 WebMail 邮件可能无法再通过详情接口找到。IMAP 详情不受此限制。
 
+IMAP 完整详情的 `body` 保留解码后的正文；存在 HTML 正文时返回 HTML，`content_type` 标识实际返回的正文类型及 UTF-8 编码。`preview` 为独立的清洗文本，multipart 邮件中的纯文本与 HTML 验证信息均保留在预览中，附件不参与正文或取码。
+
 #### 方式 A：扁平风格
 ```http
 GET /api/inbox/1042?account_id=acc_1
@@ -717,12 +719,15 @@ Authorization: Bearer <API_KEY> # 或 Bearer <EXTERNAL_TOKEN>
   - 普通外部令牌使用分配记录中的母号读取邮件；显式 `account_id` / `account` 与分配账号不一致时返回 `404 RESOURCE_NOT_FOUND`，无法通过此参数跨账号读取。
   - 查信页通过内嵌的外部 CSS/JavaScript 资源加载样式与交互，保持全局 CSP 对内联脚本和事件处理器的限制。`/mail/raw?format=html` 使用独立 CSP sandbox，允许内联排版样式，阻断脚本、表单提交、同源存储与外部资源加载。
   - `/mail/raw` 默认返回最新邮件；可传 `message_id` 选择该别名最近 20 封中的邮件，不存在时返回 `404 MESSAGE_NOT_FOUND`。HTML 预览使用 `format=html&frame=1`，仅允许同源页面嵌入，仍保留独立 sandbox 隔离。
+  - 正文读取失败时，`/mail/raw` 返回 `502 MAIL_BODY_UNAVAILABLE`，不把摘要或空内容当成成功正文；合法空正文仍返回 `200`。成功响应的 `X-Mail-Body-Complete` 标识是否为完整正文，WebMail 摘要为 `false`。
+  - `/mail/view?format=json` 的每封邮件携带 `body_complete`；单封正文失败时携带 `body_error`，其正文和验证信息为空，其他邮件仍可阅读。查信页显示失败原因或摘要预览提示；整批正文读取失败返回 `502 MAIL_BODY_UNAVAILABLE`。
   - 查信页分别展示验证码和激活链接；只有激活链接的邮件也会显示打开链接按钮，不显示空验证码复制按钮。
 
 > **关于别名停用与配额说明**：
 > - 停用别名必须由具备管理员权限的会话显式调用管理接口 `POST /api/aliases/:id/deactivate`；普通 `allocate,verify` 令牌不具备停用接口权限，且系统不提供外部令牌的租约停用能力。
 > - 在 Apple 侧停用别名仅代表停止该别名的邮件转发，**不保证**上游必定释放创建总额度，系统严禁声称可通过停用实现无限循环创建。
 > - 项目中的 `MaxAliasesPerAccount`（750）为本系统的内部安全防护与观测阈值，并非 Apple 官方的 SLA 承诺。
+> - 既有未决创建意图阻断的新请求不会消耗新的小时配额；本次已发送且结果未知的创建保留一个额度，批量请求中未发送的其他额度释放，避免重复创建与配额误扣。
 
 **命中成功响应：**
 ```json

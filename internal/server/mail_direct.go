@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 gin, html/template, net/http, strings, time, encoding/json, fmt, strconv, icloud-hme/internal/auth, icloud-hme/internal/mail, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 findAccountForEmail, mailViewHandler, mailRawHandler
- * [POS]: internal/server 的对外直出链接管道，验证码与激活链接独立展示，指定邮件预览使用隔离的 HTML 响应
+ * [POS]: internal/server 的对外直出链接管道，正文失败逐项显式交付，HTML 与文本独立展示，指定邮件预览使用隔离响应
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -104,6 +104,8 @@ type mailViewItem struct {
 	TextBody      string `json:"text_body"`
 	HTMLBody      string `json:"html_body"`
 	IsHTML        bool   `json:"is_html"`
+	BodyComplete  bool   `json:"body_complete"`
+	BodyError     string `json:"body_error,omitempty"`
 	HasOTP        bool   `json:"has_otp"`
 	Code          string `json:"code"`
 	MagicLink     string `json:"magic_link"`
@@ -340,6 +342,8 @@ var mailViewTemplate = template.Must(template.New("mailView").Parse(`<!DOCTYPE h
           </div>
         </div>
 
+        <p id="bodyStatus" class="hint is-hidden"></p>
+
         <!-- Body Views Container -->
         <div class="body-wrapper">
           <!-- Formatted Styled Text View -->
@@ -438,15 +442,11 @@ func (s *Server) mailViewHandler(c *gin.Context) {
 			data.AccountName = snap.Name
 		}
 		items, err := s.fetchRecentMessagesForAlias(c.Request.Context(), accountID, email, 20)
-		if err != nil && (c.Query("format") == "json" || strings.Contains(c.GetHeader("Accept"), "application/json")) {
-			c.Header("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0")
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "同步邮件失败，稍后重试: " + err.Error(),
-			})
+		if err != nil {
+			backendFail(c, err)
 			return
 		}
-		if err == nil && len(items) > 0 {
+		if len(items) > 0 {
 			data.HasMail = true
 			data.TotalCount = len(items)
 			data.Items = items
@@ -526,7 +526,11 @@ func (s *Server) mailRawHandler(c *gin.Context) {
 		limit = 20
 	}
 	items, err := s.fetchRecentMessagesForAlias(c.Request.Context(), accountID, email, limit)
-	if err != nil || len(items) == 0 {
+	if err != nil {
+		backendFail(c, err)
+		return
+	}
+	if len(items) == 0 {
 		c.Data(http.StatusNotFound, "text/plain; charset=utf-8", []byte("NO_EMAIL_RECEIVED"))
 		return
 	}
@@ -545,6 +549,11 @@ func (s *Server) mailRawHandler(c *gin.Context) {
 			return
 		}
 	}
+	if latest.BodyError != "" {
+		failCode(c, http.StatusBadGateway, "MAIL_BODY_UNAVAILABLE", "读取邮件正文失败: "+latest.BodyError)
+		return
+	}
+	c.Header("X-Mail-Body-Complete", strconv.FormatBool(latest.BodyComplete))
 	format := strings.ToLower(strings.TrimSpace(c.Query("format")))
 	if format == "html" {
 		// The body is untrusted mailbox content. Keep the preview renderable while
@@ -588,54 +597,53 @@ func (s *Server) fetchRecentMessagesForAlias(ctx context.Context, accountID, ema
 		return nil, err
 	}
 
-	// 批量检索详情
-	bodyMap := make(map[string]*mail.FullMessage)
+	// BatchItemResult preserves request order after the service joins fetched
+	// messages by canonical identity. Never replace failed bodies with Preview.
+	details := make([]BatchItemResult, len(result.Messages))
 	if s.mailReadService != nil {
 		reqItems := make([]batchMessageItemReq, 0, len(result.Messages))
 		for _, m := range result.Messages {
+			uid := ""
+			if m.UID > 0 {
+				uid = strconv.FormatUint(uint64(m.UID), 10)
+			}
 			reqItems = append(reqItems, batchMessageItemReq{
 				MessageRef: m.MessageRef,
 				Folder:     m.Folder,
 				ID:         m.ID,
-				UID:        strconv.FormatUint(uint64(m.UID), 10),
+				UID:        uid,
 			})
 		}
-		fullMsgs, _, err := s.mailReadService.GetMessagesBatch(ctx, accountID, reqItems)
-		if err == nil {
-			for _, fm := range fullMsgs {
-				if fm != nil {
-					if fm.MessageRef != "" {
-						bodyMap[fm.MessageRef] = fm
-					}
-					if fm.ID != "" {
-						bodyMap[fm.ID] = fm
-					}
-				}
+		_, details, err = s.mailReadService.GetMessagesBatch(ctx, accountID, reqItems)
+		if err != nil {
+			return nil, &BackendError{Status: http.StatusBadGateway, Code: "MAIL_BODY_UNAVAILABLE", Message: "读取邮件正文失败: " + err.Error()}
+		}
+	} else {
+		for i, m := range result.Messages {
+			targetID := m.MessageRef
+			if targetID == "" {
+				targetID = m.ID
+			}
+			details[i].Message, err = s.be.GetMessageContext(ctx, accountID, targetID)
+			if err != nil {
+				details[i].Error = err.Error()
 			}
 		}
 	}
 
 	items := make([]mailViewItem, 0, len(result.Messages))
 	for idx, m := range result.Messages {
-		fullMsg := bodyMap[m.MessageRef]
-		if fullMsg == nil {
-			fullMsg = bodyMap[m.ID]
-		}
-		// 单项回退获取详情
-		if fullMsg == nil && s.mailReadService != nil {
-			targetID := m.MessageRef
-			if targetID == "" {
-				targetID = m.ID
-			}
-			if fm, _, _, _, err := s.mailReadService.GetMessageDetail(ctx, accountID, targetID); err == nil && fm != nil {
-				fullMsg = fm
-			}
+		fullMsg := details[idx].Message
+		bodyError := details[idx].Error
+		if fullMsg == nil && bodyError == "" {
+			bodyError = "未返回邮件正文"
 		}
 
 		subject := m.Subject
 		from := m.From
 		date := m.Date
-		body := m.Preview
+		body, textBody := "", ""
+		bodyComplete, isHTML := false, false
 		if fullMsg != nil {
 			if fullMsg.Subject != "" {
 				subject = fullMsg.Subject
@@ -646,8 +654,15 @@ func (s *Server) fetchRecentMessagesForAlias(ctx context.Context, accountID, ema
 			if fullMsg.Date != "" {
 				date = fullMsg.Date
 			}
-			if fullMsg.Body != "" {
-				body = fullMsg.Body
+			body = fullMsg.Body
+			bodyComplete = fullMsg.BodyComplete
+			isHTML = strings.Contains(strings.ToLower(fullMsg.ContentType), "text/html")
+			textBody = body
+			if isHTML {
+				textBody = fullMsg.Preview
+				if textBody == "" {
+					textBody = mail.PreviewText(body)
+				}
 			}
 		}
 
@@ -672,15 +687,6 @@ func (s *Server) fetchRecentMessagesForAlias(ctx context.Context, accountID, ema
 
 		formattedDate, relDate := formatRelativeTime(date)
 
-		isHTML := strings.Contains(body, "<html") ||
-			strings.Contains(body, "<body") ||
-			strings.Contains(body, "<div") ||
-			strings.Contains(body, "<table") ||
-			strings.Contains(body, "<p>") ||
-			strings.Contains(body, "<br") ||
-			strings.Contains(body, "<section") ||
-			strings.Contains(body, "<style")
-
 		item := mailViewItem{
 			Index:         idx,
 			ID:            m.ID,
@@ -693,12 +699,17 @@ func (s *Server) fetchRecentMessagesForAlias(ctx context.Context, accountID, ema
 			FormattedDate: formattedDate,
 			RelativeDate:  relDate,
 			Preview:       m.Preview,
-			TextBody:      body,
+			TextBody:      textBody,
 			HTMLBody:      body,
 			IsHTML:        isHTML,
+			BodyComplete:  bodyComplete,
+			BodyError:     bodyError,
 		}
 
-		otp := mail.ExtractOTP(subject, body)
+		otp := mail.ExtractOTP(subject, textBody)
+		if bodyError != "" {
+			otp = nil
+		}
 		if otp != nil && (otp.Code != "" || otp.MagicLink != "") {
 			item.HasOTP = true
 			item.Code = otp.Code

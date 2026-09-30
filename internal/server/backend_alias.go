@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/account, internal/hme, internal/store
  * [OUTPUT]: 对外提供 managerBackend 的别名相关方法 (CreateAlias, BatchCreateAlias, ListAliases, RefreshAliases, SetAliasActive, UpdateAlias, BatchUpdateAliases, DeleteAlias) 与 BatchCreateResult, BatchUpdateResult 类型
- * [POS]: internal/server 的别名业务门面实现，账号锁覆盖远端操作与库存同步，仲裁数量上限并保留上游成功结果
+ * [POS]: internal/server 的别名业务门面实现，区分未决门禁与本次未知写入的配额，账号锁内确认删除状态并同步库存
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -47,6 +47,10 @@ type BatchUpdateResult struct {
 // aliasCacheTTL 是内存别名缓存生命周期(15分钟)。
 // 别名是准静态数据，新增/删除/修改已具备精准缓存驱逐钩子，长效缓存消除日常跨洋阻塞。
 const aliasCacheTTL = 15 * time.Minute
+
+// Existing unresolved work blocks this request before it sends any write.
+// Keep the public unknown-outcome contract while distinguishing its quota.
+var errCreateBlockedByUnresolvedIntent = fmt.Errorf("existing reserve intent blocks creation: %w", hme.ErrOutcomeUnknown)
 
 type aliasCacheItem struct {
 	aliases         []hme.Alias
@@ -111,7 +115,7 @@ func (b *managerBackend) CreateAliasForAllocationContext(ctx context.Context, ac
 		return result, nil
 	}
 	if err != nil {
-		if !errors.Is(err, hme.ErrOutcomeUnknown) && b.store != nil {
+		if b.store != nil && (!errors.Is(err, hme.ErrOutcomeUnknown) || errors.Is(err, errCreateBlockedByUnresolvedIntent)) {
 			if releaseErr := b.store.ReleaseQuota(accountID, 1); releaseErr != nil {
 				return nil, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_ERROR", Message: fmt.Sprintf("创建失败后释放账号 %s 配额失败: %v (原错误: %v)", accountID, releaseErr, err)}
 			}
@@ -227,7 +231,7 @@ func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Cli
 			}
 			if len(unresolvedAfter) > 0 {
 				// 仍存在任何 unresolved intent：立即阻断，严禁 Generate，严禁 Reserve！
-				return nil, hme.ErrOutcomeUnknown
+				return nil, errCreateBlockedByUnresolvedIntent
 			}
 		}
 	}
@@ -293,7 +297,7 @@ func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Cli
 			if errors.Is(rErr, hme.ErrOutcomeUnknown) {
 				if b.store != nil && intentID != "" {
 					if err := b.store.UpdateReserveIntentState(ctx, intentID, store.IntentStateOutcomeUnknown, "", "", rErr.Error()); err != nil {
-						return nil, fmt.Errorf("保存 reserve 未决状态: %w", err)
+						return nil, fmt.Errorf("保存 reserve 未决状态: %w", errors.Join(rErr, err))
 					}
 				}
 				return nil, rErr
@@ -432,7 +436,7 @@ func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID 
 		resp.LastError = batchErr.Error()
 		if b.store != nil && resp.SkippedCount > 0 {
 			toRelease := resp.SkippedCount
-			if errors.Is(batchErr, hme.ErrOutcomeUnknown) {
+			if errors.Is(batchErr, hme.ErrOutcomeUnknown) && !errors.Is(batchErr, errCreateBlockedByUnresolvedIntent) {
 				toRelease--
 			}
 			if toRelease > 0 {
@@ -951,24 +955,53 @@ func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
 	}
 	targetAnonID := resolvedAnonID
 
-	deltaActive := -1
-	if cached, ok := b.getCachedAliases(accountID); ok {
-		for _, al := range cached {
-			if al.AnonymousID == targetAnonID || (resolvedEmail != "" && strings.EqualFold(al.Email, resolvedEmail)) {
-				if !al.Active {
-					deltaActive = 0
-				}
-				break
-			}
-		}
-	}
 	deleted := false
 	var inventoryErr error
 	err = b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
+		// Read the old state under the same lock as deletion; a concurrent
+		// activation/deactivation must not change it between lookup and write.
+		active, stateKnown := false, false
+		if cached, ok := b.getCachedAliases(accountID); ok {
+			for _, al := range cached {
+				if al.AnonymousID == targetAnonID && strings.EqualFold(al.Email, resolvedEmail) {
+					active, stateKnown = al.Active, true
+					break
+				}
+			}
+		}
+		if !stateKnown && b.store != nil {
+			inv, lookupErr := b.store.GetInventoryAlias(resolvedEmail)
+			if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+				return fmt.Errorf("读取待删除别名状态失败: %w", lookupErr)
+			}
+			if inv != nil && inv.AccountID == accountID && inv.ProviderAliasID == targetAnonID {
+				stateKnown = inv.RemoteState == store.RemoteActive || inv.RemoteState == store.RemoteInactive
+				active = inv.RemoteState == store.RemoteActive
+			}
+		}
+		if !stateKnown {
+			aliases, lookupErr := client.ListAliases()
+			if lookupErr != nil {
+				return lookupErr
+			}
+			for _, al := range aliases {
+				if al.AnonymousID == targetAnonID && strings.EqualFold(al.Email, resolvedEmail) {
+					active, stateKnown = al.Active, true
+					break
+				}
+			}
+			if !stateKnown {
+				return &BackendError{Status: http.StatusNotFound, Code: "ALIAS_NOT_FOUND", Message: "无法确认待删除别名的状态"}
+			}
+		}
 		if err := client.Delete(targetAnonID); err != nil {
 			return err
 		}
 		deleted = true
+		deltaActive := 0
+		if active {
+			deltaActive = -1
+		}
 		if countErr := b.mgr.AdjustAliasCounts(accountID, -1, deltaActive); countErr != nil {
 			log.Printf("[HME] 账号 %s 别名已删除，但数量回写失败: %v", accountID, countErr)
 		}

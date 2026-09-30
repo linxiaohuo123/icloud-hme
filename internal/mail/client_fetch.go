@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 fmt, net/mail, sort, strings, time, github.com/emersion/go-imap
  * [OUTPUT]: 对外提供 (*Client).GetFull, (*Client).GetFullInFolder, (*Client).GetFullInFolderWithValidity, (*Client).GetFullBatchInFolder, (*Client).GetFullBatchInFolderWithValidity, (*Client).GetMailboxBoundary, (*Client).Delete, (*Client).DeleteInFolder
- * [POS]: internal/mail 的邮件正文提取与邮箱管理逻辑，保留结构化收件人、严格校验 UIDVALIDITY，批量读取逐项返回正文错误并保留成功邮件
+ * [POS]: internal/mail 的邮件正文提取与邮箱管理逻辑，原始 HTML 与清洗预览独立交付，严格校验 UIDVALIDITY，批量读取逐项返回正文错误
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -179,7 +179,6 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 			// Drain FETCH before returning so the pooled connection stays usable.
 			continue
 		}
-		full.Preview = full.Body
 		out = append(out, full)
 	}
 	if err := <-done; err != nil {
@@ -206,13 +205,18 @@ func decodeFullMessageBody(full *FullMessage, msg *imap.Message, section *imap.B
 		// net/mail errors may embed the offending header, including private data.
 		return fmt.Errorf("parse message headers (uid=%d): invalid or unreadable headers", msg.Uid)
 	}
-	body, err := readBody(em)
+	plain, html, err := readBodyParts(em)
 	if err != nil {
 		return fmt.Errorf("decode message body (uid=%d): %w", msg.Uid, err)
 	}
 	full.match = strings.Join(extractStructuralRecipients(full.To, em.Header), "\n")
-	full.Body = strings.TrimSpace(body)
-	full.ContentType = em.Header.Get("Content-Type")
+	full.Preview = bodyPreview(plain, html)
+	full.Body = strings.TrimSpace(plain)
+	full.ContentType = "text/plain; charset=utf-8"
+	if html != "" || strings.HasPrefix(strings.ToLower(em.Header.Get("Content-Type")), "text/html") {
+		full.Body = strings.TrimSpace(html)
+		full.ContentType = "text/html; charset=utf-8"
+	}
 	full.BodyComplete = true
 	return nil
 }

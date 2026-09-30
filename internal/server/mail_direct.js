@@ -81,6 +81,12 @@
       const item = emailList[index];
       if (!item) return;
 
+      const bodyStatus = document.getElementById('bodyStatus');
+      if (bodyStatus) {
+        bodyStatus.textContent = item.body_error ? '正文读取失败：' + item.body_error : (item.body_complete === false ? '当前仅提供邮件摘要预览，非完整正文' : '');
+        bodyStatus.classList.toggle('is-hidden', !bodyStatus.textContent);
+      }
+
       const subEl = document.getElementById('detailSubject');
       if (subEl) subEl.textContent = item.subject || '（无主题）';
       const avEl = document.getElementById('detailAvatar');
@@ -271,6 +277,8 @@
           const pill = document.getElementById('refreshPill');
           if (pill) pill.innerHTML = '⚠️ 权限已失效';
           showToast('身份验证失效，已暂停自动检测');
+        } else if (isManual) {
+          showToast('同步邮件失败，请稍后重试');
         }
       } catch(err) {
         console.warn('Silent poll error:', err);

@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 html, regexp, strings
- * [OUTPUT]: 对外提供 sanitizePreview, sanitizePlainPreview 等邮件内容清洗与 CSS 剥离能力
+ * [OUTPUT]: 对外提供 PreviewText，以及内部 sanitizePreview, sanitizePlainPreview 内容清洗能力
  * [POS]: internal/mail 的正文解析与摘要脱敏工具，支持 HTML 链接地址保留以供激活链接/MagicLink 嗅探
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -31,6 +31,11 @@ var (
 func sanitizePreview(raw string) string {
 	text := stripHTML(raw)
 	return sanitizePlainPreview(text)
+}
+
+// PreviewText returns readable text without exposing HTML markup as plain body.
+func PreviewText(raw string) string {
+	return sanitizePreview(raw)
 }
 
 func sanitizePlainPreview(raw string) string {

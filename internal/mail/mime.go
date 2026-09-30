@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 bytes, encoding/base64, fmt, io, mime, mime/multipart, mime/quotedprintable, net/mail, strings, time, github.com/emersion/go-imap, github.com/emersion/go-message/charset
  * [OUTPUT]: 对外提供 toMessage, toMessageWithBody, toMessageWithHeaderOnly, readBody, decodeHeader, decodeAppleRelay, folderRole, folderSortRank
- * [POS]: internal/mail 的 MIME 多级解析与字符集转码中心，合并重复投递收件人头，正文读取、截断与 multipart 解析失败显式返回错误
+ * [POS]: internal/mail 的 MIME 多级解析与字符集转码中心，保留解码后的正文与 HTML，预览独立清洗，读取与 multipart 解析失败显式返回
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -405,6 +405,28 @@ func decodeBodyCharset(raw []byte, contentType string) (string, error) {
 
 // readBody 读取邮件正文, 支持 multipart 分块(含嵌套)、base64 与 quoted-printable 编码。
 func readBody(msg *mail.Message) (string, error) {
+	plain, html, err := readBodyParts(msg)
+	if err != nil {
+		return "", err
+	}
+	return bodyPreview(plain, html), nil
+}
+
+func bodyPreview(plain, html string) string {
+	plain = sanitizePlainPreview(plain)
+	html = sanitizePreview(html)
+	if plain == "" {
+		return html
+	}
+	if html == "" || plain == html {
+		return plain
+	}
+	return plain + "\n\n" + html
+}
+
+// Decode once for both preview and complete-body callers. HTML stays intact
+// until a caller explicitly requests readable preview text.
+func readBodyParts(msg *mail.Message) (string, string, error) {
 	ct := msg.Header.Get("Content-Type")
 	mediaType, params, err := mime.ParseMediaType(ct)
 	if err != nil {
@@ -413,41 +435,25 @@ func readBody(msg *mail.Message) (string, error) {
 
 	raw, err := readBoundedBody(msg.Body)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	decoded, err := decodeTransferData(raw, msg.Header.Get("Content-Transfer-Encoding"))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if strings.HasPrefix(mediaType, "multipart/") {
-		plainText, htmlText, err := readMultipartBody(decoded, params["boundary"], 0)
-		if err != nil {
-			return "", err
-		}
-		if plainText != "" && htmlText != "" {
-			if strings.TrimSpace(plainText) == strings.TrimSpace(htmlText) {
-				return plainText, nil
-			}
-			return plainText + "\n\n" + htmlText, nil
-		}
-		if plainText != "" {
-			return plainText, nil
-		}
-		if htmlText != "" {
-			return htmlText, nil
-		}
-		return "", nil
+		return readMultipartBody(decoded, params["boundary"], 0)
 	}
 
 	// 单部分邮件
 	content, err := decodeBodyCharset(decoded, ct)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if strings.EqualFold(mediaType, "text/html") {
-		return sanitizePreview(content), nil
+		return "", content, nil
 	}
-	return sanitizePlainPreview(content), nil
+	return content, "", nil
 }
 
 // readBoundedBody preserves the existing size limit without reporting a truncated body as complete.
@@ -463,7 +469,7 @@ func readBoundedBody(r io.Reader) ([]byte, error) {
 	return raw, nil
 }
 
-// readMultipartBody 遍历 multipart 各部件: 文本部件取预览, 嵌套 multipart(如 mixed 套 alternative)递归展开,
+// readMultipartBody 遍历 multipart 各部件: 保留文本与 HTML, 嵌套 multipart(如 mixed 套 alternative)递归展开,
 // 否则带附件验证邮件的真实正文会被静默丢成空串。显式排除 Content-Disposition: attachment 避免附件污染。
 func readMultipartBody(body []byte, boundary string, depth int) (string, string, error) {
 	if boundary == "" {
@@ -514,7 +520,7 @@ func readMultipartBody(body []byte, boundary string, depth int) (string, string,
 	return plainText, htmlText, nil
 }
 
-// readMultipartPart 把单个部件转为 (纯文本预览, HTML 预览); 部件本身是嵌套 multipart 时继续下钻。
+// readMultipartPart 解码单个文本或 HTML 部件; 部件本身是嵌套 multipart 时继续下钻。
 func readMultipartPart(data []byte, partCT string, depth int) (string, string, error) {
 	mediaType, params, err := mime.ParseMediaType(partCT)
 	if err != nil {
@@ -527,11 +533,11 @@ func readMultipartPart(data []byte, partCT string, depth int) (string, string, e
 
 	if strings.EqualFold(mediaType, "text/plain") {
 		content, err := decodeBodyCharset(data, partCT)
-		return sanitizePlainPreview(content), "", err
+		return content, "", err
 	}
 	if strings.EqualFold(mediaType, "text/html") {
 		content, err := decodeBodyCharset(data, partCT)
-		return "", sanitizePreview(content), err
+		return "", content, err
 	}
 	return "", "", nil
 }

@@ -11,6 +11,7 @@ function item(index = 0) {
     index, id: `mail-${index}`, subject: 'Sign in', sender_name: 'Fixture',
     sender_initial: 'F', relative_date: '刚刚', text_body: 'Loading preview',
     html_body: '', is_html: false, has_otp: false, code: '', magic_link: '',
+    body_error: '', body_complete: true,
   }
 }
 
@@ -23,7 +24,7 @@ function boot(items: MailItem[]) {
     <div id="mailListContainer">${items.map(it => `<div class="mail-item" id="mailItem-${it.index}" data-action="select-mail" data-index="${it.index}">Mail</div>`).join('')}</div>
     <div id="otpMasterBar" class="is-hidden"><span id="topLatestOtp"></span><a id="topMagicBtn" class="is-hidden"></a></div>
     <div id="detailOtpBox" class="is-hidden"><span id="detailOtpCode"></span><a id="detailMagicBtn" class="is-hidden"></a></div>
-    <div id="rawContentArea"></div><div id="styledContentArea"></div>
+    <p id="bodyStatus" class="is-hidden"></p><div id="rawContentArea"></div><div id="styledContentArea"></div>
     <button class="tab-btn" id="tab-styled" data-action="switch-tab" data-view="styled">正文</button>
     <button class="tab-btn" id="tab-raw" data-action="switch-tab" data-view="raw">原文</button>
     <div class="body-view" id="view-styled"></div><div class="body-view" id="view-raw"></div>
@@ -58,6 +59,22 @@ afterEach(() => {
 })
 
 describe('direct mail polling', () => {
+
+  it('shows body read errors and clears them after a successful refresh', async () => {
+    boot([{ ...item(), body_error: 'broken MIME', body_complete: false, text_body: '' }])
+    expect(document.getElementById('bodyStatus')).toHaveTextContent('正文读取失败：broken MIME')
+    expect(document.getElementById('bodyStatus')).not.toHaveClass('is-hidden')
+    respond([item()])
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(document.getElementById('bodyStatus')).toHaveClass('is-hidden')
+    expect(document.getElementById('rawContentArea')).toHaveTextContent('Loading preview')
+  })
+
+  it('marks incomplete WebMail bodies as previews', () => {
+    boot([{ ...item(), body_complete: false }])
+    expect(document.getElementById('bodyStatus')).toHaveTextContent('非完整正文')
+    expect(document.getElementById('bodyStatus')).not.toHaveClass('is-hidden')
+  })
   it.each(['automatic', 'manual'])('updates same-message magic link and body on %s refresh', async mode => {
     const initial = item()
     boot([initial])

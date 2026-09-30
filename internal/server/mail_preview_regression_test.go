@@ -31,14 +31,21 @@ func newMailPreviewTestServer(t *testing.T) *Server {
 			{ID: "magic", Subject: "Sign in link", From: "fixture@example.com"},
 		}},
 		getMessageFunc: func(accountID, id string) (*mail.FullMessage, error) {
+			ref, err := mail.ParseMessageRef(id, accountID)
+			if err != nil {
+				return nil, err
+			}
+			id = ref.ThreadID
 			body, subject := previewStyledHTML, "Rich HTML"
+			contentType := "text/html; charset=utf-8"
 			if id == "older" {
 				body, subject = `<html><body><p>Older email</p></body></html>`, "Older HTML"
 			}
 			if id == "magic" {
 				body, subject = "Use https://example.com/verify?token=sample to sign in", "Sign in link"
+				contentType = "text/plain; charset=utf-8"
 			}
-			return &mail.FullMessage{Message: mail.Message{ID: id, Subject: subject, From: "fixture@example.com"}, Body: body}, nil
+			return &mail.FullMessage{Message: mail.Message{ID: id, MessageRef: ref.Encode(), Subject: subject, From: "fixture@example.com"}, Body: body, ContentType: contentType, BodyComplete: true}, nil
 		},
 	}
 	return newWithBackendAndStore(fb, Config{APIKey: previewTestAPIKey, DataDir: dir}, st)
