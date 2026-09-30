@@ -361,4 +361,45 @@ describe('AccountsPage', () => {
     await user.click(screen.getByRole('button', { name: /保存/ }))
     await waitFor(() => expect(patchedBody.name).toBe('活跃号-修改后'))
   })
+
+  it('当账号操作按钮处于视口底部时，向上翻转展开且正常弹出操作项', async () => {
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+    )
+    renderPage()
+    await screen.findByText('活跃号')
+
+    // 模拟视口底部位置 (比如第5个账号在底部，下面空间仅 50px)
+    const originalInnerHeight = window.innerHeight
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 600 })
+
+    const buttons = screen.getAllByRole('button', { name: /更多操作/ })
+    const lastBtn = buttons[buttons.length - 1]
+    lastBtn.getBoundingClientRect = () => ({
+      top: 520,
+      bottom: 550,
+      left: 700,
+      right: 730,
+      width: 30,
+      height: 30,
+      x: 700,
+      y: 520,
+      toJSON: () => {},
+    })
+
+    const user = userEvent.setup()
+    await user.click(lastBtn)
+
+    const popover = document.querySelector('.dropdown-popover') as HTMLDivElement
+    expect(popover).toBeInTheDocument()
+    expect(popover.style.top).toBe('auto')
+    expect(popover.style.bottom).toBe('84px') // 600 - 520 + 4
+    expect(screen.getByRole('button', { name: /更新 Cookie/ })).toBeInTheDocument()
+
+    // 点击更新 Cookie 弹窗应正常打开
+    await user.click(screen.getByRole('button', { name: /更新 Cookie/ }))
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+
+    window.innerHeight = originalInnerHeight
+  })
 })

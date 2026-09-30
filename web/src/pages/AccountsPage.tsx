@@ -104,10 +104,11 @@ function AccountActions({
 }: AccountActionsProps) {
   const [open, setOpen] = useState(false)
   const moreRef = useRef<HTMLButtonElement>(null)
-  const [pos, setPos] = useState<{ top?: number; bottom?: number; right: number; maxHeight: number } | null>(null)
+  const popoverRef = useRef<HTMLDivElement>(null)
+  const [pos, setPos] = useState<{ top: number | 'auto'; bottom: number | 'auto'; right: number; maxHeight: number } | null>(null)
 
   // 表格容器 overflow 裁剪会截断 absolute 弹层，改用 Portal + fixed 挂在 body 上
-  // 通过 CSS 锚定顶底边缘自然流式展开，彻底消除未挂载时测高的死代码与残影
+  // 通过 CSS 锚定顶底边缘自然流式展开，明确显式设置 top/bottom auto 避免继承或负高度压缩
   useLayoutEffect(() => {
     if (!open) {
       setPos(null)
@@ -120,8 +121,8 @@ function AccountActions({
     const openUpward = spaceBelow < 280 && rect.top > spaceBelow
 
     setPos({
-      top: openUpward ? undefined : rect.bottom + 4,
-      bottom: openUpward ? window.innerHeight - rect.top + 4 : undefined,
+      top: openUpward ? 'auto' : rect.bottom + 4,
+      bottom: openUpward ? window.innerHeight - rect.top + 4 : 'auto',
       right: window.innerWidth - rect.right,
       maxHeight: Math.max(120, openUpward ? rect.top - 16 : spaceBelow - 16),
     })
@@ -129,15 +130,19 @@ function AccountActions({
 
   useEffect(() => {
     if (!open) return
+    const onScroll = (event: Event) => {
+      if (event.target instanceof Node && popoverRef.current?.contains(event.target)) return
+      setOpen(false)
+    }
     const close = () => setOpen(false)
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') setOpen(false)
     }
-    window.addEventListener('scroll', close, true)
+    window.addEventListener('scroll', onScroll, true)
     window.addEventListener('resize', close)
     window.addEventListener('keydown', onKey)
     return () => {
-      window.removeEventListener('scroll', close, true)
+      window.removeEventListener('scroll', onScroll, true)
       window.removeEventListener('resize', close)
       window.removeEventListener('keydown', onKey)
     }
@@ -182,13 +187,14 @@ function AccountActions({
           <>
             <div className="dropdown-backdrop" role="presentation" onClick={() => setOpen(false)} />
             <div
+              ref={popoverRef}
               className="dropdown-popover"
               style={{
                 position: 'fixed',
-                top: pos.top,
-                bottom: pos.bottom,
-                right: pos.right,
-                maxHeight: pos.maxHeight,
+                top: typeof pos.top === 'number' ? `${pos.top}px` : pos.top,
+                bottom: typeof pos.bottom === 'number' ? `${pos.bottom}px` : pos.bottom,
+                right: `${pos.right}px`,
+                maxHeight: `${pos.maxHeight}px`,
                 overflowY: 'auto',
               }}
             >
@@ -375,7 +381,7 @@ export default function AccountsPage() {
               </thead>
               <tbody>
                 {accounts.map((acc) => (
-                  <tr key={acc.id}>
+                  <tr key={acc.id} data-account-id={acc.id}>
                     <td>
                       <div className="cell-main">{acc.name}</div>
                       {acc.status_message && (

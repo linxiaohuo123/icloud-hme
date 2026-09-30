@@ -858,9 +858,7 @@ td .cell-secondary {
 }
 
 .dropdown-popover {
-  position: absolute;
-  right: 0;
-  top: calc(100% + 4px);
+  position: fixed;
   z-index: 130;
   min-width: 190px;
   padding: 4px;
@@ -979,7 +977,8 @@ td .cell-secondary {
 }
 
 /* ─── 反馈区 ─── */
-.alert-error {
+.alert-error,
+.alert-danger {
   border: 1px solid color-mix(in srgb, var(--color-danger) 40%, transparent);
   background: var(--color-danger-soft);
   color: var(--color-danger);
@@ -987,6 +986,29 @@ td .cell-secondary {
   padding: var(--space-3) var(--space-4);
   margin-bottom: var(--space-4);
   font-size: var(--text-sm);
+}
+
+.alert-warning {
+  border: 1px solid color-mix(in srgb, var(--color-warning) 35%, transparent);
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+  border-radius: var(--radius);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+  font-size: var(--text-sm);
+}
+
+@keyframes row-pulse-highlight {
+  0% {
+    background-color: color-mix(in srgb, var(--color-warning) 28%, transparent);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.row-highlight {
+  animation: row-pulse-highlight 2s ease-out forwards;
 }
 
 .alert-info {
