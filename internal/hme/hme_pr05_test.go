@@ -205,6 +205,16 @@ func TestPR05_SchemaValidation_U06(t *testing.T) {
 			wantCount: 0,
 		},
 		{
+			name:      "数组中包含非对象记录不得当作空库存",
+			body:      `{"success":true,"result":{"hmeEmails":[null,7]}}`,
+			shouldErr: true,
+		},
+		{
+			name:      "有效和无邮箱记录混合不得当作完整快照",
+			body:      `{"success":true,"result":{"hmeEmails":[{"hme":"valid@icloud.com","active":true},{"anonymousId":"missing_email"}]}}`,
+			shouldErr: true,
+		},
+		{
 			name:      "合法别名列表 (正常解析)",
 			body:      `{"success": true, "result": {"hmeEmails": [{"hme": "a@icloud.com", "isActive": true}]}}`,
 			shouldErr: false,

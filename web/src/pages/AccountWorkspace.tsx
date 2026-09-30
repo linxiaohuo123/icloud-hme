@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 api/client 的 request/ApiError, api/types 的各类实体, components 各通用 Dialog 与 ToastProvider, workspace 子组件组
  * [OUTPUT]: 对外提供 AccountWorkspace 单账号专属工作台总装容器
- * [POS]: web/src/pages 的核心页面总装器，将指标、头部、别名流、收件箱与弹窗组合为统一控制台
+ * [POS]: web/src/pages 的核心页面总装器，按账号隔离异步请求与局部状态，URL 作为收件箱筛选真相源
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -26,6 +26,10 @@ import WorkspaceMetrics from './workspace/WorkspaceMetrics'
 
 export default function AccountWorkspace() {
   const { accountId } = useParams<{ accountId: string }>()
+  return <AccountWorkspaceContent key={accountId} accountId={accountId} />
+}
+
+function AccountWorkspaceContent({ accountId }: { accountId: string | undefined }) {
   const [searchParams, setSearchParams] = useSearchParams()
   const activeTab = searchParams.get('tab') === 'inbox' ? 'inbox' : 'aliases'
 
@@ -43,9 +47,7 @@ export default function AccountWorkspace() {
   const currentAccountIdRef = useRef<string | undefined>(accountId)
 
   // 别名筛选状态
-  const [selectedAliasForInbox, setSelectedAliasForInbox] = useState(
-    searchParams.get('alias') || '',
-  )
+  const selectedAliasForInbox = searchParams.get('alias') || ''
 
   // 弹窗状态
   const [cookieOpen, setCookieOpen] = useState(false)
@@ -66,6 +68,7 @@ export default function AccountWorkspace() {
   // 卸载时取消所有在途请求
   useEffect(() => {
     return () => {
+      currentAccountIdRef.current = undefined
       accountAbortRef.current?.abort()
       aliasAbortRef.current?.abort()
     }
@@ -73,7 +76,7 @@ export default function AccountWorkspace() {
 
   const loadAccountData = useCallback(
     async (forceRefresh = false) => {
-      if (!accountId) return
+      if (!accountId || currentAccountIdRef.current !== accountId) return
       const requestedId = accountId
 
       // 递增全局代数，作废此前所有未决请求
@@ -195,7 +198,7 @@ export default function AccountWorkspace() {
         `/api/quick-create?account_id=${encodeURIComponent(accountId)}`,
         { method: 'POST' },
       )
-      showCopyable('别名已生成', created.email)
+      showCopyable(created.email, '别名已生成')
       invalidateAccounts(accountId)
       void loadAccountData()
     } catch (err) {
@@ -344,7 +347,6 @@ export default function AccountWorkspace() {
           onToggleAlias={(item) => void handleToggleAlias(item)}
           onDeleteAlias={(item) => setConfirmDeleteAlias(item)}
           onReadMail={(email) => {
-            setSelectedAliasForInbox(email)
             searchParams.set('tab', 'inbox')
             searchParams.set('alias', email)
             setSearchParams(searchParams)
@@ -362,7 +364,6 @@ export default function AccountWorkspace() {
           aliases={aliases}
           selectedAlias={selectedAliasForInbox}
           onSelectAlias={(val) => {
-            setSelectedAliasForInbox(val)
             searchParams.set('alias', val)
             setSearchParams(searchParams)
           }}

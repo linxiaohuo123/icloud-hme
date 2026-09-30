@@ -288,7 +288,7 @@ func TestEndToEnd_MinimumIntegrationFlow(t *testing.T) {
 
 	// 校验 DB 轮询接口仍然能够成功直接读取终态
 	degradedSvc := NewVerificationService(scanFb, st, degradedBus, degradedWorker)
-	pollRes, err := degradedSvc.GetVerificationResult(ctx, p, vreqNoWaiter.RequestID, 0)
+	pollRes, err := degradedSvc.GetVerificationResult(ctx, p, vreqNoWaiter.RequestID, 0, "secret-token-e2e")
 	if err != nil {
 		t.Fatalf("7. 无 waiter 降级 DB 轮询失败: %v", err)
 	}

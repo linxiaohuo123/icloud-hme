@@ -290,7 +290,7 @@ func TestC03_InterleavingWinnerAuthoritative(t *testing.T) {
 	_ = st.UpdateVerificationRequestResult(ctx, "vreq_succ", "succeeded", "987654", "ev_succ")
 
 	// 读取取码结果：尽管过期时间已过，数据库 winner 为 succeeded，绝不能返回 expired！
-	res1, err := vService.GetVerificationResult(ctx, p, "vreq_succ", 0)
+	res1, err := vService.GetVerificationResult(ctx, p, "vreq_succ", 0, "sec_c03")
 	if err != nil {
 		t.Fatalf("GetVerificationResult failed: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestC03_InterleavingWinnerAuthoritative(t *testing.T) {
 	_, _, _ = st.InvalidateVerificationRequest(ctx, "vreq_inv")
 
 	// 读取取码结果：绝不能因为时间过去把 invalidated 篡改成 expired，必须返回 ErrUIDValidityChanged！
-	res2, err := vService.GetVerificationResult(ctx, p, "vreq_inv", 0)
+	res2, err := vService.GetVerificationResult(ctx, p, "vreq_inv", 0, "sec_c03")
 	if !errors.Is(err, ErrUIDValidityChanged) {
 		t.Fatalf("C03 FAILED: expected ErrUIDValidityChanged, got res=%v, err=%v", res2, err)
 	}
@@ -371,7 +371,7 @@ func TestC03_ConcurrentInterleaving_ExpiredAndSucceededDuringWait(t *testing.T) 
 	doneExp := make(chan *VerificationResult, 1)
 	errExp := make(chan error, 1)
 	go func() {
-		res, err := vService.GetVerificationResult(ctx, p, "vreq_wait_exp", 2)
+		res, err := vService.GetVerificationResult(ctx, p, "vreq_wait_exp", 2, "sec_interleave")
 		errExp <- err
 		doneExp <- res
 	}()
@@ -426,7 +426,7 @@ func TestC03_ConcurrentInterleaving_ExpiredAndSucceededDuringWait(t *testing.T) 
 	doneSucc := make(chan *VerificationResult, 1)
 	errSucc := make(chan error, 1)
 	go func() {
-		res, err := vService.GetVerificationResult(ctx, p, "vreq_wait_succ", 2)
+		res, err := vService.GetVerificationResult(ctx, p, "vreq_wait_succ", 2, "sec_interleave")
 		errSucc <- err
 		doneSucc <- res
 	}()
@@ -505,7 +505,7 @@ func TestC03_UIDValidityMutation_LosesToExpiredOrSucceeded(t *testing.T) {
 	doneExp := make(chan *VerificationResult, 1)
 	errExp := make(chan error, 1)
 	go func() {
-		res, err := vService.GetVerificationResult(ctx, p, "vreq_uid_exp", 5)
+		res, err := vService.GetVerificationResult(ctx, p, "vreq_uid_exp", 5, "sec_cas")
 		errExp <- err
 		doneExp <- res
 	}()
@@ -570,7 +570,7 @@ func TestC03_UIDValidityMutation_LosesToExpiredOrSucceeded(t *testing.T) {
 	doneSucc := make(chan *VerificationResult, 1)
 	errSucc := make(chan error, 1)
 	go func() {
-		res, err := vService.GetVerificationResult(ctx, p, "vreq_uid_succ", 5)
+		res, err := vService.GetVerificationResult(ctx, p, "vreq_uid_succ", 5, "sec_cas")
 		errSucc <- err
 		doneSucc <- res
 	}()
@@ -975,5 +975,3 @@ func TestManagerBackend_IdentityResolutionAndUpstreamZeroCallGuard(t *testing.T)
 		t.Fatalf("victim alias record was tampered with: %+v", invVictim)
 	}
 }
-
-

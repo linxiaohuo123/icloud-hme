@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 gin, net/http, strings, fmt, errors, time, strconv, icloud-hme/internal/auth, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 externalV2AllocateHandler, externalV2CreateVerificationRequestHandler, externalV2GetVerificationRequestHandler, externalV2GetOperationHandler
- * [POS]: internal/server 的 v2 外部自动化 API 规范门面 (PR-04/PR-05-1)，强制令牌幂等键、规范请求哈希、真实持久化取码请求与严格主体资源隔离
+ * [POS]: internal/server 的 v2 外部自动化 API 规范门面 (PR-04/PR-05-1)，强制令牌幂等键、规范请求哈希、真实持久化取码请求与严格主体资源隔离，取码传递原凭据供长轮询复查
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -234,7 +234,7 @@ func (s *Server) externalV2GetVerificationRequestHandler(c *gin.Context) {
 		}
 	}
 
-	res, err := s.verifyService.GetVerificationResult(c.Request.Context(), p, requestID, timeoutSec)
+	res, err := s.verifyService.GetVerificationResult(c.Request.Context(), p, requestID, timeoutSec, requestAPIKey(c))
 	if err != nil {
 		var be *BackendError
 		if errors.As(err, &be) {

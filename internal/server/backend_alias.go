@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/account, internal/hme, internal/store
  * [OUTPUT]: 对外提供 managerBackend 的别名相关方法 (CreateAlias, BatchCreateAlias, ListAliases, RefreshAliases, SetAliasActive, UpdateAlias, BatchUpdateAliases, DeleteAlias) 与 BatchCreateResult, BatchUpdateResult 类型
- * [POS]: internal/server 的别名业务门面实现，按账号锁内仲裁数量上限并保留上游成功结果
+ * [POS]: internal/server 的别名业务门面实现，账号锁覆盖远端操作与库存同步，仲裁数量上限并保留上游成功结果
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -581,6 +581,16 @@ func (b *managerBackend) RefreshAliasesContext(ctx context.Context, accountID st
 			}
 			return &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_ERROR", Message: "别名数量保存失败"}
 		}
+		// 路由登记和库存落库也必须在同账号客户端锁内，避免旧快照覆盖后续写操作。
+		if b.onAliasesFetched != nil {
+			fetched := append([]hme.Alias(nil), aliases...)
+			b.onAliasesFetched(accountID, fetched)
+		}
+		if b.store != nil {
+			if err := b.store.SyncAliasInventory(accountID, aliases); err != nil {
+				return &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_ERROR", Message: "别名库存同步失败"}
+			}
+		}
 		b.setCachedAliasesAtEpoch(accountID, epoch, aliases)
 		return nil
 	})
@@ -597,14 +607,6 @@ func (b *managerBackend) RefreshAliasesContext(ctx context.Context, accountID st
 	// 返回防御性独立拷贝，避免并发调用者直接修改缓存底切片
 	res := make([]hme.Alias, len(aliases))
 	copy(res, aliases)
-	// 自愈「别名 → 母号」路由：本次拉取已确知归属，直接登记，免去后续盲扫
-	if b.onAliasesFetched != nil {
-		b.onAliasesFetched(accountID, res)
-	}
-	// 将远端真实状态 (active/inactive) 与 provider_alias_id 同步持久化至库存表 (PR-09)
-	if b.store != nil {
-		_ = b.store.SyncAliasInventory(accountID, res)
-	}
 	return res, nil
 }
 
@@ -740,6 +742,7 @@ func (b *managerBackend) SetAliasActiveContext(ctx context.Context, accountID, a
 
 	var success bool
 	var remoteCompleted bool
+	var inventoryErr error
 	err = b.mgr.WithHMEClientContext(ctx, accountID, func(client *hme.Client) error {
 		var opErr error
 		if active {
@@ -756,9 +759,22 @@ func (b *managerBackend) SetAliasActiveContext(ctx context.Context, accountID, a
 			if countErr := b.mgr.AdjustAliasCounts(accountID, 0, delta); countErr != nil {
 				log.Printf("[HME] 账号 %s 别名状态已改变，但数量回写失败: %v", accountID, countErr)
 			}
+			b.invalidateAliasCache(accountID)
+			if b.store != nil {
+				rState, opName := store.RemoteInactive, "停用"
+				if active {
+					rState, opName = store.RemoteActive, "激活"
+				}
+				if stErr := b.store.UpdateAliasRemoteState(accountID, targetAnonID, resolvedEmail, rState); stErr != nil {
+					inventoryErr = &BackendError{Status: http.StatusInternalServerError, Code: "STORE_SYNC_PENDING_RECONCILIATION", Message: fmt.Sprintf("上游%s成功但本地库存状态同步失败 (待核对): %v", opName, stErr)}
+				}
+			}
 		}
 		return opErr
 	})
+	if inventoryErr != nil {
+		return false, inventoryErr
+	}
 	if remoteCompleted && err != nil {
 		log.Printf("[HME] 账号 %s 别名状态已改变，但会话回写失败: %v", accountID, err)
 		err = nil
@@ -781,25 +797,6 @@ func (b *managerBackend) SetAliasActiveContext(ctx context.Context, accountID, a
 			msg = "激活操作未成功"
 		}
 		return false, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILED", Message: msg}
-	}
-
-	b.invalidateAliasCache(accountID)
-	if b.store != nil {
-		rState := store.RemoteInactive
-		if active {
-			rState = store.RemoteActive
-		}
-		if stErr := b.store.UpdateAliasRemoteState(accountID, targetAnonID, resolvedEmail, rState); stErr != nil {
-			opName := "停用"
-			if active {
-				opName = "激活"
-			}
-			return false, &BackendError{
-				Status:  http.StatusInternalServerError,
-				Code:    "STORE_SYNC_PENDING_RECONCILIATION",
-				Message: fmt.Sprintf("上游%s成功但本地库存状态同步失败 (待核对): %v", opName, stErr),
-			}
-		}
 	}
 
 	return success, nil
@@ -966,6 +963,7 @@ func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
 		}
 	}
 	deleted := false
+	var inventoryErr error
 	err = b.mgr.WithHMEClient(accountID, func(client *hme.Client) error {
 		if err := client.Delete(targetAnonID); err != nil {
 			return err
@@ -974,8 +972,17 @@ func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
 		if countErr := b.mgr.AdjustAliasCounts(accountID, -1, deltaActive); countErr != nil {
 			log.Printf("[HME] 账号 %s 别名已删除，但数量回写失败: %v", accountID, countErr)
 		}
+		b.invalidateAliasCache(accountID)
+		if b.store != nil {
+			if stErr := b.store.UpdateAliasRemoteState(accountID, targetAnonID, resolvedEmail, store.RemoteDeleted); stErr != nil {
+				inventoryErr = &BackendError{Status: http.StatusInternalServerError, Code: "STORE_SYNC_PENDING_RECONCILIATION", Message: fmt.Sprintf("上游删除成功但本地库存状态同步失败 (待核对): %v", stErr)}
+			}
+		}
 		return nil
 	})
+	if inventoryErr != nil {
+		return inventoryErr
+	}
 	if deleted && err != nil {
 		log.Printf("[HME] 账号 %s 别名已删除，但会话回写失败: %v", accountID, err)
 		err = nil
@@ -986,16 +993,5 @@ func (b *managerBackend) DeleteAlias(accountID, anonymousID string) error {
 		}
 		return classifyUpstreamErr("删除失败", err)
 	}
-	b.invalidateAliasCache(accountID)
-	if b.store != nil {
-		if stErr := b.store.UpdateAliasRemoteState(accountID, targetAnonID, resolvedEmail, store.RemoteDeleted); stErr != nil {
-			return &BackendError{
-				Status:  http.StatusInternalServerError,
-				Code:    "STORE_SYNC_PENDING_RECONCILIATION",
-				Message: fmt.Sprintf("上游删除成功但本地库存状态同步失败 (待核对): %v", stErr),
-			}
-		}
-	}
-
 	return nil
 }

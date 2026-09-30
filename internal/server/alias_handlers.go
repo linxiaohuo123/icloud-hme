@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 errors, io, gin, net/http, strings, encoding/csv, time, fmt, icloud-hme/internal/hme
  * [OUTPUT]: 对外提供 createAliasHandler, createAliasBatchHandler, listAliasesHandler, updateAliasHandler, batchUpdateAliasHandler, deactivateAliasHandler, reactivateAliasHandler, deleteAliasHandler, exportAliasesHandler, promoteAliasesToPoolHandler 等 HTTP 端点
- * [POS]: internal/server 的别名生命周期与号池管理路由处理器
+ * [POS]: internal/server 的别名生命周期与号池管理路由处理器，修改与生命周期操作均拒绝非法 JSON，生命周期操作保留空请求体查询参数用法
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -214,7 +214,10 @@ type aliasActionReq struct {
 func validateAliasAction(c *gin.Context) (accountID, anonymousID string, valid bool) {
 	anonymousID = c.Param("id")
 	var req aliasActionReq
-	_ = c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: 请求体必须为有效的 JSON")
+		return "", "", false
+	}
 	accID := req.AccountID
 	if accID == "" {
 		accID = c.Query("account_id")
@@ -243,7 +246,10 @@ func (s *Server) updateAliasHandler(c *gin.Context) {
 		return
 	}
 	var req updateAliasReq
-	_ = c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: 请求体必须为有效的 JSON")
+		return
+	}
 	if req.AccountID == "" {
 		req.AccountID = c.Query("account_id")
 	}

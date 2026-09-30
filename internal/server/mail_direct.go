@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 gin, html/template, net/http, strings, time, encoding/json, fmt, strconv, icloud-hme/internal/auth, icloud-hme/internal/mail, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 findAccountForEmail, mailViewHandler, mailRawHandler
- * [POS]: internal/server 的对外直出链接管道，支持 IMAP 正文与 WebMail 预览查信、多条验证码提取与可视化正文直出
+ * [POS]: internal/server 的对外直出链接管道，验证码与激活链接独立展示，指定邮件预览使用隔离的 HTML 响应
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -218,14 +218,14 @@ var mailViewTemplate = template.Must(template.New("mailView").Parse(`<!DOCTYPE h
         <div class="otp-latest-left">
           <div class="otp-latest-tag">
             <svg viewBox="0 0 24 24"><path d="M19 9l1.25-2.75L23 5l-2.75-1.25L19 1l-1.25 2.75L15 5l2.75 1.25L19 9zm-7.5.5L9 4 6.5 9.5 1 12l5.5 2.5L9 20l2.5-5.5L17 12l-5.5-2.5zM19 15l-1.25 2.75L15 19l2.75 1.25L19 23l1.25-2.75L23 19l-2.75-1.25L19 15z"/></svg>
-            <span>提取到验证码</span>
+            <span id="topOtpLabel">{{if and .AllOTPs (index .AllOTPs 0).Code}}提取到验证码{{else}}提取到激活链接{{end}}</span>
           </div>
-          <div class="otp-code-highlight" id="topLatestOtp" data-action="copy-latest-otp" title="点击复制最新验证码">
+          <div class="otp-code-highlight{{if or (not .AllOTPs) (not (index .AllOTPs 0).Code)}} is-hidden{{end}}" id="topLatestOtp" data-action="copy-latest-otp" title="点击复制最新验证码">
             {{if .AllOTPs}}{{(index .AllOTPs 0).Code}}{{end}}
           </div>
         </div>
         <div class="otp-actions">
-          <button class="btn btn-primary" id="topLatestCopyBtn" data-action="copy-latest-otp">
+          <button class="btn btn-primary{{if or (not .AllOTPs) (not (index .AllOTPs 0).Code)}} is-hidden{{end}}" id="topLatestCopyBtn" data-action="copy-latest-otp">
             <svg viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
             <span>复制验证码</span>
           </button>
@@ -238,12 +238,16 @@ var mailViewTemplate = template.Must(template.New("mailView").Parse(`<!DOCTYPE h
 
       <!-- Historical OTPs Chips Row -->
       <div class="otp-history-section{{if le (len .AllOTPs) 1}} is-hidden{{end}}" id="otpHistorySection">
-        <span class="otp-history-label">全部提取验证码记录 ({{len .AllOTPs}} 条):</span>
+        <span class="otp-history-label">全部验证信息 ({{len .AllOTPs}} 条):</span>
         {{range .AllOTPs}}
+        {{if .Code}}
         <button class="otp-chip-btn" data-action="copy-code" data-code="{{.Code}}" title="点击复制此验证码 (来自: {{.SenderName}} · {{.RelativeDate}})">
           <span class="otp-chip-code">{{.Code}}</span>
           <span>· {{.SenderName}} ({{.RelativeDate}})</span>
         </button>
+        {{else}}
+        <a class="otp-chip-btn" href="{{.MagicLink}}" target="_blank" rel="noopener noreferrer">激活链接 · {{.SenderName}} ({{.RelativeDate}})</a>
+        {{end}}
         {{end}}
       </div>
     </section>
@@ -271,7 +275,7 @@ var mailViewTemplate = template.Must(template.New("mailView").Parse(`<!DOCTYPE h
             </div>
             <div class="mail-item-subject">{{.Subject}}</div>
             <div class="mail-item-bottom">
-              {{if .HasOTP}}
+              {{if .Code}}
               <div class="item-otp-pill">
                 <span>⚡ {{.Code}}</span>
                 <span class="quick-copy" data-action="copy-code" data-code="{{.Code}}" title="复制验证码">复制</span>
@@ -306,12 +310,12 @@ var mailViewTemplate = template.Must(template.New("mailView").Parse(`<!DOCTYPE h
 
         <!-- Detail OTP Strip (Visible if current email has OTP) -->
         <div class="detail-otp-box{{if not .LatestItem.HasOTP}} is-hidden{{end}}" id="detailOtpBox">
-          <div class="detail-otp-left">
+          <div class="detail-otp-left{{if not .LatestItem.Code}} is-hidden{{end}}" id="detailOtpCodeBox">
             <span class="detail-otp-label">本信验证码:</span>
             <span class="detail-otp-code" id="detailOtpCode" data-action="copy-detail-otp">{{.LatestItem.Code}}</span>
           </div>
           <div class="detail-otp-actions">
-            <button class="btn btn-primary compact-btn" data-action="copy-detail-otp">
+            <button class="btn btn-primary compact-btn{{if not .LatestItem.Code}} is-hidden{{end}}" id="detailOtpCopyBtn" data-action="copy-detail-otp">
               <svg viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
               <span>复制</span>
             </button>
@@ -345,7 +349,7 @@ var mailViewTemplate = template.Must(template.New("mailView").Parse(`<!DOCTYPE h
           <!-- HTML View -->
           <div class="body-view" id="view-html">
             <div class="iframe-container">
-              <iframe id="mailFrame" class="body-frame" sandbox="allow-same-origin allow-popups"></iframe>
+              <iframe id="mailFrame" class="body-frame" sandbox="allow-popups" title="邮件正文"></iframe>
             </div>
           </div>
           <!-- Raw Text View -->
@@ -383,7 +387,7 @@ var mailViewTemplate = template.Must(template.New("mailView").Parse(`<!DOCTYPE h
   <!-- Floating Toast Notification -->
   <div class="toast" id="toast"></div>
 
-  <div id="mailViewData" data-items="{{.ItemsJSON}}"></div>
+  <div id="mailViewData" data-items="{{.ItemsJSON}}" data-email="{{.Email}}" data-account-id="{{.AccountID}}"></div>
   <script src="/mail/view-assets.js" defer></script>
 </body>
 </html>
@@ -450,7 +454,7 @@ func (s *Server) mailViewHandler(c *gin.Context) {
 
 			allOtps := make([]mailViewItem, 0, len(items))
 			for _, it := range items {
-				if it.HasOTP && it.Code != "" {
+				if it.HasOTP && (it.Code != "" || it.MagicLink != "") {
 					allOtps = append(allOtps, it)
 				}
 			}
@@ -482,6 +486,8 @@ func (s *Server) mailViewHandler(c *gin.Context) {
 //
 //	email / alias (必须): 别名邮箱
 //	format (可选): html 或 text (默认 text)
+//	message_id (可选): 当前别名最近 20 封中的指定邮件；省略时返回最新邮件
+//	frame (可选): 1 表示 HTML 允许被同源查信页嵌入，仍禁止脚本与同源权限
 func (s *Server) mailRawHandler(c *gin.Context) {
 	email := strings.ToLower(strings.TrimSpace(c.Param("email")))
 	if email == "" {
@@ -514,18 +520,40 @@ func (s *Server) mailRawHandler(c *gin.Context) {
 		return
 	}
 
-	items, err := s.fetchRecentMessagesForAlias(c.Request.Context(), accountID, email, 1)
+	messageID := strings.TrimSpace(c.Query("message_id"))
+	limit := 1
+	if messageID != "" {
+		limit = 20
+	}
+	items, err := s.fetchRecentMessagesForAlias(c.Request.Context(), accountID, email, limit)
 	if err != nil || len(items) == 0 {
 		c.Data(http.StatusNotFound, "text/plain; charset=utf-8", []byte("NO_EMAIL_RECEIVED"))
 		return
 	}
 
 	latest := items[0]
+	if messageID != "" {
+		found := false
+		for _, item := range items {
+			if item.ID == messageID {
+				latest, found = item, true
+				break
+			}
+		}
+		if !found {
+			c.Data(http.StatusNotFound, "text/plain; charset=utf-8", []byte("MESSAGE_NOT_FOUND"))
+			return
+		}
+	}
 	format := strings.ToLower(strings.TrimSpace(c.Query("format")))
 	if format == "html" {
 		// The body is untrusted mailbox content. Keep the preview renderable while
 		// preventing scripts, forms, plugins, network requests, and framing.
-		c.Header("Content-Security-Policy", "sandbox allow-popups; default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+		ancestors := "'none'"
+		if c.Query("frame") == "1" {
+			ancestors = "'self'"
+		}
+		c.Header("Content-Security-Policy", "sandbox allow-popups; default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors "+ancestors)
 		c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(latest.HTMLBody))
 	} else {
 		c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(latest.TextBody))

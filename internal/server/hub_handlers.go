@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 gin, icloud-hme/internal/store, icloud-hme/internal/scheduler
- * [OUTPUT]: 对外提供 Tags, Tokens, Leases, Schedules 的 HTTP Handler，支持描述清空与原子调度参数校验
+ * [OUTPUT]: 对外提供 Tags, Tokens, Leases, Schedules 的 HTTP Handler，令牌创建拒绝非法 JSON，支持描述清空与原子调度参数校验
  * [POS]: internal/server 的中台功能路由处理器集合；scheduledTag 优先继承母号业务标签并回退 scheduled，切断与 AliasLabel 模板耦合
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -10,6 +10,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -189,7 +190,10 @@ type createTokenRequest struct {
 
 func (s *Server) createTokenHandler(c *gin.Context) {
 	var req createTokenRequest
-	_ = c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: 请求体必须为有效的 JSON")
+		return
+	}
 
 	// 【安全红线】禁止继续接受管理员自定义 Token (防止 123456 / test 等弱口令)
 	if strings.TrimSpace(req.Token) != "" {

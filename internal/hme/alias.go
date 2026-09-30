@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, errors, fmt, sort, strconv, strings, time, github.com/tidwall/gjson
  * [OUTPUT]: 对外提供 Alias, CreateResult, ListAliases, ListAliasesWithContext, Generate, GenerateWithContext, Reserve, ReserveWithContext, CreateAlias, CreateAliasWithContext, DeactivateHME, ReactivateHME, Delete, UpdateMetaData
- * [POS]: internal/hme 的 HME 别名协议操作层，负责别名生成、保留、列出、激活、修改、删除与状态核对
+ * [POS]: internal/hme 的 HME 别名协议操作层，列表拒绝不完整解析结果，负责生成、保留、激活、修改、删除与状态核对
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -470,6 +470,11 @@ func parseAliasList(body string) ([]Alias, error) {
 		})
 		return true
 	})
+
+	// 该列表用于完整库存对账；跳过坏记录会把仍存在的别名误判为已删除。
+	if len(aliases) != len(arr.Array()) {
+		return nil, fmt.Errorf("%w: alias list contains invalid entries", ErrInvalidResponseSchema)
+	}
 
 	if aliases == nil {
 		aliases = []Alias{}

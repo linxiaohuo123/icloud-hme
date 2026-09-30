@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 database/sql, fmt, errors, strings, time, icloud-hme/internal/hme
  * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation 模型及 migrateInventory, AddInventoryAlias, AddRecoveredInventoryAlias, GetInventoryAlias, SyncAliasInventory, CountAuthoritativeAvailableAliases, UpdateAliasRemoteState, PromoteUnknownToAvailable, CountDormantPoolAliases
- * [POS]: internal/store 的别名库存实体与迁移定义层，维护 alias_inventory, alias_allocations, operations 表结构与元数据
+ * [POS]: internal/store 的别名库存实体与迁移定义层，完整快照事务隔离缺失库存并保留分配归属
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -331,8 +331,12 @@ func (s *Store) GetInventoryAlias(email string) (*AliasInventory, error) {
 	return &inv, nil
 }
 
-// SyncAliasInventory 同步远端别名快照；严禁将 allocated 覆盖为 available
+// SyncAliasInventory 同步完整远端快照，隔离缺失别名并保留已有分配归属。
 func (s *Store) SyncAliasInventory(accountID string, aliases []hme.Alias) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return errors.New("accountID cannot be empty")
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -343,6 +347,12 @@ func (s *Store) SyncAliasInventory(accountID string, aliases []hme.Alias) error 
 	}
 	defer tx.Rollback()
 
+	// 先标记完整快照中待确认的旧行，下面的 upsert 恢复仍存在的别名。
+	// 所有更新位于同一事务，领取方不会看到中间状态。
+	if _, err := tx.Exec(`UPDATE alias_inventory SET remote_state = 'deleted', last_verified_at = ? WHERE account_id = ?`, now, accountID); err != nil {
+		return err
+	}
+
 	stmt, err := tx.Prepare(`
 		INSERT INTO alias_inventory (
 			email, account_id, provider_alias_id, remote_state, allocation_state, source_type, last_verified_at, snapshot_version
@@ -352,6 +362,7 @@ func (s *Store) SyncAliasInventory(accountID string, aliases []hme.Alias) error 
 			provider_alias_id = CASE WHEN excluded.provider_alias_id != '' THEN excluded.provider_alias_id ELSE alias_inventory.provider_alias_id END,
 			account_id = CASE WHEN excluded.account_id != '' THEN excluded.account_id ELSE alias_inventory.account_id END,
 			last_verified_at = excluded.last_verified_at
+		WHERE alias_inventory.account_id = excluded.account_id OR alias_inventory.account_id = ''
 	`)
 	if err != nil {
 		return err
@@ -367,11 +378,23 @@ func (s *Store) SyncAliasInventory(accountID string, aliases []hme.Alias) error 
 		if !a.Active {
 			rState = RemoteInactive
 		}
-		if _, err := stmt.Exec(email, accountID, a.AnonymousID, rState, now); err != nil {
+		result, err := stmt.Exec(email, accountID, a.AnonymousID, rState, now)
+		if err != nil {
 			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return fmt.Errorf("snapshot alias %s belongs to another account: %w", email, ErrAllocationConflict)
 		}
 	}
 
+	if _, err := tx.Exec(`UPDATE alias_inventory SET allocation_state = 'quarantined'
+		WHERE account_id = ? AND remote_state = 'deleted' AND allocation_state = 'available'`, accountID); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 

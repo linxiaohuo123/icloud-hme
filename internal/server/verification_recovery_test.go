@@ -116,7 +116,7 @@ func TestPR04B_SyncOnce_ScansEvenWithZeroEventBusSubscribers(t *testing.T) {
 		Kind:   auth.PrincipalToken,
 		ID:     tokID,
 		Scopes: []string{"verify"},
-	}, "vreq_nobus_1", 0)
+	}, "vreq_nobus_1", 0, "test-secret-token")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +376,7 @@ func TestPR04B_GetVerificationResult_DBFirstAndLegacyCompatibility(t *testing.T)
 	p := auth.Principal{Kind: auth.PrincipalToken, ID: tokID, Scopes: []string{"verify"}}
 
 	// 验证场景 1: DB-first 秒回，无任何等待
-	res1, err := vsvc.GetVerificationResult(ctx, p, "vreq_db_first_done", 30)
+	res1, err := vsvc.GetVerificationResult(ctx, p, "vreq_db_first_done", 30, "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +385,7 @@ func TestPR04B_GetVerificationResult_DBFirstAndLegacyCompatibility(t *testing.T)
 	}
 
 	// 验证场景 2: 历史 URL Code 兼容推断 MagicLink
-	res2, err := vsvc.GetVerificationResult(ctx, p, "vreq_legacy_url_code", 30)
+	res2, err := vsvc.GetVerificationResult(ctx, p, "vreq_legacy_url_code", 30, "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -618,7 +618,7 @@ func TestPR04B_SubscribeRaceReturnsFromDBWithoutWaitingForEvent(t *testing.T) {
 
 	start := time.Now()
 	// 请求 30 秒长轮询，若存在 subscribe race，它会卡死等满 30 秒
-	res, err := vsvc.GetVerificationResult(ctx, p, "vreq_race_1", 30)
+	res, err := vsvc.GetVerificationResult(ctx, p, "vreq_race_1", 30, "secret")
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -766,7 +766,7 @@ func TestPR04B_EventBusCacheExpiryCannotLoseDurableResult(t *testing.T) {
 	// 客户端此时发起查询，EventBus 内存已无此事件
 	vsvc := NewVerificationService(fb, st, fastBus, worker)
 	p := auth.Principal{Kind: auth.PrincipalToken, ID: tokID, Scopes: []string{"verify"}}
-	res, err := vsvc.GetVerificationResult(ctx, p, "vreq_cache_exp", 5)
+	res, err := vsvc.GetVerificationResult(ctx, p, "vreq_cache_exp", 5, "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -831,7 +831,7 @@ func TestPR04B_CodeAndMagicLinkSurviveStoreRestart(t *testing.T) {
 
 	vsvc := NewVerificationService(nil, st2, mail.NewEventBus(5*time.Minute), nil)
 	p := auth.Principal{Kind: auth.PrincipalToken, ID: tokID, Scopes: []string{"verify"}}
-	res, err := vsvc.GetVerificationResult(ctx, p, "vreq_survive_1", 0)
+	res, err := vsvc.GetVerificationResult(ctx, p, "vreq_survive_1", 0, "secret")
 	if err != nil {
 		t.Fatal(err)
 	}

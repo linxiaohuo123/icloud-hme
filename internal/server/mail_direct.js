@@ -59,18 +59,6 @@
       }
     }
 
-    function resizeIframe(obj) {
-      try {
-        if (obj.contentWindow && obj.contentWindow.document) {
-          const doc = obj.contentWindow.document;
-          const h = Math.max(doc.body.scrollHeight, doc.documentElement.scrollHeight);
-          if (h > 150) {
-            obj.height = String(h + 30);
-          }
-        }
-      } catch(e) {}
-    }
-
     function switchTab(viewId) {
       document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
       document.querySelectorAll('.body-view').forEach(function(v) { v.classList.remove('active'); });
@@ -80,9 +68,10 @@
       if (view) view.classList.add('active');
     }
 
-    function selectMail(index) {
+    function selectMail(index, preserveView) {
       if (!emailList || emailList.length === 0) return;
       if (index < 0 || index >= emailList.length) index = 0;
+      const activeTab = preserveView ? document.querySelector('.tab-btn.active') : null;
       currentIdx = index;
 
       document.querySelectorAll('.mail-item').forEach(function(el) { el.classList.remove('active'); });
@@ -107,20 +96,29 @@
       const otpBox = document.getElementById('detailOtpBox');
       const otpCode = document.getElementById('detailOtpCode');
       const magicBtn = document.getElementById('detailMagicBtn');
-      if (item.has_otp && item.code) {
+      if (item.has_otp && (item.code || item.magic_link)) {
         if (otpBox) otpBox.classList.remove('is-hidden');
-        if (otpCode) otpCode.textContent = item.code;
+        if (otpCode) otpCode.textContent = item.code || '';
         if (magicBtn) {
           if (item.magic_link) {
             magicBtn.classList.remove('is-hidden');
             magicBtn.href = item.magic_link;
           } else {
             magicBtn.classList.add('is-hidden');
+            magicBtn.removeAttribute('href');
           }
         }
       } else if (otpBox) {
         otpBox.classList.add('is-hidden');
+        if (magicBtn) {
+          magicBtn.classList.add('is-hidden');
+          magicBtn.removeAttribute('href');
+        }
       }
+      ['detailOtpCodeBox', 'detailOtpCopyBtn'].forEach(function(id) {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('is-hidden', !item.code);
+      });
 
       // Update raw text
       const rawArea = document.getElementById('rawContentArea');
@@ -130,8 +128,22 @@
       const frame = document.getElementById('mailFrame');
       if (frame) {
         if (item.is_html) {
-          frame.srcdoc = item.html_body;
+          // 独立 HTTP 文档使用邮件专属 CSP，避免 srcdoc 继承主页面的内联样式限制。
+          const dataEl = document.getElementById('mailViewData');
+          const currentURL = new URL(window.location.href);
+          const previewURL = new URL('/mail/raw', currentURL.origin);
+          previewURL.searchParams.set('email', dataEl.dataset.email);
+          previewURL.searchParams.set('account_id', dataEl.dataset.accountId);
+          previewURL.searchParams.set('message_id', item.id);
+          previewURL.searchParams.set('format', 'html');
+          previewURL.searchParams.set('frame', '1');
+          ['token', 'api_key'].forEach(function(key) {
+            if (currentURL.searchParams.has(key)) previewURL.searchParams.set(key, currentURL.searchParams.get(key));
+          });
+          frame.removeAttribute('srcdoc');
+          if (frame.src !== previewURL.href) frame.src = previewURL.href;
         } else {
+          frame.removeAttribute('src');
           frame.srcdoc = '<!DOCTYPE html><html><body><pre>' + escapeHtml(item.text_body) + '</pre></body></html>';
         }
       }
@@ -139,7 +151,9 @@
       // Update styled plain text view
       renderStyledText(item);
 
-      if (item.is_html) {
+      if (activeTab) {
+        switchTab(activeTab.id.replace('tab-', ''));
+      } else if (item.is_html) {
         switchTab('html');
       } else {
         switchTab('styled');
@@ -223,8 +237,6 @@
       }
     });
 
-    const mailFrame = document.getElementById('mailFrame');
-    if (mailFrame) mailFrame.addEventListener('load', function() { resizeIframe(mailFrame); });
 
     // SILENT LIVE BACKGROUND POLLING
     async function checkNewMailsSilently(isManual) {
@@ -273,6 +285,9 @@
     function applyNewData(data, isManual) {
       if (!data) return;
 
+      const selectedID = emailList[currentIdx] ? emailList[currentIdx].id : '';
+      const newItems = data.items || [];
+      const listContentChanged = JSON.stringify(emailList) !== JSON.stringify(newItems);
       const oldFirstID = (emailList && emailList.length > 0) ? emailList[0].id : '';
       const newFirstID = (data.items && data.items.length > 0) ? data.items[0].id : '';
       const oldLatestOtp = (emailList && emailList.find(function(x) { return x.has_otp; })) ? emailList.find(function(x) { return x.has_otp; }).code : '';
@@ -282,7 +297,7 @@
       const hasNewMail = Boolean(newFirstID && newFirstID !== oldFirstID);
       const hasNewOTP = Boolean(newLatestOtp && newLatestOtp !== oldLatestOtp);
 
-      emailList = data.items || [];
+      emailList = newItems;
 
       // Update Top Master OTP Bar (Extract latest OTP from AllOTPs)
       const masterOtpBar = document.getElementById('otpMasterBar');
@@ -292,7 +307,14 @@
       if (latestOtpItem) {
         if (masterOtpBar) masterOtpBar.classList.remove('is-hidden');
         const topLatestOtp = document.getElementById('topLatestOtp');
-        if (topLatestOtp) topLatestOtp.textContent = latestOtpItem.code;
+        if (topLatestOtp) {
+          topLatestOtp.textContent = latestOtpItem.code || '';
+          topLatestOtp.classList.toggle('is-hidden', !latestOtpItem.code);
+        }
+        const topCopyBtn = document.getElementById('topLatestCopyBtn');
+        if (topCopyBtn) topCopyBtn.classList.toggle('is-hidden', !latestOtpItem.code);
+        const topLabel = document.getElementById('topOtpLabel');
+        if (topLabel) topLabel.textContent = latestOtpItem.code ? '提取到验证码' : '提取到激活链接';
 
         const topMagicBtn = document.getElementById('topMagicBtn');
         if (topMagicBtn) {
@@ -301,6 +323,7 @@
             topMagicBtn.href = latestOtpItem.magic_link;
           } else {
             topMagicBtn.classList.add('is-hidden');
+            topMagicBtn.removeAttribute('href');
           }
         }
 
@@ -314,8 +337,12 @@
         if (historySec) {
           if (data.all_otps.length > 1) {
             historySec.classList.remove('is-hidden');
-            let chipsHTML = '<span class="otp-history-label">全部提取验证码记录 (' + data.all_otps.length + ' 条):</span>';
+            let chipsHTML = '<span class="otp-history-label">全部验证信息 (' + data.all_otps.length + ' 条):</span>';
             data.all_otps.forEach(function(it) {
+              if (!it.code) {
+                chipsHTML += '<a class="otp-chip-btn" href="' + escapeAttr(it.magic_link) + '" target="_blank" rel="noopener noreferrer">激活链接 · ' + escapeHtml(it.sender_name) + '</a>';
+                return;
+              }
               chipsHTML += '<button class="otp-chip-btn" data-action="copy-code" data-code="' + escapeAttr(it.code) + '">' +
                 '<span class="otp-chip-code">' + escapeHtml(it.code) + '</span>' +
                 '<span>· ' + escapeHtml(it.sender_name) + ' (' + escapeHtml(it.relative_date) + ')</span>' +
@@ -368,15 +395,18 @@
       const countBadge = document.getElementById('inboxCountBadge');
       if (countBadge) countBadge.textContent = '共 ' + (data.total_count || 0) + ' 封';
 
-      // Re-render email list only if new mail arrived or count changed
-      if (hasNewMail || hasNewOTP || listCountChanged) {
+      // Refresh content updates too, preserving the selected mail and reading tab.
+      const selectTop = hasNewMail || hasNewOTP || listCountChanged;
+      if (selectTop || listContentChanged) {
+        const selectedIndex = emailList.findIndex(function(it) { return it.id === selectedID; });
+        const nextIndex = selectTop || selectedIndex < 0 ? 0 : selectedIndex;
         const listContainer = document.getElementById('mailListContainer');
         if (listContainer && emailList.length > 0) {
           let listHTML = '';
           emailList.forEach(function(it) {
-            const activeCls = (it.index === 0) ? ' active' : '';
+            const activeCls = (it.index === nextIndex) ? ' active' : '';
             let otpBadge = '<div class="item-preview">' + escapeHtml(it.subject) + '</div>';
-            if (it.has_otp) {
+            if (it.code) {
               otpBadge = '<div class="item-otp-pill"><span>⚡ ' + escapeHtml(it.code) + '</span>' +
                 '<span class="quick-copy" data-action="copy-code" data-code="' + escapeAttr(it.code) + '">复制</span></div>';
             }
@@ -395,13 +425,16 @@
           listContainer.innerHTML = listHTML;
         }
 
-        // New mail arrived! Select top mail and toast
-        if (newLatestOtp) {
-          showToast('🎉 收到新邮件！最新验证码: ' + newLatestOtp);
-        } else {
-          showToast('🎉 收到新邮件！收件列表已更新');
+        if (selectTop) {
+          if (newLatestOtp) {
+            showToast('🎉 收到新邮件！最新验证码: ' + newLatestOtp);
+          } else {
+            showToast('🎉 收到新邮件！收件列表已更新');
+          }
+        } else if (isManual) {
+          showToast('邮件内容已更新');
         }
-        selectMail(0);
+        selectMail(nextIndex, !selectTop && selectedIndex >= 0);
       } else {
         // No new mail arrived: keep user reading state intact, give feedback if manual check
         if (isManual) {

@@ -56,7 +56,7 @@ func TestVerificationResultReadErrors(t *testing.T) {
 					injectFailure()
 				}
 				go func() {
-					r, err := svc.GetVerificationResult(ctx, p, req.RequestID, 1)
+					r, err := svc.GetVerificationResult(ctx, p, req.RequestID, 1, "review-test-token")
 					done <- outcome{r, err}
 				}()
 				if duringWait {
@@ -168,7 +168,7 @@ func TestVerificationResultRechecksTokenAfterWait(t *testing.T) {
 				}
 				done := make(chan outcome, 1)
 				go func() {
-					result, err := svc.GetVerificationResult(ctx, p, req.RequestID, 1)
+					result, err := svc.GetVerificationResult(ctx, p, req.RequestID, 1, "review-test-token")
 					done <- outcome{result, err}
 				}()
 				ticker := time.NewTicker(time.Millisecond)

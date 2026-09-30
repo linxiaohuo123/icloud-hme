@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, fmt, time, errors, sync, icloud-hme/internal/auth, icloud-hme/internal/mail, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 VerificationService, NewVerificationService, VerificationResult
- * [POS]: internal/server 的取码与基线状态机应用服务，封装基线准备、原子完成、返回前令牌复查，状态查询失败显式报错
+ * [POS]: internal/server 的取码与基线状态机应用服务，封装基线准备、原子完成，消费事件与返回结果前复查原请求令牌凭据，状态查询失败显式报错
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -298,7 +298,7 @@ func (s *VerificationService) CreateVerificationRequest(ctx context.Context, p a
 }
 
 // GetVerificationResult 读取验证码（支持超时长轮询与边界唤醒）
-func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.Principal, requestID string, timeoutSec int) (result *VerificationResult, retErr error) {
+func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.Principal, requestID string, timeoutSec int, credential string) (result *VerificationResult, retErr error) {
 	if !p.CanVerify() {
 		return nil, ErrScopeDenied
 	}
@@ -310,10 +310,13 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 		return nil, &BackendError{Status: http.StatusServiceUnavailable, Code: "SERVICE_UNAVAILABLE", Message: "存储层未就绪"}
 	}
 
-	// 唤醒前复查令牌撤销状态 (PR-06 V09, PR-04 A05)
+	// 轮换保留主体 ID；复查原请求凭据，覆盖事件消费和全部结果交付路径。
+	validateCredential := func() bool {
+		id, _, _, valid := s.store.ValidateTokenPrincipal(credential)
+		return valid && id == p.ID
+	}
 	if p.Kind == auth.PrincipalToken {
-		tok, tokErr := s.store.GetToken(ctx, p.ID)
-		if tokErr != nil || tok == nil {
+		if !validateCredential() {
 			return nil, ErrTokenRevoked
 		}
 		// Cover every result path, including durable DB results returned after
@@ -322,7 +325,7 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 			if retErr != nil || result == nil {
 				return
 			}
-			if tok, err := s.store.GetToken(ctx, p.ID); err != nil || tok == nil {
+			if !validateCredential() {
 				result, retErr = nil, ErrTokenRevoked
 			}
 		}()
@@ -407,12 +410,9 @@ func (s *VerificationService) GetVerificationResult(ctx context.Context, p auth.
 	}
 
 	handleItem := func(item *mail.CachedOTP) (*VerificationResult, error) {
-		// 原子核查 Token 撤销状态
-		if p.Kind == auth.PrincipalToken {
-			tok, tokErr := s.store.GetToken(ctx, p.ID)
-			if tokErr != nil || tok == nil {
-				return nil, ErrTokenRevoked
-			}
+		// 消费验证码事件前复查原请求凭据。
+		if p.Kind == auth.PrincipalToken && !validateCredential() {
+			return nil, ErrTokenRevoked
 		}
 		// UIDVALIDITY 突变检测 (Issue 5 & 6)
 		if item.UIDValidity != 0 && vreq.BaselineUIDValidity != 0 && item.UIDValidity != uint32(vreq.BaselineUIDValidity) {

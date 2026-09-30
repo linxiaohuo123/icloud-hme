@@ -710,11 +710,14 @@ Authorization: Bearer <API_KEY> # 或 Bearer <EXTERNAL_TOKEN>
 **参数说明**：
 - `email`（必填，亦兼容 `alias`）：待收件的别名地址。
 - `timeout`（可选）：最大挂起秒数，默认 30 秒，上限 120 秒。超时返回 `408 VERIFY_TIMEOUT`。
+- 长轮询在交付验证码前再次验证原请求的令牌凭据；令牌轮换、撤销或过期后，在途旧请求返回 `401 REVOKED_TOKEN`，不会消费该验证码事件。
 - `fresh` 或 `nocache`（可选）：布尔值，默认 `false`。传 `true` 时仅跳过本地近期内存缓存，**但不是严格的 IMAP 邮件基线保证**。需要严格基线保证的新客户端请使用 v2 端点。
 - `auto_delete`：**明确不支持并会被拒绝**。传入 `auto_delete=true` 或 `1` 会直接返回 `400 UNSUPPORTED_PARAMETER` 错误。依据 RFC 9110 规范，HTTP GET 必须具备安全/无副作用语义，严禁通过 GET 查询操作导致别名被隐式停用。
 - `/mail/view` 与 `/mail/raw` 支持 IMAP 正文和 WebMail 不完整预览。IMAP 默认查询 INBOX 最近 30 天；WebMail 不承诺按天数筛选，也不保证完整正文。
   - 普通外部令牌使用分配记录中的母号读取邮件；显式 `account_id` / `account` 与分配账号不一致时返回 `404 RESOURCE_NOT_FOUND`，无法通过此参数跨账号读取。
   - 查信页通过内嵌的外部 CSS/JavaScript 资源加载样式与交互，保持全局 CSP 对内联脚本和事件处理器的限制。`/mail/raw?format=html` 使用独立 CSP sandbox，允许内联排版样式，阻断脚本、表单提交、同源存储与外部资源加载。
+  - `/mail/raw` 默认返回最新邮件；可传 `message_id` 选择该别名最近 20 封中的邮件，不存在时返回 `404 MESSAGE_NOT_FOUND`。HTML 预览使用 `format=html&frame=1`，仅允许同源页面嵌入，仍保留独立 sandbox 隔离。
+  - 查信页分别展示验证码和激活链接；只有激活链接的邮件也会显示打开链接按钮，不显示空验证码复制按钮。
 
 > **关于别名停用与配额说明**：
 > - 停用别名必须由具备管理员权限的会话显式调用管理接口 `POST /api/aliases/:id/deactivate`；普通 `allocate,verify` 令牌不具备停用接口权限，且系统不提供外部令牌的租约停用能力。
@@ -810,6 +813,9 @@ Content-Type: application/json
 调用第三方注册/登录接口向 `fresh_alias@icloud.com` 发送验证码。
 
 #### 步骤 4：长轮询获取验证码 (GET /api/external/v2/verification-requests/:id)
+
+事件消费前与结果交付前均重新验证原请求凭据；等待期间令牌轮换、撤销或过期后返回 `401 TOKEN_REVOKED`。轮换保留任务归属，新凭据可继续查询原任务；消费事件前发现凭据失效时，不会消费该事件。
+
 ```http
 GET /api/external/v2/verification-requests/vreq_8a3d1e4f...?timeout=30
 Authorization: Bearer <TOKEN>
@@ -906,6 +912,8 @@ Content-Type: application/json
 - 响应中的 `succeeded` 和 `failed` 分别列出成功与失败的别名 ID。若 Apple 已处理修改但本地账号会话未同步，响应还会包含 `last_error`；此时应刷新列表核对结果。
 
 ### 27. 停用别名
+
+停用、重新激活与删除接口均拒绝非法 JSON 或字段类型错误，返回 `400 VALIDATION_ERROR` 且不执行操作；空请求体仍可通过查询参数 `account_id` 指定账号。
 
 ```http
 POST /api/aliases/:id/deactivate
@@ -1017,8 +1025,9 @@ Content-Type: application/json
 
 - `GET /api/tokens`：列出所有外部接入令牌。**令牌本体以掩码形式返回**，请以创建响应为准妥善保存。
 - `POST /api/tokens`：创建外部令牌。
-  - 请求体：`{"name": "下游合作方A", "scopes": "allocate,verify", "token": "am_custom_token"}`
-  - `token` 留空时由服务端自动生成高强度随机串（`crypto/rand`）。
+  - 请求体：`{"name": "下游合作方A", "scopes": "allocate,verify", "expires_in_days": 7}`
+  - 服务端自动生成高强度随机串（`crypto/rand`）；非空自定义 `token` 返回 `400 CUSTOM_TOKEN_NOT_ALLOWED`。
+  - `expires_in_days` 必须是 JSON 整数；也可使用 RFC3339 字符串 `expires_at` 指定过期时间。非法 JSON 或字段类型错误返回 `400 VALIDATION_ERROR`，不会创建令牌。空请求体保留默认创建行为；不指定过期时间时令牌无到期时间。
   - `scopes` 留空时默认为最小权限 `allocate,verify`；需要管理面能力时显式传 `admin`。
   - 响应 `data` 中一次性返回明文 `token`，之后无法再次读取。
 - `DELETE /api/tokens/:id`：销毁吊销该接入令牌

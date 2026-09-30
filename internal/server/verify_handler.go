@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 gin, time, strings, strconv, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 verifyCodeHandler
- * [POS]: server 的验证码提取管道，基于 MailEventBus 实现纯内存事件分发，Trigger 即时触发收信，安全拒绝 auto_delete 副作用
+ * [POS]: server 的验证码提取管道，交付前复查原令牌凭据，Trigger 即时触发收信，安全拒绝 auto_delete 副作用
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -81,11 +81,11 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 
 	select {
 	case item := <-ch:
-		// 【PR-04/C3】长轮询唤醒后、完成交付前基于认证的主体 p.ID 复查令牌状态 (无需重新解析请求头)
+		// 轮换保持主体 ID 不变，必须重新验证原请求凭据才能阻止旧长轮询继续取码。
 		if p.Kind == auth.PrincipalToken && s.store != nil {
-			tok, tokErr := s.store.GetToken(c.Request.Context(), p.ID)
-			if tokErr != nil || tok == nil {
-				failCode(c, http.StatusUnauthorized, "REVOKED_TOKEN", "令牌已被撤销")
+			id, _, _, valid := s.store.ValidateTokenPrincipal(requestAPIKey(c))
+			if !valid || id != p.ID {
+				failCode(c, http.StatusUnauthorized, "REVOKED_TOKEN", "令牌已失效或被轮换")
 				return
 			}
 		}

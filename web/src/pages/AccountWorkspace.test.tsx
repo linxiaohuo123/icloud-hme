@@ -1,5 +1,5 @@
 import { http, HttpResponse } from 'msw'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { useNavigate, MemoryRouter, Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it } from 'vitest'
@@ -345,5 +345,74 @@ describe('AccountWorkspace', () => {
     await new Promise((r) => setTimeout(r, 50))
     expect(screen.getByText('b-unique@icloud.com')).toBeInTheDocument()
     expect(screen.queryByText('a-stale@icloud.com')).not.toBeInTheDocument()
+  })
+
+  it('旧账号出号完成不会取消新账号正在加载的别名', async () => {
+    const mutation = createDeferred<void>()
+    const bLoad = createDeferred<void>()
+    let mutationStarted = false
+    let bLoadStarted = false
+    let oldReload = false
+    server.use(
+      http.get('/api/accounts/:id', ({ params }) => {
+        if (params.id === 'acc_a' && mutationStarted) oldReload = true
+        return HttpResponse.json({ success: true, data: { ...testAccount, id: params.id } })
+      }),
+      http.get('/api/aliases', async ({ request }) => {
+        const id = new URL(request.url).searchParams.get('account_id')
+        if (id === 'acc_b') { bLoadStarted = true; await bLoad.promise }
+        return HttpResponse.json({ success: true, data: { aliases: [{ ...testAliases[0], email: `${id}-alias@icloud.com` }] } })
+      }),
+      http.post('/api/quick-create', async () => {
+        mutationStarted = true
+        await mutation.promise
+        return HttpResponse.json({ success: true, data: { email: 'created-a@icloud.com' } })
+      }),
+    )
+    const user = userEvent.setup()
+    renderWorkspaceWithNav()
+    await screen.findByText('acc_a-alias@icloud.com')
+    await user.click(screen.getByRole('button', { name: '快速出号' }))
+    await waitFor(() => expect(mutationStarted).toBe(true))
+    await user.click(screen.getByRole('button', { name: 'Go Acc B' }))
+    await waitFor(() => expect(bLoadStarted).toBe(true))
+    await act(async () => mutation.resolve())
+    await screen.findByRole('status', { name: '别名已生成：created-a@icloud.com' })
+    await act(async () => bLoad.resolve())
+    await screen.findByText('acc_b-alias@icloud.com')
+    expect(oldReload).toBe(false)
+    expect(screen.getByRole('button', { name: '快速出号' })).toBeEnabled()
+  })
+
+  it('切换账号后收件箱不保留上一账号的别名筛选', async () => {
+    const queries: string[] = []
+    server.use(
+      http.get('/api/accounts/:id', ({ params }) => HttpResponse.json({ success: true, data: { ...testAccount, id: params.id } })),
+      http.get('/api/aliases', () => HttpResponse.json({ success: true, data: { aliases: testAliases } })),
+      http.get('/api/inbox', ({ request }) => {
+        const url = new URL(request.url)
+        if (url.searchParams.get('account_id') === 'acc_b') queries.push(url.searchParams.get('alias') || '')
+        return HttpResponse.json({ success: true, data: { ...testInbox, account_id: url.searchParams.get('account_id') } })
+      }),
+    )
+    const user = userEvent.setup()
+    renderWorkspaceWithNav('/workspace/acc_a?tab=inbox&alias=work-1%40icloud.com')
+    await screen.findByRole('heading', { name: '测试账号' })
+    await user.click(screen.getByRole('button', { name: 'Go Acc B' }))
+    await screen.findByText('work-1@icloud.com')
+    await user.click(screen.getByRole('button', { name: /收件箱与验证码/ }))
+    await waitFor(() => expect(queries.length).toBeGreaterThan(0))
+    expect(queries.at(-1)).toBe('')
+  })
+
+  it('快速出号提示复制实际创建的邮箱', async () => {
+    server.use(http.post('/api/quick-create', () => HttpResponse.json({ success: true, data: { email: 'created@icloud.com' } })))
+    const user = userEvent.setup()
+    renderWorkspace()
+    await screen.findByText('work-1@icloud.com')
+    await user.click(screen.getByRole('button', { name: '快速出号' }))
+    await screen.findByRole('status', { name: '别名已生成：created@icloud.com' })
+    await user.click(screen.getByRole('button', { name: '复制' }))
+    expect(await navigator.clipboard.readText()).toBe('created@icloud.com')
   })
 })
