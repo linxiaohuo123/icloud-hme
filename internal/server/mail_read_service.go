@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, errors, strings, sync, time, strconv, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 MailReadService, NewMailReadService, BatchItemResult, batchMessageItemReq
- * [POS]: internal/server 的邮件读取与统一详情缓存应用服务，封装收件箱读取、WebMail 列表预览缓存与基于 MessageRef 的账号隔离，接入 MailPerf 观测
+ * [POS]: internal/server 的邮件读取与统一详情缓存应用服务，基于 MessageRef 隔离账号、缓存成功正文并逐项交付批量正文错误，接入 MailPerf 观测
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -714,7 +714,8 @@ func (s *MailReadService) getMessagesBatchIMAPJoin(ctx context.Context, accountI
 		}
 
 		fetched, err := s.be.GetMessagesContext(ctx, accountID, imapRefs)
-		if err != nil {
+		var readErr *mail.BatchReadError
+		if err != nil && !errors.As(err, &readErr) {
 			if len(reqItems) == len(pendingIMAP) {
 				return nil, nil, err
 			}
@@ -813,9 +814,15 @@ func (s *MailReadService) getMessagesBatchIMAPJoin(ctx context.Context, accountI
 						Message:      matched,
 					}
 				} else {
+					itemErr := "message not found"
+					if readErr != nil {
+						if failure := readErr.ErrorFor(pi.refObj); failure != nil {
+							itemErr = failure.Error()
+						}
+					}
 					results[pi.index] = BatchItemResult{
 						RequestedRef: pi.rawRef,
-						Error:        "message not found",
+						Error:        itemErr,
 					}
 				}
 			}

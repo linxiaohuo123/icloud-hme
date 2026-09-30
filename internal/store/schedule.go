@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 log, strings, time, icloud-hme/internal/store (Store)
- * [OUTPUT]: 对外提供 ScheduleConfig 类型, GetScheduleConfig, ListScheduleConfigs, SaveScheduleConfig, DeleteScheduleConfig, TryReserveQuota, ReleaseQuota, RemainingQuota, IncrementHourlyQuota, GetSetting, SaveSetting
+ * [OUTPUT]: 对外提供 ScheduleConfig 与配置读取、保存、UpdateScheduleConfig 原子校验更新、配额仲裁和设置读写
  * [POS]: internal/store 的定时任务与配额持久化领域，配置更新不覆盖配额仲裁状态
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -102,15 +102,17 @@ func (s *Store) SaveScheduleConfig(cfg ScheduleConfig) error {
 	return s.saveScheduleConfigLocked(cfg, false)
 }
 
-// UpdateScheduleConfig serializes a partial update with quota reservations and other config updates.
-func (s *Store) UpdateScheduleConfig(accountID string, update func(*ScheduleConfig)) (ScheduleConfig, error) {
+// UpdateScheduleConfig serializes a validated partial update with quota reservations and other config updates.
+func (s *Store) UpdateScheduleConfig(accountID string, update func(*ScheduleConfig) error) (ScheduleConfig, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cfg, err := s.GetScheduleConfig(accountID)
 	if err != nil {
 		return ScheduleConfig{}, err
 	}
-	update(&cfg)
+	if err := update(&cfg); err != nil {
+		return ScheduleConfig{}, err
+	}
 	if err := s.saveScheduleConfigLocked(cfg, false); err != nil {
 		return ScheduleConfig{}, err
 	}

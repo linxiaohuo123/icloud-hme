@@ -1,13 +1,14 @@
 /**
  * [INPUT]: 依赖 fmt, net/mail, sort, strings, time, github.com/emersion/go-imap
  * [OUTPUT]: 对外提供 (*Client).GetFull, (*Client).GetFullInFolder, (*Client).GetFullInFolderWithValidity, (*Client).GetFullBatchInFolder, (*Client).GetFullBatchInFolderWithValidity, (*Client).GetMailboxBoundary, (*Client).Delete, (*Client).DeleteInFolder
- * [POS]: internal/mail 的邮件正文提取与邮箱管理逻辑，保留结构化收件人、严格校验 UIDVALIDITY，读取或解析失败不返回完整正文
+ * [POS]: internal/mail 的邮件正文提取与邮箱管理逻辑，保留结构化收件人、严格校验 UIDVALIDITY，批量读取逐项返回正文错误并保留成功邮件
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 package mail
 
 import (
+	"errors"
 	"fmt"
 	"net/mail"
 	"sort"
@@ -146,7 +147,7 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 		done <- c.cli.UidFetch(seqset, items, messages)
 	}()
 
-	var bodyErr error
+	var failures []MessageReadFailure
 	for msg := range messages {
 		if msg == nil {
 			continue
@@ -172,9 +173,9 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 			Method:   "imap",
 		}
 		if err := decodeFullMessageBody(full, msg, section); err != nil {
-			if bodyErr == nil {
-				bodyErr = err
-			}
+			failures = append(failures, MessageReadFailure{
+				Ref: ref, Err: err, Permanent: !errors.Is(err, ErrMissingMessageBody),
+			})
 			// Drain FETCH before returning so the pooled connection stays usable.
 			continue
 		}
@@ -184,21 +185,21 @@ func (c *Client) GetFullBatchInFolderWithValidity(folder string, uidValidity uin
 	if err := <-done; err != nil {
 		return nil, err
 	}
-	if bodyErr != nil {
-		return nil, bodyErr
-	}
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].Date > out[j].Date
 	})
+	if len(failures) > 0 {
+		return out, &BatchReadError{Failures: failures}
+	}
 	return out, nil
 }
 
 // decodeFullMessageBody only marks a message complete after its body was read
-// and decoded. An unreadable message must not advance the verification cursor.
+// and decoded. Missing bodies remain retryable; malformed content is reported per message.
 func decodeFullMessageBody(full *FullMessage, msg *imap.Message, section *imap.BodySectionName) error {
 	r := msg.GetBody(section)
 	if r == nil {
-		return fmt.Errorf("missing message body (uid=%d)", msg.Uid)
+		return fmt.Errorf("%w (uid=%d)", ErrMissingMessageBody, msg.Uid)
 	}
 	em, err := mail.ReadMessage(r)
 	if err != nil {

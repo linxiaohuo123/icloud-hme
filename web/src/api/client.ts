@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 api/types 的 ApiResponse 契约
- * [OUTPUT]: 导出 request 请求函数、ApiError、CSRF 与 401 统一处理器
+ * [OUTPUT]: 导出 request 请求函数、ApiError、CSRF 与认证代际隔离的 401 处理器
  * [POS]: web/src/api 的通信中枢，所有前端请求的唯一出口
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -9,6 +9,7 @@ import type { ApiResponse, MessageDetailResponse } from './types'
 
 /** CSRF token,仅存 React 内存状态 */
 let csrfToken: string | null = null
+let authGeneration = 0
 
 /** 全局 401 回调(由 AuthProvider 注册,避免循环 import) */
 let unauthorizedHandler: (() => void) | null = null
@@ -21,6 +22,11 @@ export function registerUnauthorizedHandler(handler: (() => void) | null): void 
 /** 设置内存 CSRF token(由 AuthProvider 管理) */
 export function setCSRFToken(token: string | null): void {
   csrfToken = token
+  authGeneration++
+}
+
+export function getAuthGeneration(): number {
+  return authGeneration
 }
 
 /** ApiError 携带 HTTP 状态与稳定错误码 */
@@ -54,6 +60,7 @@ export async function request<T>(
   init?: RequestOptions,
   onUnauthorized?: () => void,
 ): Promise<T> {
+  const requestAuthGeneration = authGeneration
   const headers = new Headers(init?.headers)
   headers.set('Accept', 'application/json')
   headers.set('Content-Type', 'application/json')
@@ -92,7 +99,10 @@ export async function request<T>(
   }
 
   // 只有当服务端明确返回 AUTH_REQUIRED 且不是管理登录接口时，才判定为管理台会话过期
-  if (resp.status === 401 && payload.code === 'AUTH_REQUIRED' && path !== '/api/auth/login') {
+  if (
+    resp.status === 401 && payload.code === 'AUTH_REQUIRED' && path !== '/api/auth/login' &&
+    requestAuthGeneration === authGeneration && !init?.signal?.aborted
+  ) {
     onUnauthorized?.()
     unauthorizedHandler?.()
   }

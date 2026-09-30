@@ -178,6 +178,7 @@ Authorization: Bearer <API_KEY>
       "has_cookies": true,
       "has_app_password": true,
       "has_proxy": false,
+      "schedule_protected": false,
       "tags": ["default", "reg_pool_a"],
       "last_validated": "2026-09-20T12:00:00+08:00",
       "status_message": "",
@@ -186,6 +187,8 @@ Authorization: Bearer <API_KEY>
   ]
 }
 ```
+
+`schedule_protected` 是后端根据账号名称和保护标签计算的只读布尔值。为 `true` 时，账号不参与自动、普通手动或全员强制补货；前端据此标记保护状态并排除自动补货统计。修改账号名称或标签后的响应会重新计算该值。
 
 ### 5. 添加新账号
 
@@ -657,6 +660,7 @@ Content-Type: application/json
 }
 ```
 - 单次最多批量拉取 50 封邮件，支持单条 IMAP `UidFetch` 指令批量聚合，自动载入服务端 10 分钟只读内存缓存。
+- 单封邮件正文超限、损坏或缺失时，`data.items` 按原请求顺序保留对应的 `error`；成功读取的邮件仍出现在 `data.messages` 中，并且只有成功正文进入缓存。网络、取消等整批失败仍返回错误，不伪装为逐项成功。
 
 ### 20. 删除邮件（当前不支持）
 
@@ -706,6 +710,7 @@ Authorization: Bearer <API_KEY> # 或 Bearer <EXTERNAL_TOKEN>
 - `timeout`（可选）：最大挂起秒数，默认 30 秒，上限 120 秒。超时返回 `408 VERIFY_TIMEOUT`。
 - `fresh` 或 `nocache`（可选）：布尔值，默认 `false`。传 `true` 时仅跳过本地近期内存缓存，**但不是严格的 IMAP 邮件基线保证**。需要严格基线保证的新客户端请使用 v2 端点。
 - `auto_delete`：**明确不支持并会被拒绝**。传入 `auto_delete=true` 或 `1` 会直接返回 `400 UNSUPPORTED_PARAMETER` 错误。依据 RFC 9110 规范，HTTP GET 必须具备安全/无副作用语义，严禁通过 GET 查询操作导致别名被隐式停用。
+- `/mail/view` 与 `/mail/raw` 支持 IMAP 正文和 WebMail 不完整预览。IMAP 默认查询 INBOX 最近 30 天；WebMail 不承诺按天数筛选，也不保证完整正文。
 
 > **关于别名停用与配额说明**：
 > - 停用别名必须由具备管理员权限的会话显式调用管理接口 `POST /api/aliases/:id/deactivate`；普通 `allocate,verify` 令牌不具备停用接口权限，且系统不提供外部令牌的租约停用能力。
@@ -768,6 +773,11 @@ Content-Type: application/json
 > - 若相同幂等键传参不一致返回 `409 IDEMPOTENCY_CONFLICT`；底层别名分配出现状态或唯一性冲突返回 `409 ALLOCATION_CONFLICT`。
 
 #### 步骤 2：创建取码意图并锁定邮件基线 (POST /api/external/v2/verification-requests)
+
+配置了原生或外部 IMAP 时，基线读取失败返回 `502 UPSTREAM_FAILURE` 并保留实际 IMAP 故障；只有 Cookie/WebMail 可用的账号返回 `400 CAPABILITY_UNSUPPORTED`。
+
+严格取码同步中，完整邮件正文的超限、MIME 或编码损坏会按账号、文件夹、UIDVALIDITY 与 UID 记录逐项错误，并继续处理其他邮件；失败正文不会完成取码任务。缺失正文、网络错误或结果持久化失败仍保留当前页游标等待重试。
+
 使用出号时返回的 `allocation_id`（即 `lease_id`）建立取码任务。系统将自动原子采集目标母号 IMAP 的最新 `UIDVALIDITY` 与 `UIDNEXT` 基线：
 ```http
 POST /api/external/v2/verification-requests
@@ -994,7 +1004,7 @@ Content-Type: application/json
 
 - `GET /api/tags`：列出所有业务标识
 - `POST /api/tags`：创建业务标识 `{"tag": "reg_pool_a", "name": "注册A组"}`
-- `PATCH /api/tags/:id`：更新业务标识名称与标签
+- `PATCH /api/tags/:id`：部分更新业务标识名称、标签、状态和描述。未提交字段保持现值；`{"description":""}` 清空描述，省略或传 `null` 保持原描述。创建时间和最近活动时间由服务端保留。
 - `DELETE /api/tags/:id`：删除业务标识
 
 ### 32. 外部接入令牌 (APITokens)
@@ -1022,8 +1032,15 @@ Content-Type: application/json
 - 调度配置、业务标识和令牌列表查询遇到数据库错误时返回 `500 PERSISTENCE_ERROR`，不会把故障当作空列表或配额耗尽。
 - `PUT /api/schedule/configs/:account_id`：**部分更新**调度配置，只覆盖请求体中显式出现的字段：
   `enabled`、`hourly_quota`(1-500)、`alias_label`、`mode`(`always`/`daily_window`/`duration`)、`start_time`、`end_time`、`duration_hours`、`started_at`。
+  - 非空时段必须为 `HH:mm`，非空 `started_at` 必须为 RFC3339，时长不能为负数或超出可表示范围。
+  - 启用后合并配置必须有效：`daily_window` 要求完整的开始/结束时间（支持跨午夜）；`duration` 要求正整数时长，启动时间为空时由服务端初始化。
+  - 合并与校验在同一配置锁内完成，校验失败返回 `400 VALIDATION_ERROR`，不保存任何字段、不改变已用配额。已有非法配置仍可通过 `{"enabled":false}` 安全暂停。
+  - `/api/create/jobs/:id/resume` 使用同一启用校验，不能绕过校验启动尚未填写完整的停用配置。
+  - 前端同一账号的保存按操作顺序执行，只提交变化字段并采用响应中的完整配置。轮询等待上一轮结束，保存期间仍可更新日志和运行状态，旧配置响应不能覆盖保存结果；所有保存完成前禁止手动补货。
+  - 持续时长到期表示停止自动补货，不等于 `enabled=false`。界面保留真实启用开关，并提供独立的重新计时入口；关闭开关才暂停普通手动补货，全员强制补货仍包含暂停账号。
   > `current_hour_count` / `last_hour_window` 是服务端配额仲裁状态，**不接受客户端提交**（即使提交也被忽略），避免把已扣减的小时配额回退成旧值。
 - `POST /api/schedule/run-now`：立即触发一次补货。
+  前端触发时淘汰旧状态请求，提交完成后重新读取真实状态。`triggered=true` 表示请求已提交，实际执行结果以运行状态和日志为准；已有轮次执行中时调度器会防重入并记录跳过。
   默认**只跑已启用定时任务的账号**（`scope=enabled_only`）；需要连未启用账号一起强推时传 `?all=true`（`scope=all_accounts`）。
 - `GET /api/schedule/logs`：读取最新 100 条环形调度运行日志
 - `GET /api/schedule/status`：查询调度器运行概览统计

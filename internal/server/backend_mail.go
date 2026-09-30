@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/mail, internal/account
  * [OUTPUT]: 对外提供 managerBackend 的邮件收发与邮箱管理方法 (ListInbox, ListMailboxes, GetMessage, GetMessages, DeleteMessage, ScanMailboxUIDPage, GetMailboxBoundaryContext)、parseMessageID 与 InboxQuery, InboxResult, ScanPageQuery, ScanPageResult, MessageRef 类型
- * [POS]: internal/server 的邮件业务门面实现；IMAP 别名列表按需读取正文，WebMail 按线程 ID 读取详情元数据并标记为不完整预览，接入 MailPerf 观测
+ * [POS]: internal/server 的邮件业务门面实现；IMAP 批量正文逐项隔离失败，基线保留真实 IMAP 故障，WebMail 详情标记为不完整预览，接入 MailPerf 观测
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -451,6 +451,7 @@ func (b *managerBackend) GetMessagesContext(ctx context.Context, accountID strin
 	}
 
 	var allMessages []*mail.FullMessage
+	var failures []mail.MessageReadFailure
 	if len(groups) > 0 {
 		err := b.mgr.WithMailClientContext(ctx, accountID, func(mc *mail.Client) error {
 			for _, g := range groups {
@@ -469,7 +470,14 @@ func (b *managerBackend) GetMessagesContext(ctx context.Context, accountID strin
 						// UIDVALIDITY 不一致表示代际变更，不能读取新代际邮件充当旧邮件，跳过该组
 						continue
 					}
-					return e
+					var readErr *mail.BatchReadError
+					if !errors.As(e, &readErr) {
+						return e
+					}
+					for _, failure := range readErr.Failures {
+						failure.Ref.AccountID = accountID
+						failures = append(failures, failure)
+					}
 				}
 				for _, m := range msgs {
 					m.AccountID = accountID
@@ -508,6 +516,9 @@ func (b *managerBackend) GetMessagesContext(ctx context.Context, accountID strin
 		}
 	}
 
+	if len(failures) > 0 {
+		return allMessages, &mail.BatchReadError{Failures: failures}
+	}
 	return allMessages, nil
 }
 
@@ -558,7 +569,13 @@ func (b *managerBackend) GetMailboxBoundaryContext(ctx context.Context, accountI
 	}
 
 	acc, ok := b.mgr.GetAccount(accountID)
-	if ok && (len(acc.Cookies) > 0 || acc.AppPassword != "") {
+	if ok && (acc.AppPassword != "" || (acc.Mailbox != nil && acc.Mailbox.Email != "" && acc.Mailbox.Password != "")) {
+		return "imap", 0, 0, &BackendError{
+			Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE",
+			Message: "读取 IMAP 邮件基线失败: " + poolErr.Error(),
+		}
+	}
+	if ok && len(acc.Cookies) > 0 {
 		return "webmail", 0, 0, &BackendError{
 			Status:  http.StatusBadRequest,
 			Code:    "CAPABILITY_UNSUPPORTED",

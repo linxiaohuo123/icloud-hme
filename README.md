@@ -12,6 +12,7 @@
 - ✅ **收取邮件** — 通过 IMAP 或 Web API 读取发到 HME 别名的邮件
 - ✅ **双路径读信** — 邮件读取优先走 IMAP (App Password),无 App Password 时回退 Web API (Cookie)
 - ✅ **多账号管理** — 支持多个 iCloud 账号并行管理
+- ✅ **桌面定时任务大盘** — 每页 25 个账号，配置顺序保存，保存完成前禁止手动补货；读取失败可重试，保护账号单独标记并排除统计，到期任务可暂停或重新计时，日志支持跟随最新及上翻阅读
 - ✅ **双认证模式** — Cookie (创建别名 + 读邮件回退) 和 App Password (IMAP 优先)
 - ✅ **Cookie 健康监控** — 后台周期校验账号会话，凭据失效自动标记 error 并让调度器跳过，杜绝出号链路静默停摆
 - ✅ **系统设置 + 通知推送** — 管理台「系统设置」页配置飞书/Bark/Telegram 渠道，Cookie 失效/恢复、配额水位告警实时送达手机与 IM
@@ -102,6 +103,33 @@ docker compose up -d
 > docker compose up -d
 > ```
 
+#### 生产网络与反向代理（公网部署必须）
+
+如果通过域名从公网访问管理界面，必须在主服务前放置 Nginx 或 Caddy 反向代理：由反代终止 HTTPS，主服务只监听本机回环地址。不要把 Camoufox agent 的 8089 端口发布到宿主机；它只应通过 Compose 内部网络被主服务访问。
+
+仓库已提供可直接修改的模板：`deploy/Caddyfile` 和 `deploy/nginx.conf`。二选一即可，通常新服务器优先使用 Caddy，已有 Nginx 环境继续使用 Nginx。
+
+生产 `.env` 至少确认以下配置：
+
+~~~dotenv
+ICLOUD_HME_PORT_BINDING=127.0.0.1:8081:8081
+ICLOUD_HME_SECURE_COOKIE=true
+ICLOUD_HME_TRUSTED_PROXIES=127.0.0.1
+~~~
+
+如果反代运行在 Docker 容器中，`ICLOUD_HME_TRUSTED_PROXIES` 应填写实际 Docker 网桥或反代容器网段，不要盲目照抄 `127.0.0.1`。如果没有域名和 HTTPS，只在本机或受控 VPN 内使用，可以不部署反代，但不要直接把 8081 暴露到公网。
+
+反代上线后检查：
+
+~~~bash
+curl -fsS http://127.0.0.1:8081/livez
+curl -fsS http://127.0.0.1:8081/readyz
+docker compose ps
+ss -lntp | grep -E ':80|:443|:8081'
+~~~
+
+预期是公网只开放 80/443，8081 仅本机监听；8089 不应出现在宿主机监听列表中。验证码长轮询接口需要保留模板中的 130 秒代理读取超时配置。
+
 #### 方式三：Docker 单容器轻量运行（无 Camoufox 自动化上号）
 
 若不需要使用网页端自动上号（仅手工录入 Web Cookie 与 App 专用密码），可单独运行轻量主镜像：
@@ -109,7 +137,7 @@ docker compose up -d
 ```bash
 docker run -d \
   --name icloud-hme \
-  -p 8081:8081 \
+  -p 127.0.0.1:8081:8081 \
   -v /path/to/data:/app/data \
   -e ICLOUD_HME_ADMIN_PASSWORD='change-this-before-running-2026' \
   -e ICLOUD_HME_MASTER_KEY='your-32-byte-base64-master-key' \
@@ -710,7 +738,7 @@ docker pull ghcr.io/linxiaohuo123/icloud-hme:latest
 
 docker run -d \
   --name icloud-hme \
-  -p 8081:8081 \
+  -p 127.0.0.1:8081:8081 \
   -v /path/to/data:/app/data \
   -e ICLOUD_HME_ADMIN_PASSWORD='change-this-before-running-2026' \
   -e ICLOUD_HME_MASTER_KEY='your-32-byte-base64-master-key' \

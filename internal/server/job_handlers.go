@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 internal/store, github.com/gin-gonic/gin, time, strings, net/http
- * [OUTPUT]: 对外提供 listCreateJobsHandler, upsertCreateJobHandler, pauseCreateJobHandler, resumeCreateJobHandler, deleteCreateJobHandler
+ * [OUTPUT]: 对外提供创建作业管理 Handler，校验可表示的调度时长并采用原子配置更新
  * [POS]: internal/server 的自动化创建作业标准 RESTful 门面，写入失败显式报错，无法准确预测时省略 next_run_at
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -8,6 +8,7 @@
 package server
 
 import (
+	"errors"
 	"net/http"
 	"regexp"
 	"strings"
@@ -18,6 +19,8 @@ import (
 )
 
 var clockPattern = regexp.MustCompile(`^([01]\d|2[0-3]):[0-5]\d$`)
+
+const maxScheduleDurationHours = int((1<<63 - 1) / int64(time.Hour))
 
 type createJobResp struct {
 	ID            string `json:"id"`
@@ -166,7 +169,7 @@ func (s *Server) upsertCreateJobHandler(c *gin.Context) {
 	}
 
 	now := time.Now()
-	cfg, err := s.store.UpdateScheduleConfig(req.AccountID, func(cfg *store.ScheduleConfig) {
+	cfg, err := s.store.UpdateScheduleConfig(req.AccountID, func(cfg *store.ScheduleConfig) error {
 		cfg.Enabled = true
 		cfg.Mode = req.Mode
 		cfg.AliasLabel = req.LabelPrefix
@@ -178,6 +181,7 @@ func (s *Server) upsertCreateJobHandler(c *gin.Context) {
 		} else {
 			cfg.StartedAt = ""
 		}
+		return nil
 	})
 	if err != nil {
 		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "保存任务失败")
@@ -197,8 +201,8 @@ func validateJobScheduleParams(req *upsertJobReq) error {
 
 	switch req.Mode {
 	case "duration":
-		if req.DurationHours <= 0 {
-			return httpError("duration_hours 必须大于 0")
+		if req.DurationHours <= 0 || req.DurationHours > maxScheduleDurationHours {
+			return httpError("duration_hours 必须大于 0 且不能超出有效时长范围")
 		}
 	case "daily_window":
 		if !clockPattern.MatchString(req.StartTime) || !clockPattern.MatchString(req.EndTime) {
@@ -224,8 +228,9 @@ func (s *Server) pauseCreateJobHandler(c *gin.Context) {
 		failCode(c, http.StatusNotFound, "NOT_FOUND", "任务或账号不存在")
 		return
 	}
-	cfg, err := s.store.UpdateScheduleConfig(accID, func(cfg *store.ScheduleConfig) {
+	cfg, err := s.store.UpdateScheduleConfig(accID, func(cfg *store.ScheduleConfig) error {
 		cfg.Enabled = false
+		return nil
 	})
 	if err != nil {
 		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "暂停任务失败")
@@ -242,13 +247,19 @@ func (s *Server) resumeCreateJobHandler(c *gin.Context) {
 		return
 	}
 	now := time.Now()
-	cfg, err := s.store.UpdateScheduleConfig(accID, func(cfg *store.ScheduleConfig) {
+	cfg, err := s.store.UpdateScheduleConfig(accID, func(cfg *store.ScheduleConfig) error {
 		cfg.Enabled = true
 		if cfg.Mode == "duration" {
 			cfg.StartedAt = now.Format(time.RFC3339)
 		}
+		return validateEnabledScheduleConfig(*cfg)
 	})
 	if err != nil {
+		var parameterErr jobParamError
+		if errors.As(err, &parameterErr) {
+			failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", parameterErr.Error())
+			return
+		}
 		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "恢复任务失败")
 		return
 	}

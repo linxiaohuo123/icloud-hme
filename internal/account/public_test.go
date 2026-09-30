@@ -7,6 +7,31 @@ import (
 	"testing"
 )
 
+func TestSummaryScheduleProtectionFollowsAccountPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tags []string
+		want bool
+	}{
+		{"普通账号", nil, false},
+		{"个人大号", nil, true},
+		{"普通账号", []string{"gpt", " Protected "}, true},
+		{"普通账号", []string{"PRIVATE"}, true},
+		{"普通账号", []string{"personal"}, true},
+	} {
+		acc := &Account{Name: tc.name, Tags: tc.tags}
+		if got := acc.Summary().ScheduleProtected; got != tc.want {
+			t.Fatalf("name=%q tags=%v protection=%v want=%v", tc.name, tc.tags, got, tc.want)
+		}
+		// 删除保护名称与标签后公开快照必须即时更新，不能保留陈旧标记。
+		acc.Name = "普通账号"
+		acc.Tags = []string{"gpt"}
+		if acc.Summary().ScheduleProtected {
+			t.Fatal("protection remained after name/tag update")
+		}
+	}
+}
+
 // TestSummaryDoesNotSerializeSecrets 验证 Summary 序列化后不包含任何秘密。
 func TestSummaryDoesNotSerializeSecrets(t *testing.T) {
 	acc := &Account{

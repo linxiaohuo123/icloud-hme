@@ -141,7 +141,7 @@ describe('SchedulePage', () => {
         const body = (await request.json()) as { hourly_quota?: number }
         storedQuota = body?.hourly_quota ?? storedQuota
         putBodies.push(body)
-        return HttpResponse.json({ success: true, data: null })
+        return HttpResponse.json({ success: true, data: { ...configs[0], hourly_quota: storedQuota } })
       }),
     )
     renderPage()
@@ -184,7 +184,7 @@ describe('SchedulePage', () => {
     server.use(
       http.put('/api/schedule/configs/acc_enabled', async ({ request }) => {
         putBody = (await request.json()) as { alias_label?: string }
-        return HttpResponse.json({ success: true, data: null })
+        return HttpResponse.json({ success: true, data: { ...configs[0], ...putBody } })
       }),
     )
     renderPage()
@@ -201,7 +201,7 @@ describe('SchedulePage', () => {
     server.use(
       http.put('/api/schedule/configs/acc_enabled', async ({ request }) => {
         putBody = (await request.json()) as Partial<ScheduleConfig>
-        return HttpResponse.json({ success: true, data: null })
+        return HttpResponse.json({ success: true, data: { ...configs[0], ...putBody } })
       }),
     )
     renderPage()
@@ -211,8 +211,8 @@ describe('SchedulePage', () => {
     expect(customTrigger?.textContent).toContain('全天常驻')
 
     const user = userEvent.setup()
-    const selectElements = screen.getAllByLabelText('调度模式')
-    await user.selectOptions(selectElements[0]!, 'daily_window')
+    await user.click(screen.getByRole('button', { name: '账号 启用号 调度模式' }))
+    await user.click(screen.getByRole('option', { name: '每日时段窗口' }))
     await waitFor(() => expect(putBody?.mode).toBe('daily_window'))
   })
 
@@ -244,7 +244,7 @@ describe('SchedulePage', () => {
           })
         }),
         http.put('/api/schedule/configs/acc_off', async () => {
-          return HttpResponse.json({ success: true, data: null })
+          return HttpResponse.json({ success: true, data: { account_id: 'acc_off', enabled: true, hourly_quota: 5, current_hour_count: 0 } })
         }),
       )
 

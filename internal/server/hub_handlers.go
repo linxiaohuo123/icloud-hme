@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 gin, icloud-hme/internal/store, icloud-hme/internal/scheduler
- * [OUTPUT]: 对外提供 Tags, Tokens, Leases, Schedules 的 HTTP Handler 方法
+ * [OUTPUT]: 对外提供 Tags, Tokens, Leases, Schedules 的 HTTP Handler，支持描述清空与原子调度参数校验
  * [POS]: internal/server 的中台功能路由处理器集合；scheduledTag 优先继承母号业务标签并回退 scheduled，切断与 AliasLabel 模板耦合
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -8,6 +8,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -88,7 +89,12 @@ func (s *Server) createTagHandler(c *gin.Context) {
 
 func (s *Server) updateTagHandler(c *gin.Context) {
 	id := c.Param("id")
-	var req store.BusinessTag
+	var req struct {
+		Tag         string  `json:"tag"`
+		Name        string  `json:"name"`
+		Status      string  `json:"status"`
+		Description *string `json:"description"`
+	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "无效参数")
 		return
@@ -104,38 +110,32 @@ func (s *Server) updateTagHandler(c *gin.Context) {
 		failCode(c, http.StatusNotFound, "NOT_FOUND", "业务标识不存在")
 		return
 	}
-	req.ID = id
-	if req.CreatedAt == "" {
-		req.CreatedAt = existing.CreatedAt
+	if req.Status != "" {
+		existing.Status = req.Status
 	}
-	if req.Status == "" {
-		req.Status = existing.Status
+	if req.Description != nil {
+		existing.Description = *req.Description
 	}
-	if req.Description == "" {
-		req.Description = existing.Description
+	if tag := strings.TrimSpace(req.Tag); tag != "" {
+		existing.Tag = tag
 	}
-	if strings.TrimSpace(req.Tag) == "" {
-		req.Tag = existing.Tag
+	if name := strings.TrimSpace(req.Name); name != "" {
+		existing.Name = name
 	}
-	if strings.TrimSpace(req.Name) == "" {
-		req.Name = existing.Name
-	}
-	req.Tag = strings.TrimSpace(req.Tag)
-	req.Name = strings.TrimSpace(req.Name)
-	exists, err := s.tagExistsFor(req.Tag, id)
+	exists, err := s.tagExistsFor(existing.Tag, id)
 	if err != nil {
 		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "读取业务标识失败")
 		return
 	}
 	if exists {
-		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "业务标识已存在: "+req.Tag)
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "业务标识已存在: "+existing.Tag)
 		return
 	}
-	if err := s.store.SaveTag(req); err != nil {
+	if err := s.store.SaveTag(existing); err != nil {
 		backendFail(c, err)
 		return
 	}
-	ok(c, req)
+	ok(c, existing)
 }
 
 // findTagByID 按主键定位业务标识。
@@ -415,6 +415,23 @@ type updateScheduleConfigReq struct {
 	StartedAt     *string `json:"started_at"`
 }
 
+func validateEnabledScheduleConfig(cfg store.ScheduleConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if err := validateJobScheduleParams(&upsertJobReq{
+		Mode: cfg.Mode, DurationHours: cfg.DurationHours, StartTime: cfg.StartTime, EndTime: cfg.EndTime,
+	}); err != nil {
+		return err
+	}
+	if cfg.Mode == "duration" {
+		if _, err := time.Parse(time.RFC3339, cfg.StartedAt); err != nil {
+			return httpError("started_at 必须为 RFC3339 格式")
+		}
+	}
+	return nil
+}
+
 func (s *Server) updateScheduleConfigHandler(c *gin.Context) {
 	accountID := c.Param("account_id")
 	if !s.hasAccount(accountID) {
@@ -442,7 +459,23 @@ func (s *Server) updateScheduleConfigHandler(c *gin.Context) {
 			return
 		}
 	}
-	cfg, err := s.store.UpdateScheduleConfig(accountID, func(cfg *store.ScheduleConfig) {
+	for _, clock := range []*string{req.StartTime, req.EndTime} {
+		if clock != nil && strings.TrimSpace(*clock) != "" && !clockPattern.MatchString(strings.TrimSpace(*clock)) {
+			failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "start_time 和 end_time 必须为 HH:mm 格式")
+			return
+		}
+	}
+	if req.DurationHours != nil && (*req.DurationHours < 0 || *req.DurationHours > maxScheduleDurationHours) {
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "duration_hours 超出有效时长范围")
+		return
+	}
+	if req.StartedAt != nil && strings.TrimSpace(*req.StartedAt) != "" {
+		if _, err := time.Parse(time.RFC3339, strings.TrimSpace(*req.StartedAt)); err != nil {
+			failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "started_at 必须为 RFC3339 格式")
+			return
+		}
+	}
+	cfg, err := s.store.UpdateScheduleConfig(accountID, func(cfg *store.ScheduleConfig) error {
 		if req.Enabled != nil {
 			cfg.Enabled = *req.Enabled
 		}
@@ -470,8 +503,14 @@ func (s *Server) updateScheduleConfigHandler(c *gin.Context) {
 		if cfg.Mode == "duration" && cfg.Enabled && strings.TrimSpace(cfg.StartedAt) == "" {
 			cfg.StartedAt = time.Now().Format(time.RFC3339)
 		}
+		return validateEnabledScheduleConfig(*cfg)
 	})
 	if err != nil {
+		var parameterErr jobParamError
+		if errors.As(err, &parameterErr) {
+			failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", parameterErr.Error())
+			return
+		}
 		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "保存调度配置失败")
 		return
 	}

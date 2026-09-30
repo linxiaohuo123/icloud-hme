@@ -43,13 +43,13 @@ func TestConcurrentScheduleUpdatesPreserveIndependentFields(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			if _, err := st.UpdateScheduleConfig("acc_1", func(cfg *ScheduleConfig) { cfg.HourlyQuota = 50 }); err != nil {
+			if _, err := st.UpdateScheduleConfig("acc_1", func(cfg *ScheduleConfig) error { cfg.HourlyQuota = 50; return nil }); err != nil {
 				t.Error(err)
 			}
 		}()
 		go func() {
 			defer wg.Done()
-			if _, err := st.UpdateScheduleConfig("acc_1", func(cfg *ScheduleConfig) { cfg.AliasLabel = "parallel" }); err != nil {
+			if _, err := st.UpdateScheduleConfig("acc_1", func(cfg *ScheduleConfig) error { cfg.AliasLabel = "parallel"; return nil }); err != nil {
 				t.Error(err)
 			}
 		}()

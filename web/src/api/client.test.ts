@@ -1,6 +1,6 @@
 import { http, HttpResponse } from 'msw'
 import { describe, expect, it, vi, beforeEach } from 'vitest'
-import { request, setCSRFToken } from './client'
+import { request, setCSRFToken, registerUnauthorizedHandler } from './client'
 import { server } from '../test/server'
 
 describe('api client', () => {
@@ -132,5 +132,33 @@ describe('api client', () => {
     await expect(
       request('/api/accounts', { signal: controller.signal }),
     ).rejects.toThrow()
+  })
+
+  it('旧请求的 401 保留错误，但不触发新会话的退出回调', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let started = false
+    const globalHandler = vi.fn()
+    const localHandler = vi.fn()
+    registerUnauthorizedHandler(globalHandler)
+    server.use(http.get('/api/accounts', async () => {
+      started = true
+      await gate
+      return HttpResponse.json({ success: false, code: 'AUTH_REQUIRED', message: '旧会话失效' }, { status: 401 })
+    }))
+    try {
+      setCSRFToken('old-session')
+      const pending = request('/api/accounts', undefined, localHandler)
+      const rejected = expect(pending).rejects.toMatchObject({ status: 401, code: 'AUTH_REQUIRED' })
+      await vi.waitFor(() => expect(started).toBe(true))
+      setCSRFToken('new-session')
+      release()
+      await rejected
+      expect(localHandler).not.toHaveBeenCalled()
+      expect(globalHandler).not.toHaveBeenCalled()
+    } finally {
+      release()
+      registerUnauthorizedHandler(null)
+    }
   })
 })

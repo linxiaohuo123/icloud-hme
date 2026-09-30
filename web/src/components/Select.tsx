@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 react (useState, useRef, useEffect, useLayoutEffect), react-dom (createPortal), ./icons (IconChevronDown, IconCheck)
- * [OUTPUT]: 对外提供 Select 组件及 SelectOption, SelectProps 类型
+ * [OUTPUT]: 对外提供带命名触发按钮的 Select 组件及 SelectOption, SelectProps 类型
  * [POS]: web/src/components 的通用自定义下拉组件，替代原生丑陋的 select/option 控件
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -26,6 +26,7 @@ export interface SelectProps {
   className?: string
   style?: React.CSSProperties
   'aria-label'?: string
+  triggerLabel?: string
   size?: 'sm' | 'md'
 }
 
@@ -40,6 +41,7 @@ export default function Select({
   className = '',
   style,
   'aria-label': ariaLabel,
+  triggerLabel,
   size = 'md',
 }: SelectProps) {
   const [open, setOpen] = useState(false)
@@ -141,6 +143,7 @@ export default function Select({
         id={id}
         name={name}
         aria-label={ariaLabel}
+        aria-hidden={triggerLabel ? true : undefined}
         value={value}
         disabled={disabled}
         tabIndex={-1}
@@ -173,6 +176,7 @@ export default function Select({
         className={`ui-select-trigger ${open ? 'open' : ''}`}
         disabled={disabled}
         aria-haspopup="listbox"
+        aria-label={triggerLabel}
         aria-expanded={open}
         onClick={toggleOpen}
       >

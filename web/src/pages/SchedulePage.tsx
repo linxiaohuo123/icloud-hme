@@ -1,11 +1,11 @@
 /**
  * [INPUT]: 依赖 hooks/useAccounts, api/client 的 request/ApiError, api/types 的 ScheduleConfig/ScheduleLog/ScheduleStatus/AccountSummary, components/ToastProvider, components/icons, components/schedule
- * [OUTPUT]: 对外提供 SchedulePage 定时别名任务与调度大盘组件，区分账号加载中、失败与空列表
+ * [OUTPUT]: 对外提供桌面分页调度大盘，保存与手动执行隔离、账号重试、保护策略展示与独立读取状态
  * [POS]: web/src/pages 的核心页面，组装 ScheduleMetrics, ScheduleAccountRow, ScheduleMacroHintBar, ScheduleLogConsole，支持常规补货与强制全员补货(?all=true)
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError, request } from '../api/client'
 import type { AccountSummary, ScheduleConfig, ScheduleLog, ScheduleStatus } from '../api/types'
 import { useToast } from '../components/ToastProvider'
@@ -15,6 +15,9 @@ import { ScheduleLogConsole } from '../components/schedule/ScheduleLogConsole'
 import { ScheduleMacroHintBar } from '../components/schedule/ScheduleMacroHintBar'
 import { ScheduleMetrics } from '../components/schedule/ScheduleMetrics'
 import { useAccounts } from '../hooks/useAccounts'
+import { isScheduleExpired } from '../utils/schedule'
+
+const PAGE_SIZE = 25
 
 export default function SchedulePage() {
   const { accounts, loading: accountsLoading, error: accountsError } = useAccounts()
@@ -23,8 +26,13 @@ export default function SchedulePage() {
   const [status, setStatus] = useState<ScheduleStatus | null>(null)
   const [logFilter, setLogFilter] = useState<'all' | 'success' | 'error'>('all')
   const [triggering, setTriggering] = useState(false)
+  const [configsLoaded, setConfigsLoaded] = useState(false)
+  const [logsLoaded, setLogsLoaded] = useState(false)
+  const [pollErrors, setPollErrors] = useState<Record<'configs' | 'logs' | 'status', string | null>>({ configs: null, logs: null, status: null })
+  const [savingAccounts, setSavingAccounts] = useState<Record<string, number>>({})
+  const [page, setPage] = useState(1)
+  const [now, setNow] = useState(Date.now)
   const { show } = useToast()
-  const terminalRef = useRef<HTMLDivElement>(null)
 
   const [showMacroHint, setShowMacroHint] = useState(() => {
     try {
@@ -34,7 +42,7 @@ export default function SchedulePage() {
     }
   })
 
-  const toggleMacroHint = () => {
+  const toggleMacroHint = useCallback(() => {
     setShowMacroHint((prev) => {
       const next = !prev
       try {
@@ -44,49 +52,79 @@ export default function SchedulePage() {
       }
       return next
     })
-  }
+  }, [])
 
   const pollGenerationRef = useRef(0)
   const pollAbortRef = useRef<AbortController | null>(null)
-  const pollInFlightRef = useRef(false)
+  const pollEnabledRef = useRef(false)
+  const pendingWritesRef = useRef(0)
+  const triggeringRef = useRef(false)
+  const writeQueuesRef = useRef(new Map<string, Promise<ScheduleConfig>>())
+  const configsRef = useRef(configs)
+  const writeVersionsRef = useRef(new Map<string, number>())
 
-  const runPoll = useCallback(async () => {
-    // 中止上一轮未决请求，递增代数
+  const runPoll = useCallback(async (force = false) => {
+    if (!pollEnabledRef.current || triggeringRef.current) return
+    if (!force && pollAbortRef.current && !pollAbortRef.current.signal.aborted) return
     pollAbortRef.current?.abort()
     pollGenerationRef.current++
     const gen = pollGenerationRef.current
     const controller = new AbortController()
     pollAbortRef.current = controller
-    pollInFlightRef.current = true
+    const versions = new Map(writeVersionsRef.current)
+    const pendingAccounts = new Set(writeQueuesRef.current.keys())
+    const isCurrent = () => gen === pollGenerationRef.current && !controller.signal.aborted
+    const read = async <T,>(kind: 'configs' | 'logs' | 'status', commit: (data: T) => void) => {
+      try {
+        const data = await request<T>(`/api/schedule/${kind}`, { signal: controller.signal })
+        if (!isCurrent()) return
+        commit(data)
+        setPollErrors((prev) => prev[kind] === null ? prev : { ...prev, [kind]: null })
+      } catch (err) {
+        if (!isCurrent()) return
+        const message = err instanceof Error ? err.message : '读取失败'
+        setPollErrors((prev) => prev[kind] === message ? prev : { ...prev, [kind]: message })
+      }
+    }
 
     try {
-      const [logsData, configsData, statusData] = await Promise.all([
-        request<ScheduleLog[]>('/api/schedule/logs', { signal: controller.signal }).catch(() => null),
-        request<ScheduleConfig[]>('/api/schedule/configs', { signal: controller.signal }).catch(() => null),
-        request<ScheduleStatus>('/api/schedule/status', { signal: controller.signal }).catch(() => null),
-      ])
-
-      // 必须满足 latest-wins：仅当代数完全一致且未中止时允许提交到状态
-      if (gen === pollGenerationRef.current && !controller.signal.aborted) {
-        if (Array.isArray(logsData)) {
-          setLogs(logsData)
-        }
-        if (Array.isArray(configsData)) {
-          setConfigs(() => {
-            const map: Record<string, ScheduleConfig> = {}
-            configsData.forEach((c) => {
-              map[c.account_id] = c
-            })
-            return map
+      await Promise.all([
+        read<ScheduleLog[]>('logs', (data) => {
+          if (!Array.isArray(data)) throw new Error('调度日志响应格式错误')
+          setLogs((prev) => prev.length === data.length && prev.every((entry, i) => entry.time === data[i].time && entry.message === data[i].message) ? prev : data)
+          setLogsLoaded(true)
+        }),
+        read<ScheduleConfig[]>('configs', (data) => {
+          if (!Array.isArray(data)) throw new Error('调度配置响应格式错误')
+          const map: Record<string, ScheduleConfig> = {}
+          data.forEach((cfg) => {
+            const id = cfg.account_id
+            const previous = configsRef.current[id]
+            if (pendingAccounts.has(id) || writeQueuesRef.current.has(id) || versions.get(id) !== writeVersionsRef.current.get(id)) {
+              if (previous) map[id] = previous
+              return
+            }
+            const keys = Object.keys(cfg) as (keyof ScheduleConfig)[]
+            map[id] = previous && Object.keys(previous).length === keys.length && keys.every((key) => previous[key] === cfg[key]) ? previous : cfg
           })
-        }
-        if (statusData && typeof statusData === 'object') {
-          setStatus(statusData)
-        }
-      }
+          // GET 开始时保存中的账号可能尚无数据库记录，也必须保留本地权威结果。
+          for (const [id, cfg] of Object.entries(configsRef.current)) {
+            if (pendingAccounts.has(id) || writeQueuesRef.current.has(id) || versions.get(id) !== writeVersionsRef.current.get(id)) map[id] = cfg
+          }
+          if (Object.keys(map).length !== Object.keys(configsRef.current).length || Object.keys(map).some((id) => map[id] !== configsRef.current[id])) {
+            configsRef.current = map
+            setConfigs(map)
+          }
+          setConfigsLoaded(true)
+        }),
+        read<ScheduleStatus>('status', (data) => {
+          if (!data || typeof data.running !== 'boolean' || typeof data.interval_seconds !== 'number') throw new Error('调度状态响应格式错误')
+          setStatus((prev) => prev?.running === data.running && prev?.last_run_at === data.last_run_at && prev?.interval_seconds === data.interval_seconds ? prev : data)
+        }),
+      ])
     } finally {
-      if (gen === pollGenerationRef.current) {
-        pollInFlightRef.current = false
+      if (pollAbortRef.current === controller) {
+        pollAbortRef.current = null
       }
     }
   }, [])
@@ -95,15 +133,18 @@ export default function SchedulePage() {
     let timer: ReturnType<typeof setInterval> | null = null
 
     const start = () => {
+      pollEnabledRef.current = true
       if (timer) clearInterval(timer)
       void runPoll()
       timer = setInterval(() => {
         if (typeof document !== 'undefined' && document.hidden) return
+        setNow(Date.now())
         void runPoll()
       }, 3000)
     }
 
     const stop = () => {
+      pollEnabledRef.current = false
       if (timer) {
         clearInterval(timer)
         timer = null
@@ -142,168 +183,139 @@ export default function SchedulePage() {
     }
   }, [runPoll])
 
-  // 新日志到达时跟随滚动到底部; 用户手动上翻阅读历史时不打扰
-  useEffect(() => {
-    const el = terminalRef.current
-    if (!el) return
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60
-    if (nearBottom) el.scrollTop = el.scrollHeight
-  }, [logs])
+  const saveSchedulePatch = useCallback((
+    accountId: string,
+    buildPatch: (current: ScheduleConfig | undefined) => Partial<ScheduleConfig>,
+  ): Promise<ScheduleConfig> => {
+    pendingWritesRef.current++
+    writeVersionsRef.current.set(accountId, (writeVersionsRef.current.get(accountId) ?? 0) + 1)
+    setSavingAccounts((prev) => ({ ...prev, [accountId]: (prev[accountId] ?? 0) + 1 }))
+    pollAbortRef.current?.abort()
+    pollGenerationRef.current++
 
-  const configsRef = useRef(configs)
-  useEffect(() => {
-    configsRef.current = configs
-  }, [configs])
+    const execute = async () => {
+      const saved = await request<ScheduleConfig>(
+        `/api/schedule/configs/${encodeURIComponent(accountId)}`,
+        { method: 'PUT', body: buildPatch(configsRef.current[accountId]) },
+      )
+      configsRef.current = { ...configsRef.current, [accountId]: saved }
+      setConfigs(configsRef.current)
+      return saved
+    }
+    const previous = writeQueuesRef.current.get(accountId)
+    const pending = previous ? previous.then(execute, execute) : Promise.resolve().then(execute)
+    const queued = pending.finally(() => {
+      pendingWritesRef.current--
+      setSavingAccounts((prev) => ({ ...prev, [accountId]: prev[accountId] - 1 }))
+      if (writeQueuesRef.current.get(accountId) === queued) {
+        writeQueuesRef.current.delete(accountId)
+      }
+      if (pendingWritesRef.current === 0) void runPoll(true)
+    })
+    writeQueuesRef.current.set(accountId, queued)
+    return queued
+  }, [runPoll])
 
   const handleToggleAccount = useCallback(
     async (acc: AccountSummary) => {
-      // 1. PUT 开始前：使所有 mutation 前的 poll response 失效并中止
-      pollAbortRef.current?.abort()
-      pollGenerationRef.current++
-
-      const cur = configsRef.current[acc.id] || {
-        account_id: acc.id,
-        enabled: false,
-        hourly_quota: 5,
-        current_hour_count: 0,
-        mode: 'always',
-      }
-      const updated: ScheduleConfig = {
-        ...cur,
-        enabled: !cur.enabled,
-        started_at:
-          !cur.enabled && cur.mode === 'duration' ? new Date().toISOString() : cur.started_at,
-      }
       try {
-        await request(`/api/schedule/configs/${encodeURIComponent(acc.id)}`, {
-          method: 'PUT',
-          body: updated,
-        })
-        // 2. PUT 成功后，local commit 立即生效
-        setConfigs((prev) => ({ ...prev, [acc.id]: updated }))
-        show(`账号 [${acc.name || acc.real_email}] 定时任务已${updated.enabled ? '开启' : '关闭'}`)
-        // 3. 执行最新权威 revalidate
-        void runPoll()
+        const saved = await saveSchedulePatch(acc.id, (current) => ({
+          enabled: !current?.enabled,
+          ...(!current?.enabled && current?.mode === 'duration'
+            ? { started_at: new Date().toISOString() }
+            : {}),
+        }))
+        show(`账号 [${acc.name || acc.real_email}] 定时任务已${saved.enabled ? '开启' : '关闭'}`)
+        return true
       } catch (err) {
         show(err instanceof ApiError ? err.message : '更新配置失败')
+        return false
       }
     },
-    [show, runPoll],
+    [show, saveSchedulePatch],
   )
 
   const handleUpdateScheduleMode = useCallback(
     async (accId: string, patch: Partial<ScheduleConfig>) => {
-      // 1. PUT 开始前：使所有 mutation 前的 poll response 失效并中止
-      pollAbortRef.current?.abort()
-      pollGenerationRef.current++
-
-      const cur = configsRef.current[accId] || {
-        account_id: accId,
-        enabled: false,
-        hourly_quota: 5,
-        current_hour_count: 0,
-        mode: 'always',
-      }
-      const updated: ScheduleConfig = { ...cur, ...patch }
       try {
-        await request(`/api/schedule/configs/${encodeURIComponent(accId)}`, {
-          method: 'PUT',
-          body: updated,
-        })
-        setConfigs((prev) => ({ ...prev, [accId]: updated }))
+        await saveSchedulePatch(accId, (current) => ({
+          ...patch,
+          ...(patch.mode === 'daily_window' ? {
+            ...(!current?.start_time ? { start_time: '09:00' } : {}),
+            ...(!current?.end_time ? { end_time: '18:00' } : {}),
+          } : {}),
+          ...(patch.mode === 'duration' ? {
+            ...(!current?.duration_hours ? { duration_hours: 12 } : {}),
+            ...(current?.enabled ? { started_at: new Date().toISOString() } : {}),
+          } : {}),
+        }))
         show('调度策略已更新')
-        void runPoll()
+        return true
       } catch (err) {
         show(err instanceof ApiError ? err.message : '更新调度策略失败')
+        return false
       }
     },
-    [show, runPoll],
+    [show, saveSchedulePatch],
   )
 
   const handleUpdateQuota = useCallback(
     async (accId: string, quota: number) => {
-      // 1. PUT 开始前：使所有 mutation 前的 poll response 失效并中止
-      pollAbortRef.current?.abort()
-      pollGenerationRef.current++
-
-      const cur = configsRef.current[accId] || {
-        account_id: accId,
-        enabled: false,
-        hourly_quota: 5,
-        current_hour_count: 0,
-      }
-      const updated: ScheduleConfig = { ...cur, hourly_quota: quota }
       try {
-        await request(`/api/schedule/configs/${encodeURIComponent(accId)}`, {
-          method: 'PUT',
-          body: updated,
-        })
-        setConfigs((prev) => ({ ...prev, [accId]: updated }))
+        await saveSchedulePatch(accId, () => ({ hourly_quota: quota }))
         show('每小时配额已更新')
-        void runPoll()
+        return true
       } catch (err) {
         show(err instanceof ApiError ? err.message : '更新配额失败')
+        return false
       }
     },
-    [show, runPoll],
+    [show, saveSchedulePatch],
   )
 
   const handleUpdateLabel = useCallback(
     async (accId: string, label: string) => {
-      // 1. PUT 开始前：使所有 mutation 前的 poll response 失效并中止
-      pollAbortRef.current?.abort()
-      pollGenerationRef.current++
-
-      const cur = configsRef.current[accId] || {
-        account_id: accId,
-        enabled: false,
-        hourly_quota: 5,
-        alias_label: 'scheduled',
-        current_hour_count: 0,
-      }
       const clean = label.trim() || 'scheduled'
-      const updated: ScheduleConfig = { ...cur, alias_label: clean }
       try {
-        await request(`/api/schedule/configs/${encodeURIComponent(accId)}`, {
-          method: 'PUT',
-          body: updated,
-        })
-        setConfigs((prev) => ({ ...prev, [accId]: updated }))
+        await saveSchedulePatch(accId, () => ({ alias_label: clean }))
         show('别名备注模板已更新')
-        void runPoll()
+        return true
       } catch (err) {
         show(err instanceof ApiError ? err.message : '更新别名备注模板失败')
+        return false
       }
     },
-    [show, runPoll],
+    [show, saveSchedulePatch],
   )
 
-  const handleApplyPreset = useCallback(
-    (accountId: string, presetVal: string) => {
-      void handleUpdateLabel(accountId, presetVal)
-    },
-    [handleUpdateLabel],
-  )
+  const accountsUnavailable = accountsLoading || accountsError !== null
+  const configsUnavailable = !configsLoaded || pollErrors.configs !== null
+  const statusUnavailable = !status || pollErrors.status !== null
+  const saving = Object.values(savingAccounts).some((count) => count > 0)
+  const triggerDisabled = triggering || saving || accountsUnavailable || configsUnavailable || statusUnavailable || status?.running === true
 
-  const handleTriggerNow = async (all = false) => {
+  const handleTriggerNow = useCallback(async (all = false) => {
+    // 失焦保存和点击可以发生在同一事件序列，不能只依赖渲染后的 disabled。
+    if (pendingWritesRef.current > 0 || triggeringRef.current || accountsUnavailable || configsUnavailable || statusUnavailable || status?.running) return
+    triggeringRef.current = true
+    pollAbortRef.current?.abort()
+    pollGenerationRef.current++
+    setStatus(null)
     setTriggering(true)
     try {
       const url = all ? '/api/schedule/run-now?all=true' : '/api/schedule/run-now'
       await request(url, { method: 'POST' })
-      setStatus((prev) => ({
-        running: true,
-        last_run_at: prev?.last_run_at,
-        interval_seconds: prev?.interval_seconds ?? 300,
-      }))
-      show(all ? '已强制对全部账号触发一轮补货任务' : '已触发一轮定时别名补货任务')
+      show(all ? '已提交全员补货请求，请查看日志确认执行结果' : '已提交补货请求，请查看日志确认执行结果')
     } catch (err) {
       show(err instanceof ApiError ? err.message : '触发任务失败')
     } finally {
+      triggeringRef.current = false
       setTriggering(false)
+      void runPoll(true)
     }
-  }
+  }, [show, runPoll, accountsUnavailable, configsUnavailable, statusUnavailable, status])
 
-  const handleCopyMacro = (macroText: string) => {
+  const handleCopyMacro = useCallback((macroText: string) => {
     if (navigator.clipboard?.writeText) {
       navigator.clipboard
         .writeText(macroText)
@@ -316,12 +328,19 @@ export default function SchedulePage() {
     } else {
       show(`占位符: ${macroText}`)
     }
-  }
+  }, [show])
+  const handleRefreshLogs = useCallback(() => void runPoll(true), [runPoll])
 
   // 统计指标
-  const enabledCount = accounts.filter((a) => configs[a.id]?.enabled).length
+  const defaults = useMemo(() => Object.fromEntries(accounts.map((acc) => [acc.id, {
+    account_id: acc.id, enabled: false, hourly_quota: 5, alias_label: 'scheduled', current_hour_count: 0,
+  } satisfies ScheduleConfig])), [accounts])
+  const pageCount = Math.max(1, Math.ceil(accounts.length / PAGE_SIZE))
+  const currentPage = Math.min(page, pageCount)
+  const visibleAccounts = accounts.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE)
+  const enabledCount = accounts.filter((a) => !a.schedule_protected && configs[a.id]?.enabled && !isScheduleExpired(configs[a.id], now)).length
   const totalHourlyQuota = accounts.reduce(
-    (acc, a) => (configs[a.id]?.enabled ? acc + configs[a.id].hourly_quota : acc),
+    (acc, a) => (!a.schedule_protected && configs[a.id]?.enabled && !isScheduleExpired(configs[a.id], now) ? acc + configs[a.id].hourly_quota : acc),
     0,
   )
 
@@ -335,13 +354,13 @@ export default function SchedulePage() {
             定时为已启用的账号补充 HME 别名，支持设置每小时限额与 Cookie 失效自动暂停
           </p>
         </div>
-        <div style={{ display: 'flex', gap: '8px' }}>
+        <div className="schedule-header-actions">
           <button
             type="button"
             className="btn btn-secondary"
             onClick={() => void handleTriggerNow(true)}
-            disabled={triggering || status?.running === true}
-            title="对全部账号（包含尚未开启定时任务的账号）强制触发一轮补货"
+            disabled={triggerDisabled}
+            title="对全部非保护账号（包含未启用账号）补货，绕过时段和到期限制"
           >
             <span>强制全员补货</span>
           </button>
@@ -349,7 +368,8 @@ export default function SchedulePage() {
             type="button"
             className="btn btn-primary"
             onClick={() => void handleTriggerNow(false)}
-            disabled={triggering || status?.running === true}
+            disabled={triggerDisabled}
+            title={saving ? '请等待配置保存完成' : '为已启用的非保护账号补货，绕过时段和到期限制'}
           >
             <IconZap size={15} />
             <span>
@@ -359,6 +379,14 @@ export default function SchedulePage() {
         </div>
       </div>
 
+      <p className="text-muted schedule-execution-note">普通补货仅针对已启用账号，强制全员包含暂停账号；两者均绕过时段和到期限制，遵守配额与保护规则。{saving && '配置正在保存，完成后可执行。'}</p>
+      {Object.values(pollErrors).some(Boolean) && <div className="schedule-read-error" role="alert">
+        <div>{pollErrors.configs && <p>调度配置读取失败：{pollErrors.configs}。{configsLoaded ? '当前显示上次成功读取的数据，编辑暂不可用。' : '尚未确认账号配置，编辑暂不可用。'}</p>}
+        {pollErrors.status && <p>运行状态读取失败：{pollErrors.status}。当前状态未确认。</p>}
+        {pollErrors.logs && <p>日志读取失败：{pollErrors.logs}。{logsLoaded ? '当前显示历史日志。' : '尚未获取日志。'}</p>}</div>
+        <button type="button" className="btn btn-sm btn-secondary" onClick={() => void runPoll(true)}>重新读取</button>
+      </div>}
+
       {/* 顶部指标统计 */}
       <ScheduleMetrics
         enabledCount={enabledCount}
@@ -366,6 +394,10 @@ export default function SchedulePage() {
         totalHourlyQuota={totalHourlyQuota}
         status={status}
         logsCount={logs.length}
+        accountsKnown={!accountsUnavailable}
+        configsKnown={configsLoaded && !pollErrors.configs && !accountsUnavailable}
+        statusKnown={!statusUnavailable}
+        logsKnown={logsLoaded && !pollErrors.logs}
       />
 
       <div className="schedule-layout">
@@ -375,7 +407,7 @@ export default function SchedulePage() {
             className="card-header"
             style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
           >
-            <h2 className="card-title">各账号调度策略 ({accounts.length})</h2>
+            <h2 className="card-title">各账号调度策略 ({accountsUnavailable ? '—' : accounts.length})</h2>
             <button
               type="button"
               className={`btn-hint-toggle ${showMacroHint ? 'active' : ''}`}
@@ -387,14 +419,14 @@ export default function SchedulePage() {
             </button>
           </div>
           <div className="table-responsive">
-            <table className="table schedule-table-compact">
+            <table className="table schedule-table-compact" aria-label="账号调度策略" aria-busy={!configsLoaded && !pollErrors.configs}>
               <thead>
                 <tr>
-                  <th style={{ minWidth: 200 }}>账号信息</th>
+                  <th>账号信息</th>
                   <th style={{ textAlign: 'center', width: 80 }}>自动补货</th>
                   <th style={{ textAlign: 'center', width: 80 }}>配额/时</th>
-                  <th style={{ minWidth: 220 }}>调度模式与时段</th>
-                  <th style={{ minWidth: 360 }}>
+                  <th>调度模式与时段</th>
+                  <th>
                     <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
                       <span>别名备注模板</span>
                       <span
@@ -415,14 +447,8 @@ export default function SchedulePage() {
                     </td>
                   </tr>
                 ) : (
-                  accounts.map((acc) => {
-                    const cfg = configs[acc.id] || {
-                      account_id: acc.id,
-                      enabled: false,
-                      hourly_quota: 5,
-                      alias_label: 'scheduled',
-                      current_hour_count: 0,
-                    }
+                  visibleAccounts.map((acc) => {
+                    const cfg = configs[acc.id] || defaults[acc.id]
                     return (
                       <ScheduleAccountRow
                         key={acc.id}
@@ -432,7 +458,9 @@ export default function SchedulePage() {
                         onUpdateQuota={handleUpdateQuota}
                         onUpdateLabel={handleUpdateLabel}
                         onUpdateMode={handleUpdateScheduleMode}
-                        onApplyPreset={handleApplyPreset}
+                        disabled={configsUnavailable || accountsUnavailable || triggering}
+                        saving={(savingAccounts[acc.id] ?? 0) > 0}
+                        expired={isScheduleExpired(cfg, now)}
                       />
                     )
                   })
@@ -440,6 +468,14 @@ export default function SchedulePage() {
               </tbody>
             </table>
           </div>
+
+          {accounts.length > PAGE_SIZE && <nav className="pagination-bar" aria-label="调度账号分页">
+            <span className="pagination-info">共 {accounts.length} 个账号，每页 {PAGE_SIZE} 个 · 第 {currentPage} / {pageCount} 页</span>
+            <div className="pagination-controls">
+              <button type="button" className="pagination-btn" disabled={currentPage === 1} onClick={() => setPage(currentPage - 1)}>上一页</button>
+              <button type="button" className="pagination-btn" disabled={currentPage === pageCount} onClick={() => setPage(currentPage + 1)}>下一页</button>
+            </div>
+          </nav>}
 
           <ScheduleMacroHintBar
             show={showMacroHint}
@@ -454,10 +490,13 @@ export default function SchedulePage() {
           status={status}
           logFilter={logFilter}
           setLogFilter={setLogFilter}
-          terminalRef={terminalRef}
           triggering={triggering}
           onTriggerNow={handleTriggerNow}
-          onRefreshLogs={() => void runPoll()}
+          onRefreshLogs={handleRefreshLogs}
+          loading={!logsLoaded && !pollErrors.logs}
+          error={pollErrors.logs}
+          triggerDisabled={triggerDisabled}
+          intervalSeconds={status?.interval_seconds}
         />
       </div>
     </div>

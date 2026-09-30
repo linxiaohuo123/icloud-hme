@@ -216,11 +216,14 @@ func TestAccountLoginResponseNoSecrets(t *testing.T) {
 	if _, exists := out.Data["cookies"]; exists {
 		t.Fatalf("登录响应不应包含 cookies 键")
 	}
+	if value, exists := out.Data["schedule_protected"].(bool); !exists || value {
+		t.Fatalf("普通账号的调度保护标记应为 false 布尔值: %v", out.Data["schedule_protected"])
+	}
 	// 只允许 Summary 字段
 	for key := range out.Data {
 		switch key {
 		case "id", "name", "real_email", "icloud_email", "host", "status", "alias_total",
-			"alias_active", "has_cookies", "has_app_password", "has_proxy",
+			"alias_active", "has_cookies", "has_app_password", "has_proxy", "schedule_protected",
 			"last_validated", "status_message", "created_at":
 		default:
 			t.Fatalf("登录响应包含意外字段 %q", key)

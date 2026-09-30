@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 gin, html/template, net/http, strings, time, encoding/json, fmt, strconv, icloud-hme/internal/auth, icloud-hme/internal/mail, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 findAccountForEmail, mailViewHandler, mailRawHandler
- * [POS]: internal/server 的对外直出链接管道，提供免复杂头的多封邮件查信列表、多条验证码提取与可视化正文直出
+ * [POS]: internal/server 的对外直出链接管道，支持 IMAP 正文与 WebMail 预览查信、多条验证码提取与可视化正文直出
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -1768,7 +1768,7 @@ func (s *Server) fetchRecentMessagesForAlias(ctx context.Context, accountID, ema
 		Days:            30,
 		WithBody:        true,
 		FolderSpecified: false,
-		DaysSpecified:   true,
+		DaysSpecified:   false,
 		Refresh:         true,
 	}
 

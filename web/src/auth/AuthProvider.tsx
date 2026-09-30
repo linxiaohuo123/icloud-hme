@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 react, api/client (request, registerUnauthorizedHandler, setCSRFToken), api/types (LoginResult)
+ * [INPUT]: 依赖 react, api/client (request, getAuthGeneration, registerUnauthorizedHandler, setCSRFToken), api/types (LoginResult)
  * [OUTPUT]: 对外提供 AuthProvider, useAuth
  * [POS]: web/src/auth 的全局认证状态提供者与鉴权上下文
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -14,7 +14,7 @@ import {
   useState,
   type ReactNode,
 } from 'react'
-import { ApiError, request, registerUnauthorizedHandler, setCSRFToken } from '../api/client'
+import { ApiError, request, getAuthGeneration, registerUnauthorizedHandler, setCSRFToken } from '../api/client'
 import type { LoginResult } from '../api/types'
 
 type AuthStatus = 'checking' | 'anonymous' | 'authenticated'
@@ -40,21 +40,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>('checking')
 
   useEffect(() => {
-    let cancelled = false
-    request<LoginResult>('/api/auth/session', undefined, () => {
-      // session 探测本身 401 不算"会话过期",交给状态判断
-    })
+    const controller = new AbortController()
+    const generation = getAuthGeneration()
+    request<LoginResult>('/api/auth/session', { signal: controller.signal })
       .then((data) => {
-        if (cancelled) return
+        if (controller.signal.aborted || generation !== getAuthGeneration()) return
         setCSRFToken(data.csrf_token)
         setStatus('authenticated')
       })
       .catch(() => {
-        if (cancelled) return
+        if (controller.signal.aborted || generation !== getAuthGeneration()) return
         setStatus('anonymous')
       })
     return () => {
-      cancelled = true
+      controller.abort()
     }
   }, [])
 

@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 bytes, encoding/base64, fmt, io, mime, mime/multipart, mime/quotedprintable, net/mail, strings, time, github.com/emersion/go-imap, github.com/emersion/go-message/charset
  * [OUTPUT]: 对外提供 toMessage, toMessageWithBody, toMessageWithHeaderOnly, readBody, decodeHeader, decodeAppleRelay, folderRole, folderSortRank
- * [POS]: internal/mail 的 MIME 多级解析与字符集转码中心，正文读取、截断与 multipart 解析失败显式返回错误
+ * [POS]: internal/mail 的 MIME 多级解析与字符集转码中心，合并重复投递收件人头，正文读取、截断与 multipart 解析失败显式返回错误
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -159,17 +159,11 @@ func extractStructuralRecipients(toHeader string, header mail.Header) []string {
 
 	add(toHeader)
 	if header != nil {
-		add(header.Get("To"))
-		add(header.Get("Cc"))
-		add(header.Get("Delivered-To"))
-		add(header.Get("X-Original-To"))
-		add(header.Get("Envelope-To"))
-		add(header.Get("X-Forwarded-To"))
-		add(header.Get("Resent-To"))
-		add(header.Get("X-Envelope-To"))
-		add(header.Get("Original-Recipient"))
-		add(header.Get("X-Apple-Original-To"))
-		add(header.Get("X-Apple-Recipient"))
+		for _, name := range []string{"To", "Cc", "Delivered-To", "X-Original-To", "Envelope-To", "X-Forwarded-To", "Resent-To", "X-Envelope-To", "Original-Recipient", "X-Apple-Original-To", "X-Apple-Recipient"} {
+			for _, value := range header[name] {
+				add(value)
+			}
+		}
 	}
 	return recipients
 }

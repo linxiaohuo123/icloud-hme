@@ -121,7 +121,7 @@ describe('BusinessTagsPage', () => {
     expect(createdBody).toMatchObject({ tag: 'walmart', name: 'walmart', description: '沃尔玛业务线' })
   })
 
-  it('编辑业务标识：PATCH 全量回传，保留 status/created_at/last_assigned_at', async () => {
+  it('编辑业务标识：PATCH 只提交编辑字段，不回传旧状态和活动时间', async () => {
     const user = userEvent.setup()
     let patchedBody: Record<string, unknown> | undefined
     server.use(
@@ -145,15 +145,10 @@ describe('BusinessTagsPage', () => {
     await waitFor(() => {
       expect(patchedBody).toBeDefined()
     })
-    // 后端 PATCH 为整对象 upsert，未提交字段必须原样带回
-    expect(patchedBody).toMatchObject({
-      id: 'tag_1',
+    expect(patchedBody).toEqual({
       tag: 'tiktok',
       name: 'tiktok',
       description: '新描述',
-      status: 'active',
-      created_at: '2026-09-18T10:00:00+08:00',
-      last_assigned_at: tags[0].last_assigned_at,
     })
   })
 

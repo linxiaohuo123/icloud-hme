@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 react-router-dom 的 Link, api/client 的 request/ApiError, api/types 的 BusinessTag/APIToken, components/AsyncState/ConfirmDialog/Dialog/ToastProvider, utils/clipboard 的 copyText, utils/date 的 formatDate/formatFullDate/formatRelativeTime/isWithinWindow, utils/snippets 的 buildLeaseCommand/buildCurlSnippet/buildPythonSnippet
- * [OUTPUT]: 对外提供 BusinessTagsPage 业务标识与 API 令牌管理组件 (Bento 指标卡 + 双栏 CRUD + 自动化接入指南)
+ * [OUTPUT]: 对外提供 BusinessTagsPage 业务标识与 API 令牌管理组件，编辑仅提交名称、标签和可清空的描述
  * [POS]: web/src/pages 的核心页面，负责业务归类增删改查、出号流水入口与 API 令牌生成/作废
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -205,11 +205,9 @@ export default function BusinessTagsPage() {
     if (!editingTag || !editTagValue.trim()) return
     setSavingEdit(true)
     try {
-      // 后端 PATCH 是整对象 upsert，必须全量回传以免未提交字段被清空
       await request(`/api/tags/${encodeURIComponent(editingTag.id)}`, {
         method: 'PATCH',
         body: {
-          ...editingTag,
           tag: editTagValue.trim(),
           name: editTagValue.trim(),
           description: editDescValue.trim(),

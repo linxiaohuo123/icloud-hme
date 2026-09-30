@@ -31,6 +31,8 @@ export interface AccountSummary {
   status_message?: string
   created_at: string
   tags?: string[]
+  /** 后端保护策略的只读判定，受保护账号不参与自动或手动补货。 */
+  schedule_protected?: boolean
 }
 
 export interface MailboxSummary {

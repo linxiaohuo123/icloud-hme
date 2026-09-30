@@ -3478,13 +3478,29 @@ button.btn-success:hover:not(:disabled),
   pointer-events: none;
 }
 
-/* ─── 调度备注输入与快捷预设 (Schedule Label & Presets · 紧凑单行) ─── */
+/* ─── 调度备注输入与快捷预设 (Schedule Label & Presets) ─── */
 .schedule-table-compact th {
   padding: 9px 14px;
   font-size: 12px;
   background: var(--color-bg-subtle);
   border-bottom: 1px solid var(--color-border);
 }
+
+/* 桌面调度表：固定列宽，名称和邮箱各占一行，备注控件允许换行。 */
+.schedule-table-compact {
+  table-layout: fixed;
+  min-width: 820px;
+}
+
+.schedule-table-compact th:nth-child(1) { width: 25%; }
+.schedule-table-compact th:nth-child(4) { width: 24%; }
+.schedule-center-cell { text-align: center; }
+.schedule-header-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.schedule-execution-note { margin: -12px 0 0; font-size: 12px; }
+.schedule-read-error { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 16px; border: 1px solid var(--color-danger); border-radius: var(--radius); background: var(--color-danger-soft); }
+.schedule-read-error p { margin: 0; }
+.schedule-row-status { min-height: 16px; font-size: 11px; color: var(--color-text-secondary); }
+.schedule-follow-latest { align-self: flex-end; margin: 8px 16px 0; }
 
 .schedule-table-compact td {
   padding: 8px 14px;
@@ -3499,8 +3515,9 @@ button.btn-success:hover:not(:disabled),
 
 .schedule-acc-top {
   display: flex;
-  align-items: baseline;
-  gap: 6px;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
   line-height: 1.3;
 }
 
@@ -3508,18 +3525,25 @@ button.btn-success:hover:not(:disabled),
   font-weight: 600;
   font-size: 13px;
   color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .schedule-acc-email-dim {
-  font-size: 11px;
-  color: var(--color-text-tertiary);
+  font-size: 12px;
+  color: var(--color-text-secondary);
   font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .schedule-acc-progress-inline {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .schedule-acc-meter-mini {
@@ -3553,12 +3577,12 @@ button.btn-success:hover:not(:disabled),
   line-height: 1;
 }
 
-/* 备注与预设单行横向排布 */
+/* 备注独占一行，快捷预设在下方按可用宽度排列。 */
 .schedule-label-row-compact {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
 }
 
 .schedule-label-box-compact {
@@ -3566,7 +3590,7 @@ button.btn-success:hover:not(:disabled),
   align-items: center;
   justify-content: center;
   height: 28px;
-  width: 170px;
+  width: 100%;
   background: var(--color-bg-raised);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
@@ -3613,7 +3637,7 @@ button.btn-success:hover:not(:disabled),
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  flex-shrink: 0;
+  flex-wrap: wrap;
 }
 
 .schedule-preset-chip {
@@ -3651,6 +3675,9 @@ button.btn-success:hover:not(:disabled),
   font-weight: 600;
   box-shadow: 0 1px 3px rgba(37, 99, 235, 0.12);
 }
+
+.schedule-preset-chip:disabled { opacity: 0.5; cursor: wait; }
+.schedule-preset-chip:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
 
 :root[data-theme="dark"] .schedule-preset-chip {
   background: rgba(255, 255, 255, 0.03);
@@ -5024,5 +5051,3 @@ button.btn-row-action:hover:not(:disabled) {
   display: inline-block;
   vertical-align: middle;
 }
-
-

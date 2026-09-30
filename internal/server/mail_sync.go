@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, sync, time, icloud-hme/internal/account, mail, store
  * [OUTPUT]: 对外提供 MailSyncWorker, NewMailSyncWorker, ForgetAccount
- * [POS]: server 的后台邮件同步器，实现增量 UID 扫描、别名归属探测与取码持久化，空邮箱也校验代际并清理旧基线
+ * [POS]: server 的后台邮件同步器，逐项隔离不可解析正文、保留可重试失败游标，支持外部 IMAP 归属探测与取码持久化
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -411,7 +411,7 @@ accountLoop:
 		var eligible []account.Summary
 		var accountIDs []string
 		for _, acc := range accounts {
-			if acc.HasAppPassword || acc.HasCookies {
+			if acc.HasAppPassword || acc.HasCookies || acc.Mailbox != nil {
 				eligible = append(eligible, acc)
 				accountIDs = append(accountIDs, acc.ID)
 			}
@@ -880,10 +880,25 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 				})
 			}
 			fullMsgs, err := w.be.GetMessagesContext(ctx, accountID, refs)
-			if err != nil {
+			var readErr *mail.BatchReadError
+			if err != nil && !errors.As(err, &readErr) {
 				// 网络错误或取消: 不得提前推进未处理的本页 checkpoint
 				scanErr = err
 				break
+			}
+			if readErr != nil {
+				scanErr = readErr
+				retryable := false
+				for _, failure := range readErr.Failures {
+					if !failure.Permanent {
+						retryable = true
+						continue
+					}
+					log.Printf("[MailSync] 邮件正文不可解析 account=%s mailbox=%s uid_validity=%d uid=%d: %v", accountID, failure.Ref.Mailbox, failure.Ref.UIDValidity, failure.Ref.UID, failure.Err)
+				}
+				if retryable {
+					break
+				}
 			}
 
 			pageDurableFailed := false
@@ -974,7 +989,7 @@ func (w *MailSyncWorker) scanAndPublishPages(ctx context.Context, accountID stri
 			}
 		}
 
-		// 只有一整 page 成功完成处理后，才能向前推进 checkpoint
+		// 整页邮件已处理或明确报告不可解析内容后才能推进；可重试读取与持久化失败仍保留游标。
 		maxUIDInPage := pageRes.Messages[len(pageRes.Messages)-1].UID
 		nextCursor := maxUIDInPage + 1
 		if pageRes.NextUID > nextCursor {
