@@ -54,13 +54,47 @@ chmod +x icloud-hme_linux_amd64
 > ⚠️ **Master Key 生命周期核心契约**：
 > Master Key 用于认证加密 Apple Cookies、App 专用密码与通知 Secret。必须**生成一次 → 安全保存 → 所有后续启动继续使用同一把 Key**。严禁每次启动重新运行 `openssl rand`，否则已有数据库将无法解密！
 
-#### 方式二：Docker
+#### 方式二：Docker Compose 编排（生产标准推荐，含自动化上号浏览器）
+
+系统包含两个核心协同容器：
+1. **`icloud-hme`**：主服务（Go + 内嵌前端，负责出号、IMAP邮件管理、API流控）；
+2. **`icloud-camoufox-agent`**：反检测无头浏览器代理服务（基于 Camoufox，负责 Apple ID 密码与 2FA 验证码全自动登录提取 Web Cookie）。
 
 ```bash
-# 拉取镜像
-docker pull ghcr.io/linxiaohuo123/icloud-hme:latest
+# 1. 克隆代码仓库
+git clone https://github.com/linxiaohuo123/icloud-hme.git
+cd icloud-hme
 
-# 运行（将本机 data 目录挂载进去）
+# 2. 从模板生成生产配置文件
+cp .env.example .env
+
+# 3. 生成严格 32 字节 Base64 凭据根密钥 (Master Key)
+openssl rand -base64 32
+# 编辑 .env 文件，填入上面生成的 ICLOUD_HME_MASTER_KEY 以及管理员强口令 ICLOUD_HME_ADMIN_PASSWORD
+
+# 4. 首次启动前确保本地持久化目录属主属于容器用户 (UID 10001)
+mkdir -p ./data && chown -R 10001:10001 ./data
+
+# 5. 首次完整启动双服务
+docker compose up -d --build
+```
+
+> 🚀 **日常增量更新（极速更新，避开庞大的无头浏览器）**：
+> 平时修改了前端页面或后端接口，**绝不要使用全局 `--build`**，仅需增量构建主服务：
+> ```bash
+> # 1. 拉取最新代码
+> git pull origin main
+> # 2. 仅增量构建主服务 (耗时仅 15~20 秒，Camoufox 直接沿用已有镜像)
+> docker compose build icloud-hme
+> # 3. 后台无缝启动替换容器
+> docker compose up -d
+> ```
+
+#### 方式三：Docker 单容器轻量运行（无 Camoufox 自动化上号）
+
+若不需要使用网页端自动上号（仅手工录入 Web Cookie 与 App 专用密码），可单独运行轻量主镜像：
+
+```bash
 docker run -d \
   --name icloud-hme \
   -p 8081:8081 \
@@ -70,11 +104,9 @@ docker run -d \
   ghcr.io/linxiaohuo123/icloud-hme:latest
 ```
 
-> ⚠️ 上面的密码与密钥仅为示例，**不可照抄**。密码请设为至少 8 字符的强密码，Master Key 必须为严格 32 字节的 Base64 字符串（首次部署前运行 `openssl rand -base64 32` 单独生成并安全保存，严禁每次启动重新生成）。
+> ⚠️ 上面的密码与密钥仅为示例，**不可照抄**。密码请设为至少 8 字符的强密码，Master Key 必须为严格 32 字节的 Base64 字符串（首次部署前运行 `openssl rand -base64 32` 单独生成并安全保存，严禁每次启动重新生成）。镜像支持 `linux/amd64` 和 `linux/arm64` 双架构，自动适配。
 
-镜像支持 `linux/amd64` 和 `linux/arm64` 双架构，自动适配。
-
-#### 方式三：源码编译（需要 Go 1.26+ 与 Node.js 22.12+ 双工具链）
+#### 方式四：源码编译（需要 Go 1.26+ 与 Node.js 22.12+ 双工具链）
 
 ```bash
 # 前置要求: Go 1.26+、Node.js 22.12+
