@@ -14,8 +14,16 @@
 
 ## 标准更新与重启命令
 ```bash
+# 1. 拉取最新代码
 git pull origin main
-docker compose up -d --build
+
+# 2. 仅增量构建主服务 (避开庞大的无头浏览器，15~20秒极速完成)
+docker compose build icloud-hme
+
+# 3. 后台无缝启动并替换容器
+docker compose up -d
+
+# 4. 查看实时日志
 docker compose logs -f --tail=50
 ```
 
