@@ -100,6 +100,31 @@ func TestTokenScopesRestrictAdminSurface(t *testing.T) {
 	}
 }
 
+func TestQueryTokensCannotAuthenticateAdminOrWriteAPIs(t *testing.T) {
+	ts, _ := newScopeTestServer(t)
+	for _, credential := range []string{"token", "api_key"} {
+		for _, test := range []struct{ method, path string }{
+			{http.MethodGet, "/api/accounts"},
+			{http.MethodPost, "/api/create"},
+			{http.MethodPost, "/api/external/v2/allocate"},
+			{http.MethodGet, "/api/external/v2/operations/op_example"},
+		} {
+			req, err := http.NewRequest(test.method, ts.URL+test.path+"?"+credential+"=admin-token-bbbb", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := ts.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("%s %s query credential %s: got %d, want 401", test.method, test.path, credential, resp.StatusCode)
+			}
+		}
+	}
+}
+
 // 令牌列表只回显掩码，杜绝「一枚令牌收割全部令牌」的权限永久化链路。
 func TestListTokensReturnsMaskedValue(t *testing.T) {
 	ts, _ := newScopeTestServer(t)

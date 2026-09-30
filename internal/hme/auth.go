@@ -393,10 +393,23 @@ func (c *Client) getTrust(state *authState) error {
 
 // authenticateWeb 认证 iCloud Web 服务
 func (c *Client) authenticateWeb(state *authState) error {
-	body := fmt.Sprintf(`{"dsWebAuthToken":"%s","accountCountryCode":"USA","extended_login":true,"trustToken":"%s"}`,
-		state.authToken, state.trustToken)
+	payload := struct {
+		DSWebAuthToken     string `json:"dsWebAuthToken"`
+		AccountCountryCode string `json:"accountCountryCode"`
+		ExtendedLogin      bool   `json:"extended_login"`
+		TrustToken         string `json:"trustToken"`
+	}{
+		DSWebAuthToken:     state.authToken,
+		AccountCountryCode: "USA",
+		ExtendedLogin:      true,
+		TrustToken:         state.trustToken,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("auth web 请求编码失败: %w", err)
+	}
 
-	req, err := http.NewRequest("POST", authWebFmt, bytes.NewReader([]byte(body)))
+	req, err := http.NewRequest("POST", authWebFmt, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -420,7 +433,12 @@ func (c *Client) authenticateWeb(state *authState) error {
 			Dsid string `json:"dsid"`
 		} `json:"dsInfo"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("auth web 响应解析失败: %w", err)
+	}
+	if strings.TrimSpace(result.DsInfo.Dsid) == "" {
+		return errors.New("auth web 响应缺少 dsid")
+	}
 	state.dsid = result.DsInfo.Dsid
 
 	// 复制 idmsa.apple.com 的 Cookie 到 icloud.com 与相关域名

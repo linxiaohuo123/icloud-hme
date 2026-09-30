@@ -63,6 +63,8 @@ HTTP JSON API，所有接口均采用标准 JSON 格式交互。
    - 通过中台 `/api/tokens` 签发的令牌（如 `am_xxxxxx`），直接在请求头携带 `Authorization: Bearer <TOKEN>`。
    - 系统会自动记录该 Token 分销的出号流水，用于计量审计。
    - **令牌按作用域授权（最小权限）**，详见下方「作用域模型」。
+   - URL 查询参数 `token` / `api_key` 仅在 `GET /mail/code*`、`/mail/view*`、`/mail/raw*`、`/api/mail/code*`、`/api/mail/view*`、`/api/mail/raw*` 和 `GET /api/verify-code` 的已注册路由有效。管理接口、写接口及所有外部 v2 接口必须使用请求头凭据。
+   - 主服务访问日志省略查询参数，避免记录直链凭据；反向代理访问日志需采用相同的隐藏策略。
 3. **作用域模型 (Scopes)**：
 
    | 作用域 | 授权范围 | 覆盖端点与限制 |
@@ -711,6 +713,8 @@ Authorization: Bearer <API_KEY> # 或 Bearer <EXTERNAL_TOKEN>
 - `fresh` 或 `nocache`（可选）：布尔值，默认 `false`。传 `true` 时仅跳过本地近期内存缓存，**但不是严格的 IMAP 邮件基线保证**。需要严格基线保证的新客户端请使用 v2 端点。
 - `auto_delete`：**明确不支持并会被拒绝**。传入 `auto_delete=true` 或 `1` 会直接返回 `400 UNSUPPORTED_PARAMETER` 错误。依据 RFC 9110 规范，HTTP GET 必须具备安全/无副作用语义，严禁通过 GET 查询操作导致别名被隐式停用。
 - `/mail/view` 与 `/mail/raw` 支持 IMAP 正文和 WebMail 不完整预览。IMAP 默认查询 INBOX 最近 30 天；WebMail 不承诺按天数筛选，也不保证完整正文。
+  - 普通外部令牌使用分配记录中的母号读取邮件；显式 `account_id` / `account` 与分配账号不一致时返回 `404 RESOURCE_NOT_FOUND`，无法通过此参数跨账号读取。
+  - 查信页通过内嵌的外部 CSS/JavaScript 资源加载样式与交互，保持全局 CSP 对内联脚本和事件处理器的限制。`/mail/raw?format=html` 使用独立 CSP sandbox，允许内联排版样式，阻断脚本、表单提交、同源存储与外部资源加载。
 
 > **关于别名停用与配额说明**：
 > - 停用别名必须由具备管理员权限的会话显式调用管理接口 `POST /api/aliases/:id/deactivate`；普通 `allocate,verify` 令牌不具备停用接口权限，且系统不提供外部令牌的租约停用能力。

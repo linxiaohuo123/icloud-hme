@@ -8,11 +8,16 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/net/html"
 
 	"icloud-hme/internal/account"
 	"icloud-hme/internal/mail"
@@ -41,6 +46,7 @@ func TestMailDirectLinks(t *testing.T) {
 	fb := &fakeBackend{
 		accounts: []account.Summary{
 			{ID: testAccountID, RealEmail: "owner@icloud.com", Status: "active", HasCookies: true},
+			{ID: "acc_other_2", RealEmail: "other@icloud.com", Status: "active", HasCookies: true},
 		},
 		inbox: InboxResult{
 			AccountID: testAccountID,
@@ -189,6 +195,40 @@ func TestMailDirectLinks(t *testing.T) {
 		if !strings.Contains(body, "654321") {
 			t.Fatalf("HTML 应渲染出提取到的验证码 654321, 实际: %s", body)
 		}
+		if strings.Contains(body, "<style") || strings.Contains(body, "onclick=") || !strings.Contains(body, "/mail/view-assets.js") {
+			t.Fatalf("邮件页应使用 CSP 兼容的外部资源和事件委托")
+		}
+
+		assetReq := httptest.NewRequest("GET", "/mail/view-assets.js", nil)
+		assetRec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(assetRec, assetReq)
+		if assetRec.Code != http.StatusOK || !strings.Contains(assetRec.Header().Get("Content-Type"), "javascript") || !strings.Contains(assetRec.Body.String(), "data-action") {
+			t.Fatalf("邮件页脚本资源应公开可加载，实际 %d %s", assetRec.Code, assetRec.Header().Get("Content-Type"))
+		}
+	})
+
+	t.Run("Mail View Cannot Override Token Account", func(t *testing.T) {
+		for _, path := range []string{"/mail/view", "/mail/raw", "/api/mail/view", "/api/mail/raw"} {
+			for _, parameter := range []string{"account_id", "account"} {
+				req := httptest.NewRequest("GET", path+"?email="+testEmail+"&"+parameter+"=acc_other_2&token="+secretToken, nil)
+				rec := httptest.NewRecorder()
+				srv.Handler().ServeHTTP(rec, req)
+				if rec.Code != http.StatusNotFound {
+					t.Fatalf("%s 普通令牌指定其他 %s 应返回 404, 实际 %d: %s", path, parameter, rec.Code, rec.Body.String())
+				}
+			}
+		}
+	})
+
+	t.Run("Raw HTML Has IsolatedPolicy", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/mail/raw?email="+testEmail+"&format=html&token="+secretToken, nil)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		policy := rec.Header().Get("Content-Security-Policy")
+		if rec.Code != http.StatusOK || !strings.Contains(policy, "sandbox allow-popups;") ||
+			!strings.Contains(policy, "script-src 'none'") || !strings.Contains(policy, "form-action 'none'") || strings.Contains(policy, "allow-same-origin") {
+			t.Fatalf("raw HTML must be isolated and deny active content: status=%d policy=%q", rec.Code, policy)
+		}
 	})
 
 	// ==========================================
@@ -251,4 +291,49 @@ func TestMailDirectLinks(t *testing.T) {
 			t.Fatalf("页面应包含自定义矢量 SVG Favicon")
 		}
 	})
+}
+
+func TestMailViewDataAttributePreservesUntrustedBody(t *testing.T) {
+	items := []mailViewItem{{TextBody: `"'><script>alert(1)</script><img src=x onerror=alert(1)> & \`, Subject: `</div><script>bad()</script>`}}
+	encoded, err := json.Marshal(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var page bytes.Buffer
+	if err := mailViewTemplate.Execute(&page, mailViewData{ItemsJSON: string(encoded), Items: items}); err != nil {
+		t.Fatal(err)
+	}
+	tokens := html.NewTokenizer(&page)
+	foundData, scripts := false, 0
+	for {
+		switch tokens.Next() {
+		case html.ErrorToken:
+			if tokens.Err() != io.EOF {
+				t.Fatal(tokens.Err())
+			}
+			if !foundData || scripts != 1 {
+				t.Fatalf("missing mailbox data or injected script: found=%v scripts=%d", foundData, scripts)
+			}
+			return
+		case html.StartTagToken:
+			token := tokens.Token()
+			if token.Data == "script" {
+				scripts++
+			}
+			attrs := map[string]string{}
+			for _, attr := range token.Attr {
+				attrs[attr.Key] = attr.Val
+			}
+			if attrs["id"] == "mailViewData" {
+				var decoded []mailViewItem
+				if err := json.Unmarshal([]byte(attrs["data-items"]), &decoded); err != nil {
+					t.Fatal(err)
+				}
+				if len(decoded) != 1 || decoded[0] != items[0] {
+					t.Fatal("HTML escaping changed the mailbox payload")
+				}
+				foundData = true
+			}
+		}
+	}
 }

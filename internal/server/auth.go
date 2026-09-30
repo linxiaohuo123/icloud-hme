@@ -42,13 +42,31 @@ func requestAPIKey(c *gin.Context) string {
 	if strings.HasPrefix(header, "Bearer ") {
 		return strings.TrimPrefix(header, "Bearer ")
 	}
-	if token := c.Query("token"); token != "" {
-		return token
-	}
-	if apiKey := c.Query("api_key"); apiKey != "" {
-		return apiKey
+	// Query credentials are supported only for the read-only direct-mail links
+	// that are intentionally shareable. State-changing and administrative APIs
+	// must use an explicit header so secrets do not leak through URLs/logs.
+	if queryCredentialsAllowed(c) {
+		if token := c.Query("token"); token != "" {
+			return token
+		}
+		if apiKey := c.Query("api_key"); apiKey != "" {
+			return apiKey
+		}
 	}
 	return ""
+}
+
+func queryCredentialsAllowed(c *gin.Context) bool {
+	if c.Request.Method != http.MethodGet {
+		return false
+	}
+	switch c.FullPath() {
+	case "/mail/code", "/mail/code/:email", "/mail/view", "/mail/view/:email", "/mail/raw", "/mail/raw/:email",
+		"/api/verify-code", "/api/mail/code", "/api/mail/code/:email", "/api/mail/view", "/api/mail/view/:email", "/api/mail/raw", "/api/mail/raw/:email":
+		return true
+	default:
+		return false
+	}
 }
 
 func authenticateAPIKey(c *gin.Context, reqKey, apiKey string, st *store.Store) bool {

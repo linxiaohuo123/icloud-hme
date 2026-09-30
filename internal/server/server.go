@@ -250,7 +250,7 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 	s.auth = authManager
 	hasAuth := cfg.AdminPassword != "" || cfg.APIKey != ""
 	s.r = gin.New()
-	s.r.Use(gin.Logger(), gin.Recovery(), securityHeadersMiddleware(), dnsRebindingMiddleware(hasAuth))
+	s.r.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipQueryString: true}), gin.Recovery(), securityHeadersMiddleware(), dnsRebindingMiddleware(hasAuth))
 	// 默认不信任任意代理头,登录限流使用真实连接 IP;
 	// 显式配置 TrustedProxies 时才采信来自这些地址的 X-Forwarded-For。
 	_ = s.r.SetTrustedProxies(cfg.TrustedProxies)
@@ -535,6 +535,8 @@ func (s *Server) register() {
 	s.r.GET("/readyz", s.handleReadyz)
 
 	// ===== 对外查信与直出路由组 (同步支持 /mail 前缀) =====
+	s.r.GET("/mail/view-assets.css", serveMailDirectAsset("mail_direct.css", "text/css; charset=utf-8"))
+	s.r.GET("/mail/view-assets.js", serveMailDirectAsset("mail_direct.js", "application/javascript; charset=utf-8"))
 	mailGroup := s.r.Group("/mail")
 	mailGroup.Use(apiCacheControlMiddleware())
 	mailGroup.Use(requireSession(s.auth, s.cfg.APIKey, s.store))
