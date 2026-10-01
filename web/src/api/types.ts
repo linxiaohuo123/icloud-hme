@@ -169,6 +169,8 @@ export interface LeaseRecord {
   id: string
   email: string
   account_id: string
+  account_name?: string
+  account_email?: string
   tag: string
   status: string
   allocated_at: string

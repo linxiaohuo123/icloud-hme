@@ -128,7 +128,7 @@ docker compose ps
 ss -lntp | grep -E ':80|:443|:8081'
 ~~~
 
-预期是公网只开放 80/443，8081 仅本机监听；8089 不应出现在宿主机监听列表中。验证码长轮询接口需要保留模板中的 130 秒代理读取超时配置。
+预期是公网只开放 80/443，8081 仅本机监听；8089 不应出现在宿主机监听列表中。验证码长轮询接口保留 130 秒读取超时；Nginx 账号登录路由使用 330 秒，覆盖健康检查、创建任务和 210 秒初次轮询。Nginx 模板应包含在 `http` 配置块中，其访问日志只记录 `$uri`，不记录查询字符串或 Referer，避免保存分享链接中的令牌。
 
 #### 方式三：Docker 单容器轻量运行（无 Camoufox 自动化上号）
 
@@ -146,10 +146,10 @@ docker run -d \
 
 > ⚠️ 上面的密码与密钥仅为示例，**不可照抄**。密码请设为至少 8 字符的强密码，Master Key 必须为严格 32 字节的 Base64 字符串（首次部署前运行 `openssl rand -base64 32` 单独生成并安全保存，严禁每次启动重新生成）。镜像支持 `linux/amd64` 和 `linux/arm64` 双架构，自动适配。
 
-#### 方式四：源码编译（需要 Go 1.26+ 与 Node.js 22.12+ 双工具链）
+#### 方式四：源码编译（需要 Go 1.26+ 与受支持的 Node.js 双工具链）
 
 ```bash
-# 前置要求: Go 1.26+、Node.js 22.12+
+# 前置要求: Go 1.26+；Node.js 22.22.2+ (22.x)、24.15+ (24.x) 或 26+
 git clone https://github.com/linxiaohuo123/icloud-hme.git
 cd icloud-hme
 
@@ -747,7 +747,7 @@ docker run -d \
 
 > The password and master key above are only examples — do NOT copy them. Use a strong password (min 8 chars) and a 32-byte Base64 master key (generate once via `openssl rand -base64 32` and preserve it).
 
-#### Option 3: Build from source (Go 1.26+ and Node.js 22.12+)
+#### Option 3: Build from source (Go 1.26+; Node.js 22.22.2+ on 22.x, 24.15+ on 24.x, or 26+)
 
 ```bash
 git clone https://github.com/linxiaohuo123/icloud-hme.git

@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 react-router-dom 的 Link, api/client 的 request/ApiError, api/types 的 BusinessTag/APIToken, components/AsyncState/ConfirmDialog/Dialog/ToastProvider, utils/clipboard 的 copyText, utils/date 的 formatDate/formatFullDate/formatRelativeTime/isWithinWindow, utils/snippets 的 buildLeaseCommand/buildCurlSnippet/buildPythonSnippet
- * [OUTPUT]: 对外提供 BusinessTagsPage 业务标识与 API 令牌管理组件，编辑仅提交名称、标签和可清空的描述
+ * [OUTPUT]: 对外提供 BusinessTagsPage 业务标识与 API 令牌管理组件，编辑仅提交名称、标签和可清空的描述，令牌与接入示例复制按实际结果反馈
  * [POS]: web/src/pages 的核心页面，负责业务归类增删改查、出号流水入口与 API 令牌生成/作废
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -393,9 +393,9 @@ export default function BusinessTagsPage() {
             <button
               type="button"
               className="btn btn-sm btn-primary"
-              onClick={() => {
-                copyText(createdTokenVal)
-                show('令牌已复制到剪贴板')
+              onClick={async () => {
+                const ok = await copyText(createdTokenVal)
+                show(ok ? '令牌已复制到剪贴板' : '复制失败，请手动复制令牌')
               }}
             >
               <IconCopy size={13} /> 复制令牌
@@ -403,9 +403,9 @@ export default function BusinessTagsPage() {
             <button
               type="button"
               className="btn btn-sm btn-primary"
-              onClick={() => {
-                copyText(buildLeaseCommand(window.location.origin, activeDocTag, createdTokenVal))
-                show('完整接入命令已复制')
+              onClick={async () => {
+                const ok = await copyText(buildLeaseCommand(window.location.origin, activeDocTag, createdTokenVal))
+                show(ok ? '完整接入命令已复制' : '复制失败，请手动复制接入命令')
               }}
             >
               <IconCopy size={13} /> 复制完整接入命令
@@ -755,9 +755,9 @@ export default function BusinessTagsPage() {
             <button
               type="button"
               className="btn btn-sm btn-secondary"
-              onClick={() => {
-                copyText(activeLang === 'curl' ? curlSnippet : pythonSnippet)
-                show(activeLang === 'curl' ? 'cURL 示例命令已复制' : 'Python 自动化脚本已复制')
+              onClick={async () => {
+                const ok = await copyText(activeLang === 'curl' ? curlSnippet : pythonSnippet)
+                show(ok ? (activeLang === 'curl' ? 'cURL 示例命令已复制' : 'Python 自动化脚本已复制') : '复制失败，请手动复制接入示例')
               }}
             >
               <IconCopy size={13} /> {activeLang === 'curl' ? '复制 cURL 命令' : '复制 Python 脚本'}

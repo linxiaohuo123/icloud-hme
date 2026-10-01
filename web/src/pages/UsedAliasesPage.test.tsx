@@ -13,6 +13,7 @@ const leases: LeaseRecord[] = Array.from({ length: 25 }, (_, i) => ({
   id: `lease_${i + 1}`,
   email: `alias${i + 1}_abc@icloud.com`,
   account_id: `acc_${1000 + i}`,
+  ...(i === 0 ? { account_name: '注册母号 A', account_email: 'owner@icloud.com' } : {}),
   tag: i % 2 === 0 ? 'tiktok' : 'walmart',
   // 覆盖三种展示分支：正常映射(已完成)、正常映射(已分配)、未知状态原文兜底
   status: i === 0 ? 'allocated' : i === 1 ? 'weird_state' : 'completed',
@@ -83,6 +84,9 @@ describe('UsedAliasesPage', () => {
     renderPage()
     await waitForRows()
 
+    expect(screen.getByText('owner@icloud.com')).toBeInTheDocument()
+    expect(screen.getByText('注册母号 A')).toBeInTheDocument()
+
     const totalHeader = screen.getByText('累计出号流水').closest('.card-header') as HTMLElement
     expect(within(totalHeader).getByText('25')).toBeInTheDocument()
 
@@ -109,13 +113,13 @@ describe('UsedAliasesPage', () => {
     await waitForRows()
     const user = userEvent.setup()
 
-    await user.type(screen.getByLabelText('搜索别名邮箱或账号 ID'), 'alias2')
+    await user.type(screen.getByLabelText('搜索别名邮箱、母号名称、母号邮箱或账号 ID'), 'alias2')
     // alias2 模糊匹配 alias2/20-25 共 7 条；alias25 不在未筛选的第 1 页，可作刷新完成信号
     expect(await screen.findByText('alias25_abc@icloud.com')).toBeInTheDocument()
     expect(screen.queryByText('alias1_abc@icloud.com')).toBeNull()
 
     // 清空搜索恢复 25 条 → 第 1 页 20 条 → 下一页看第 2 页
-    await user.clear(screen.getByLabelText('搜索别名邮箱或账号 ID'))
+    await user.clear(screen.getByLabelText('搜索别名邮箱、母号名称、母号邮箱或账号 ID'))
     await screen.findByText('alias1_abc@icloud.com')
     await user.click(screen.getByRole('button', { name: '下一页' }))
     expect(await screen.findByText('alias25_abc@icloud.com')).toBeInTheDocument()
@@ -162,7 +166,7 @@ describe('UsedAliasesPage', () => {
       ),
     )
     const user = userEvent.setup()
-    await user.type(screen.getByLabelText('搜索别名邮箱或账号 ID'), 'zzz')
+    await user.type(screen.getByLabelText('搜索别名邮箱、母号名称、母号邮箱或账号 ID'), 'zzz')
     expect(await screen.findByText('没有匹配的领用流水，试试调整筛选条件')).toBeInTheDocument()
     expect(screen.queryByRole('link', { name: /前往账号页生成别名/ })).toBeNull()
   })

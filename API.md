@@ -305,6 +305,7 @@ Content-Type: application/json
 ```
 - 请求体必须在 `password` 与 `otp_code` 中二选一；`otp_code` 必须是 6 位数字。若 Apple 要求双重认证，接口返回 `409 OTP_REQUIRED`；Camoufox 模式下响应的 `data.task_id` 标识本次登录任务。客户端输入收到的 6 位验证码后，仅提交带有 `otp_code` 的请求即可。
 - 未配置 Camoufox URL 和令牌时使用原生 SRP；已配置代理但不可用时返回 `503 CAMOUFOX_UNAVAILABLE`，不会自动切换登录方式。主服务重启后旧 Camoufox 验证码返回 `OTP_EXPIRED`。
+- Camoufox 模式下，中断登录请求会取消轮询并回收代理任务。若中断发生在任务创建期间，会先在有超时限制的创建请求中取得任务 ID，再执行回收；代理暂时不可用时保留回收记录，后续登录继续回收。
 - 自动登录所得 Cookie 通过 Apple 会话校验后才会替换账号原有凭据；校验失败返回 `422 COOKIE_VALIDATION_FAILED`。
 
 取消 Camoufox 双重认证任务时，使用 `OTP_REQUIRED` 响应中的任务 ID：
@@ -1041,7 +1042,7 @@ Content-Type: application/json
 
 记录全站每一个被分配出的别名流水与归属 Token（定时调度产出同样入账，`token_name` 为 `scheduler`）：
 
-- `GET /api/leases?alias=...&tag=...&status=...&limit=20&offset=0`：`alias` 同时搜索别名邮箱和账号 ID，分页检索出号流水与交付状态（`limit` 上限 500；查询故障返回 500）
+- `GET /api/leases?alias=...&tag=...&status=...&limit=20&offset=0`：`alias` 同时搜索别名邮箱、账号 ID、母号名称和母号邮箱；返回记录包含 `account_name`、`account_email` 供界面直接展示，分页检索出号流水与交付状态（`limit` 上限 500；查询故障返回 500）
 - `PATCH /api/leases/:id/status`：更新流水状态 `{"status": "completed"}`（仅接受 `completed` / `leased` / `abandoned`）
 
 ### 34. 定时调度配置与运行大盘 (Schedules)

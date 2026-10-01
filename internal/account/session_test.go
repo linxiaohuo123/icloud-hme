@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -253,10 +254,10 @@ func TestV7MigrationKeepsLegacyCookiesAndCreatesBackup(t *testing.T) {
 	}
 	defer upgraded.Close()
 	var version int
-	if err := upgraded.DB().QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 8 {
+	if err := upgraded.DB().QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != store.CurrentSchemaVersion {
 		t.Fatalf("migration failed: %d %v", version, err)
 	}
-	backups, err := filepath.Glob(filepath.Join(dir, "backups", "pre-migrate-v7-to-v8-*.db"))
+	backups, err := filepath.Glob(filepath.Join(dir, "backups", fmt.Sprintf("pre-migrate-v7-to-v%d-*.db", store.CurrentSchemaVersion)))
 	if err != nil || len(backups) != 1 {
 		t.Fatal("migration backup missing")
 	}

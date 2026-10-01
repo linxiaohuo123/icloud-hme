@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 api/types 的 Alias, components/icons 的各类图标, components/Select, utils/clipboard, utils/date
- * [OUTPUT]: 对外提供 WorkspaceAliasesTab 别名表格与批量操作组件 (可配置单页条数)
+ * [OUTPUT]: 对外提供 WorkspaceAliasesTab 别名表格与批量操作组件，异步启停防重复提交，按真实复制结果反馈
  * [POS]: web/src/pages/workspace 的别名管理视图，提供检索、多条件过滤、批量修改、分页与行级快捷操作
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -9,10 +9,12 @@ import { useCallback, useMemo, useState } from 'react'
 import type { Alias } from '../../api/types'
 import Select from '../../components/Select'
 import {
+  IconCheck,
   IconChevronDown,
   IconChevronLeft,
   IconChevronRight,
   IconChevronUp,
+  IconClose,
   IconCopy,
   IconEdit,
   IconInbox,
@@ -33,10 +35,11 @@ interface WorkspaceAliasesTabProps {
   aliasLoading: boolean
   totalAliasCount: number
   activeAliasCount: number
+  togglingAliasId: string | null
   selectedIds: Set<string>
   setSelectedIds: React.Dispatch<React.SetStateAction<Set<string>>>
   onEditAlias: (item: Alias) => void
-  onToggleAlias: (item: Alias) => void
+  onToggleAlias: (item: Alias) => Promise<void>
   onDeleteAlias: (item: Alias) => void
   onReadMail: (email: string) => void
   onOpenBatchEdit: () => void
@@ -48,6 +51,7 @@ export default function WorkspaceAliasesTab({
   aliasLoading,
   totalAliasCount,
   activeAliasCount,
+  togglingAliasId,
   selectedIds,
   setSelectedIds,
   onEditAlias,
@@ -61,6 +65,7 @@ export default function WorkspaceAliasesTab({
   const [filterActive, setFilterActive] = useState<'all' | 'active' | 'inactive'>('all')
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc')
   const [page, setPage] = useState(1)
+  const [copiedAliasId, setCopiedAliasId] = useState<string | null>(null)
   const [pageSize, setPageSize] = useState<number>(() => {
     try {
       const saved = Number(localStorage.getItem('icloud_hme_workspace_alias_page_size'))
@@ -80,6 +85,27 @@ export default function WorkspaceAliasesTab({
     } catch {
       // ignore
     }
+  }
+
+  function handleFilterChange(nextFilter: 'all' | 'active' | 'inactive') {
+    setFilterActive(nextFilter)
+    setPage(1)
+    if (selectedIds.size > 0) {
+      setSelectedIds(new Set())
+    }
+  }
+
+  async function handleCopyAlias(email: string, id: string) {
+    if (!await copyText(email)) {
+      setCopiedAliasId(null)
+      onCopySuccess('复制失败，请手动复制邮箱')
+      return
+    }
+    setCopiedAliasId(id)
+    onCopySuccess('别名邮箱已复制')
+    setTimeout(() => {
+      setCopiedAliasId((prev) => (prev === id ? null : prev))
+    }, 1600)
   }
 
   const filteredAliases = useMemo(() => {
@@ -164,10 +190,7 @@ export default function WorkspaceAliasesTab({
           <button
             type="button"
             className={`segmented-filter-btn ${filterActive === 'all' ? 'active' : ''}`}
-            onClick={() => {
-              setFilterActive('all')
-              setPage(1)
-            }}
+            onClick={() => handleFilterChange('all')}
           >
             <span>全部</span>
             <span className="filter-count-badge">{totalAliasCount}</span>
@@ -175,10 +198,7 @@ export default function WorkspaceAliasesTab({
           <button
             type="button"
             className={`segmented-filter-btn ${filterActive === 'active' ? 'active' : ''}`}
-            onClick={() => {
-              setFilterActive('active')
-              setPage(1)
-            }}
+            onClick={() => handleFilterChange('active')}
           >
             <span className="filter-dot active" />
             <span>仅活跃</span>
@@ -187,10 +207,7 @@ export default function WorkspaceAliasesTab({
           <button
             type="button"
             className={`segmented-filter-btn ${filterActive === 'inactive' ? 'active' : ''}`}
-            onClick={() => {
-              setFilterActive('inactive')
-              setPage(1)
-            }}
+            onClick={() => handleFilterChange('inactive')}
           >
             <span className="filter-dot inactive" />
             <span>仅停用</span>
@@ -208,7 +225,27 @@ export default function WorkspaceAliasesTab({
               setAliasSearch(e.target.value)
               setPage(1)
             }}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') {
+                setAliasSearch('')
+                setPage(1)
+              }
+            }}
           />
+          {aliasSearch && (
+            <button
+              type="button"
+              className="filter-search-clear"
+              onClick={() => {
+                setAliasSearch('')
+                setPage(1)
+              }}
+              title="清空搜索 (Esc)"
+              aria-label="清空搜索"
+            >
+              <IconClose size={13} />
+            </button>
+          )}
         </div>
       </div>
 
@@ -323,14 +360,12 @@ export default function WorkspaceAliasesTab({
                       <span className="font-mono font-semibold">{item.email}</span>
                       <button
                         type="button"
-                        className="btn-icon"
-                        onClick={() => {
-                          copyText(item.email)
-                          onCopySuccess('别名邮箱已复制')
-                        }}
-                        title="复制邮箱"
+                        className={`btn-icon ${copiedAliasId === item.anonymousId ? 'text-success' : ''}`}
+                        onClick={() => void handleCopyAlias(item.email, item.anonymousId)}
+                        title={copiedAliasId === item.anonymousId ? '已复制到剪贴板！' : '复制邮箱'}
+                        aria-label="复制邮箱"
                       >
-                        <IconCopy size={13} />
+                        {copiedAliasId === item.anonymousId ? <IconCheck size={13} /> : <IconCopy size={13} />}
                       </button>
                     </div>
                   </td>
@@ -379,9 +414,11 @@ export default function WorkspaceAliasesTab({
                       <button
                         type="button"
                         className="btn btn-xs btn-ghost"
-                        onClick={() => onToggleAlias(item)}
+                        onClick={() => void onToggleAlias(item)}
+                        disabled={Boolean(togglingAliasId)}
+                        title={item.active ? '停用此别名' : '启用此别名'}
                       >
-                        {item.active ? '停用' : '启用'}
+                        {togglingAliasId === item.anonymousId ? '处理中…' : item.active ? '停用' : '启用'}
                       </button>
                       <button
                         type="button"

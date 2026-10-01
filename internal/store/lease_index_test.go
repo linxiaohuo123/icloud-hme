@@ -46,6 +46,40 @@ func TestLeaseTimeQueryPlans(t *testing.T) {
 	}
 }
 
+func TestListLeasesIncludesReadableAccountIdentity(t *testing.T) {
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if _, err := st.DB().Exec(`
+		INSERT INTO accounts (id, name, real_email, icloud_email, status, tags, created_at, updated_at)
+		VALUES ('acc_readable', '注册母号 A', 'backup@example.com', 'owner@icloud.com', 'active', '[]', '2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordLease(LeaseRecord{
+		ID:          "lease_readable",
+		Email:       "alias@icloud.com",
+		AccountID:   "acc_readable",
+		Tag:         "default",
+		AllocatedAt: "2026-09-28T10:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	records, total, err := st.ListLeases("owner@icloud.com", "", "", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(records) != 1 {
+		t.Fatalf("expected one readable lease, total=%d records=%+v", total, records)
+	}
+	if records[0].AccountName != "注册母号 A" || records[0].AccountEmail != "owner@icloud.com" {
+		t.Fatalf("readable account identity mismatch: %+v", records[0])
+	}
+}
+
 func TestV5LeaseIndexUpgrade(t *testing.T) {
 	for _, fail := range []bool{false, true} {
 		t.Run(fmt.Sprintf("migration_failure=%v", fail), func(t *testing.T) {

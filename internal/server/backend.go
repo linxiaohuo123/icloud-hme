@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/account.Manager, internal/hme.Client, internal/mail.Client/WebClient
  * [OUTPUT]: 对外提供 Backend 接口、managerBackend 生产适配器与 BackendError 错误结构
- * [POS]: internal/server 的高层业务门面与依赖倒置边界，隔离 Handler 与具体协议实现
+ * [POS]: internal/server 的高层业务门面，隔离协议实现并传递 Camoufox 登录请求取消与任务回收
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -65,11 +65,13 @@ type Backend interface {
 	SetMailboxContext(context.Context, string, account.MailboxConfig) (account.Summary, error)
 	RemoveMailbox(string) (account.Summary, error)
 	LoginAccount(string, string, string) (account.Summary, error)
+	LoginAccountContext(context.Context, string, string, string) (account.Summary, error)
 	CancelCamoufoxLogin(string, string) (bool, error)
 	RemoveAccount(string) bool
 	CreateAlias(string, string) (*hme.CreateResult, error)
 	CreateAliasContext(context.Context, string, string) (*hme.CreateResult, error)
 	CreateAliasForAllocationContext(context.Context, string, string, string) (*hme.CreateResult, error)
+	CreateAliasForReplenishmentContext(context.Context, string, string) (*hme.CreateResult, error)
 	BatchCreateAlias(string, int, string) (*BatchCreateResult, error)
 	BatchCreateAliasContext(context.Context, string, int, string) (*BatchCreateResult, error)
 	ListAliases(string) ([]hme.Alias, error)
@@ -672,7 +674,18 @@ func (b *managerBackend) cancelAllCamoufoxTasks() {
 	}
 }
 
-func (b *managerBackend) loginWithCamoufox(id, password, otpCode, camoufoxBase string) (account.Summary, error) {
+func (b *managerBackend) loginWithCamoufox(ctx context.Context, id, password, otpCode, camoufoxBase string) (account.Summary, error) {
+	if err := ctx.Err(); err != nil {
+		return account.Summary{}, err
+	}
+	var cleanupTaskID string
+	defer func() {
+		if ctx.Err() != nil && cleanupTaskID != "" {
+			if err := b.cancelAndClearCamoufoxTask(id, cleanupTaskID, camoufoxBase); err != nil && !errors.Is(err, errCamoufoxTaskMissing) {
+				log.Printf("[Camoufox] 请求取消后回收任务失败 account=%s task=%s: %v", id, cleanupTaskID, err)
+			}
+		}
+	}()
 	acc, ok := b.mgr.GetAccount(id)
 	if !ok {
 		return account.Summary{}, &BackendError{Status: http.StatusNotFound, Code: "ACCOUNT_NOT_FOUND", Message: "账号不存在"}
@@ -703,6 +716,7 @@ func (b *managerBackend) loginWithCamoufox(id, password, otpCode, camoufoxBase s
 			}
 			return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "OTP_EXPIRED", Message: "2FA 验证会话已超时，请重新登录"}
 		}
+		cleanupTaskID = pending.taskID
 
 		submitPayload := map[string]string{
 			"task_id":  pending.taskID,
@@ -717,7 +731,7 @@ func (b *managerBackend) loginWithCamoufox(id, password, otpCode, camoufoxBase s
 		if err != nil {
 			return account.Summary{}, &BackendError{Status: http.StatusServiceUnavailable, Code: "CAMOUFOX_CONFIG_ERROR", Message: err.Error()}
 		}
-		resp, err := httpClient.Do(req)
+		resp, err := httpClient.Do(req.WithContext(ctx))
 		if err != nil {
 			return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "提交验证码失败: " + err.Error()}
 		}
@@ -744,7 +758,7 @@ func (b *managerBackend) loginWithCamoufox(id, password, otpCode, camoufoxBase s
 			return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "Camoufox 未接受验证码提交"}
 		}
 
-		return b.pollCamoufoxTask(id, pending.taskID, camoufoxBase, 55*time.Second, true)
+		return b.pollCamoufoxTask(ctx, id, pending.taskID, camoufoxBase, 55*time.Second, true)
 	}
 
 	// 阶段 1: 发起全新无头登录
@@ -773,7 +787,10 @@ func (b *managerBackend) loginWithCamoufox(id, password, otpCode, camoufoxBase s
 	if err != nil {
 		return account.Summary{}, &BackendError{Status: http.StatusServiceUnavailable, Code: "CAMOUFOX_CONFIG_ERROR", Message: err.Error()}
 	}
-	resp, err := httpClient.Do(req)
+	// Keep the bounded task-creation handshake alive so cancellation cannot
+	// discard a newly created task ID. Once received, the deferred cleanup
+	// cancels it if the caller has disconnected.
+	resp, err := httpClient.Do(req.WithContext(context.WithoutCancel(ctx)))
 	if err != nil {
 		return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "启动 Camoufox 任务失败: " + err.Error()}
 	}
@@ -794,6 +811,7 @@ func (b *managerBackend) loginWithCamoufox(id, password, otpCode, camoufoxBase s
 	if decodeErr != nil || !loginRes.Success || loginRes.TaskID == "" {
 		return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "Camoufox 任务创建异常"}
 	}
+	cleanupTaskID = loginRes.TaskID
 
 	if err := b.setCamoufoxTask(id, loginRes.TaskID); err != nil {
 		if cancelErr := b.cancelAndClearCamoufoxTask(id, loginRes.TaskID, camoufoxBase); cancelErr != nil && !errors.Is(cancelErr, errCamoufoxTaskMissing) {
@@ -802,10 +820,10 @@ func (b *managerBackend) loginWithCamoufox(id, password, otpCode, camoufoxBase s
 		return account.Summary{}, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_FAILURE", Message: "Camoufox 登录任务持久化失败"}
 	}
 	started = true
-	return b.pollCamoufoxTask(id, loginRes.TaskID, camoufoxBase, camoufoxInitialPollTimeout, false)
+	return b.pollCamoufoxTask(ctx, id, loginRes.TaskID, camoufoxBase, camoufoxInitialPollTimeout, false)
 }
 
-func (b *managerBackend) pollCamoufoxTask(accountID, taskID, camoufoxBase string, timeout time.Duration, isOTPPhase bool) (account.Summary, error) {
+func (b *managerBackend) pollCamoufoxTask(ctx context.Context, accountID, taskID, camoufoxBase string, timeout time.Duration, isOTPPhase bool) (account.Summary, error) {
 	deadline := time.Now().Add(timeout)
 	httpClient, err := newCamoufoxHTTPClient(5 * time.Second)
 	if err != nil {
@@ -814,8 +832,15 @@ func (b *managerBackend) pollCamoufoxTask(accountID, taskID, camoufoxBase string
 	firstPoll := true
 
 	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return account.Summary{}, err
+		}
 		if !firstPoll {
-			time.Sleep(1 * time.Second)
+			select {
+			case <-ctx.Done():
+				return account.Summary{}, ctx.Err()
+			case <-time.After(time.Second):
+			}
 		}
 		firstPoll = false
 
@@ -823,8 +848,11 @@ func (b *managerBackend) pollCamoufoxTask(accountID, taskID, camoufoxBase string
 		if err != nil {
 			return account.Summary{}, &BackendError{Status: http.StatusServiceUnavailable, Code: "CAMOUFOX_CONFIG_ERROR", Message: err.Error()}
 		}
-		resp, err := httpClient.Do(req)
+		resp, err := httpClient.Do(req.WithContext(ctx))
 		if err != nil {
+			if ctx.Err() != nil {
+				return account.Summary{}, ctx.Err()
+			}
 			_ = b.cancelAndClearCamoufoxTask(accountID, taskID, camoufoxBase)
 			return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "查询 Camoufox 登录任务失败: " + err.Error()}
 		}
@@ -851,6 +879,9 @@ func (b *managerBackend) pollCamoufoxTask(accountID, taskID, camoufoxBase string
 		}
 		err = json.NewDecoder(resp.Body).Decode(&task)
 		resp.Body.Close()
+		if ctx.Err() != nil {
+			return account.Summary{}, ctx.Err()
+		}
 		if err != nil {
 			_ = b.cancelAndClearCamoufoxTask(accountID, taskID, camoufoxBase)
 			return account.Summary{}, &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "Camoufox 任务响应格式无效"}
@@ -931,6 +962,13 @@ func (b *managerBackend) pollCamoufoxTask(accountID, taskID, camoufoxBase string
 // LoginAccount 使用 iCloud 密码登录账号,成功只返回 Summary,绝不返回 Cookies。
 // 未配置 Camoufox 时使用原生 SRP；已配置的代理失败会明确返回错误。
 func (b *managerBackend) LoginAccount(id, password, otpCode string) (account.Summary, error) {
+	return b.LoginAccountContext(context.Background(), id, password, otpCode)
+}
+
+func (b *managerBackend) LoginAccountContext(ctx context.Context, id, password, otpCode string) (account.Summary, error) {
+	if err := ctx.Err(); err != nil {
+		return account.Summary{}, err
+	}
 	if (password == "") == (otpCode == "") {
 		return account.Summary{}, &BackendError{Status: http.StatusBadRequest, Code: "VALIDATION_ERROR", Message: "password 与 otp_code 必须二选一"}
 	}
@@ -957,11 +995,11 @@ func (b *managerBackend) LoginAccount(id, password, otpCode string) (account.Sum
 			return account.Summary{}, &BackendError{Status: http.StatusServiceUnavailable, Code: "CAMOUFOX_TRANSPORT_INVALID", Message: err.Error()}
 		}
 		if !hasCamoufoxPending {
-			if _, _, err := camoufoxHealth(camoufoxBase, 10*time.Second); err != nil {
+			if _, _, err := camoufoxHealthContext(ctx, camoufoxBase, 10*time.Second); err != nil {
 				return account.Summary{}, &BackendError{Status: http.StatusServiceUnavailable, Code: "CAMOUFOX_UNAVAILABLE", Message: "Camoufox 代理不可用: " + err.Error()}
 			}
 		}
-		return b.loginWithCamoufox(id, password, otpCode, camoufoxBase)
+		return b.loginWithCamoufox(ctx, id, password, otpCode, camoufoxBase)
 	}
 
 	var otpProvider hme.OTPProvider

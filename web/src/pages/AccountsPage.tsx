@@ -376,7 +376,7 @@ export default function AccountsPage() {
                   <th style={{ width: '130px' }}>别名 (可用/总数)</th>
                   <th style={{ minWidth: '200px' }}>已配凭据</th>
                   <th style={{ width: '150px' }}>最后检查时间</th>
-                  <th style={{ width: '140px', textAlign: 'right' }}>快捷操作</th>
+                  <th style={{ minWidth: '180px', textAlign: 'right' }}>快捷操作</th>
                 </tr>
               </thead>
               <tbody>

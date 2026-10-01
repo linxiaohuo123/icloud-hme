@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 net/http, encoding/json, strings, gin, icloud-hme/internal/notify, icloud-hme/internal/security
+ * [INPUT]: 依赖 context, net/http, encoding/json, strings, gin, icloud-hme/internal/notify, icloud-hme/internal/security
  * [OUTPUT]: 对外提供 getNotifySettingsHandler, updateNotifySettingsHandler, testNotifyHandler, loadNotifySettings
  * [POS]: server 的系统设置 HTTP Handlers (PR-07: 通知配置密文加密、GET 响应脱敏、PATCH 保留原值与 Fail-Closed 门禁)
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -8,6 +8,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -269,6 +270,10 @@ func errNotify(msg string) error { return &notifyConfigError{msg: msg} }
 
 // camoufoxHealth 检查受保护的代理健康端点与浏览器内核状态。
 func camoufoxHealth(baseURL string, timeout time.Duration) (bool, int64, error) {
+	return camoufoxHealthContext(context.Background(), baseURL, timeout)
+}
+
+func camoufoxHealthContext(ctx context.Context, baseURL string, timeout time.Duration) (bool, int64, error) {
 	req, err := newCamoufoxRequest(http.MethodGet, baseURL+"/health", nil)
 	if err != nil {
 		return false, 0, err
@@ -278,7 +283,7 @@ func camoufoxHealth(baseURL string, timeout time.Duration) (bool, int64, error) 
 	if err != nil {
 		return false, 0, err
 	}
-	resp, err := client.Do(req)
+	resp, err := client.Do(req.WithContext(ctx))
 	latencyMs := time.Since(start).Milliseconds()
 	if err != nil {
 		return false, latencyMs, err

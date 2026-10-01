@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 api/types (InboxMessage), components/icons, utils/sniffer (extractOTPMemoized, parseSenderInfo, buildSniffContext, stripHtml), utils/date (formatDate, formatFullDate), react (memo, useMemo)
- * [OUTPUT]: 对外提供 InboxTableRow 邮件单行数据渲染原子组件 (带 React.memo 隔离与 O(1) 记忆化)
+ * [OUTPUT]: 对外提供 InboxTableRow 邮件单行数据渲染原子组件，隔离行操作与内部按钮的键盘事件
  * [POS]: web/src/components/inbox 的行级原子展示组件，承载验证码/激活链接高亮、发件人头像、收件别名复制与行级交互
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -73,6 +73,7 @@ function InboxTableRowBase({
       aria-label={`查看发自 ${sender.name} 的邮件详情`}
       onClick={() => onOpenMessage(m)}
       onKeyDown={(e) => {
+        if (e.target !== e.currentTarget) return
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault()
           onOpenMessage(m)

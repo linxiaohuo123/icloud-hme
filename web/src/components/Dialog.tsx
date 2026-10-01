@@ -1,11 +1,12 @@
 /**
- * [INPUT]: 依赖 React 基础能力，接收 title, open, onClose, children
- * [OUTPUT]: 对外提供可访问的通用 Dialog 弹窗组件
+ * [INPUT]: 依赖 React 基础能力、utils/focus，接收 title, open, onClose, children
+ * [OUTPUT]: 对外提供可访问的通用 Dialog 弹窗组件，最顶层管理可见控件焦点与 Escape
  * [POS]: web/src/components 的弹窗基础容器，被所有业务 Dialog 消费
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 import { useEffect, useRef, type ReactNode } from 'react'
+import { getFocusableElements } from '../utils/focus'
 
 // 模块级弹窗栈:嵌套弹窗(如详情上叠删除确认)时只有最顶层响应 Escape，且采用引用计数管理 body 滚动锁
 const dialogStack: symbol[] = []
@@ -33,10 +34,8 @@ export default function Dialog({ title, open, onClose, children }: DialogProps) 
     lastFocused.current = document.activeElement
     const node = ref.current
     if (node && !node.contains(document.activeElement)) {
-      const first = node.querySelector<HTMLElement>(
-        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-      )
-      first?.focus()
+      const focusTarget = getFocusableElements(node)[0] ?? node
+      focusTarget.focus()
     }
   }, [open])
 
@@ -53,24 +52,19 @@ export default function Dialog({ title, open, onClose, children }: DialogProps) 
     dialogStack.push(dialogId)
 
     const node = ref.current
-    const focusables = () =>
-      node
-        ? Array.from(
-            node.querySelectorAll<HTMLElement>(
-              'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-            ),
-          ).filter((el) => !el.hasAttribute('disabled'))
-        : []
-
     const handleKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || dialogStack[dialogStack.length - 1] !== dialogId) return
       if (e.key === 'Escape') {
-        if (dialogStack[dialogStack.length - 1] !== dialogId) return
         onCloseRef.current()
         return
       }
       if (e.key !== 'Tab') return
-      const items = focusables()
-      if (items.length === 0) return
+      const items = node ? getFocusableElements(node) : []
+      if (items.length === 0) {
+        e.preventDefault()
+        node?.focus()
+        return
+      }
       const first = items[0]
       const last = items[items.length - 1]
       if (e.shiftKey && document.activeElement === first) {
@@ -110,6 +104,7 @@ export default function Dialog({ title, open, onClose, children }: DialogProps) 
         ref={ref}
         className="dialog"
         role="dialog"
+        tabIndex={-1}
         aria-modal="true"
         aria-label={title}
       >

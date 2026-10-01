@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 api/client (request, ApiError), api/types (AccountSummary, BatchCreateResult), components/Dialog, components/Select, utils/clipboard
- * [OUTPUT]: 对外提供 BatchCreateAliasDialog 批量生成别名弹窗组件
+ * [OUTPUT]: 对外提供 BatchCreateAliasDialog 批量生成别名弹窗组件，申请期间禁止关闭，账号列表刷新时保留表单与生成结果，复制失败显示明确错误
  * [POS]: web/src/components 的交互组件，为 AliasesPage 与 AccountWorkspace 提供 1-5 个别名的高并发原子生成
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -36,18 +36,19 @@ export default function BatchCreateAliasDialog({
   const [result, setResult] = useState<BatchCreateResult | null>(null)
   const [copied, setCopied] = useState(false)
 
-  // 每次弹窗打开或目标账号变化时，重置所有表单状态
+  const initialAccountId = defaultAccountId && defaultAccountId !== 'all'
+    ? defaultAccountId : (accounts[0]?.id ?? '')
+
+  // 仅打开弹窗或默认目标账号变化时重置，后台列表刷新不清空结果。
   useEffect(() => {
     if (!open) return
-    const id = defaultAccountId && defaultAccountId !== 'all'
-      ? defaultAccountId : (accounts[0]?.id ?? '')
-    setAccountId(id)
+    setAccountId(initialAccountId)
     setCount(1)
     setNote('')
     setResult(null)
     setError('')
     setCopied(false)
-  }, [open, defaultAccountId, accounts])
+  }, [open, initialAccountId])
 
   const accountOptions = accounts.map((a) => ({
     value: a.id,
@@ -55,6 +56,7 @@ export default function BatchCreateAliasDialog({
   }))
 
   async function handleSubmit() {
+    if (loading) return
     if (!accountId) {
       setError('请选择所属母账号')
       return
@@ -80,6 +82,7 @@ export default function BatchCreateAliasDialog({
   }
 
   function handleClose() {
+    if (loading) return
     setResult(null)
     setError('')
     setCopied(false)
@@ -89,8 +92,10 @@ export default function BatchCreateAliasDialog({
   async function handleCopyAll() {
     if (!result?.created?.length) return
     const text = result.created.map((item) => item.email).join('\n')
-    await copyText(text)
-    setCopied(true)
+    const ok = await copyText(text)
+    setCopied(ok)
+    setError(ok ? '' : '复制失败，请手动复制邮箱列表')
+    if (!ok) return
     setTimeout(() => setCopied(false), 2000)
   }
 

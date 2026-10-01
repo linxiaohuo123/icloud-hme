@@ -136,8 +136,8 @@ describe('AccountWorkspace', () => {
     expect(screen.getByText('test@icloud.com')).toBeInTheDocument()
 
     // 指标卡
-    expect(screen.getByText('活跃别名')).toBeInTheDocument()
-    expect(screen.getByText('已建别名')).toBeInTheDocument()
+    expect(screen.getByText('别名配额')).toBeInTheDocument()
+    expect(screen.getByText('/ 750')).toBeInTheDocument()
 
     // 别名表格
     await waitFor(() => {
@@ -414,5 +414,50 @@ describe('AccountWorkspace', () => {
     await screen.findByRole('status', { name: '别名已生成：created@icloud.com' })
     await user.click(screen.getByRole('button', { name: '复制' }))
     expect(await navigator.clipboard.readText()).toBe('created@icloud.com')
+  })
+
+  it('点击头部 iCloud 登录按钮打开密码登录弹窗', async () => {
+    const user = userEvent.setup()
+    renderWorkspace()
+    await screen.findByRole('heading', { name: '测试账号' })
+    const loginBtn = screen.getByRole('button', { name: 'iCloud 登录' })
+    await user.click(loginBtn)
+    await screen.findByRole('heading', { name: 'Apple ID 账号授权登录' })
+    expect(screen.getByLabelText('Apple ID 密码')).toBeInTheDocument()
+  })
+
+  it('账号无独立昵称时头部邮箱按钮显示复制邮箱而不是重复邮箱文本', async () => {
+    const noNicknameAccount: AccountSummary = {
+      ...testAccount,
+      id: 'acc_no_nick',
+      name: 'test@icloud.com', // 昵称与邮箱相同
+      real_email: 'test@icloud.com',
+      icloud_email: 'test@icloud.com',
+    }
+    server.use(
+      http.get('/api/accounts/:id', () => HttpResponse.json({ success: true, data: noNicknameAccount })),
+      http.get('/api/aliases', () => HttpResponse.json({ success: true, data: { aliases: testAliases } })),
+    )
+    renderWorkspace('/workspace/acc_no_nick')
+    await screen.findByRole('heading', { name: 'test@icloud.com' })
+    // 不应重复出现第二个 "test@icloud.com" 文本作为邮箱复制按钮，而是展示 "复制邮箱"
+    expect(screen.getByText('复制邮箱')).toBeInTheDocument()
+  })
+
+  it('当账号缺少 Cookie 凭据时状态指示为待配置', async () => {
+    const noCookiesAccount: AccountSummary = {
+      ...testAccount,
+      id: 'acc_no_cookie',
+      has_cookies: false,
+      status: 'active', // 后端可能存 active 但 cookies 为空
+    }
+    server.use(
+      http.get('/api/accounts/:id', () => HttpResponse.json({ success: true, data: noCookiesAccount })),
+      http.get('/api/aliases', () => HttpResponse.json({ success: true, data: { aliases: testAliases } })),
+    )
+    renderWorkspace('/workspace/acc_no_cookie')
+    await screen.findByRole('heading', { name: '测试账号' })
+    expect(screen.getByText('待配置')).toBeInTheDocument()
+    expect(screen.queryByText('正常运行')).not.toBeInTheDocument()
   })
 })

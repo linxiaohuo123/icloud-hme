@@ -547,9 +547,16 @@ func TestPR05_ServerCloseWaitsForWorkersBeforeStoreClose(t *testing.T) {
 		t.Fatalf("F10 破坏：优雅停机超时后，底层 Store 被过早关闭: %v", err)
 	}
 
-	// 释放在途 worker，并清理关闭 store
+	// Release the worker and retry shutdown; Store must close only after it exits.
 	close(unblockCreator)
-	_ = st.Close()
+	retryCtx, retryCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer retryCancel()
+	if err := s.CloseContext(retryCtx); err != nil {
+		t.Fatalf("shutdown retry failed: %v", err)
+	}
+	if err := st.DB().Ping(); err == nil {
+		t.Fatal("Store remained open after successful shutdown retry")
+	}
 }
 
 // TestPR05_CreateAliasContextCanceledWhileHMEClientBusy 验证当同账号 HME 客户端被并发占用时，

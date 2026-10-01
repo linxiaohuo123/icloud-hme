@@ -291,8 +291,8 @@ export default function UsedAliasesPage() {
             <input
               type="text"
               className="input"
-              placeholder="搜索别名邮箱 / 账号 ID…"
-              aria-label="搜索别名邮箱或账号 ID"
+              placeholder="搜索别名邮箱 / 母号名称 / 母号邮箱…"
+              aria-label="搜索别名邮箱、母号名称、母号邮箱或账号 ID"
               value={search}
               onChange={(e) => {
                 setSearch(e.target.value)
@@ -359,7 +359,16 @@ export default function UsedAliasesPage() {
                             <IconCopy size={11} className="copy-hint-icon" />
                           </button>
                         </td>
-                        <td className="text-xs text-secondary font-mono">{r.account_id}</td>
+                        <td className="text-xs text-secondary" title={r.account_id}>
+                          {r.account_email || r.account_name ? (
+                            <>
+                              <div className="font-mono">{r.account_email || r.account_name}</div>
+                              {r.account_email && r.account_name ? <div className="text-xs text-muted">{r.account_name}</div> : null}
+                            </>
+                          ) : (
+                            <span className="font-mono">{r.account_id}</span>
+                          )}
+                        </td>
                         <td>
                           {statusMeta ? (
                             <span className={`status-pill ${statusMeta.pill}`}>

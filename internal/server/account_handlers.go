@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 gin, net/http, encoding/json, icloud-hme/internal/account
  * [OUTPUT]: 对外提供 listAccountsHandler, addAccountHandler, updateAccountHandler 等 HTTP 端点
- * [POS]: internal/server 的账号层路由适配器，负责请求反序列化、邮箱绑定与解绑、入参校验及安全 Summary 响应包装
+ * [POS]: internal/server 的账号路由适配器，负责反序列化、邮箱绑定与校验、安全 Summary 响应及登录 Context 传递
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -296,7 +296,7 @@ func (s *Server) loginAccountHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "OTP_INVALID", "otp_code 必须是 6 位数字")
 		return
 	}
-	sum, err := s.be.LoginAccount(id, req.Password, req.OTPCode)
+	sum, err := s.be.LoginAccountContext(c.Request.Context(), id, req.Password, req.OTPCode)
 	if err != nil {
 		backendFail(c, err)
 		return

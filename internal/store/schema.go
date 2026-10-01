@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 database/sql, fmt, strings, time, sync
  * [OUTPUT]: 对外提供 CurrentSchemaVersion, schemaExecutor 接口, migrateV0ToV1, validateSchema, SetBeforeMigrationStepHookForTest
- * [POS]: internal/store 的版本化架构演进与元数据校验层，唯一性契约要求覆盖整张表
+ * [POS]: internal/store 的版本化架构与终态校验，v9 要求 Reserve 意图用途字段，唯一性契约覆盖整张表
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -16,7 +16,7 @@ import (
 )
 
 // CurrentSchemaVersion 数据库正式版本基线
-const CurrentSchemaVersion = 8
+const CurrentSchemaVersion = 9
 
 type schemaExecutor interface {
 	Exec(query string, args ...any) (sql.Result, error)
@@ -737,6 +737,9 @@ func validateSchemaVersion(db *sql.DB, expectedVersion int) error {
 			struct{ table, col string }{"camoufox_tasks", "created_at"},
 			struct{ table, col string }{"camoufox_tasks", "updated_at"},
 		)
+	}
+	if expectedVersion >= 9 {
+		requiredCols = append(requiredCols, struct{ table, col string }{"hme_reserve_intents", "purpose"})
 	}
 	for _, rc := range requiredCols {
 		has, err := tableHasColumn(db, rc.table, rc.col)

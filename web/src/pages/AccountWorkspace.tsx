@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 api/client 的 request/ApiError, api/types 的各类实体, components 各通用 Dialog 与 ToastProvider, workspace 子组件组
- * [OUTPUT]: 对外提供 AccountWorkspace 单账号专属工作台总装容器
+ * [OUTPUT]: 对外提供 AccountWorkspace 单账号专属工作台总装容器，启停跨标签保持处理中状态并等待列表同步完成，复制反馈遵循实际结果
  * [POS]: web/src/pages 的核心页面总装器，按账号隔离异步请求与局部状态，URL 作为收件箱筛选真相源
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -15,6 +15,7 @@ import ConfirmDialog from '../components/ConfirmDialog'
 import CookieDialog from '../components/CookieDialog'
 import CreateAliasDialog from '../components/CreateAliasDialog'
 import EditAliasDialog from '../components/EditAliasDialog'
+import ICloudLoginDialog from '../components/ICloudLoginDialog'
 import MailboxDialog from '../components/MailboxDialog'
 import { useToast } from '../components/ToastProvider'
 import { IconAliases, IconInbox } from '../components/icons'
@@ -22,7 +23,6 @@ import { copyText } from '../utils/clipboard'
 import WorkspaceAliasesTab from './workspace/WorkspaceAliasesTab'
 import WorkspaceHeader from './workspace/WorkspaceHeader'
 import WorkspaceInboxTab from './workspace/WorkspaceInboxTab'
-import WorkspaceMetrics from './workspace/WorkspaceMetrics'
 
 export default function AccountWorkspace() {
   const { accountId } = useParams<{ accountId: string }>()
@@ -39,6 +39,7 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
   const [accountLoading, setAccountLoading] = useState(true)
   const [aliasLoading, setAliasLoading] = useState(true)
   const [quickCreating, setQuickCreating] = useState(false)
+  const [togglingAliasId, setTogglingAliasId] = useState<string | null>(null)
 
   // 跨账号竞态保护与请求取消
   const workspaceGenRef = useRef(0)
@@ -50,6 +51,7 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
   const selectedAliasForInbox = searchParams.get('alias') || ''
 
   // 弹窗状态
+  const [loginOpen, setLoginOpen] = useState(false)
   const [cookieOpen, setCookieOpen] = useState(false)
   const [mailboxOpen, setMailboxOpen] = useState(false)
   const [createAliasOpen, setCreateAliasOpen] = useState(false)
@@ -209,7 +211,8 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
   }
 
   async function handleToggleAlias(item: Alias) {
-    if (!accountId) return
+    if (!accountId || togglingAliasId) return
+    setTogglingAliasId(item.anonymousId)
     try {
       const path = item.active
         ? `/api/aliases/${encodeURIComponent(item.anonymousId)}/deactivate`
@@ -220,9 +223,11 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
       })
       show(item.active ? '别名已停用' : '别名已重新启用')
       invalidateAccounts(accountId)
-      void loadAccountData()
+      await loadAccountData()
     } catch (err) {
       show(err instanceof ApiError ? err.message : '操作失败')
+    } finally {
+      setTogglingAliasId(null)
     }
   }
 
@@ -271,28 +276,23 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
 
   return (
     <div className="page-container">
-      {/* 顶部指标矩阵 */}
-      <WorkspaceMetrics
+      {/* 顶部一体化旗舰工作台卡片 */}
+      <WorkspaceHeader
         account={account}
         aliases={aliases}
         activeAliasCount={activeAliasCount}
-      />
-
-      {/* 顶部账号卡片与快捷操作 */}
-      <WorkspaceHeader
-        account={account}
         quickCreating={quickCreating}
         aliasLoading={aliasLoading}
         onQuickCreate={() => void handleQuickCreate()}
         onCreateCustom={() => setCreateAliasOpen(true)}
         onSync={() => void loadAccountData(true)}
+        onOpenLogin={() => setLoginOpen(true)}
         onOpenCookie={() => setCookieOpen(true)}
         onOpenMailbox={() => setMailboxOpen(true)}
-        onCopyAccount={(mail) => {
-          if (mail) {
-            copyText(mail)
-            show(`已复制账号邮箱: ${mail}`)
-          }
+        onCopyAccount={async (mail) => {
+          const ok = await copyText(mail)
+          show(ok ? `已复制账号邮箱: ${mail}` : '复制失败，请手动复制账号邮箱')
+          return ok
         }}
       />
 
@@ -328,10 +328,6 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
             )}
           </button>
         </div>
-
-        <div className="workspace-nav-status">
-          <span>共管理 <b>{aliases.length || account?.alias_total || 0}</b> 个隐私别名</span>
-        </div>
       </div>
 
       {/* 别名管理 Tab 视图 */}
@@ -341,10 +337,11 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
           aliasLoading={aliasLoading}
           totalAliasCount={aliases.length || account?.alias_total || 0}
           activeAliasCount={activeAliasCount}
+          togglingAliasId={togglingAliasId}
           selectedIds={selectedIds}
           setSelectedIds={setSelectedIds}
           onEditAlias={(item) => setEditingAlias(item)}
-          onToggleAlias={(item) => void handleToggleAlias(item)}
+          onToggleAlias={handleToggleAlias}
           onDeleteAlias={(item) => setConfirmDeleteAlias(item)}
           onReadMail={(email) => {
             searchParams.set('tab', 'inbox')
@@ -434,6 +431,21 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
                 )
                 setEditingAlias(null)
                 show('别名备注已更新')
+              }}
+            />
+          )}
+          {loginOpen && (
+            <ICloudLoginDialog
+              open={true}
+              accountId={account.id}
+              accountEmail={account.icloud_email || account.real_email}
+              accountName={account.name}
+              onClose={() => setLoginOpen(false)}
+              onSaved={() => {
+                setLoginOpen(false)
+                show('iCloud 登录成功，会话凭据已更新')
+                invalidateAccounts(account.id)
+                void loadAccountData(true)
               }}
             />
           )}

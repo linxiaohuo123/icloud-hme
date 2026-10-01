@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 api/types 的 FullMessage, components 下 Dialog 与 icons (IconCheck, IconCopy, IconKey, IconExternalLink), utils 下 clipboard/sniffer (extractOTP, buildSniffContext, parseSenderInfo)/date
- * [OUTPUT]: 对外提供 MailDetailDialog 统一邮件详情弹窗组件 (发件人/别名/时间/多模式正文清洗；OTP 与激活链接嗅探展示)
+ * [OUTPUT]: 对外提供 MailDetailDialog 统一邮件详情弹窗组件 (发件人/别名/时间/多模式正文清洗；OTP 与激活链接嗅探展示；按真实复制结果反馈)
  * [POS]: web/src/components/inbox 的详情展示层，供工作台 Tab 与全局收件箱双入口消费
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -48,19 +48,19 @@ export default function MailDetailDialog({
 
   async function handleCopyCode(otp: string) {
     const ok = await copyText(otp)
-    setCopiedCode(true)
-    setTimeout(() => setCopiedCode(false), 1600)
+    setCopiedCode(ok)
+    if (ok) setTimeout(() => setCopiedCode(false), 1600)
     if (onCopySuccess) {
-      onCopySuccess(ok ? `验证码 [${otp}] 已复制` : `验证码：${otp}`)
+      onCopySuccess(ok ? `验证码 [${otp}] 已复制` : `复制失败，请手动复制验证码：${otp}`)
     }
   }
 
   async function handleCopyAlias(aliasText: string) {
-    await copyText(aliasText)
-    setCopiedAlias(true)
-    setTimeout(() => setCopiedAlias(false), 1600)
+    const ok = await copyText(aliasText)
+    setCopiedAlias(ok)
+    if (ok) setTimeout(() => setCopiedAlias(false), 1600)
     if (onCopySuccess) {
-      onCopySuccess(`别名 [${aliasText}] 已复制`)
+      onCopySuccess(ok ? `别名 [${aliasText}] 已复制` : '复制失败，请手动复制收件别名')
     }
   }
 

@@ -166,6 +166,32 @@ body {
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+/* 全局精致平滑细滚动条规范（替代 Windows 粗笨大灰块与小三角箭头） */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-tertiary);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-strong) transparent;
 }
 
 /* 可见 focus ring */
@@ -778,8 +804,12 @@ td .cell-secondary {
 .btn-action-primary {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
-  padding: 5px 10px;
+  height: 28px;
+  min-width: 106px;
+  padding: 0 8px;
+  box-sizing: border-box;
   border-radius: var(--radius-sm);
   background: var(--color-primary-soft);
   color: var(--color-primary);
@@ -798,6 +828,10 @@ td .cell-secondary {
   box-shadow: var(--shadow-sm);
 }
 
+.btn-action-primary:active {
+  transform: scale(0.98);
+}
+
 .btn-action-primary:hover .alias-count-pill {
   background: rgba(255, 255, 255, 0.25);
   color: #ffffff;
@@ -807,14 +841,16 @@ td .cell-secondary {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 18px;
+  min-width: 26px;
   height: 18px;
   padding: 0 4px;
+  box-sizing: border-box;
   border-radius: 999px;
   background: color-mix(in srgb, var(--color-primary) 18%, transparent);
   color: var(--color-primary);
   font-size: 11px;
   font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
   font-weight: 700;
   transition: all var(--dur-fast) var(--ease-out);
 }
@@ -1873,7 +1909,7 @@ a.inbox-link-pill:hover {
   height: 100vh;
   position: sticky;
   top: 0;
-  overflow-y: auto;
+  overflow: hidden;
   z-index: 100;
   user-select: none;
 }
@@ -1923,10 +1959,27 @@ a.inbox-link-pill:hover {
 
 .sidebar-nav {
   flex: 1;
+  min-height: 0;
   padding: 14px 10px;
   display: flex;
   flex-direction: column;
   gap: 3px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+}
+
+.sidebar-nav::-webkit-scrollbar {
+  width: 4px;
+}
+
+.sidebar-nav::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 4px;
+}
+
+.sidebar-nav:hover::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
 }
 
 .sidebar-section-header {
@@ -2011,8 +2064,9 @@ a.inbox-link-pill:hover {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  max-height: calc(100vh - 440px);
+  max-height: calc(100vh - 430px);
   overflow-y: auto;
+  scrollbar-width: thin;
 }
 
 .sidebar-account-item {
@@ -2036,7 +2090,6 @@ a.inbox-link-pill:hover {
   background: var(--color-primary-soft);
   color: var(--color-primary);
   font-weight: 600;
-  border-left: 3px solid var(--color-primary);
 }
 
 .account-dot {
@@ -2057,17 +2110,19 @@ a.inbox-link-pill:hover {
 .account-count {
   font-size: 11px;
   font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
   background: var(--color-bg);
   color: var(--color-text-tertiary);
   padding: 1px 6px;
   border-radius: 10px;
   border: 1px solid var(--color-border);
+  transition: all var(--dur-fast) var(--ease-out);
 }
 
 .sidebar-account-item.active .account-count {
-  background: var(--color-primary);
-  border-color: var(--color-primary);
-  color: #ffffff;
+  background: color-mix(in srgb, var(--color-primary) 15%, transparent);
+  border-color: color-mix(in srgb, var(--color-primary) 25%, transparent);
+  color: var(--color-primary);
 }
 
 .sidebar-empty-accounts {
@@ -2133,8 +2188,6 @@ a.inbox-link-pill:hover {
   flex: 1;
   min-width: 0;
   padding: 20px 28px;
-  overflow-y: auto;
-  max-height: 100vh;
 }
 
 .page-container {
@@ -5050,4 +5103,753 @@ button.btn-row-action:hover:not(:disabled) {
   white-space: nowrap;
   display: inline-block;
   vertical-align: middle;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   一体化旗舰工作台卡片 & 极致美学切号器 (Workspace Hero Card & Switcher)
+   设计语言：Apple / Linear 工业级极简中台 · 统一流体卡片 · 零碎片感
+   ────────────────────────────────────────────────────────────────────────── */
+
+/* ─── 现代工作台主控卡片 (Linear/Apple 风格紧凑 Command Header) ─── */
+.workspace-hero-card {
+  position: relative;
+  background: var(--color-bg-raised);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-xs);
+  padding: 14px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 16px;
+  transition: border-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out);
+}
+
+.workspace-hero-card:hover {
+  border-color: var(--color-border-strong);
+}
+
+/* 顶部主行：身份与操作 */
+.workspace-hero-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.workspace-hero-identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.workspace-hero-avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--color-primary) 12%, transparent);
+  color: var(--color-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border: 1px solid color-mix(in srgb, var(--color-primary) 20%, transparent);
+}
+
+.workspace-hero-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+/* ── 顶栏专属状态指示器：彻底移除粗糙绿底绿框，回归顶级无框呼吸光斑态 (Linear / Vercel 级极简) ── */
+.workspace-hero-info .status-pill {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  padding: 0 2px;
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: 500;
+  gap: 6px;
+  color: var(--color-text-secondary);
+}
+
+.workspace-hero-info .status-pill.active {
+  color: var(--color-text-secondary);
+}
+
+.workspace-hero-info .status-pill.pending {
+  color: var(--color-warning);
+}
+
+.workspace-hero-info .status-pill.error {
+  color: var(--color-danger);
+}
+
+.workspace-hero-info .status-pill .status-dot {
+  width: 7px;
+  height: 7px;
+}
+
+
+/* ── 标题与切号器触发器 (自然无缝融入标题) ── */
+.hero-account-switcher {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.hero-switcher-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: unset;
+  background: transparent;
+  border: 1px solid transparent !important;
+  box-shadow: none !important;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm, 6px);
+  cursor: pointer;
+  text-align: left;
+  transition: all var(--dur-fast) var(--ease-out);
+}
+
+button.hero-switcher-trigger:hover,
+.hero-switcher-trigger:hover {
+  background: var(--color-bg-hover) !important;
+  border-color: transparent !important;
+}
+
+button.hero-switcher-trigger.is-active,
+.hero-switcher-trigger.is-active {
+  background: color-mix(in srgb, var(--color-primary) 8%, var(--color-bg-raised)) !important;
+  border-color: color-mix(in srgb, var(--color-primary) 20%, transparent) !important;
+}
+
+.hero-switcher-trigger .workspace-name {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--color-text);
+  margin: 0;
+  letter-spacing: -0.015em;
+  line-height: 1.25;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hero-switcher-trigger.is-active .workspace-name {
+  color: var(--color-primary);
+}
+
+.hero-switcher-chevron {
+  color: var(--color-text-tertiary);
+  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), color var(--dur-fast) var(--ease-out);
+}
+
+.hero-switcher-trigger:hover .hero-switcher-chevron,
+.hero-switcher-trigger.is-active .hero-switcher-chevron {
+  color: var(--color-primary);
+}
+
+.hero-switcher-chevron.is-open {
+  transform: rotate(180deg);
+}
+
+/* ── 账号真实邮箱纯粹内联按钮 (极简纯粹无框，彻底禁绝文本误选、下划线与大绿框) ── */
+.hero-email-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: unset;
+  padding: 2px 6px;
+  background: transparent;
+  border: none !important;
+  box-shadow: none !important;
+  outline: none;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 4px;
+  user-select: none !important;
+  -webkit-user-select: none !important;
+  transition: background var(--dur-fast, 150ms) var(--ease-out), color var(--dur-fast, 150ms) var(--ease-out);
+  box-sizing: border-box;
+}
+
+.hero-email-btn,
+.hero-email-btn * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
+button.hero-email-btn:hover,
+.hero-email-btn:hover {
+  background: var(--color-bg-hover) !important;
+}
+
+.hero-email-btn:active {
+  transform: scale(0.98);
+}
+
+.hero-email-btn:focus-visible {
+  outline: 2px solid var(--color-primary-soft-border);
+}
+
+.hero-email-btn .hero-email-text {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: -0.01em;
+  color: var(--color-text-secondary);
+  line-height: 1.2;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: color var(--dur-fast, 150ms) var(--ease-out);
+}
+
+.hero-email-btn:hover .hero-email-text {
+  color: var(--color-text);
+}
+
+.hero-email-btn .hero-email-copy-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-tertiary);
+  opacity: 0.6;
+  flex-shrink: 0;
+  transition: opacity var(--dur-fast, 150ms) var(--ease-out), color var(--dur-fast, 150ms) var(--ease-out);
+}
+
+.hero-email-btn:hover .hero-email-copy-icon {
+  opacity: 1;
+  color: var(--color-text);
+}
+
+/* 复制成功态：保持邮箱文字中性优雅颜色完全不变，仅图标微变绿勾勾 */
+.hero-email-btn.is-copied .hero-email-copy-icon {
+  opacity: 1;
+  color: var(--color-success);
+}
+
+
+
+
+/* ── 极致现代切号器下拉面板 (Linear / Apple 级高质感浮层) ── */
+.hero-switcher-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  width: 310px;
+  max-width: 92vw;
+  background: var(--color-bg-raised, #ffffff);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  box-shadow: 0 16px 36px -4px rgba(0, 0, 0, 0.12), 0 4px 12px -2px rgba(0, 0, 0, 0.05);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  padding: 5px;
+  animation: fadeInDown 140ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.hero-switcher-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 4px;
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: 7px;
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+
+.hero-switcher-search:focus-within {
+  border-color: var(--color-border-strong);
+  background: var(--color-bg-raised);
+}
+
+.hero-switcher-search-icon {
+  color: var(--color-text-tertiary);
+  flex-shrink: 0;
+}
+
+.hero-switcher-input {
+  flex: 1;
+  min-height: 0 !important;
+  height: 22px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border: none !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  outline: none !important;
+  font-size: 12.5px !important;
+  color: var(--color-text);
+  line-height: 22px;
+}
+
+.hero-switcher-input:focus {
+  border: none !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.hero-switcher-input::placeholder {
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+}
+
+.hero-switcher-list {
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 1px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.hero-switcher-empty {
+  padding: 20px 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+
+.hero-switcher-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-height: unset;
+  padding: 7px 9px;
+  border-radius: 6px;
+  background: transparent;
+  border: 1px solid transparent !important;
+  box-shadow: none !important;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  transition: background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+
+button.hero-switcher-option:hover,
+button.hero-switcher-option.is-keyboard-active,
+.hero-switcher-option:hover,
+.hero-switcher-option.is-keyboard-active {
+  background: var(--color-bg-hover) !important;
+  border-color: transparent !important;
+  outline: none !important;
+}
+
+button.hero-switcher-option:hover .hero-switcher-option-name,
+button.hero-switcher-option.is-keyboard-active .hero-switcher-option-name,
+.hero-switcher-option:hover .hero-switcher-option-name,
+.hero-switcher-option.is-keyboard-active .hero-switcher-option-name {
+  color: var(--color-text);
+}
+
+button.hero-switcher-option:hover .hero-switcher-option-email,
+button.hero-switcher-option.is-keyboard-active .hero-switcher-option-email,
+.hero-switcher-option:hover .hero-switcher-option-email,
+.hero-switcher-option.is-keyboard-active .hero-switcher-option-email {
+  color: var(--color-text-secondary);
+}
+
+button.hero-switcher-option:hover .hero-switcher-count,
+button.hero-switcher-option.is-keyboard-active .hero-switcher-count,
+.hero-switcher-option:hover .hero-switcher-count,
+.hero-switcher-option.is-keyboard-active .hero-switcher-count {
+  background: var(--color-bg-raised);
+  border-color: var(--color-border-strong);
+}
+
+button.hero-switcher-option:active,
+.hero-switcher-option:active {
+  transform: scale(0.99);
+}
+
+/* 选中态：极度优雅克制，微透底色，绝非刺眼大蓝块或边框小卡片 */
+button.hero-switcher-option.is-selected,
+.hero-switcher-option.is-selected {
+  background: color-mix(in srgb, var(--color-primary) 8%, var(--color-bg-raised)) !important;
+  border-color: color-mix(in srgb, var(--color-primary) 18%, transparent) !important;
+}
+
+button.hero-switcher-option.is-selected:hover,
+button.hero-switcher-option.is-selected.is-keyboard-active,
+.hero-switcher-option.is-selected:hover,
+.hero-switcher-option.is-selected.is-keyboard-active {
+  background: color-mix(in srgb, var(--color-primary) 14%, var(--color-bg-raised)) !important;
+  border-color: color-mix(in srgb, var(--color-primary) 28%, transparent) !important;
+}
+
+/* 状态灯精确对齐第一行标题文字 */
+.hero-switcher-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-top: 6px;
+}
+
+.hero-switcher-dot.is-success {
+  background-color: var(--color-success);
+}
+.hero-switcher-dot.is-warning {
+  background-color: var(--color-warning);
+}
+.hero-switcher-dot.is-danger {
+  background-color: var(--color-danger);
+}
+
+.hero-switcher-option-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.hero-switcher-option-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.35;
+}
+
+.hero-switcher-option.is-selected .hero-switcher-option-name {
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+.hero-switcher-option-email {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.25;
+}
+
+.hero-switcher-option-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.hero-switcher-count {
+  font-size: 10.5px;
+  color: var(--color-text-tertiary);
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+  padding: 1px 6px;
+  border-radius: 10px;
+  line-height: 1.2;
+}
+
+.hero-switcher-check-slot {
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.hero-switcher-check {
+  color: var(--color-primary);
+}
+
+.hero-switcher-footer {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--color-border);
+}
+
+.hero-switcher-footer-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: unset;
+  padding: 7px 10px;
+  border-radius: 7px;
+  background: transparent;
+  border: none !important;
+  box-shadow: none !important;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease-out);
+}
+
+button.hero-switcher-footer-btn:hover,
+.hero-switcher-footer-btn:hover {
+  background: var(--color-bg-hover) !important;
+  color: var(--color-primary) !important;
+}
+
+
+/* ── 底部精炼指标与遥测看板条（两端对齐，彻底消除荒芜空白） ── */
+.workspace-hero-substrip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--color-border) 60%, transparent);
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.hero-inline-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.hero-inline-stat .stat-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-tertiary);
+}
+
+.hero-inline-stat .stat-value {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.hero-inline-stat .stat-sub {
+  font-size: 11.5px;
+  color: var(--color-text-tertiary);
+}
+
+.hero-inline-stat .stat-tag {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+}
+
+.hero-quota-track {
+  width: 100px;
+  height: 5px;
+  background: color-mix(in srgb, var(--color-text-tertiary) 20%, transparent);
+  border-radius: 9999px;
+  overflow: hidden;
+  margin: 0 4px;
+}
+
+.hero-quota-bar {
+  height: 100%;
+  background: var(--color-primary);
+  border-radius: 9999px;
+  transition: width 0.3s ease;
+}
+
+.hero-quota-bar.is-warning { background: var(--color-warning); }
+.hero-quota-bar.is-danger { background: var(--color-danger); }
+
+/* 右侧收件箱可交互轻量微链接 */
+.workspace-hero-meta-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11.5px;
+}
+
+.hero-meta-clickable-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: transparent;
+  border: none;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 11.5px;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease-out);
+}
+
+.hero-meta-clickable-link:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+}
+
+.hero-meta-clickable-link.text-muted {
+  color: var(--color-text-tertiary);
+  opacity: 0.8;
+}
+
+.hero-meta-clickable-link.text-muted:hover {
+  opacity: 1;
+}
+
+/* ── 右侧动作按钮栏与逻辑分组 ── */
+.workspace-hero-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.hero-actions-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 运维组轻量化，降低视觉噪音，让出号成为绝对焦点 */
+.hero-actions-group.is-subtle .btn {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--color-border) 80%, transparent);
+  color: var(--color-text-secondary);
+}
+
+.hero-actions-group.is-subtle .btn:hover {
+  background: var(--color-bg-hover);
+  border-color: var(--color-border-strong);
+  color: var(--color-text);
+}
+
+.hero-actions-divider {
+  width: 1px;
+  height: 18px;
+  background: var(--color-border);
+  margin: 0 4px;
+  flex-shrink: 0;
+}
+
+.workspace-hero-actions .btn {
+  height: 32px;
+  padding: 0 12px;
+  font-size: 12.5px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+}
+
+
+/* ── 条件式告警横幅 ── */
+.workspace-hero-alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  background: color-mix(in srgb, var(--color-warning) 10%, var(--color-bg-raised));
+  border: 1px solid color-mix(in srgb, var(--color-warning) 25%, transparent);
+  border-radius: 8px;
+  font-size: 12.5px;
+  color: var(--color-text);
+  animation: fadeInDown 140ms ease-out;
+}
+
+.hero-alert-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ── 侧边栏全部账号入口 (优雅无缝设计，杜绝虚线) ── */
+.sidebar-accounts-footer-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  margin: 6px 4px 2px;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  text-decoration: none;
+  font-size: 12.5px;
+  font-weight: 500;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  transition: all var(--dur-fast) var(--ease-out);
+}
+
+.sidebar-accounts-footer-link:hover {
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+  border-color: var(--color-primary-soft-border);
+}
+
+.account-dot-success { background-color: var(--color-success); }
+.account-dot-warning { background-color: var(--color-warning); }
+.account-dot-danger { background-color: var(--color-danger); }
+
+/* ─── 切号器与搜索微交互增强 (UI/UX Pro Max) ─── */
+.hero-switcher-clear-btn {
+  background: transparent;
+  min-height: unset;
+  border: none !important;
+  box-shadow: none !important;
+  color: var(--color-text-tertiary);
+  padding: 3px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  transition: all var(--dur-fast) var(--ease-out);
+}
+
+button.hero-switcher-clear-btn:hover,
+.hero-switcher-clear-btn:hover {
+  color: var(--color-text) !important;
+  background: var(--color-bg-hover) !important;
+}
+
+
+.filter-search-clear {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  color: var(--color-text-tertiary);
+  padding: 3px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  transition: all var(--dur-fast) var(--ease-out);
+}
+
+.filter-search-clear:hover {
+  color: var(--color-text);
+  background: var(--color-bg-subtle);
+}
+
+.filter-search input {
+  padding-right: 28px !important;
+}
+
+.workspace-chip.is-copied {
+  background: var(--color-success-soft) !important;
+  border-color: color-mix(in srgb, var(--color-success) 35%, transparent) !important;
 }

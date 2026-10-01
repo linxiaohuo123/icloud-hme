@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/account, internal/auth, internal/mail, internal/webui
  * [OUTPUT]: 对外提供 Server 结构体, New, Run, Handler
- * [POS]: internal/server 的主入口与路由注册中心 (PR-07 §10.4)，统一管理 API 与 WebUI 路由，提供优雅停机生命周期闭环
+ * [POS]: internal/server 的主入口，统一 API 与 WebUI，事务化完成补货入库，停机等待超时后仍持续清理并支持再次等待
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -86,7 +86,9 @@ type Server struct {
 	autoSyncWg      sync.WaitGroup     // 跟踪启动预热任务收敛 (PR-05 F10)
 	ctx             context.Context    // 【BUG-11】停机信号,由 Close() 触发 cancel
 	cancel          context.CancelFunc // 【BUG-11】停机信号取消函数
-	closeOnce       sync.Once          // 优雅停机幂等保证 (PR-07 §10.4)
+	closeOnce       sync.Once          // Start cleanup once; callers wait with independent budgets.
+	closeDone       chan struct{}
+	closeErr        error // Published by closing closeDone.
 }
 
 // New 创建 Server。mgr 为账号管理器,st 为持久化存储(可为 nil),cfg 为安全配置。
@@ -180,23 +182,22 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 	}
 	// 调度器在 Server 组装完成后注入，语义闭环为可用库存补货 (PR-06 §9.4, Issue 10, PR-05 F10)
 	s.scheduler = scheduler.NewScheduler(st, func(ctx context.Context, accountID, label string) (*hme.CreateResult, error) {
-		res, err := be.CreateAliasContext(ctx, accountID, label)
+		res, err := be.CreateAliasForReplenishmentContext(ctx, accountID, label)
 		if err == nil && res != nil {
 			syncWorker.RegisterAliasAccount(res.Email, accountID)
-			// 补货只做：AddInventoryAlias(source_type='replenish', allocation_state='available')
+			// Commit replenishment inventory, routing and intent completion together.
 			// 严禁在补货时创建 consumer allocation / lease，确保普通出号能原子认领
 			if st != nil {
-				if addErr := st.AddInventoryAlias(accountID, hme.Alias{
+				if addErr := st.AddReplenishedInventoryAlias(ctx, accountID, hme.Alias{
 					Email:       res.Email,
 					AnonymousID: res.AnonymousID,
 					Label:       res.Label,
 					CreatedAt:   res.CreatedAt,
 					Active:      true,
-				}, "replenish", true); addErr != nil {
+				}); addErr != nil {
 					log.Printf("[Scheduler] 补货入库失败 email=%s: %v", res.Email, addErr)
 					return nil, fmt.Errorf("补货入库持久化失败 email=%s: %w", res.Email, addErr)
 				}
-				_ = st.UpsertAliasRoutes(accountID, []string{res.Email})
 			}
 		}
 		return res, err
@@ -404,19 +405,20 @@ func (s *Server) autoSyncAccounts() {
 
 // CloseContext 停止后台工作引擎，严格遵守优雅停机生命周期顺序与单一预算约束 (PR-05 F10):
 //  1. 发送上下文取消信号 (停止接纳新工作与预热请求)
-//  2. 并发通知并等待各后台 worker 收敛 (受到传入 ctx 统一预算限制)
+//  2. 并发通知后台 worker 退出；ctx 只限制当前调用的等待预算，清理持续执行
 //  3. 只有在 worker 全部平稳收敛后，才依次关闭底层客户端连接池与持久化数据库 (Store)
 //     若超时未完成，严禁提前关闭 Store，避免在途 goroutine 访问已关闭 DB 造成 panic 或数据破坏。
-func (s *Server) CloseContext(ctx context.Context) (err error) {
+func (s *Server) CloseContext(ctx context.Context) error {
 	s.closeOnce.Do(func() {
+		s.closeDone = make(chan struct{})
 		// 1. 停止接收新工作，通知所有引用 s.ctx 的后台 goroutine 立即取消
 		if s.cancel != nil {
 			s.cancel()
 		}
 
 		// 2. 并发停止各 worker 并等待它们退出
-		workersDone := make(chan struct{})
 		go func() {
+			defer close(s.closeDone)
 			var wg sync.WaitGroup
 
 			// Scheduler 调度器
@@ -424,7 +426,7 @@ func (s *Server) CloseContext(ctx context.Context) (err error) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					_ = s.scheduler.StopContext(ctx)
+					_ = s.scheduler.StopContext(context.Background())
 				}()
 			}
 
@@ -490,31 +492,27 @@ func (s *Server) CloseContext(ctx context.Context) (err error) {
 			}()
 
 			wg.Wait()
-			close(workersDone)
-		}()
-
-		select {
-		case <-workersDone:
-			// worker 全部平稳收敛
-		case <-ctx.Done():
-			log.Printf("[Server] 优雅停机等待后台 worker 收敛超时: %v (保留 Store 连接以防损坏)", ctx.Err())
-			err = ctx.Err()
-			return
-		}
-
-		// 3. 关闭底层客户端连接池
-		if closer, ok := s.be.(interface{ Close() }); ok {
-			closer.Close()
-		}
-
-		// 4. 最后关闭持久化存储
-		if s.store != nil {
-			if cerr := s.store.Close(); cerr != nil {
-				err = cerr
+			// Cleanup continues after a caller's wait budget expires. Store stays
+			// open until every worker exits; later callers observe the same result.
+			if closer, ok := s.be.(interface{ Close() }); ok {
+				closer.Close()
 			}
-		}
+			if s.store != nil {
+				s.closeErr = s.store.Close()
+			}
+		}()
 	})
-	return err
+	select {
+	case <-s.closeDone:
+		return s.closeErr
+	default:
+	}
+	select {
+	case <-s.closeDone:
+		return s.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Close 提供向后兼容的无上下文停机接口，默认使用 defaultShutdownTimeout (10s)。

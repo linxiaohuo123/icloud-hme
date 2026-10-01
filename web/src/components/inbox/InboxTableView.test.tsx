@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 @testing-library/react, vitest, msw, react-router-dom, components/inbox/InboxTableView
- * [OUTPUT]: 对外提供 InboxTableView 账号加载失败重试、跨账号并发防污染、详情缓存隔离、仅看未读与 WebMail 首屏 capability 防竞争及退避重试单元测试
+ * [OUTPUT]: 对外提供 InboxTableView 账号加载失败重试、跨账号并发防污染、详情缓存隔离与正文验证码同步、仅看未读与 WebMail 首屏 capability 防竞争及退避重试单元测试
  * [POS]: web/src/components/inbox 的单元测试防线
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -530,8 +530,9 @@ describe('InboxTableView WebMail 首屏 Capability 防竞争与退避重试 (PR-
 
     await waitFor(() => {
       expect(detailRequestCount).toBe(1)
-      expect(screen.getByText('576932')).toBeInTheDocument()
+      expect(within(screen.getByRole('dialog')).getByText('576932')).toBeInTheDocument()
     })
+    expect(within(screen.getByRole('table')).getByText('576932')).toBeInTheDocument()
 
     // 3. 关闭详情弹窗后，再次点击同一封邮件：直接命中缓存，detailRequestCount 保持为 1
     const dialog = screen.getByRole('dialog')

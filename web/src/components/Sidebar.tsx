@@ -5,7 +5,7 @@
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
-import { memo, useMemo, useRef, useState } from 'react'
+import { memo, useRef } from 'react'
 import { NavLink, useLocation, useNavigate } from 'react-router-dom'
 import type { AccountSummary } from '../api/types'
 import { useAuth } from '../auth/AuthProvider'
@@ -31,8 +31,6 @@ interface SidebarProps {
   onAddAccount?: () => void
 }
 
-const ITEM_HEIGHT = 36 // 每项固定行高
-
 const AccountItem = memo(function AccountItem({ acc, active }: { acc: AccountSummary; active: boolean }) {
   const dotColor =
     acc.status === 'active'
@@ -48,12 +46,11 @@ const AccountItem = memo(function AccountItem({ acc, active }: { acc: AccountSum
       to={`/workspace/${encodeURIComponent(acc.id)}`}
       className={`sidebar-account-item ${active ? 'active' : ''}`}
       title={`${acc.name || acc.real_email} (${acc.status}) - 活跃别名: ${activeCount} 个`}
-      style={{ height: `${ITEM_HEIGHT}px`, boxSizing: 'border-box' }}
     >
       <span className="account-dot" style={{ backgroundColor: dotColor }} />
       <span className="account-label">{acc.name || acc.real_email}</span>
       <span
-        className="account-count"
+        className="account-count font-mono"
         title={`活跃别名数: ${activeCount} 个 (总计 ${acc.alias_total ?? activeCount} 个)`}
       >
         {activeCount}
@@ -64,8 +61,6 @@ const AccountItem = memo(function AccountItem({ acc, active }: { acc: AccountSum
 
 export default function Sidebar({ onAddAccount }: SidebarProps) {
   const { accounts, loading, error } = useAccounts()
-  const [search, setSearch] = useState('')
-  const [scrollTop, setScrollTop] = useState(0)
   const listRef = useRef<HTMLDivElement>(null)
 
   const { logout } = useAuth()
@@ -73,29 +68,6 @@ export default function Sidebar({ onAddAccount }: SidebarProps) {
   const { theme, toggleTheme } = useTheme()
   const navigate = useNavigate()
   const location = useLocation()
-
-  // 搜索过滤
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase()
-    if (!q) return accounts
-    return accounts.filter(
-      (a) =>
-        (a.name && a.name.toLowerCase().includes(q)) ||
-        (a.real_email && a.real_email.toLowerCase().includes(q)) ||
-        (a.icloud_email && a.icloud_email.toLowerCase().includes(q)) ||
-        (a.id && a.id.toLowerCase().includes(q)),
-    )
-  }, [accounts, search])
-
-  // 虚拟滚动计算 (视口约维持 15-20 个 DOM 节点)
-  const totalHeight = filtered.length * ITEM_HEIGHT
-  const rawStartIndex = Math.max(0, Math.floor(scrollTop / ITEM_HEIGHT) - 3)
-  const visibleCount = 20
-  const maxStartIndex = Math.max(0, filtered.length - visibleCount)
-  const startIndex = Math.min(maxStartIndex, rawStartIndex)
-  const endIndex = Math.min(filtered.length, startIndex + visibleCount)
-  const visibleItems = filtered.slice(startIndex, endIndex)
-  const offsetY = startIndex * ITEM_HEIGHT
 
   async function handleLogout() {
     try {
@@ -180,74 +152,38 @@ export default function Sidebar({ onAddAccount }: SidebarProps) {
           </button>
         </div>
 
-        {accounts.length > 5 && (
-          <div style={{ padding: '0 8px 6px 8px' }}>
-            <input
-              type="text"
-              className="sidebar-search-input"
-              placeholder={`搜索 ${accounts.length} 个账号...`}
-              value={search}
-              onChange={(e) => {
-                setSearch(e.target.value)
-                if (listRef.current) listRef.current.scrollTop = 0
-                setScrollTop(0)
-              }}
-              style={{
-                width: '100%',
-                padding: '4px 8px',
-                fontSize: '12px',
-                borderRadius: '6px',
-                border: '1px solid var(--color-border)',
-                background: 'var(--color-bg)',
-                color: 'var(--color-text)',
-                boxSizing: 'border-box',
-                outline: 'none',
-              }}
-            />
-          </div>
-        )}
-
-        <div
-          className="sidebar-accounts-list"
-          ref={listRef}
-          onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
-        >
-          {filtered.length === 0 ? (
+        <div className="sidebar-accounts-list" ref={listRef}>
+          {accounts.length === 0 ? (
             <div className="sidebar-empty-accounts">
-              {loading ? '账号加载中…' : error ? '账号加载失败' : search ? '无匹配账号' : '暂无账号'}
+              {loading ? '账号加载中…' : error ? '账号加载失败' : '暂无账号'}
             </div>
-          ) : filtered.length <= 25 ? (
-            // 数量较少时直接渲染
-            filtered.map((acc) => (
+          ) : (
+            accounts.map((acc) => (
               <AccountItem
                 key={acc.id}
                 acc={acc}
-                active={location.pathname === `/workspace/${acc.id}`}
+                active={
+                  location.pathname === `/workspace/${encodeURIComponent(acc.id)}` ||
+                  location.pathname === `/workspace/${acc.id}`
+                }
               />
             ))
-          ) : (
-            // 千号规模时启用虚拟列表视口，仅保留 20 个 DOM 节点
-            <div style={{ height: `${totalHeight}px`, position: 'relative', width: '100%' }}>
-              <div
-                style={{
-                  position: 'absolute',
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  transform: `translateY(${offsetY}px)`,
-                }}
-              >
-                {visibleItems.map((acc) => (
-                  <AccountItem
-                    key={acc.id}
-                    acc={acc}
-                    active={location.pathname === `/workspace/${acc.id}`}
-                  />
-                ))}
-              </div>
-            </div>
           )}
         </div>
+
+        {accounts.length > 5 && (
+          <div className="sidebar-all-accounts-wrapper">
+            <NavLink
+              to="/accounts"
+              className="sidebar-accounts-footer-link"
+              title="前往账号管理页查看全部账号大盘"
+            >
+              <IconAccounts size={14} />
+              <span>全部账号大盘</span>
+              <span className="account-count font-mono" style={{ marginLeft: 'auto' }}>{accounts.length}</span>
+            </NavLink>
+          </div>
+        )}
       </nav>
 
       <div className="sidebar-footer">

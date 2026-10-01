@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 api/client (request, ApiError, getMessageDetail), api/types, components (AsyncState, ConfirmDialog, ToastProvider), hooks/useAccounts (fetchAccountsDeduped), utils (clipboard, date, mail, sniffer: buildSniffContext, extractOTPMemoized, parseSenderInfo), ./InboxFilterBar, ./InboxTableRow, ./MailDetailDialog
  * [OUTPUT]: 对外提供 InboxTableView 收件箱表格与筛选核心组件；支持账号加载失败后重试、仅看明确未读、externalAliases 直传消灭冗余 I/O、fetchAccountsDeduped 全局缓存共享、INBOX First 首屏优先加载、/api/mailboxes 交互式按需懒加载 (带 pending 队列与 IMAP 避让)、模块级缓存防 Tab 切换重载、Body-on-demand 按需加载单封正文 (零首屏批量正文 I/O)
- * [POS]: web/src/components/inbox 的核心视图容器，统一单账号工作台与全局收件箱大盘的数据流与交互
+ * [POS]: web/src/components/inbox 的核心视图容器，同步 URL 与账号能力，按需正文合入列表驱动 OTP 更新，隔离旧请求和旧降级状态
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -27,6 +27,7 @@ export interface InboxTableViewProps {
   accountSummary?: AccountSummary | null
   fixedAccount?: boolean
   initialAlias?: string
+  onSelectAlias?: (value: string) => void
   externalAliases?: Alias[]
   onCopySuccess?: (msg: string) => void
   showPageHeader?: boolean
@@ -111,6 +112,11 @@ if (typeof window !== 'undefined') {
     moduleFolderCache.clear()
     moduleMessageCache.clear()
   })
+  // 模块缓存必须在页面卸载后仍响应账号配置更新。
+  window.addEventListener('account-updated', (event) => {
+    const accountId = (event as CustomEvent<{ accountId?: string }>).detail?.accountId
+    clearInboxSnapshotCache(accountId)
+  })
 }
 
 function getCachedFolders(accountId: string): MailboxFolder[] | null {
@@ -158,6 +164,7 @@ export default function InboxTableView({
   accountSummary,
   fixedAccount = false,
   initialAlias = '',
+  onSelectAlias,
   externalAliases,
   onCopySuccess,
   showPageHeader = false,
@@ -184,28 +191,30 @@ export default function InboxTableView({
     return initialAccountId ? getCachedFolders(initialAccountId) || [] : []
   })
 
-  const [alias, setAlias] = useState(initialAlias)
-  const [folder, setFolder] = useState('INBOX')
-  const [limit, setLimit] = useState(20)
-  const [days, setDays] = useState(7)
+  const [alias, setAlias] = useState(fixedAccount ? initialAlias : searchParams.get('alias') || initialAlias)
+  const [folder, setFolder] = useState(fixedAccount ? 'INBOX' : searchParams.get('folder') || 'INBOX')
+  const [limit, setLimit] = useState(fixedAccount ? 20 : Number(searchParams.get('limit')) || 20)
+  const [days, setDays] = useState(fixedAccount ? 7 : Number(searchParams.get('days')) || 7)
+  const initialURLQueryRef = useRef(searchParams.toString())
+  const appliedURLQueryRef = useRef<string | null>(null)
   const [autoRefreshInterval, setAutoRefreshInterval] = useState<number>(0)
   const [unreadOnly, setUnreadOnly] = useState(false)
 
-  // 记录通过 CAPABILITY_UNSUPPORTED 降级或静态推断为仅 WebMail 的账号集合
-  const [effectiveWebMailAccounts, setEffectiveWebMailAccounts] = useState<Record<string, boolean>>(() => {
-    if (initialAccountId && initialIsWebMail) {
-      return { [initialAccountId]: true }
-    }
-    return {}
-  })
+  // 仅记录服务器返回的降级结论，并绑定到当时的配置；静态能力直接从最新账号配置计算。
+  const [effectiveWebMailAccounts, setEffectiveWebMailAccounts] = useState<Record<string, string>>({})
   const unsupportedRetryRef = useRef<Record<string, number>>({})
 
-  const currentAccount = useMemo(() => accounts.find((a) => a.id === accountId) || (accountSummary?.id === accountId ? accountSummary : undefined), [accounts, accountId, accountSummary])
+  const currentAccount = useMemo(() => accountSummary?.id === accountId ? accountSummary : accounts.find((a) => a.id === accountId), [accounts, accountId, accountSummary])
+  const accountConfigKey = currentAccount ? JSON.stringify([
+    currentAccount.id, currentAccount.has_app_password, currentAccount.mailbox?.email,
+    currentAccount.mailbox?.imap_host, currentAccount.mailbox?.imap_port,
+    currentAccount.has_proxy, currentAccount.status, currentAccount.last_validated,
+  ]) : ''
   const isWebMailOnly = useMemo(() => {
-    if (effectiveWebMailAccounts[accountId]) return true
+    if (effectiveWebMailAccounts[accountId] === accountConfigKey) return true
     if (!currentAccount) return false
     return !currentAccount.has_app_password && !currentAccount.mailbox?.email
-  }, [currentAccount, effectiveWebMailAccounts, accountId])
+  }, [currentAccount, effectiveWebMailAccounts, accountId, accountConfigKey])
 
   // 客户端分页
   const [page, setPage] = useState(1)
@@ -272,7 +281,7 @@ export default function InboxTableView({
 
   // 监听外部 propAccountId 变更（工作台模式），严格杜绝跨账号预取与详情污染
   useEffect(() => {
-    if (propAccountId && propAccountId !== accountId) {
+    if (fixedAccount && propAccountId && propAccountId !== accountId) {
       accountGenRef.current += 1
       resetDetailState()
       abortRef.current?.abort()
@@ -285,14 +294,14 @@ export default function InboxTableView({
       setFolder('INBOX')
       setFolders(getCachedFolders(propAccountId) || [])
     }
-  }, [propAccountId, accountId, resetDetailState])
+  }, [fixedAccount, propAccountId, accountId, resetDetailState])
 
   // 监听外部 initialAlias 变更（工作台别名联动）
   useEffect(() => {
-    if (initialAlias !== undefined) {
+    if (fixedAccount && initialAlias !== undefined) {
       setAlias(initialAlias)
     }
-  }, [initialAlias])
+  }, [fixedAccount, initialAlias])
 
   const loadingRef = useRef(loading)
   useEffect(() => {
@@ -310,7 +319,6 @@ export default function InboxTableView({
       pendingFolderLoadRef.current = false
       isBusyRef.current = false
       messageCacheRef.current.clear()
-      clearInboxSnapshotCache()
       setLoading(false)
       setResult(null)
       setFolders([])
@@ -319,7 +327,22 @@ export default function InboxTableView({
     const handleAccountUpdated = (e: Event) => {
       const customEvent = e as CustomEvent<{ accountId?: string }>
       const targetId = customEvent.detail?.accountId
-      if (!targetId || targetId === accountId) {
+      setEffectiveWebMailAccounts((previous) => {
+        if (!targetId) return {}
+        if (!(targetId in previous)) return previous
+        const next = { ...previous }
+        delete next[targetId]
+        return next
+      })
+      if (targetId) delete unsupportedRetryRef.current[targetId]
+      else unsupportedRetryRef.current = {}
+
+      const reloadAccounts = !(fixedAccount && accountSummary)
+      if (reloadAccounts) {
+        hasAccountsLoadedRef.current = false
+        setAccountCapabilityReady(false)
+      }
+      if (!targetId || targetId === accountId || reloadAccounts) {
         accountGenRef.current += 1
         resetDetailState()
         abortRef.current?.abort()
@@ -328,9 +351,6 @@ export default function InboxTableView({
         pendingFolderLoadRef.current = false
         isBusyRef.current = false
         messageCacheRef.current.clear()
-        if (accountId) {
-          clearInboxSnapshotCache(accountId)
-        }
         setRetryKey((k) => k + 1)
       }
     }
@@ -341,23 +361,27 @@ export default function InboxTableView({
       window.removeEventListener('auth-logout', handleLogout)
       window.removeEventListener('account-updated', handleAccountUpdated)
     }
-  }, [accountId, resetDetailState])
+  }, [accountId, fixedAccount, accountSummary, resetDetailState])
 
   const prevAccountConfigRef = useRef('')
   useEffect(() => {
-    if (!accountSummary) return
-    const configSig = `${accountSummary.id}:${accountSummary.has_app_password}:${accountSummary.mailbox?.email || ''}:${accountSummary.mailbox?.imap_host || ''}:${accountSummary.has_proxy}:${accountSummary.status}:${accountSummary.last_validated}`
-    if (prevAccountConfigRef.current && prevAccountConfigRef.current !== configSig) {
+    if (!currentAccount) return
+    if (prevAccountConfigRef.current && prevAccountConfigRef.current !== accountConfigKey) {
       accountGenRef.current += 1
       resetDetailState()
       abortRef.current?.abort()
+      folderAbortRef.current?.abort()
+      folderLoadingAccountRef.current = null
+      pendingFolderLoadRef.current = false
+      setFolders([])
       isBusyRef.current = false
       messageCacheRef.current.clear()
-      clearInboxSnapshotCache(accountSummary.id)
+      clearInboxSnapshotCache(currentAccount.id)
+      unsupportedRetryRef.current[currentAccount.id] = 0
       setRetryKey((k) => k + 1)
     }
-    prevAccountConfigRef.current = configSig
-  }, [accountSummary, resetDetailState])
+    prevAccountConfigRef.current = accountConfigKey
+  }, [currentAccount, accountConfigKey, resetDetailState])
 
   // 自动刷新轮询定时器：页面在后台时暂停，在途请求未完成（包括后台 revalidate 与正文补全）时跳过打断
   useEffect(() => {
@@ -383,42 +407,16 @@ export default function InboxTableView({
     let cancelled = false
     setLoading(true)
     setError('')
-    fetchAccountsDeduped(retryKey > 0)
+    fetchAccountsDeduped()
       .then((data) => {
         if (cancelled) return
         hasAccountsLoadedRef.current = true
         setAccounts(data)
-        setAccountCapabilityReady(true)
         if (!fixedAccount) {
           const queryId = searchParams.get('account_id')
-          const valid = data.find((a) => a.id === queryId)
-          const target = valid ? valid.id : data[0]?.id ?? ''
-          setAccountId(target)
-          if (target) {
-            const next: Record<string, string> = { account_id: target }
-            const qAlias = searchParams.get('alias')
-            if (qAlias) {
-              setAlias(qAlias)
-              next.alias = qAlias
-            }
-            const qFolder = searchParams.get('folder')
-            if (qFolder) {
-              setFolder(qFolder)
-              next.folder = qFolder
-            }
-            const qLimit = searchParams.get('limit')
-            if (qLimit) {
-              setLimit(Number(qLimit) || 20)
-              next.limit = qLimit
-            }
-            const qDays = searchParams.get('days')
-            if (qDays) {
-              setDays(Number(qDays) || 7)
-              next.days = qDays
-            }
-            setSearchParams(next, { replace: true })
-          }
+          setAccountId(data.find((account) => account.id === queryId)?.id ?? data[0]?.id ?? '')
         }
+        setAccountCapabilityReady(true)
         if (data.length === 0 && !fixedAccount) {
           setLoading(false)
         }
@@ -431,7 +429,50 @@ export default function InboxTableView({
     return () => {
       cancelled = true
     }
-  }, [fixedAccount, accountSummary, retryKey, searchParams, setSearchParams])
+  }, [fixedAccount, accountSummary, retryKey, searchParams])
+
+  // URL 同步独立于账号列表初始化，覆盖同页导航、前进/后退与刷新。
+  useEffect(() => {
+    if (fixedAccount || !accountCapabilityReady || accounts.length === 0) return
+    const queryId = searchParams.get('account_id')
+    const target = accounts.find((account) => account.id === queryId)?.id ?? accounts[0].id
+    const nextAlias = searchParams.get('alias') || ''
+    const nextFolder = searchParams.get('folder') || 'INBOX'
+    const nextLimit = Number(searchParams.get('limit')) || 20
+    const nextDays = Number(searchParams.get('days')) || 7
+    const queryKey = JSON.stringify([target, nextAlias, nextFolder, nextLimit, nextDays])
+    // 补全默认账号不改变查询语义，不应覆盖用户刚编辑的筛选值。
+    if (queryKey !== appliedURLQueryRef.current) {
+      const syncFilters = appliedURLQueryRef.current !== null || searchParams.toString() !== initialURLQueryRef.current
+      appliedURLQueryRef.current = queryKey
+      if (target !== accountId) {
+        accountGenRef.current += 1
+        resetDetailState()
+        abortRef.current?.abort()
+        folderAbortRef.current?.abort()
+        folderLoadingAccountRef.current = null
+        pendingFolderLoadRef.current = false
+        messageCacheRef.current.clear()
+        unsupportedRetryRef.current[target] = 0
+        setAccountId(target)
+        setFolders(getCachedFolders(target) || [])
+        setResult(null)
+      }
+      // 首屏筛选已从 URL 初始化，账号加载期间的用户编辑应保留。
+      if (syncFilters) {
+        setAlias(nextAlias)
+        setFolder(nextFolder)
+        setLimit(nextLimit)
+        setDays(nextDays)
+      }
+      setPage(1)
+    }
+    if (target !== queryId) {
+      const next = new URLSearchParams(searchParams)
+      next.set('account_id', target)
+      setSearchParams(next, { replace: true })
+    }
+  }, [fixedAccount, accountCapabilityReady, accounts, accountId, searchParams, setSearchParams, resetDetailState])
 
   // 2. 账号变化时拉取别名列表 (若父级已直传 externalAliases 则直接复用，避免重复网络请求)
   useEffect(() => {
@@ -607,7 +648,7 @@ export default function InboxTableView({
           const retried = unsupportedRetryRef.current[accountId] || 0
           if (retried < 1) {
             unsupportedRetryRef.current[accountId] = retried + 1
-            setEffectiveWebMailAccounts((prev) => ({ ...prev, [accountId]: true }))
+            setEffectiveWebMailAccounts((prev) => ({ ...prev, [accountId]: accountConfigKey }))
             return
           }
         }
@@ -627,7 +668,7 @@ export default function InboxTableView({
       isBusyRef.current = false
       controller.abort()
     }
-  }, [accountId, accountCapabilityReady, isWebMailOnly, alias, folder, limit, days, retryKey, fixedAccount])
+  }, [accountId, accountCapabilityReady, accountConfigKey, isWebMailOnly, alias, folder, limit, days, retryKey, fixedAccount])
 
   // 查询提交
   function handleSearch() {
@@ -711,6 +752,17 @@ export default function InboxTableView({
         setModuleMessageCache(primaryKey, fullMsg)
         messageCacheRef.current.set(primaryKey, fullMsg)
       }
+      // 正文进入 React 列表状态，驱动当前行的预览与验证码重新计算。
+      setResult((previous) => {
+        if (!previous) return previous
+        let updated = false
+        const messages = previous.messages.map((summary) => {
+          if (buildMailCacheKey(accountId, summary) !== primaryKey) return summary
+          updated = true
+          return { ...summary, body: fullMsg.body, preview: fullMsg.preview || summary.preview }
+        })
+        return updated ? { ...previous, messages } : previous
+      })
       setDetail(fullMsg)
     } catch (err) {
       if (
@@ -759,21 +811,19 @@ export default function InboxTableView({
   const handleCopyCode = useCallback(async (code: string) => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current)
     const ok = await copyText(code)
-    setCopiedCode(code)
-    copiedTimerRef.current = setTimeout(() => {
-      setCopiedCode(null)
-    }, 1600)
-    const notifyMsg = ok ? `验证码 [${code}] 已复制` : `验证码：${code}`
+    setCopiedCode(ok ? code : null)
+    if (ok) copiedTimerRef.current = setTimeout(() => setCopiedCode(null), 1600)
+    const notifyMsg = ok ? `验证码 [${code}] 已复制` : `复制失败，请手动复制验证码：${code}`
     show(notifyMsg)
     if (onCopySuccess) onCopySuccess(notifyMsg)
   }, [show, onCopySuccess])
 
   const handleCopyAlias = useCallback(async (aliasText: string) => {
     if (copiedAliasTimerRef.current) clearTimeout(copiedAliasTimerRef.current)
-    await copyText(aliasText)
-    setCopiedAlias(aliasText)
-    copiedAliasTimerRef.current = setTimeout(() => setCopiedAlias(null), 1600)
-    const notifyMsg = `别名 [${aliasText}] 已复制`
+    const ok = await copyText(aliasText)
+    setCopiedAlias(ok ? aliasText : null)
+    if (ok) copiedAliasTimerRef.current = setTimeout(() => setCopiedAlias(null), 1600)
+    const notifyMsg = ok ? `别名 [${aliasText}] 已复制` : '复制失败，请手动复制收件别名'
     show(notifyMsg)
     if (onCopySuccess) onCopySuccess(notifyMsg)
   }, [show, onCopySuccess])
@@ -958,7 +1008,10 @@ export default function InboxTableView({
           onAccountChange={handleAccountChange}
           alias={alias}
           aliases={aliases}
-          onAliasChange={(val) => setAlias(val)}
+          onAliasChange={(val) => {
+            setAlias(val)
+            onSelectAlias?.(val)
+          }}
           folder={folder}
           folderOptions={folderOptions}
           onFolderChange={(val) => {

@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 components/inbox/InboxTableView, api/types 的 Alias
- * [OUTPUT]: 对外提供 WorkspaceInboxTab 单账号工作台收件箱视图
+ * [OUTPUT]: 对外提供 WorkspaceInboxTab 单账号工作台收件箱视图，双向同步父级 URL 别名筛选
  * [POS]: web/src/pages/workspace 的收件箱标签页，封装 InboxTableView 并将父级 aliases 直传消灭冗余 I/O
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -23,6 +23,7 @@ export default function WorkspaceInboxTab({
   accountSummary,
   aliases,
   selectedAlias,
+  onSelectAlias,
   onCopySuccess,
   onCountChange,
 }: WorkspaceInboxTabProps) {
@@ -32,6 +33,7 @@ export default function WorkspaceInboxTab({
       accountSummary={accountSummary}
       fixedAccount={true}
       initialAlias={selectedAlias}
+      onSelectAlias={onSelectAlias}
       externalAliases={aliases}
       onCopySuccess={onCopySuccess}
       onCountChange={onCountChange}

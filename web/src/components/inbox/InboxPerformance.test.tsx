@@ -1,3 +1,9 @@
+/**
+ * [INPUT]: 依赖 React Testing Library、Vitest、MSW 与 InboxTableView
+ * [OUTPUT]: 覆盖首屏请求预算、正文按需读取、缓存身份隔离、请求取消及详情和列表同步的回归测试
+ * [POS]: web/src/components/inbox 的网络请求与缓存生命周期验证
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
 import { describe, it, expect, beforeEach } from 'vitest'
 import { render, screen, waitFor, fireEvent, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
@@ -429,8 +435,9 @@ describe('Inbox Baseline Performance Measurements', () => {
 
     // 详情弹窗中展示 Junk 正文
     await waitFor(() => {
-      expect(screen.getByText('Malicious spam content')).toBeInTheDocument()
+      expect(within(screen.getByRole('dialog')).getByText('Malicious spam content')).toBeInTheDocument()
     })
+    expect(screen.getByRole('button', { name: 'Junk Spam Warning' }).closest('tr')).toHaveTextContent('Malicious spam content')
 
     // CRITICAL: The INBOX message must NEVER receive the Junk message body despite sharing UID 100
     const inboxRow = screen.getByText('Inbox Security Code').closest('tr')
@@ -686,8 +693,9 @@ describe('Inbox Baseline Performance Measurements', () => {
 
     // 详情弹窗中展示提取的验证码 884812
     await waitFor(() => {
-      expect(screen.getByText('884812')).toBeInTheDocument()
+      expect(within(screen.getByRole('dialog')).getByText('884812')).toBeInTheDocument()
     })
+    expect(within(screen.getByRole('table')).getByText('884812')).toBeInTheDocument()
     expect(detailFetched).toBe(1)
 
     // 再次点击：从缓存打开，detailFetched 仍为 1
@@ -1669,8 +1677,9 @@ describe('PR-MAIL-04: Body-on-demand & Single-message reading', () => {
     resolveDetail!()
 
     await waitFor(() => {
-      expect(screen.getByText('Full body of first mail')).toBeInTheDocument()
+      expect(within(screen.getByRole('dialog')).getByText('Full body of first mail')).toBeInTheDocument()
     })
+    expect(btn.closest('tr')).toHaveTextContent('Full body of first mail')
 
     unmount()
   })
@@ -1753,8 +1762,10 @@ describe('PR-MAIL-04: Body-on-demand & Single-message reading', () => {
 
     // 邮件 2 最终正常呈现
     await waitFor(() => {
-      expect(screen.getByText('Body for msg 2')).toBeInTheDocument()
+      expect(within(screen.getByRole('dialog')).getByText('Body for msg 2')).toBeInTheDocument()
     })
+    expect(screen.getByRole('button', { name: 'Second Mail Subject' }).closest('tr')).toHaveTextContent('Body for msg 2')
+    expect(screen.queryByText('Body for msg 1')).not.toBeInTheDocument()
 
     unmount()
   })
@@ -1823,7 +1834,7 @@ describe('PR-MAIL-04: Body-on-demand & Single-message reading', () => {
     // 0. 先打开并关闭 B，使 B 存入缓存
     fireEvent.click(screen.getByRole('button', { name: 'Second Mail Subject' }))
     await waitFor(() => {
-      expect(screen.getByText('CACHED_BODY_FOR_B')).toBeInTheDocument()
+      expect(within(screen.getByRole('dialog')).getByText('CACHED_BODY_FOR_B')).toBeInTheDocument()
     })
     const dialog = screen.getByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: '关闭' }))
@@ -1840,7 +1851,7 @@ describe('PR-MAIL-04: Body-on-demand & Single-message reading', () => {
     // 3. 断言 A 被立即 abort，且弹窗立即展示 B 的正文
     await waitFor(() => {
       expect(abortedMsg1).toBe(true)
-      expect(screen.getByText('CACHED_BODY_FOR_B')).toBeInTheDocument()
+      expect(within(screen.getByRole('dialog')).getByText('CACHED_BODY_FOR_B')).toBeInTheDocument()
     })
 
     // 4. 释放延迟的 A 响应，模拟晚到的 A 返回
@@ -1848,7 +1859,8 @@ describe('PR-MAIL-04: Body-on-demand & Single-message reading', () => {
     await new Promise((r) => setTimeout(r, 60))
 
     // 核心断言：晚到的 A 绝对不得覆盖当前已展示的 B
-    expect(screen.getByText('CACHED_BODY_FOR_B')).toBeInTheDocument()
+    expect(within(screen.getByRole('dialog')).getByText('CACHED_BODY_FOR_B')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Second Mail Subject' }).closest('tr')).toHaveTextContent('CACHED_BODY_FOR_B')
     expect(screen.queryByText('LATE_ARRIVING_BODY_A')).toBeNull()
 
     unmount()
@@ -1938,8 +1950,9 @@ describe('PR-MAIL-04: Body-on-demand & Single-message reading', () => {
 
     await waitFor(() => {
       expect(detailCalls).toBe(1)
-      expect(screen.getByText('CACHED_BODY_PREVIEW_SECRET_9988')).toBeInTheDocument()
+      expect(within(screen.getByRole('dialog')).getByText('CACHED_BODY_PREVIEW_SECRET_9988')).toBeInTheDocument()
     })
+    expect(screen.getByRole('button', { name: 'First Mail Subject' }).closest('tr')).toHaveTextContent('CACHED_BODY_PREVIEW_SECRET_9988')
 
     // 关闭详情
     const dialog = screen.getByRole('dialog')

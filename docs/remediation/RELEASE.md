@@ -1,5 +1,17 @@
 # icloud-hme 发布与运维部署指南 (RELEASE.md)
 
+## 2026-10-01 更新
+
+本轮包含桌面工作台与收件箱优化、键盘焦点和下拉菜单修复、复制失败反馈、通知配置读取失败时的保存保护，以及流水母号信息展示和搜索。
+
+后端修复通知网络错误泄露凭据、补货成功后库存写入失败无法恢复、Camoufox 登录请求断开遗留任务，以及停机超时后重试提前返回成功的问题。数据库升级到 v9，补货用途与库存完成引用支持幂等恢复；历史用途未知记录不自动转为可用库存。升级与回滚约束见 [MIGRATION.md](MIGRATION.md)。
+
+Nginx 范本新增登录路由 330 秒读取超时，并排除 access log 中的 query 和 Referer；已有部署需同步调整实际代理配置。源码构建要求 Node.js 22.22.2+（22.x）、24.15+（24.x）或 26+。
+
+本地 Go 测试和 vet、前端 lint/262 项测试/typecheck/build、Camoufox 22 项测试、Linux amd64 交叉编译和 Compose 配置解析均通过。npm 完整及生产依赖审计均为 0 个已知漏洞。实际容器、Nginx、Apple 和 IMAP 生产链路未验证，GitHub 推送不代表服务器已部署。完整证据见 [system-audit-2026-10-01.md](system-audit-2026-10-01.md)。
+
+服务器继续使用原有 `.env`、`data` 和 `ICLOUD_HME_MASTER_KEY`；升级前保留备份，更新后检查 Compose 服务、日志和 `/readyz`。
+
 ---
 
 ## 1. 核心架构变更与行为变化 (Breaking Changes)

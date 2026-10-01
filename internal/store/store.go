@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 database/sql, modernc.org/sqlite, os, path/filepath, sync, time, encoding/hex, crypto/rand
  * [OUTPUT]: 对外提供 Store 结构定义、NewStore、Close 引擎生命周期与 initSchema SQLite 数据库与 DDL 初始化
- * [POS]: internal/store 的核心存储引擎，维护 WAL 连接生命周期与事务化版本迁移，v7 持久化 Camoufox 任务元数据
+ * [POS]: internal/store 的核心引擎，维护 WAL 生命周期与事务化迁移，v7 持久化登录任务，v9 持久化补货用途
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -426,6 +426,23 @@ func (s *Store) initSchema(dbExistedBefore bool) error {
 			// open and silently discard the richer credential format.
 			if _, err := s.db.Exec(`PRAGMA user_version = 8;`); err != nil {
 				return fmt.Errorf("migrate v7 to v8 failed: %w", err)
+			}
+		case 8:
+			tx, err := s.db.Begin()
+			if err != nil {
+				return fmt.Errorf("begin migration v8 to v9: %w", err)
+			}
+			// Historical requests have unknown purposes and must remain isolated.
+			if err := ensureColumn(tx, "hme_reserve_intents", "purpose", "TEXT NOT NULL DEFAULT ''"); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migrate v8 to v9: %w", err)
+			}
+			if _, err := tx.Exec(`PRAGMA user_version = 9;`); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("set schema version 9: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit migration v8 to v9: %w", err)
 			}
 		default:
 			return fmt.Errorf("unsupported migration path from version %d", currentV)

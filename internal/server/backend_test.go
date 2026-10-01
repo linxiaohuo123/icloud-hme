@@ -186,6 +186,13 @@ func (f *fakeBackend) LoginAccount(id, password, otp string) (account.Summary, e
 
 func (f *fakeBackend) CancelCamoufoxLogin(string, string) (bool, error) { return false, nil }
 
+func (f *fakeBackend) LoginAccountContext(ctx context.Context, id, password, otp string) (account.Summary, error) {
+	if err := ctx.Err(); err != nil {
+		return account.Summary{}, err
+	}
+	return f.LoginAccount(id, password, otp)
+}
+
 func (f *fakeBackend) RemoveAccount(id string) bool {
 	f.removedID = id
 	return f.removedOK
@@ -218,6 +225,10 @@ func (f *fakeBackend) CreateAliasContext(ctx context.Context, accountID, label s
 }
 
 func (f *fakeBackend) CreateAliasForAllocationContext(ctx context.Context, accountID, label, _ string) (*hme.CreateResult, error) {
+	return f.CreateAliasContext(ctx, accountID, label)
+}
+
+func (f *fakeBackend) CreateAliasForReplenishmentContext(ctx context.Context, accountID, label string) (*hme.CreateResult, error) {
 	return f.CreateAliasContext(ctx, accountID, label)
 }
 

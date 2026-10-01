@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -224,7 +225,7 @@ func TestCamoufoxIncompleteSessionReportsActionableError(t *testing.T) {
 	be := &managerBackend{}
 	be.reserveCamoufoxTask("account-1", server.URL)
 	be.setCamoufoxTask("account-1", "task-1")
-	_, err := be.pollCamoufoxTask("account-1", "task-1", server.URL, time.Second, false)
+	_, err := be.pollCamoufoxTask(context.Background(), "account-1", "task-1", server.URL, time.Second, false)
 	backendErr, ok := err.(*BackendError)
 	if !ok || backendErr.Code != "APPLE_AUTH_REJECTED" || backendErr.Message != "未捕获完整的保持登录会话，请重新登录并确认保持登录和信任浏览器" {
 		t.Fatalf("incomplete session must have an actionable error: %v", err)
@@ -262,7 +263,7 @@ func TestPollCamoufoxTaskFailsFastOnHTTPError(t *testing.T) {
 
 	be := &managerBackend{}
 	started := time.Now()
-	_, err := be.pollCamoufoxTask("account-1", "task-1", server.URL, 30*time.Second, false)
+	_, err := be.pollCamoufoxTask(context.Background(), "account-1", "task-1", server.URL, 30*time.Second, false)
 	if time.Since(started) > 2*time.Second {
 		t.Fatalf("HTTP 503 was not handled promptly: elapsed=%v", time.Since(started))
 	}
@@ -285,7 +286,7 @@ func TestPollCamoufoxTaskReportsOTPInputFailure(t *testing.T) {
 	defer server.Close()
 
 	be := &managerBackend{}
-	_, err := be.pollCamoufoxTask("account-1", "task-1", server.URL, time.Second, true)
+	_, err := be.pollCamoufoxTask(context.Background(), "account-1", "task-1", server.URL, time.Second, true)
 	backendErr, ok := err.(*BackendError)
 	if !ok || backendErr.Code != "OTP_INPUT_FAILED" || backendErr.Status != http.StatusBadGateway {
 		t.Fatalf("OTP automation failure was reported as invalid code: %v", err)
@@ -312,7 +313,7 @@ func TestCamoufoxOTPSubmissionExpiredTask(t *testing.T) {
 	be := &managerBackend{mgr: mgr}
 	be.reserveCamoufoxTask(acc.ID, server.URL)
 	be.setCamoufoxTask(acc.ID, "task-1")
-	_, err = be.loginWithCamoufox(acc.ID, "", "123456", server.URL)
+	_, err = be.loginWithCamoufox(context.Background(), acc.ID, "", "123456", server.URL)
 	backendErr, ok := err.(*BackendError)
 	if !ok || backendErr.Code != "OTP_EXPIRED" {
 		t.Fatalf("expired OTP task was not reported as expired: %v", err)

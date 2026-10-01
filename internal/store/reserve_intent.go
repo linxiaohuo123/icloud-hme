@@ -17,6 +17,7 @@ const (
 	IntentStateOutcomeUnknown  IntentState = "outcome_unknown"
 	IntentStateSucceeded       IntentState = "succeeded"
 	IntentStateConfirmedFailed IntentState = "confirmed_failed"
+	IntentPurposeReplenishment             = "replenish"
 )
 
 // HmeReserveIntent 记录上游 HME Reserve 写操作的持久化意图状态机 (F03)
@@ -30,6 +31,7 @@ type HmeReserveIntent struct {
 	ResultRef      string `json:"result_ref"`
 	ErrorMessage   string `json:"error_message"`
 	OperationID    string `json:"operation_id,omitempty"`
+	Purpose        string `json:"purpose,omitempty"`
 	CreatedAt      string `json:"created_at"`
 	UpdatedAt      string `json:"updated_at"`
 }
@@ -41,6 +43,14 @@ func (s *Store) CreateReserveIntent(ctx context.Context, accountID, candidateEma
 
 // CreateReserveIntentForOperation binds a generated candidate to its allocation operation before Reserve.
 func (s *Store) CreateReserveIntentForOperation(ctx context.Context, operationID, accountID, candidateEmail, label string) (*HmeReserveIntent, error) {
+	return s.createReserveIntent(ctx, operationID, accountID, candidateEmail, label, "")
+}
+
+func (s *Store) CreateReplenishmentReserveIntent(ctx context.Context, accountID, candidateEmail, label string) (*HmeReserveIntent, error) {
+	return s.createReserveIntent(ctx, "", accountID, candidateEmail, label, IntentPurposeReplenishment)
+}
+
+func (s *Store) createReserveIntent(ctx context.Context, operationID, accountID, candidateEmail, label, purpose string) (*HmeReserveIntent, error) {
 	accountID = strings.TrimSpace(accountID)
 	candidateEmail = strings.TrimSpace(strings.ToLower(candidateEmail))
 	operationID = strings.TrimSpace(operationID)
@@ -79,9 +89,9 @@ func (s *Store) CreateReserveIntentForOperation(ctx context.Context, operationID
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO hme_reserve_intents (
-			intent_id, account_id, candidate_email, label, state, operation_id, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, intentID, accountID, candidateEmail, label, IntentStatePrepared, operationID, now, now)
+			intent_id, account_id, candidate_email, label, state, operation_id, purpose, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, intentID, accountID, candidateEmail, label, IntentStatePrepared, operationID, purpose, now, now)
 	if err != nil {
 		return nil, err
 	}
@@ -96,6 +106,7 @@ func (s *Store) CreateReserveIntentForOperation(ctx context.Context, operationID
 		Label:          label,
 		State:          IntentStatePrepared,
 		OperationID:    operationID,
+		Purpose:        purpose,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}, nil
@@ -142,11 +153,11 @@ func (s *Store) GetReserveIntent(ctx context.Context, intentID string) (*HmeRese
 
 	var intent HmeReserveIntent
 	err := s.db.QueryRowContext(ctx, `
-		SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), COALESCE(operation_id, ''), created_at, updated_at
+		SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), COALESCE(operation_id, ''), COALESCE(purpose, ''), created_at, updated_at
 		FROM hme_reserve_intents
 		WHERE intent_id = ?
 	`, intentID).Scan(
-		&intent.IntentID, &intent.AccountID, &intent.CandidateEmail, &intent.Label, &intent.State, &intent.AnonymousID, &intent.ResultRef, &intent.ErrorMessage, &intent.OperationID, &intent.CreatedAt, &intent.UpdatedAt,
+		&intent.IntentID, &intent.AccountID, &intent.CandidateEmail, &intent.Label, &intent.State, &intent.AnonymousID, &intent.ResultRef, &intent.ErrorMessage, &intent.OperationID, &intent.Purpose, &intent.CreatedAt, &intent.UpdatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -157,7 +168,7 @@ func (s *Store) GetReserveIntent(ctx context.Context, intentID string) (*HmeRese
 	return &intent, nil
 }
 
-// ListUnresolvedReserveIntents 查询所有未决 (prepared, reserve_sent, outcome_unknown) 的 Reserve 意图
+// ListUnresolvedReserveIntents includes successful replenishments awaiting local inventory commit.
 func (s *Store) ListUnresolvedReserveIntents(ctx context.Context, accountID string) ([]HmeReserveIntent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -168,16 +179,18 @@ func (s *Store) ListUnresolvedReserveIntents(ctx context.Context, accountID stri
 
 	if accountID != "" {
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), COALESCE(operation_id, ''), created_at, updated_at
+			SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), COALESCE(operation_id, ''), COALESCE(purpose, ''), created_at, updated_at
 			FROM hme_reserve_intents
-			WHERE account_id = ? AND state IN ('prepared', 'reserve_sent', 'outcome_unknown')
+			WHERE account_id = ? AND (state IN ('prepared', 'reserve_sent', 'outcome_unknown')
+				OR (state = 'succeeded' AND purpose = 'replenish' AND COALESCE(result_ref, '') = ''))
 			ORDER BY created_at ASC
 		`, accountID)
 	} else {
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), COALESCE(operation_id, ''), created_at, updated_at
+			SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), COALESCE(operation_id, ''), COALESCE(purpose, ''), created_at, updated_at
 			FROM hme_reserve_intents
 			WHERE state IN ('prepared', 'reserve_sent', 'outcome_unknown')
+				OR (state = 'succeeded' AND purpose = 'replenish' AND COALESCE(result_ref, '') = '')
 			ORDER BY created_at ASC
 		`)
 	}
@@ -190,7 +203,7 @@ func (s *Store) ListUnresolvedReserveIntents(ctx context.Context, accountID stri
 	for rows.Next() {
 		var it HmeReserveIntent
 		if scanErr := rows.Scan(
-			&it.IntentID, &it.AccountID, &it.CandidateEmail, &it.Label, &it.State, &it.AnonymousID, &it.ResultRef, &it.ErrorMessage, &it.OperationID, &it.CreatedAt, &it.UpdatedAt,
+			&it.IntentID, &it.AccountID, &it.CandidateEmail, &it.Label, &it.State, &it.AnonymousID, &it.ResultRef, &it.ErrorMessage, &it.OperationID, &it.Purpose, &it.CreatedAt, &it.UpdatedAt,
 		); scanErr != nil {
 			return nil, scanErr
 		}
@@ -210,13 +223,13 @@ func (s *Store) FindLatestIntentForCandidate(ctx context.Context, candidateEmail
 	candidateEmail = strings.TrimSpace(strings.ToLower(candidateEmail))
 	var intent HmeReserveIntent
 	err := s.db.QueryRowContext(ctx, `
-		SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), COALESCE(operation_id, ''), created_at, updated_at
+		SELECT intent_id, account_id, candidate_email, COALESCE(label, ''), state, COALESCE(anonymous_id, ''), COALESCE(result_ref, ''), COALESCE(error_message, ''), COALESCE(operation_id, ''), COALESCE(purpose, ''), created_at, updated_at
 		FROM hme_reserve_intents
 		WHERE candidate_email = ?
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, candidateEmail).Scan(
-		&intent.IntentID, &intent.AccountID, &intent.CandidateEmail, &intent.Label, &intent.State, &intent.AnonymousID, &intent.ResultRef, &intent.ErrorMessage, &intent.OperationID, &intent.CreatedAt, &intent.UpdatedAt,
+		&intent.IntentID, &intent.AccountID, &intent.CandidateEmail, &intent.Label, &intent.State, &intent.AnonymousID, &intent.ResultRef, &intent.ErrorMessage, &intent.OperationID, &intent.Purpose, &intent.CreatedAt, &intent.UpdatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

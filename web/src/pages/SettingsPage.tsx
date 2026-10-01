@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 react, api/client 的 request/ApiError, api/types 的 NotifyChannelResult/NotifySettingsResponse/UpdateNotifySettingsRequest, components/ToastProvider, components/icons
- * [OUTPUT]: 对外提供 SettingsPage 系统设置组件 (通知渠道配置、事件开关、配额阈值与一键测试推送)
+ * [OUTPUT]: 对外提供 SettingsPage 系统设置组件 (通知渠道配置、读取失败重试与保存保护、事件开关、配额阈值与一键测试推送)
  * [POS]: web/src/pages 的系统设置页面，通知配置脱敏显示、按需安全更新与 Fail-Closed 契约对齐
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -36,6 +36,8 @@ const CHANNEL_LABELS: Record<string, string> = {
 export default function SettingsPage() {
   const [serverSettings, setServerSettings] = useState<NotifySettingsResponse | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
+  const [loadRetryKey, setLoadRetryKey] = useState(0)
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
   const [error, setError] = useState('')
@@ -78,6 +80,8 @@ export default function SettingsPage() {
 
   useEffect(() => {
     let unmounted = false
+    setLoading(true)
+    setLoadError('')
     request<NotifySettingsResponse>('/api/settings/notify')
       .then((data) => {
         if (unmounted) return
@@ -88,13 +92,20 @@ export default function SettingsPage() {
       })
       .catch((err: unknown) => {
         if (!unmounted) {
-          show(err instanceof Error ? err.message : '加载通知设置失败')
+          setLoadError(err instanceof Error ? err.message : '加载通知设置失败')
         }
       })
       .finally(() => {
         if (!unmounted) setLoading(false)
       })
 
+    return () => {
+      unmounted = true
+    }
+  }, [loadRetryKey])
+
+  useEffect(() => {
+    let unmounted = false
     // 读取 Camoufox 状态
     request<{
       url: string
@@ -112,7 +123,7 @@ export default function SettingsPage() {
     return () => {
       unmounted = true
     }
-  }, [show])
+  }, [])
 
   async function handleTestCamoufox() {
     if (camoufoxTesting) return
@@ -171,7 +182,7 @@ export default function SettingsPage() {
   }
 
   async function handleSave() {
-    if (saving) return
+    if (saving || loading || loadError || !serverSettings) return
     setSaving(true)
     setError('')
     try {
@@ -260,6 +271,18 @@ export default function SettingsPage() {
     return (
       <div className="page-container">
         <p className="empty-state" aria-busy="true">加载中…</p>
+      </div>
+    )
+  }
+
+  if (loadError) {
+    return (
+      <div className="page-container">
+        <h1 className="page-title">系统设置</h1>
+        <div className="alert-error" role="alert">{loadError}</div>
+        <button type="button" className="btn btn-secondary" onClick={() => setLoadRetryKey((key) => key + 1)}>
+          重试
+        </button>
       </div>
     )
   }
@@ -618,7 +641,7 @@ export default function SettingsPage() {
             type="button"
             className="btn btn-primary"
             onClick={() => void handleSave()}
-            disabled={saving}
+            disabled={saving || !serverSettings}
           >
             <IconCheck size={14} />
             {saving ? '保存中…' : '保存配置'}

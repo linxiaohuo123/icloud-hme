@@ -17,14 +17,16 @@ import (
 
 // LeaseRecord 已用别名流水记录
 type LeaseRecord struct {
-	ID          string `json:"id"`
-	Email       string `json:"email"`
-	AccountID   string `json:"account_id"`
-	Tag         string `json:"tag"`
-	Status      string `json:"status"` // "completed" | "leased" | "abandoned"
-	AllocatedAt string `json:"allocated_at"`
-	CompletedAt string `json:"completed_at,omitempty"`
-	TokenName   string `json:"token_name,omitempty"`
+	ID           string `json:"id"`
+	Email        string `json:"email"`
+	AccountID    string `json:"account_id"`
+	AccountName  string `json:"account_name,omitempty"`
+	AccountEmail string `json:"account_email,omitempty"`
+	Tag          string `json:"tag"`
+	Status       string `json:"status"` // "completed" | "leased" | "abandoned"
+	AllocatedAt  string `json:"allocated_at"`
+	CompletedAt  string `json:"completed_at,omitempty"`
+	TokenName    string `json:"token_name,omitempty"`
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -181,23 +183,23 @@ func (s *Store) ListLeases(aliasQuery, tagQuery, statusQuery string, limit, offs
 	args := []any{}
 
 	if aliasQuery != "" {
-		whereClauses = append(whereClauses, "(LOWER(email) LIKE ? OR LOWER(account_id) LIKE ?)")
+		whereClauses = append(whereClauses, "(LOWER(l.email) LIKE ? OR LOWER(l.account_id) LIKE ? OR LOWER(COALESCE(a.name, '')) LIKE ? OR LOWER(COALESCE(NULLIF(a.icloud_email, ''), NULLIF(a.real_email, ''), '')) LIKE ?)")
 		search := "%" + strings.ToLower(aliasQuery) + "%"
-		args = append(args, search, search)
+		args = append(args, search, search, search, search)
 	}
 	if tagQuery != "" && tagQuery != "all" {
-		whereClauses = append(whereClauses, "LOWER(tag) = LOWER(?)")
+		whereClauses = append(whereClauses, "LOWER(l.tag) = LOWER(?)")
 		args = append(args, tagQuery)
 	}
 	if statusQuery != "" && statusQuery != "all" {
-		whereClauses = append(whereClauses, "LOWER(status) = LOWER(?)")
+		whereClauses = append(whereClauses, "LOWER(l.status) = LOWER(?)")
 		args = append(args, statusQuery)
 	}
 
 	whereSQL := strings.Join(whereClauses, " AND ")
 
 	var total int
-	countQuery := "SELECT COUNT(*) FROM lease_records WHERE " + whereSQL
+	countQuery := "SELECT COUNT(*) FROM lease_records l LEFT JOIN accounts a ON a.id = l.account_id WHERE " + whereSQL
 	if err := s.db.QueryRow(countQuery, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count leases: %w", err)
 	}
@@ -209,7 +211,7 @@ func (s *Store) ListLeases(aliasQuery, tagQuery, statusQuery string, limit, offs
 	if limit <= 0 {
 		limit = 50
 	}
-	query := fmt.Sprintf("SELECT id, email, account_id, tag, status, allocated_at, COALESCE(completed_at, ''), COALESCE(token_name, '') FROM lease_records WHERE %s ORDER BY julianday(allocated_at) DESC, id DESC LIMIT ? OFFSET ?", whereSQL)
+	query := fmt.Sprintf("SELECT l.id, l.email, l.account_id, COALESCE(a.name, ''), COALESCE(NULLIF(a.icloud_email, ''), NULLIF(a.real_email, ''), ''), l.tag, l.status, l.allocated_at, COALESCE(l.completed_at, ''), COALESCE(l.token_name, '') FROM lease_records l LEFT JOIN accounts a ON a.id = l.account_id WHERE %s ORDER BY julianday(l.allocated_at) DESC, l.id DESC LIMIT ? OFFSET ?", whereSQL)
 	queryArgs := append(args, limit, offset)
 
 	rows, err := s.db.Query(query, queryArgs...)
@@ -221,7 +223,7 @@ func (s *Store) ListLeases(aliasQuery, tagQuery, statusQuery string, limit, offs
 	records := make([]LeaseRecord, 0, limit)
 	for rows.Next() {
 		var rec LeaseRecord
-		if err := rows.Scan(&rec.ID, &rec.Email, &rec.AccountID, &rec.Tag, &rec.Status, &rec.AllocatedAt, &rec.CompletedAt, &rec.TokenName); err != nil {
+		if err := rows.Scan(&rec.ID, &rec.Email, &rec.AccountID, &rec.AccountName, &rec.AccountEmail, &rec.Tag, &rec.Status, &rec.AllocatedAt, &rec.CompletedAt, &rec.TokenName); err != nil {
 			return nil, 0, fmt.Errorf("scan lease: %w", err)
 		}
 		records = append(records, rec)

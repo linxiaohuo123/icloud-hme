@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/account, internal/hme, internal/store
  * [OUTPUT]: 对外提供 managerBackend 的别名相关方法 (CreateAlias, BatchCreateAlias, ListAliases, RefreshAliases, SetAliasActive, UpdateAlias, BatchUpdateAliases, DeleteAlias) 与 BatchCreateResult, BatchUpdateResult 类型
- * [POS]: internal/server 的别名业务门面实现，区分未决门禁与本次未知写入的配额，账号锁内确认删除状态并同步库存
+ * [POS]: internal/server 的别名业务门面，持久区分补货用途与未知用途，恢复未完成库存并维护未决门禁与写入配额
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -74,6 +74,14 @@ func (b *managerBackend) CreateAliasContext(ctx context.Context, accountID, labe
 
 // CreateAliasForAllocationContext binds a Reserve intent to the allocation operation when one exists.
 func (b *managerBackend) CreateAliasForAllocationContext(ctx context.Context, accountID, label, operationID string) (*hme.CreateResult, error) {
+	return b.createAliasContext(ctx, accountID, label, operationID, "")
+}
+
+func (b *managerBackend) CreateAliasForReplenishmentContext(ctx context.Context, accountID, label string) (*hme.CreateResult, error) {
+	return b.createAliasContext(ctx, accountID, label, "", store.IntentPurposeReplenishment)
+}
+
+func (b *managerBackend) createAliasContext(ctx context.Context, accountID, label, operationID, purpose string) (*hme.CreateResult, error) {
 	// 1. 检查别名上限熔断 (总数或活跃数达到上限)
 	if acc, ok := b.mgr.GetAccount(accountID); ok && (acc.AliasTotal >= account.MaxAliasesPerAccount || acc.AliasActive >= account.MaxAliasesPerAccount) {
 		return nil, &BackendError{
@@ -100,7 +108,7 @@ func (b *managerBackend) CreateAliasForAllocationContext(ctx context.Context, ac
 
 	var result *hme.CreateResult
 	err := b.mgr.WithHMEClientContext(ctx, accountID, func(client *hme.Client) error {
-		res, cerr := b.durableCreateAlias(ctx, client, accountID, label, operationID, 5)
+		res, cerr := b.durableCreateAlias(ctx, client, accountID, label, operationID, purpose, 5)
 		if cerr != nil {
 			return cerr
 		}
@@ -145,6 +153,9 @@ func (b *managerBackend) reconcileIntentsWithClient(ctx context.Context, client 
 	aliases, listErr := client.ListAliasesWithContext(ctx)
 	if listErr != nil {
 		for i := range intents {
+			if intents[i].State == store.IntentStateSucceeded {
+				continue // A list failure cannot erase an already proven Reserve success.
+			}
 			if err := b.store.UpdateReserveIntentState(ctx, intents[i].IntentID, store.IntentStateOutcomeUnknown, "", "", fmt.Sprintf("reconciliation list failed: %v", listErr)); err != nil {
 				return fmt.Errorf("保存别名核对失败状态 %s: %w", intents[i].IntentID, err)
 			}
@@ -164,6 +175,14 @@ func (b *managerBackend) reconcileIntentsWithClient(ctx context.Context, client 
 		}
 
 		if found != nil {
+			if it.Purpose == store.IntentPurposeReplenishment {
+				if err := b.store.AddReplenishedInventoryAlias(ctx, it.AccountID, *found); err != nil {
+					return fmt.Errorf("恢复补货库存 %s: %w", found.Email, err)
+				}
+				intents[i].State = store.IntentStateSucceeded
+				intents[i].AnonymousID = found.AnonymousID
+				continue
+			}
 			// 原请求的用途未知，恢复的别名必须隔离，避免被公共或定向分配。
 			if err := b.store.AddRecoveredInventoryAlias(it.AccountID, *found); err != nil {
 				return fmt.Errorf("保存恢复别名 %s: %w", found.Email, err)
@@ -182,6 +201,9 @@ func (b *managerBackend) reconcileIntentsWithClient(ctx context.Context, client 
 			intents[i].State = store.IntentStateSucceeded
 			intents[i].AnonymousID = found.AnonymousID
 		} else {
+			if it.State == store.IntentStateSucceeded {
+				return fmt.Errorf("已确认创建的补货邮箱 %s 未在远端列表中找到", it.CandidateEmail)
+			}
 			// INCONCLUSIVE_NOT_FOUND: 坚决保持 outcome_unknown，严禁标记失败，严禁产生第二候选！
 			if err := b.store.UpdateReserveIntentState(ctx, it.IntentID, store.IntentStateOutcomeUnknown, "", "", "reconciliation inconclusive: candidate not found in upstream list"); err != nil {
 				return fmt.Errorf("保存别名核对未决状态 %s: %w", it.IntentID, err)
@@ -200,7 +222,7 @@ func (b *managerBackend) reconcileIntentsWithClient(ctx context.Context, client 
 //  3. 标记状态为 reserve_sent 并 Commit SQLite
 //  4. 才向网络发送 Reserve(A)
 //  5. 成功 -> succeeded; 明确失败 -> confirmed_failed 并允许重试下一候选; 未知异常 -> outcome_unknown 并坚决阻断重试
-func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Client, accountID, label, operationID string, maxRetries int) (*hme.CreateResult, error) {
+func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Client, accountID, label, operationID, purpose string, maxRetries int) (*hme.CreateResult, error) {
 	// 针对单账号串行化写操作与未决门禁检查，避免并发 check empty -> Generate 穿透窗口
 	lock := b.getAccountMutationLock(accountID)
 	lock.Lock()
@@ -266,7 +288,13 @@ func (b *managerBackend) durableCreateAlias(ctx context.Context, client *hme.Cli
 		// 2. 持久化 intent(A, prepared) 并 Commit SQLite (必须在 Reserve 发送之前完成)
 		var intentID string
 		if b.store != nil {
-			intent, iErr := b.store.CreateReserveIntentForOperation(ctx, operationID, accountID, cand, label)
+			var intent *store.HmeReserveIntent
+			var iErr error
+			if purpose == store.IntentPurposeReplenishment {
+				intent, iErr = b.store.CreateReplenishmentReserveIntent(ctx, accountID, cand, label)
+			} else {
+				intent, iErr = b.store.CreateReserveIntentForOperation(ctx, operationID, accountID, cand, label)
+			}
 			if iErr != nil {
 				return nil, fmt.Errorf("持久化 reserve intent 失败: %w", iErr)
 			}
@@ -417,7 +445,7 @@ func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID 
 			if lbl != "" && count > 1 {
 				lbl = fmt.Sprintf("%s %d", labelPrefix, i+1)
 			}
-			res, createErr := b.durableCreateAlias(ctx, client, accountID, lbl, "", 3)
+			res, createErr := b.durableCreateAlias(ctx, client, accountID, lbl, "", "", 3)
 			if createErr != nil {
 				return createErr
 			}

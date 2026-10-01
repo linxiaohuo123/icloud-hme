@@ -1,13 +1,14 @@
 /**
  * [INPUT]: 依赖 database/sql, fmt, errors, strings, time, icloud-hme/internal/hme
- * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation 模型及 migrateInventory, AddInventoryAlias, AddRecoveredInventoryAlias, GetInventoryAlias, SyncAliasInventory, CountAuthoritativeAvailableAliases, UpdateAliasRemoteState, PromoteUnknownToAvailable, CountDormantPoolAliases
- * [POS]: internal/store 的别名库存实体与迁移定义层，完整快照事务隔离缺失库存并保留分配归属
+ * [OUTPUT]: 对外提供 AliasInventory, AliasAllocation, Operation 模型及 migrateInventory, AddInventoryAlias, AddReplenishedInventoryAlias, AddRecoveredInventoryAlias, GetInventoryAlias, SyncAliasInventory, CountAuthoritativeAvailableAliases, UpdateAliasRemoteState, PromoteUnknownToAvailable, CountDormantPoolAliases
+ * [POS]: internal/store 的别名库存与迁移，原子完成补货库存、路由和意图，完整快照隔离缺失库存并保留分配归属
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -273,6 +274,75 @@ func (s *Store) AddInventoryAlias(accountID string, alias hme.Alias, sourceType 
 		return fmt.Errorf("inventory alias %s belongs to another account", email)
 	}
 	return nil
+}
+
+// AddReplenishedInventoryAlias commits inventory, routing and completion as one
+// transaction. Only proven replenishments may promote a synced/recovered row;
+// allocated, reserved and intentionally quarantined inventory stays unchanged.
+func (s *Store) AddReplenishedInventoryAlias(ctx context.Context, accountID string, alias hme.Alias) error {
+	email := normalizeEmail(alias.Email)
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" || email == "" {
+		return errors.New("account_id and email must not be empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var pendingReplenishment bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM hme_reserve_intents WHERE account_id = ? AND candidate_email = ?
+		AND purpose = 'replenish' AND COALESCE(operation_id, '') = ''
+		AND state != 'confirmed_failed' AND COALESCE(result_ref, '') = '')`, accountID, email).Scan(&pendingReplenishment); err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	remoteState := RemoteActive
+	if !alias.Active {
+		remoteState = RemoteInactive
+	}
+	res, err := tx.ExecContext(ctx, `INSERT INTO alias_inventory
+		(email, account_id, provider_alias_id, remote_state, allocation_state, source_type, last_verified_at, snapshot_version)
+		VALUES (?, ?, ?, ?, 'available', 'replenish', ?, 1)
+		ON CONFLICT(email) DO UPDATE SET
+			remote_state = excluded.remote_state,
+			provider_alias_id = excluded.provider_alias_id,
+			last_verified_at = excluded.last_verified_at
+		WHERE alias_inventory.account_id = excluded.account_id`, email, accountID, alias.AnonymousID, remoteState, now)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return fmt.Errorf("replenished alias %s belongs to another account: rows=%d: %v", email, n, err)
+	}
+	if pendingReplenishment {
+		if _, err := tx.ExecContext(ctx, `UPDATE alias_inventory SET allocation_state = 'available', source_type = 'replenish'
+			WHERE email = ? AND ((allocation_state = 'unknown' AND source_type = 'synced')
+				OR (allocation_state = 'quarantined' AND source_type = 'recovered'))
+			AND NOT EXISTS (SELECT 1 FROM alias_allocations WHERE alias_email = ?)`, email, email); err != nil {
+			return err
+		}
+	}
+	res, err = tx.ExecContext(ctx, `INSERT INTO alias_routes (email, account_id, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(email) DO UPDATE SET updated_at = excluded.updated_at
+		WHERE alias_routes.account_id = excluded.account_id`, email, accountID, now)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return fmt.Errorf("replenished alias route %s belongs to another account: rows=%d: %v", email, n, err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE hme_reserve_intents
+		SET state = 'succeeded', anonymous_id = ?, result_ref = ?, error_message = '', updated_at = ?
+		WHERE account_id = ? AND candidate_email = ? AND purpose = 'replenish'
+		AND COALESCE(operation_id, '') = '' AND state != 'confirmed_failed' AND COALESCE(result_ref, '') = ''`,
+		alias.AnonymousID, "inventory:"+email, now, accountID, email); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // AddRecoveredInventoryAlias 隔离恢复的未决别名；已有分配或保留状态不回退。
