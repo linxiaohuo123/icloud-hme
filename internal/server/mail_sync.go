@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, sync, time, icloud-hme/internal/account, mail, store
  * [OUTPUT]: 对外提供 MailSyncWorker, NewMailSyncWorker, ForgetAccount
- * [POS]: server 的后台邮件同步器，按结构化收件人索引活跃别名，逐项隔离损坏正文并保留失败游标，绑定物理来源和读取快照，按当前任务集合维护扫描覆盖，代际失效仅作用于边界读取前已观察的任务
+ * [POS]: server 的后台邮件同步器，按结构化收件人索引活跃别名，独立仲裁 MIME 验证码，逐项隔离损坏正文并保留失败游标，绑定物理来源和读取快照，按当前任务集合维护扫描覆盖，代际失效仅作用于边界读取前已观察的任务
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -724,11 +724,7 @@ func (w *MailSyncWorker) fetchAndPublishLegacyBatch(ctx context.Context, batch *
 	found := make(map[string]bool, len(aliases))
 	process := func(messages []mail.Message) error {
 		for _, msg := range messages {
-			bodyText := msg.Preview
-			if bodyText == "" {
-				bodyText = msg.Body
-			}
-			otp := mail.ExtractOTP(msg.Subject, bodyText)
+			otp := msg.ExtractOTP()
 			if otp == nil {
 				continue
 			}
@@ -1066,11 +1062,7 @@ func (w *MailSyncWorker) scanAndPublishPagesAggregated(ctx context.Context, batc
 				if fullMsg == nil {
 					continue
 				}
-				bodyText := fullMsg.Preview
-				if bodyText == "" {
-					bodyText = fullMsg.Body
-				}
-				otp := mail.ExtractOTP(fullMsg.Subject, bodyText)
+				otp := fullMsg.ExtractOTP()
 				if otp == nil {
 					continue
 				}

@@ -90,7 +90,7 @@ HTTP JSON API，所有接口均采用标准 JSON 格式交互。
    - `GET /api/tokens` **只回显令牌掩码**（如 `am_1a2b****(35位)`），令牌本体仅在创建响应中出现一次，避免管理台被读取后批量收割令牌。
 6. **DNS Rebinding 与本地环回安全默认配置**：
    - 默认绑定 `127.0.0.1:8081`。当监听未授权的外部 IP 时，网关层强制拦截非法公网 Host 探测，防止恶意网站发起 DNS 重绑定内部穿透。
-   - 通知 Webhook 等可配置出站地址默认**拒绝环回 / 私有网段 / 链路本地（含 `169.254.169.254` 云元数据）**，阻断盲 SSRF。确有内网自建 Webhook 需求时设置 `ICLOUD_HME_ALLOW_PRIVATE_WEBHOOK=true` 显式放行。
+   - 通知 Webhook 等可配置出站地址默认**拒绝环回 / 私有网段 / 链路本地（含 `169.254.169.254` 云元数据）**，保存配置、每次 HTTP 请求及重定向、实际 DNS 解析后的连接均应用该策略；连接固定到已校验的 IP，TLS 仍校验原始主机名。通知使用直接连接，不使用 HTTP(S)_PROXY 环境代理。确有内网自建 Webhook 需求时设置 `ICLOUD_HME_ALLOW_PRIVATE_WEBHOOK=true` 显式放行。
 
 ---
 
@@ -391,7 +391,7 @@ Content-Type: application/json
 **出号机制与核心优势：**
 - **本地号池预存提取**：后台定时任务（Schedules/Jobs）在平时按 Apple 单账号约 5 个/小时限制平稳补货，注册机高峰期直接从本地号池认领可用库存，有效平抑突发建号瓶颈。
 - **无需指定 `account_id`**：底层调度引擎结合号池优先策略与 Round-Robin 算法自动轮询分配。
-- **业务标签亲和隔离 (`tag`)**：优先分配打上指定业务标签的专属母号；若无则自动匹配通用号池，严禁跨业务串号。
+- **业务标签亲和隔离 (`tag`)**：库存领取仅匹配打上指定业务标签的母号；非 default 标签无匹配母号时直接返回无可用库存，不回退公共池。管理员实时创建按独立候选选择规则执行。
 - **并发原子防重**：底层 `ClaimInventoryAlias` 在 SQLite 事务中认领库存并写入分配与流水，阻止同一别名重复出号。
 - **自动审计与流水落库**：自动记录调用主体、分配的别名、出号来源 (`pool`/`created`)、业务标签至数据库。
 - **存量资产充分复用**：单号达到 750 上限后虽无法新建，但其存量预置别名仍可划入号池供外部业务认领。
@@ -878,6 +878,7 @@ Content-Type: application/json
 }
 ```
 - `:id` 为别名的 `anonymousId`。
+- 列表中的 `note` 返回当前补充说明。此维护接口同时写入 `label` 和 `note`；仅修改标签时，应提交列表读取到的原说明。`note: ""` 表示清空说明，省略 `note` 也会按空字符串写入，不能用省略字段表示保持原值。
 
 ### 25. 批量更新别名
 
@@ -1000,8 +1001,8 @@ Content-Type: application/json
 用于在母账号池中划分业务领域（如区分不同游戏、不同海外电商渠道）：
 
 - `GET /api/tags`：列出所有业务标识
-- `POST /api/tags`：创建业务标识 `{"tag": "reg_pool_a", "name": "注册A组"}`
-- `PATCH /api/tags/:id`：部分更新业务标识名称、标签、状态和描述。未提交字段保持现值；`{"description":""}` 清空描述，省略或传 `null` 保持原描述。创建时间和最近活动时间由服务端保留。
+- `POST /api/tags`：创建业务标识 `{"tag": "reg_pool_a", "name": "注册A组"}`。主键、创建时间和活动时间由服务端控制，客户端传入的 `id`、`created_at`、`last_assigned_at` 不参与创建；不会覆盖已有记录。业务键按大小写无关规则原子查重。
+- `PATCH /api/tags/:id`：部分更新业务标识名称、标签、状态和描述。未提交字段保持现值；`{"description":""}` 清空描述，省略或传 `null` 保持原描述。创建时间和最近活动时间由服务端保留。业务键仍被母号标签引用时，改为另一个业务键返回 `409 TAG_IN_USE`，其他字段也不落库；名称、描述和状态仍可独立编辑。请先调整母号标签再改业务键，历史流水不级联重命名。不存在的标识返回 `404 NOT_FOUND`。
 - `DELETE /api/tags/:id`：删除业务标识
 
 ### 31. 外部接入令牌 (APITokens)
@@ -1018,7 +1019,8 @@ Content-Type: application/json
 - `POST /api/tokens/:id/rotate`：轮换令牌密钥。令牌 ID、名称、作用域、过期时间与历史归属 (租约、取码任务) 保持不变；旧密钥立即失效，在途长轮询交付前复查凭据并返回 `401`。
   - 响应结构与创建相同，`data.token` 一次性返回新明文密钥。
   - 令牌不存在返回 `404 NOT_FOUND`；已吊销令牌返回 `400 TOKEN_REVOKED`。
-- `DELETE /api/tokens/:id`：销毁吊销该接入令牌
+- `DELETE /api/tokens/:id`：作废令牌，立即使凭据失效，同时保留令牌身份与历史审计记录。成功响应包含 `deleted: true`、`purged: false`。
+- `DELETE /api/tokens/:id?purge=true`：永久清除令牌记录；成功响应包含 `deleted: true`、`purged: true`。管理页用于清除历史失效令牌；此操作不可撤回。令牌不存在返回 `404 NOT_FOUND`。
 
 ### 32. 已用别名流水审计 (Leases)
 
@@ -1428,7 +1430,7 @@ if result.get("success"):
 7. **最小权限令牌与作用域隔离**：
    对外发放的令牌默认只有 `allocate,verify`，无法触达账号、令牌、设置等管理面，亦无法通过 `GET /api/tokens` 收割其它令牌（该接口仅回显掩码）。
 8. **内网出站防护**：
-   通知 Webhook 等可配置出站地址默认拒绝环回、私有网段与链路本地地址（含 `169.254.169.254`），消除盲 SSRF；如需内网自建 Webhook，设置 `ICLOUD_HME_ALLOW_PRIVATE_WEBHOOK=true`。
+   通知 Webhook 等可配置出站地址默认拒绝环回、私有网段与链路本地地址（含 `169.254.169.254`），校验覆盖初始地址、HTTP 重定向及实际拨号 IP，通知直接连接并保留 TLS 主机名验证；如需内网自建 Webhook，设置 `ICLOUD_HME_ALLOW_PRIVATE_WEBHOOK=true`。
 9. **凭据文件权限**：
    数据目录以 `0700` 创建，SQLite 库及其 WAL/SHM 边车文件收紧为 `0600`。**Windows 部署需自行收紧 ACL**（`os.Chmod` 在 Windows 上只映射只读位）。
 10. **启动口令强校验**：

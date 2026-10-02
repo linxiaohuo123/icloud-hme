@@ -461,3 +461,31 @@ describe('AccountWorkspace', () => {
     expect(screen.queryByText('正常运行')).not.toBeInTheDocument()
   })
 })
+
+it('workspace deletion must submit only once while pending', async () => {
+  const pending = createDeferred<void>()
+  let deletes = 0
+  server.use(
+    http.get('/api/accounts', () => HttpResponse.json({ success: true, data: [testAccount] })),
+    http.get('/api/accounts/:id', () => HttpResponse.json({ success: true, data: testAccount })),
+    http.get('/api/aliases', () => HttpResponse.json({ success: true, data: { aliases: [testAliases[1]] } })),
+    http.delete('/api/aliases/:id', async () => { deletes++; await pending.promise; return HttpResponse.json({ success: true, data: {} }) }),
+  )
+  setCSRFToken('csrf-test')
+  renderWorkspaceWithNav('/workspace/acc_test')
+  const user = userEvent.setup()
+  await screen.findByText(testAliases[1].email)
+  await user.click(screen.getByRole('button', { name: '彻底删除别名' }))
+  const confirm = screen.getByRole('button', { name: '确认删除' })
+  await user.click(confirm)
+  await waitFor(() => expect(deletes).toBe(1))
+  await user.click(confirm)
+  expect(confirm).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: '取消' }))
+  await user.keyboard('{Escape}')
+  expect(screen.getByRole('dialog')).toBeInTheDocument()
+  expect(deletes).toBe(1)
+  pending.resolve()
+  await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  expect(deletes).toBe(1)
+})

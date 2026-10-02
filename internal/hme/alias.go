@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, errors, fmt, sort, strconv, strings, time, github.com/tidwall/gjson
  * [OUTPUT]: 对外提供 Alias, CreateResult, ListAliases, ListAliasesWithContext, Generate, GenerateWithContext, Reserve, ReserveWithContext, CreateAlias, CreateAliasWithContext, DeactivateHME, ReactivateHME, Delete, UpdateMetaData
- * [POS]: internal/hme 的 HME 别名协议操作层，列表拒绝不完整解析结果，负责生成、保留、激活、修改、删除与状态核对
+ * [POS]: internal/hme 的 HME 别名协议操作层，列表保留 label/note 并拒绝不完整结果，负责创建、启停、元数据更新与状态核对
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -24,6 +24,7 @@ type Alias struct {
 	Email       string `json:"email"`
 	AnonymousID string `json:"anonymousId"`
 	Label       string `json:"label"`
+	Note        string `json:"note"`
 	Active      bool   `json:"active"`
 	CreatedAt   string `json:"createdAt,omitempty"`
 	AccountID   string `json:"account_id,omitempty"`
@@ -465,6 +466,7 @@ func parseAliasList(body string) ([]Alias, error) {
 			Email:       email,
 			AnonymousID: firstNonEmpty(item.Get("anonymousId").String(), item.Get("id").String()),
 			Label:       firstNonEmpty(item.Get("label").String(), meta.Get("label").String()),
+			Note:        firstNonEmpty(item.Get("note").String(), meta.Get("note").String()),
 			Active:      active,
 			CreatedAt:   created,
 		})

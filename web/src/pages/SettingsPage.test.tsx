@@ -230,3 +230,58 @@ describe('SettingsPage', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Telegram Bot Token 与 Chat ID 必须同时填写')
   })
 })
+
+it('locks notification controls while saving and unlocks after completion', async () => {
+  let release!: () => void
+  const pending = new Promise<void>(resolve => { release = resolve })
+  let body: Record<string, unknown> | undefined
+  const stored = { feishu_configured: false, bark_configured: false, telegram_configured: false,
+    feishu_webhook_masked: '', bark_url_masked: '', telegram_token_masked: '', telegram_chat: '', event_kinds: {}, quota_threshold: 700 }
+  server.use(
+    http.get('/api/settings/notify', () => HttpResponse.json({ success: true, data: stored })),
+    http.get('/api/settings/camoufox', () => HttpResponse.json({ success: true, data: { available: true, ready: true } })),
+    http.put('/api/settings/notify', async ({ request }) => { body = await request.json() as Record<string, unknown>; await pending; return HttpResponse.json({ success: true, data: { ...stored, ...body } }) }),
+  )
+  setCSRFToken('csrf-test')
+  renderPage()
+  const quota = await screen.findByLabelText('配额水位阈值 (活跃别名数)')
+  const user = userEvent.setup()
+  await user.clear(quota)
+  await user.type(quota, '850')
+  await user.click(screen.getByRole('button', { name: '保存配置' }))
+  await waitFor(() => expect(body?.quota_threshold).toBe(850))
+  expect(quota).toBeDisabled()
+  expect(screen.getByRole('button', { name: '发送测试通知' })).toBeDisabled()
+  for (const input of document.querySelectorAll('.settings-section input:not([readonly])')) expect(input).toBeDisabled()
+  await user.type(quota, '900')
+  expect(quota).toHaveValue(850)
+  release()
+  await screen.findByText('通知配置已保存')
+  expect(quota).toHaveValue(850)
+  expect(quota).toBeEnabled()
+  await user.clear(quota)
+  await user.type(quota, '900')
+  expect(quota).toHaveValue(900)
+})
+
+
+it('preserves the submitted draft and unlocks notification controls after save failure', async () => {
+  setCSRFToken('csrf-test')
+  mockGet()
+  server.use(http.put('/api/settings/notify', () => HttpResponse.json(
+    { success: false, message: '通知配置写入失败', code: 'SAVE_FAILED' }, { status: 500 },
+  )))
+  renderPage()
+  const user = userEvent.setup()
+  const quota = await screen.findByLabelText('配额水位阈值 (活跃别名数)')
+  await user.clear(quota)
+  await user.type(quota, '850')
+  const token = screen.getByLabelText('Telegram Bot Token')
+  await user.type(token, 'fixture-new-token')
+  await user.click(screen.getByRole('button', { name: '保存配置' }))
+  await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('通知配置写入失败'))
+  expect(quota).toHaveValue(850)
+  expect(token).toHaveValue('fixture-new-token')
+  expect(quota).toBeEnabled()
+  expect(token).toBeEnabled()
+})

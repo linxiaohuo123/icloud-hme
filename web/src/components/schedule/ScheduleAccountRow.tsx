@@ -54,7 +54,7 @@ export const ScheduleAccountRow = memo(function ScheduleAccountRow({
   const normalizeNumber = (raw: string, previous: string, max: number) =>
     raw.trim() === '' ? previous : String(Math.max(1, Math.min(max, Math.trunc(Number(raw)) || 1)))
   const meterWidth = enabled && !expired && !protectedAccount && cfg.hourly_quota > 0 ? Math.min(100, Math.round(cfg.current_hour_count / cfg.hourly_quota * 100)) : 0
-  const meterClass = meterWidth >= 100 ? ' meter-full' : meterWidth >= 75 ? ' meter-warn' : ''
+  const meterClass = meterWidth >= 75 && meterWidth < 100 ? ' meter-warn' : ''
   return <tr aria-busy={saving}>
     <td>
       <div className="schedule-acc-cell-compact">

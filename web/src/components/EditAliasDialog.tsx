@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 React 基础能力、Dialog 基础容器及 API 客户端
- * [OUTPUT]: 对外提供 EditAliasDialog 别名备注与说明修改对话框
+ * [OUTPUT]: 对外提供 EditAliasDialog，回显现有说明，名称修改保留说明，成功后同步父级元数据
  * [POS]: web/src/components 的别名元数据编辑浮层，被 AccountWorkspace 和 AliasesPage 消费
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -15,12 +15,13 @@ interface EditAliasDialogProps {
     anonymousId: string
     email: string
     label: string
+    note?: string
     accountId?: string
     account_id?: string
   } | null
   open: boolean
   onClose: () => void
-  onSaved: (newLabel: string) => void
+  onSaved: (newLabel: string, newNote: string) => void
 }
 
 export default function EditAliasDialog({
@@ -31,7 +32,7 @@ export default function EditAliasDialog({
   onSaved,
 }: EditAliasDialogProps) {
   const [label, setLabel] = useState(alias?.label ?? '')
-  const [note, setNote] = useState('')
+  const [note, setNote] = useState(alias?.note ?? '')
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
@@ -39,7 +40,7 @@ export default function EditAliasDialog({
   useEffect(() => {
     if (open && alias) {
       setLabel(alias.label || '')
-      setNote('')
+      setNote(alias.note ?? '')
       setError('')
     }
   }, [open, alias])
@@ -63,7 +64,7 @@ export default function EditAliasDialog({
           }),
         },
       )
-      onSaved(trimmedLabel)
+      onSaved(trimmedLabel, note.trim())
       onClose()
     } catch (err) {
       setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
@@ -84,51 +85,52 @@ export default function EditAliasDialog({
       }}
     >
       {error && (
-        <div className="alert-error" role="alert" style={{ marginBottom: 12 }}>
+        <div className="alert-error" role="alert">
           {error}
         </div>
       )}
       <form onSubmit={handleSubmit}>
-        <div className="form-field" style={{ marginBottom: 12 }}>
+        <div className="form-field">
           <label htmlFor="alias-email-readonly">别名邮箱</label>
           <input
             id="alias-email-readonly"
             type="text"
-            className="input"
             value={alias?.email ?? ''}
             disabled
             readOnly
-            style={{ opacity: 0.7, fontFamily: 'monospace' }}
+            className="input font-mono"
           />
         </div>
 
-        <div className="form-field" style={{ marginBottom: 12 }}>
+        <div className="form-field">
           <label htmlFor="alias-label-input">备注名称 (用途标签)</label>
           <input
             id="alias-label-input"
             type="text"
             className="input"
             value={label}
+            disabled={submitting}
             onChange={(e) => setLabel(e.target.value)}
             placeholder="例如: Twitter注册, OpenAI主号, 游戏账号等"
             maxLength={200}
           />
         </div>
 
-        <div className="form-field" style={{ marginBottom: 16 }}>
+        <div className="form-field">
           <label htmlFor="alias-note-input">补充说明 (可选)</label>
           <input
             id="alias-note-input"
             type="text"
             className="input"
             value={note}
+            disabled={submitting}
             onChange={(e) => setNote(e.target.value)}
             placeholder="额外备忘说明，如绑定手机或注册日期"
             maxLength={500}
           />
         </div>
 
-        <div className="dialog-actions" style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+        <div className="dialog-actions">
           <button
             type="button"
             className="btn btn-secondary"

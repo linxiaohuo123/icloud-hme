@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 net/url, regexp, strings, unicode, unicode/utf8 标准库与 preview.go stripHTML
- * [OUTPUT]: 对外提供 OTPResult, ExtractOTP
+ * [OUTPUT]: 对外提供 OTPResult, ExtractOTP 及邮件 ExtractOTP 方法，独立仲裁 MIME 内容字段
  * [POS]: internal/mail 的验证码与激活链接嗅探器，供 server/verify_handler 消费；完整候选提取、上下文筛选、歧义拒绝与独立 URL 解析
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -80,12 +80,40 @@ var (
 // ExtractOTP selects a unique strongest candidate. Conflicting candidates never
 // complete a verification request, even if the message also contains a link.
 func ExtractOTP(subject, body string) *OTPResult {
+	return extractOTPFields(subject, []string{body})
+}
+
+// ExtractOTP preserves decoded MIME boundaries while keeping previews suitable for display.
+func (m Message) ExtractOTP() *OTPResult {
+	if len(m.otpBodies) > 0 {
+		return extractOTPFields(m.Subject, m.otpBodies)
+	}
+	body := m.Preview
+	if body == "" {
+		body = m.Body
+	}
+	return ExtractOTP(m.Subject, body)
+}
+
+func (m FullMessage) ExtractOTP() *OTPResult {
+	base := m.Message
+	base.Body = m.Body
+	return base.ExtractOTP()
+}
+
+func extractOTPFields(subject string, bodies []string) *OTPResult {
 	subject = toHalfWidth(subject)
-	body = cleanEmailText(body)
-	link := extractMagicLink(subject + "\n" + body)
-	subject = urlRegex.ReplaceAllString(subject, " ")
-	body = urlRegex.ReplaceAllString(body, " ")
-	text := subject + "\n" + body
+	fields := make([]string, 1, len(bodies)+1)
+	fields[0] = subject
+	for _, body := range bodies {
+		fields = append(fields, cleanEmailText(body))
+	}
+	link := extractMagicLink(strings.Join(fields, "\n"))
+	for i := range fields {
+		fields[i] = urlRegex.ReplaceAllString(fields[i], " ")
+	}
+	subject = fields[0]
+	text := strings.Join(fields, "\n")
 	bestRank := 0
 	candidates := map[string]bool{}
 	add := func(code string, rank int) {
@@ -97,7 +125,7 @@ func ExtractOTP(subject, body string) *OTPResult {
 			candidates[code] = true
 		}
 	}
-	for _, field := range []string{subject, body} {
+	for _, field := range fields {
 		for _, loc := range digitRunRegex.FindAllStringIndex(field, -1) {
 			start, end := loc[0], loc[1]
 			if !numericBoundary(field, start, end) {

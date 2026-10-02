@@ -458,7 +458,7 @@ export default function WorkspaceHeader({
               <b>凭据需更新</b>：当前账号尚未配置可用 Cookie 或处于离线状态，出号与自动同步功能已挂起。
             </span>
           </div>
-          <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <div className="hero-alert-actions">
             {onOpenLogin && (
               <button
                 type="button"

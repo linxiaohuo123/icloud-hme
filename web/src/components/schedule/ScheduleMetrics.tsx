@@ -38,11 +38,11 @@ export const ScheduleMetrics = memo(function ScheduleMetrics({
   logsKnown,
 }: ScheduleMetricsProps) {
   return (
-    <div className="stat-grid stat-grid-compact">
+    <div className="stat-grid">
       <div className="stat-card stat-card-blue">
         <div className="stat-card-header">
           <div className="stat-card-title-group">
-            <div className="stat-icon stat-icon-blue">
+            <div className="stat-icon">
               <IconAccounts size={16} />
             </div>
             <span className="stat-label">自动补货账号</span>
@@ -56,7 +56,7 @@ export const ScheduleMetrics = memo(function ScheduleMetrics({
       <div className="stat-card stat-card-purple">
         <div className="stat-card-header">
           <div className="stat-card-title-group">
-            <div className="stat-icon stat-icon-purple">
+            <div className="stat-icon">
               <IconZap size={16} />
             </div>
             <span className="stat-label">总计每小时配额</span>
@@ -71,7 +71,7 @@ export const ScheduleMetrics = memo(function ScheduleMetrics({
       <div className="stat-card stat-card-green">
         <div className="stat-card-header">
           <div className="stat-card-title-group">
-            <div className="stat-icon stat-icon-green">
+            <div className="stat-icon">
               <IconShield size={16} />
             </div>
             <span className="stat-label">调度巡检周期</span>
@@ -89,7 +89,7 @@ export const ScheduleMetrics = memo(function ScheduleMetrics({
       <div className="stat-card stat-card-amber">
         <div className="stat-card-header">
           <div className="stat-card-title-group">
-            <div className="stat-icon stat-icon-amber">
+            <div className="stat-icon">
               <IconTerminal size={16} />
             </div>
             <span className="stat-label">实时日志缓冲区</span>

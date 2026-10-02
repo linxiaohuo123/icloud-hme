@@ -24,6 +24,8 @@ import {
 import { copyText } from '../../utils/clipboard'
 import { dateTimestamp, formatDate, formatFullDate } from '../../utils/date'
 
+const SKELETON_CELL_WIDTHS = ['70%', '40%', '50px', '60%', '80px']
+
 const PAGE_SIZE_OPTIONS = [
   { value: '20', label: '20 条 / 页' },
   { value: '50', label: '50 条 / 页' },
@@ -35,6 +37,7 @@ interface WorkspaceAliasesTabProps {
   aliasLoading: boolean
   totalAliasCount: number
   activeAliasCount: number
+  deletingAlias: boolean
   togglingAliasId: string | null
   selectedIds: Set<string>
   setSelectedIds: React.Dispatch<React.SetStateAction<Set<string>>>
@@ -52,6 +55,7 @@ export default function WorkspaceAliasesTab({
   totalAliasCount,
   activeAliasCount,
   togglingAliasId,
+  deletingAlias,
   selectedIds,
   setSelectedIds,
   onEditAlias,
@@ -300,7 +304,7 @@ export default function WorkspaceAliasesTab({
                 />
               </th>
               <th style={{ width: '32%', minWidth: 220 }}>别名邮箱</th>
-              <th style={{ width: '26%', minWidth: 150 }}>备注</th>
+              <th style={{ width: '22%', minWidth: 140 }}>备注</th>
               <th style={{ width: '12%', minWidth: 90 }}>状态</th>
               <th style={{ width: '16%', minWidth: 130 }} aria-sort={sortDirection === 'asc' ? 'ascending' : 'descending'}>
                 <button
@@ -317,26 +321,22 @@ export default function WorkspaceAliasesTab({
                   {sortDirection === 'asc' ? <IconChevronUp size={14} /> : <IconChevronDown size={14} />}
                 </button>
               </th>
-              <th style={{ width: 175, minWidth: 175, textAlign: 'right' }}>操作</th>
+              <th style={{ width: 200, minWidth: 200, textAlign: 'right' }}>操作</th>
             </tr>
           </thead>
           <tbody>
             {aliasLoading && aliases.length === 0 ? (
               Array.from({ length: 5 }).map((_, i) => (
-                <tr key={`skel-${i}`}>
-                  <td style={{ textAlign: 'center' }}>
-                    <div className="skeleton-line" style={{ width: 16, height: 16, borderRadius: 3, margin: '0 auto', background: 'var(--color-border)', opacity: 0.5 }} />
-                  </td>
-                  <td><div className="skeleton-line" style={{ width: '70%', height: 14, borderRadius: 4, background: 'var(--color-border)', opacity: 0.5, animation: 'pulse 1.5s ease-in-out infinite' }} /></td>
-                  <td><div className="skeleton-line" style={{ width: '40%', height: 14, borderRadius: 4, background: 'var(--color-border)', opacity: 0.4, animation: 'pulse 1.5s ease-in-out 0.1s infinite' }} /></td>
-                  <td><div className="skeleton-line" style={{ width: '50px', height: 20, borderRadius: 10, background: 'var(--color-border)', opacity: 0.4, animation: 'pulse 1.5s ease-in-out 0.2s infinite' }} /></td>
-                  <td><div className="skeleton-line" style={{ width: '60%', height: 14, borderRadius: 4, background: 'var(--color-border)', opacity: 0.3, animation: 'pulse 1.5s ease-in-out 0.3s infinite' }} /></td>
-                  <td><div className="skeleton-line" style={{ width: '80px', height: 24, borderRadius: 4, background: 'var(--color-border)', opacity: 0.3, animation: 'pulse 1.5s ease-in-out 0.4s infinite' }} /></td>
+                <tr key={`skel-${i}`} className="table-skeleton-row" aria-hidden="true">
+                  <td />
+                  {SKELETON_CELL_WIDTHS.map((width, col) => (
+                    <td key={col}><div className="skeleton-line" style={{ width }} /></td>
+                  ))}
                 </tr>
               ))
             ) : filteredAliases.length === 0 ? (
               <tr>
-                <td colSpan={6} className="text-center text-muted" style={{ padding: '32px' }}>
+                <td colSpan={6} className="empty-state">
                   暂无匹配的别名
                 </td>
               </tr>
@@ -344,7 +344,7 @@ export default function WorkspaceAliasesTab({
               paginatedAliases.map((item) => (
                 <tr
                   key={item.anonymousId}
-                  style={selectedIds.has(item.anonymousId) ? { background: 'var(--color-bg-subtle)' } : undefined}
+                  className={selectedIds.has(item.anonymousId) ? 'is-selected' : undefined}
                 >
                   <td style={{ textAlign: 'center' }}>
                     <input
@@ -394,7 +394,7 @@ export default function WorkspaceAliasesTab({
                     {formatDate(item.createdAt)}
                   </td>
                   <td style={{ textAlign: 'right' }}>
-                    <div style={{ display: 'inline-flex', gap: '6px', alignItems: 'center', justifyContent: 'flex-end' }}>
+                    <div className="row-actions">
                       <button
                         type="button"
                         className="btn btn-xs btn-secondary"
@@ -413,7 +413,7 @@ export default function WorkspaceAliasesTab({
                       </button>
                       <button
                         type="button"
-                        className="btn btn-xs btn-ghost"
+                        className="btn btn-xs btn-ghost row-toggle-btn"
                         onClick={() => void onToggleAlias(item)}
                         disabled={Boolean(togglingAliasId)}
                         title={item.active ? '停用此别名' : '启用此别名'}
@@ -424,7 +424,9 @@ export default function WorkspaceAliasesTab({
                         type="button"
                         className="btn-icon-danger"
                         onClick={() => onDeleteAlias(item)}
+                        disabled={deletingAlias}
                         title="彻底删除别名"
+                        aria-label="彻底删除别名"
                       >
                         <IconTrash size={13} />
                       </button>

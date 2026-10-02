@@ -1,13 +1,13 @@
 /**
  * [INPUT]: 依赖 api/client, api/types, react-dom createPortal, components 下各 Dialog 与 ToastProvider, utils/date, components/icons
- * [OUTPUT]: 对外提供 AccountsPage 页面组件 (卡片顶栏内嵌状态胶囊 + 统一 1240px 容器 + 账号凭据与生命周期管理)
- * [POS]: web/src/pages 的核心页面，负责管理 iCloud 账号、凭据与快捷跳转；AccountActions 采用单次确定性 useLayoutEffect 计算定位并重置收起状态
+ * [OUTPUT]: 对外提供 AccountsPage，按编辑目标 key 挂载表单，异步凭据弹窗自行刷新账号缓存，父页面负责呈现结果
+ * [POS]: web/src/pages 的核心页面，负责管理 iCloud 账号、凭据与快捷跳转，支持 ?add=true 深链直接打开添加弹窗；AccountActions 采用单次确定性 useLayoutEffect 计算定位并重置收起状态
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { request, ApiError } from '../api/client'
 import type { AccountSummary } from '../api/types'
 import { useAccounts, invalidateAccounts } from '../hooks/useAccounts'
@@ -67,15 +67,9 @@ function CredentialCell({ acc }: { acc: AccountSummary }) {
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
-        <span className="badge badge-active" style={{ fontSize: '11px', padding: '1px 6px' }}>
-          已配置
-        </span>
-        <span className="cell-secondary" style={{ fontSize: '12px' }}>
-          {parts.join(' · ')}
-        </span>
-      </div>
+    <div className="credential-cell">
+      <span className="badge badge-active">已配置</span>
+      <span className="credential-list">{parts.join(' · ')}</span>
     </div>
   )
 }
@@ -256,6 +250,17 @@ export default function AccountsPage() {
   const [deleting, setDeleting] = useState(false)
 
   const { show } = useToast()
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  // 侧边栏「添加新账号」以 ?add=true 深链进入：打开添加弹窗后清除参数，避免刷新时重复弹出
+  useEffect(() => {
+    if (searchParams.get('add') !== 'true') return
+    setEditing(null)
+    setFormOpen(true)
+    const next = new URLSearchParams(searchParams)
+    next.delete('add')
+    setSearchParams(next, { replace: true })
+  }, [searchParams, setSearchParams])
 
   function handleRetry() {
     void refresh(true).catch(() => {})
@@ -303,7 +308,7 @@ export default function AccountsPage() {
           <h1 className="page-title">账号管理</h1>
           <p className="page-desc">管理已接入的 iCloud 母账号、登录凭据与可用别名</p>
         </div>
-        <div>
+        <div className="page-actions">
           <button
             type="button"
             className="btn btn-primary"
@@ -370,13 +375,13 @@ export default function AccountsPage() {
             <table className="table">
               <thead>
                 <tr>
-                  <th style={{ minWidth: '150px' }}>账号备注</th>
-                  <th style={{ minWidth: '220px' }}>登录邮箱 / 账号ID</th>
+                  <th style={{ minWidth: '130px' }}>账号备注</th>
+                  <th style={{ minWidth: '200px' }}>登录邮箱 / 账号ID</th>
                   <th style={{ width: '110px' }}>运行状态</th>
                   <th style={{ width: '130px' }}>别名 (可用/总数)</th>
-                  <th style={{ minWidth: '200px' }}>已配凭据</th>
-                  <th style={{ width: '150px' }}>最后检查时间</th>
-                  <th style={{ minWidth: '180px', textAlign: 'right' }}>快捷操作</th>
+                  <th style={{ minWidth: '150px' }}>已配凭据</th>
+                  <th style={{ width: '130px' }}>最后检查时间</th>
+                  <th style={{ minWidth: '170px', textAlign: 'right' }}>快捷操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -385,7 +390,7 @@ export default function AccountsPage() {
                     <td>
                       <div className="cell-main">{acc.name}</div>
                       {acc.status_message && (
-                        <span className="hint" style={{ display: 'block' }}>
+                        <span className="hint">
                           {acc.status_message}
                         </span>
                       )}
@@ -403,7 +408,7 @@ export default function AccountsPage() {
                           {acc.alias_active} / {acc.alias_total}
                         </span>
                       </div>
-                      <span className="cell-secondary" style={{ fontSize: '11px', display: 'block' }}>
+                      <span className="cell-secondary">
                         {acc.alias_active} 个可用收信
                       </span>
                     </td>
@@ -433,13 +438,12 @@ export default function AccountsPage() {
 
       {formOpen && (
         <AccountFormDialog
+          key={editing?.id ?? 'new'}
           open={formOpen}
           onClose={() => setFormOpen(false)}
           onSaved={() => {
-            const targetId = editing?.id
             setFormOpen(false)
             show('账号已保存')
-            invalidateAccounts(targetId)
           }}
           editing={editing ? { id: editing.id, name: editing.name, icloudEmail: editing.icloud_email, host: editing.host } : null}
         />
@@ -480,10 +484,8 @@ export default function AccountsPage() {
           open
           onClose={() => setAppPwdFor(null)}
           onSaved={() => {
-            const targetId = appPwdFor.id
             setAppPwdFor(null)
             show('App 专用密码已设置')
-            invalidateAccounts(targetId)
           }}
         />
       )}
@@ -493,10 +495,8 @@ export default function AccountsPage() {
           open
           onClose={() => setProxyFor(null)}
           onSaved={() => {
-            const targetId = proxyFor.id
             setProxyFor(null)
             show('代理已更新')
-            invalidateAccounts(targetId)
           }}
         />
       )}

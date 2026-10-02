@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 React 基础能力、utils/focus，接收 title, open, onClose, children
+ * [INPUT]: 依赖 React 基础能力、utils/focus，接收 title, open, onClose, children, size (md 480px / lg 760px)
  * [OUTPUT]: 对外提供可访问的通用 Dialog 弹窗组件，最顶层管理可见控件焦点与 Escape
  * [POS]: web/src/components 的弹窗基础容器，被所有业务 Dialog 消费
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -17,10 +17,12 @@ interface DialogProps {
   open: boolean
   onClose: () => void
   children: ReactNode
+  /** md 默认 480px；lg 760px，用于邮件正文、代码片段等宽内容 */
+  size?: 'md' | 'lg'
 }
 
 /** 可访问 Dialog:Escape 关闭、焦点圈定、关闭后回到触发按钮、防滚动穿透死锁 */
-export default function Dialog({ title, open, onClose, children }: DialogProps) {
+export default function Dialog({ title, open, onClose, children, size = 'md' }: DialogProps) {
   const ref = useRef<HTMLDivElement>(null)
   const lastFocused = useRef<Element | null>(null)
   const onCloseRef = useRef(onClose)
@@ -102,7 +104,7 @@ export default function Dialog({ title, open, onClose, children }: DialogProps) 
     >
       <div
         ref={ref}
-        className="dialog"
+        className={size === 'lg' ? 'dialog dialog-lg' : 'dialog'}
         role="dialog"
         tabIndex={-1}
         aria-modal="true"

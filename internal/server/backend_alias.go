@@ -1,7 +1,8 @@
 /**
  * [INPUT]: 依赖 internal/account, internal/hme, internal/store
  * [OUTPUT]: 对外提供 managerBackend 的别名相关方法 (CreateAlias, BatchCreateAlias, ListAliases, RefreshAliases, SetAliasActive, UpdateAlias, BatchUpdateAliases, DeleteAlias) 与 BatchCreateResult, BatchUpdateResult 类型
- * [POS]: internal/server 的别名业务门面，持久区分补货用途与未知用途，恢复未完成库存并维护未决门禁与写入配额
+ * [POS]: internal/server 的别名业务门面，持久区分补货用途与未知用途，失败配额释放绑定原小时窗口，恢复未完成库存并维护未决门禁与写入配额
+ * 成功的单条/批量元数据写入同步缓存 label/note，失败记录保持原值。
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -92,8 +93,9 @@ func (b *managerBackend) createAliasContext(ctx context.Context, accountID, labe
 	}
 
 	// 2. 扣减本地小时配额
+	var quotaWindow int64
 	if b.store != nil {
-		allowed, rem, quotaErr := b.store.TryReserveQuota(accountID, 1)
+		allowed, rem, window, quotaErr := b.store.TryReserveQuota(accountID, 1)
 		if quotaErr != nil {
 			return nil, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_ERROR", Message: fmt.Sprintf("查询账号 %s 创建配额失败: %v", accountID, quotaErr)}
 		}
@@ -104,6 +106,7 @@ func (b *managerBackend) createAliasContext(ctx context.Context, accountID, labe
 				Message: fmt.Sprintf("账号 %s 当前小时创建配额已用完 (剩余 %d 个)", accountID, rem),
 			}
 		}
+		quotaWindow = window
 	}
 
 	var result *hme.CreateResult
@@ -124,7 +127,7 @@ func (b *managerBackend) createAliasContext(ctx context.Context, accountID, labe
 	}
 	if err != nil {
 		if b.store != nil && (!errors.Is(err, hme.ErrOutcomeUnknown) || errors.Is(err, errCreateBlockedByUnresolvedIntent)) {
-			if releaseErr := b.store.ReleaseQuota(accountID, 1); releaseErr != nil {
+			if releaseErr := b.store.ReleaseQuota(accountID, 1, quotaWindow); releaseErr != nil {
 				return nil, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_ERROR", Message: fmt.Sprintf("创建失败后释放账号 %s 配额失败: %v (原错误: %v)", accountID, releaseErr, err)}
 			}
 		}
@@ -417,8 +420,9 @@ func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID 
 	}
 
 	// 2. 扣减本地小时配额
+	var quotaWindow int64
 	if b.store != nil {
-		allowed, rem, quotaErr := b.store.TryReserveQuota(accountID, count)
+		allowed, rem, window, quotaErr := b.store.TryReserveQuota(accountID, count)
 		if quotaErr != nil {
 			return nil, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_ERROR", Message: fmt.Sprintf("查询账号 %s 创建配额失败: %v", accountID, quotaErr)}
 		}
@@ -429,6 +433,7 @@ func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID 
 				Message: fmt.Sprintf("账号 %s 当前小时创建配额不足以满足 %d 个别名 (剩余 %d 个)", accountID, count, rem),
 			}
 		}
+		quotaWindow = window
 	}
 
 	resp := &BatchCreateResult{
@@ -468,7 +473,7 @@ func (b *managerBackend) BatchCreateAliasContext(ctx context.Context, accountID 
 				toRelease--
 			}
 			if toRelease > 0 {
-				if releaseErr := b.store.ReleaseQuota(accountID, toRelease); releaseErr != nil {
+				if releaseErr := b.store.ReleaseQuota(accountID, toRelease, quotaWindow); releaseErr != nil {
 					resp.AuditFailed = append(resp.AuditFailed, fmt.Sprintf("释放账号 %s 配额失败: %v", accountID, releaseErr))
 					if resp.CreatedCount == 0 {
 						return nil, &BackendError{Status: http.StatusInternalServerError, Code: "PERSISTENCE_ERROR", Message: resp.AuditFailed[0]}
@@ -845,23 +850,8 @@ func (b *managerBackend) UpdateAlias(accountID, anonymousID, label, note string)
 		}
 		return classifyUpstreamErr("更新备注失败", err)
 	}
-	b.updateCachedAliasLabel(accountID, anonymousID, label)
+	b.updateCachedAliasMetadata(accountID, []string{anonymousID}, label, note)
 	return nil
-}
-
-func (b *managerBackend) updateCachedAliasLabel(accountID, anonymousID, label string) {
-	b.aliasMu.Lock()
-	defer b.aliasMu.Unlock()
-	if b.aliasCache != nil {
-		if item, ok := b.aliasCache[accountID]; ok && item != nil {
-			for i := range item.aliases {
-				if item.aliases[i].AnonymousID == anonymousID {
-					item.aliases[i].Label = label
-					break
-				}
-			}
-		}
-	}
 }
 
 // BatchUpdateAliases 批量更新别名备注 (label) 与说明 (note)。
@@ -937,13 +927,13 @@ func (b *managerBackend) BatchUpdateAliases(accountID string, anonymousIDs []str
 	}
 
 	if len(result.Succeeded) > 0 {
-		b.updateCachedAliasLabels(accountID, result.Succeeded, label)
+		b.updateCachedAliasMetadata(accountID, result.Succeeded, label, note)
 	}
 
 	return result, nil
 }
 
-func (b *managerBackend) updateCachedAliasLabels(accountID string, anonymousIDs []string, label string) {
+func (b *managerBackend) updateCachedAliasMetadata(accountID string, anonymousIDs []string, label, note string) {
 	if len(anonymousIDs) == 0 {
 		return
 	}
@@ -959,6 +949,7 @@ func (b *managerBackend) updateCachedAliasLabels(accountID string, anonymousIDs 
 			for i := range item.aliases {
 				if _, hit := idMap[item.aliases[i].AnonymousID]; hit {
 					item.aliases[i].Label = label
+					item.aliases[i].Note = note
 				}
 			}
 		}

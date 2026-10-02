@@ -1,0 +1,196 @@
+/* ═══════════════════════════════════════════════════════════
+   Design Tokens — 唯一的颜色/间距/圆角/尺寸/动效来源
+   组件样式只引用这里的变量，不写裸色值
+   ═══════════════════════════════════════════════════════════ */
+
+/* 视觉方向：Linear 式克制 —— 中性灰阶为主，靛蓝是唯一强调色，
+   只用于主动作、选中态、链接与焦点；语义色只出现在圆点、图标与少量文字上 */
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* 表面层级：canvas < raised；subtle/hover/active 用于分组与交互反馈 */
+  --color-bg: #f7f7f8;
+  --color-bg-subtle: #f3f3f5;
+  --color-bg-raised: #ffffff;
+  --color-bg-inset: #f7f7f8;
+  --color-bg-hover: #f0f0f2;
+  --color-bg-active: #e9e9ec;
+  --color-sidebar: #f7f7f8;
+
+  /* 文字：中性冷灰三级，tertiary 在白底约 4.6:1 */
+  --color-text: #1b1c1f;
+  --color-text-secondary: #575a62;
+  --color-text-tertiary: #6e727b;
+  --color-text-inverse: #ffffff;
+
+  --color-border: #e8e8eb;
+  --color-border-strong: #d9d9de;
+
+  /* 唯一强调色 (靛蓝) */
+  --color-primary: #5257cd;
+  --color-primary-hover: #4449bb;
+  --color-primary-solid: #5e63d8;
+  --color-primary-solid-hover: #5156c9;
+  --color-primary-soft: #f0f0fc;
+  --color-primary-soft-border: #d6d7f6;
+
+  /* 语义色：降低饱和度，避免"调色盘"效果 */
+  --color-success: #1f8a5b;
+  --color-success-hover: #186f49;
+  --color-success-soft: #edf7f2;
+  --color-success-border: #c6e7d7;
+
+  --color-warning: #b26b12;
+  --color-warning-hover: #8f560e;
+  --color-warning-soft: #fdf6ea;
+  --color-warning-border: #f0dcb6;
+
+  --color-danger: #cf3f36;
+  --color-danger-hover: #b0342c;
+  --color-danger-soft: #fcf0ef;
+  --color-danger-border: #f2cfcc;
+
+  --color-accent: #7a5bd6;
+
+  --color-switch-bg: #d4d4d9;
+  --color-overlay: rgb(20 20 24 / 0.32);
+  --color-toast-bg: #1f2023;
+  --color-toast-text: #f4f4f5;
+
+  /* 日志终端 */
+  --color-terminal-bg: #fbfbfc;
+  --color-terminal-text: #2a2c31;
+  --color-terminal-time: #6e727b;
+
+  /* 阴影：卡片不使用阴影，仅浮层与弹窗使用 */
+  --shadow-xs: 0 1px 1px rgb(20 20 24 / 0.04);
+  --shadow-pop: 0 0 0 1px rgb(20 20 24 / 0.04), 0 8px 24px -6px rgb(20 20 24 / 0.14);
+  --shadow-dialog: 0 0 0 1px rgb(20 20 24 / 0.04), 0 24px 56px -16px rgb(20 20 24 / 0.24);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* 深色：近黑中性底 + 柔和浅灰文字，长时间使用不刺眼 */
+  --color-bg: #0f1012;
+  --color-bg-subtle: #17181b;
+  --color-bg-raised: #141517;
+  --color-bg-inset: #111214;
+  --color-bg-hover: #1c1d21;
+  --color-bg-active: #232429;
+  --color-sidebar: #0f1012;
+
+  --color-text: #e6e6e9;
+  --color-text-secondary: #a1a3ab;
+  --color-text-tertiary: #80838c;
+  --color-text-inverse: #ffffff;
+
+  --color-border: #232428;
+  --color-border-strong: #2f3035;
+
+  --color-primary: #8f93ef;
+  --color-primary-hover: #a7aaf3;
+  --color-primary-solid: #5e63d8;
+  --color-primary-solid-hover: #6b70e0;
+  --color-primary-soft: rgb(124 129 236 / 0.14);
+  --color-primary-soft-border: rgb(124 129 236 / 0.32);
+
+  --color-success: #4cb782;
+  --color-success-hover: #6cc79a;
+  --color-success-soft: rgb(76 183 130 / 0.12);
+  --color-success-border: rgb(76 183 130 / 0.28);
+
+  --color-warning: #e0a245;
+  --color-warning-hover: #e8b66a;
+  --color-warning-soft: rgb(224 162 69 / 0.12);
+  --color-warning-border: rgb(224 162 69 / 0.28);
+
+  --color-danger: #eb6a5f;
+  --color-danger-hover: #f08a81;
+  --color-danger-soft: rgb(235 106 95 / 0.12);
+  --color-danger-border: rgb(235 106 95 / 0.3);
+
+  --color-accent: #a68cf2;
+
+  --color-switch-bg: #34353b;
+  --color-overlay: rgb(0 0 0 / 0.6);
+  --color-toast-bg: #26272b;
+  --color-toast-text: #e6e6e9;
+
+  --color-terminal-bg: #111214;
+  --color-terminal-text: #c8cad0;
+  --color-terminal-time: #80838c;
+
+  --shadow-xs: 0 1px 1px rgb(0 0 0 / 0.3);
+  --shadow-pop: 0 0 0 1px rgb(255 255 255 / 0.05), 0 12px 32px -8px rgb(0 0 0 / 0.7);
+  --shadow-dialog: 0 0 0 1px rgb(255 255 255 / 0.06), 0 24px 64px -12px rgb(0 0 0 / 0.75);
+}
+
+/* 主题无关的尺度 */
+:root {
+  /* 圆角：控件 6，卡片 8，弹窗 10 */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius: 8px;
+  --radius-lg: 8px;
+  --radius-xl: 10px;
+  --radius-full: 999px;
+
+  /* 间距：4px 节奏 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 48px;
+
+  /* 控件高度：桌面高密度，触屏自动放大 */
+  --control-xs: 24px;
+  --control-sm: 28px;
+  --control: 34px;
+  --control-lg: 40px;
+
+  /* 排版 */
+  /* 英文/数字用打包的 Inter，中文回退到各平台系统黑体 */
+  --font: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace;
+  --text-2xs: 11px;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-lg: 16px;
+  --text-xl: 18px;
+  --text-2xl: 20px;
+
+  /* 动效：只做颜色/透明度过渡 */
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
+
+  /* 布局 */
+  --sidebar-width: 232px;
+  --topbar-height: 52px;
+  --content-max: 1600px;
+
+  /* z-index */
+  --z-sticky: 20;
+  --z-sidebar: 100;
+  --z-dropdown: 130;
+  --z-dialog: 150;
+  --z-popover: 1050;
+  --z-toast: 1100;
+}
+
+@media (pointer: coarse) {
+  :root {
+    --control-xs: 30px;
+    --control-sm: 34px;
+    --control: 40px;
+    --control-lg: 44px;
+  }
+}

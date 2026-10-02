@@ -126,7 +126,7 @@ export default function MailboxDialog({ accountId, current, open, onClose, onSav
         <div className="form-field">
           <label htmlFor="mailbox-email">收件邮箱</label>
           <input id="mailbox-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
-          <small style={{ display: 'block', marginTop: 4, color: 'var(--color-text-secondary)', fontSize: '0.85em' }}>
+          <small className="hint">
             请确认此地址是 Apple 隐藏邮箱当前的转发目标；接入操作不会修改 Apple 设置。
           </small>
         </div>
@@ -142,7 +142,7 @@ export default function MailboxDialog({ accountId, current, open, onClose, onSav
             placeholder={current?.email ? '邮箱和服务器不变时可留空' : '请输入邮箱授权码'}
             onChange={(e) => setCode(e.target.value)}
           />
-          <small style={{ display: 'block', marginTop: 4, color: 'var(--color-text-secondary)', fontSize: '0.85em' }}>
+          <small className="hint">
             提示：QQ / 163 等邮箱须使用网页设置生成的 IMAP 独立授权码（支持直接粘贴带空格格式）
           </small>
         </div>

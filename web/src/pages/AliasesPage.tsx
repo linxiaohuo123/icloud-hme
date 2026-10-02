@@ -2,6 +2,7 @@
  * [INPUT]: 依赖 api/client, api/types, components 下各 Dialog (含 BatchCreateAliasDialog)、Select 与 ToastProvider, utils/clipboard, utils/date, components/icons (含 IconDownload)
  * [OUTPUT]: 对外提供 AliasesPage 全局别名号池与资产大盘页面组件 (紧凑型资产大盘 + 卡片顶栏内嵌状态胶囊 + 批量生成 + 资产全量导出 + 统一紧凑筛选栏 + 柔性母号徽章 + 极简行级单行操作 + 客户端分页与可配置单页条数)
  * [POS]: web/src/pages 的核心页面，负责跨账号全局别名号池总览、批量生成、资产导出、所属母号溯源、启停、备注编辑与销毁
+ * 单条及批量元数据保存同步本地 label/note，重新编辑保留上次保存的说明。
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -50,10 +51,6 @@ function tagHue(name: string): number {
   return hash
 }
 
-const srOnly: CSSProperties = {
-  position: 'absolute', width: 1, height: 1, padding: 0, margin: -1, overflow: 'hidden', clip: 'rect(0, 0, 0, 0)', border: 0,
-}
-
 export default function AliasesPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const { show, showCopyable } = useToast()
@@ -67,10 +64,8 @@ export default function AliasesPage() {
   const [failedAccounts, setFailedAccounts] = useState<string[]>([])
   const [retryKey, setRetryKey] = useState(0)
 
-  // 跨账号筛选竞态保护
-  const refreshGenRef = useRef(0)
-  const refreshAbortRef = useRef<AbortController | null>(null)
-  const currentAccountIdRef = useRef(accountId)
+  // 普通加载与手动同步共享响应所有权，切账号或卸载作废全部旧请求
+  const listRequestRef = useRef({ generation: 0, controller: null as AbortController | null })
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<'all' | 'active' | 'inactive'>('all')
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
@@ -109,18 +104,6 @@ export default function AliasesPage() {
     }
   }
 
-  // 保持当前选中的 accountId 实时同步
-  useEffect(() => {
-    currentAccountIdRef.current = accountId
-  }, [accountId])
-
-  // 组件卸载时终止所有刷新请求
-  useEffect(() => {
-    return () => {
-      refreshAbortRef.current?.abort()
-    }
-  }, [])
-
   // 监听 URL 外部变动（如前进/后退）或账号列表就绪并同步 accountId
   useEffect(() => {
     if (accounts.length === 0) return
@@ -131,6 +114,7 @@ export default function AliasesPage() {
 
   // 加载别名列表
   useEffect(() => {
+    const requests = listRequestRef.current
     if (accounts.length === 0) {
       setAliases([])
       setFailedAccounts([])
@@ -139,26 +123,30 @@ export default function AliasesPage() {
     }
     if (!accountId) return
     setLoading(true)
-    let cancelled = false
+    const gen = ++requests.generation
+    requests.controller?.abort()
+    const controller = new AbortController()
+    requests.controller = controller
     const url = accountId === 'all'
       ? '/api/aliases?account_id=all'
       : `/api/aliases?account_id=${encodeURIComponent(accountId)}`
-    request<AliasListResult>(url)
+    request<AliasListResult>(url, { signal: controller.signal })
       .then((data) => {
-        if (cancelled) return
+        if (gen !== requests.generation || controller.signal.aborted) return
         setAliases(data.aliases ?? [])
         setFailedAccounts(data.failed_accounts ?? [])
         setError('')
       })
       .catch((err) => {
-        if (cancelled) return
+        if (gen !== requests.generation || controller.signal.aborted) return
         setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
       })
       .finally(() => {
-        if (!cancelled) setLoading(false)
+        if (gen === requests.generation && !controller.signal.aborted) setLoading(false)
       })
     return () => {
-      cancelled = true
+      ++requests.generation
+      requests.controller?.abort()
     }
   }, [accountId, accounts.length, retryKey])
 
@@ -255,12 +243,13 @@ export default function AliasesPage() {
   }
 
   async function handleRefreshPool() {
+    const requests = listRequestRef.current
     setLoading(true)
-    refreshGenRef.current++
-    const gen = refreshGenRef.current
-    refreshAbortRef.current?.abort()
+    requests.generation++
+    const gen = requests.generation
+    requests.controller?.abort()
     const controller = new AbortController()
-    refreshAbortRef.current = controller
+    requests.controller = controller
     const requestedAccountId = accountId
 
     try {
@@ -270,10 +259,9 @@ export default function AliasesPage() {
       const data = await request<AliasListResult>(url, {
         signal: controller.signal,
       })
-      // 必须确认: requested account selection 仍等于当前 accountId，且 generation 匹配且未被 abort
+      // 普通加载、切账号及卸载都能作废此请求的响应所有权。
       if (
-        gen === refreshGenRef.current &&
-        currentAccountIdRef.current === requestedAccountId &&
+        gen === requests.generation &&
         !controller.signal.aborted
       ) {
         setAliases(data.aliases ?? [])
@@ -284,16 +272,14 @@ export default function AliasesPage() {
       }
     } catch (err) {
       if (
-        gen === refreshGenRef.current &&
-        currentAccountIdRef.current === requestedAccountId &&
+        gen === requests.generation &&
         !controller.signal.aborted
       ) {
         show(err instanceof ApiError ? err.message : '刷新号池失败')
       }
     } finally {
       if (
-        gen === refreshGenRef.current &&
-        currentAccountIdRef.current === requestedAccountId
+        gen === requests.generation && !controller.signal.aborted
       ) {
         setLoading(false)
       }
@@ -434,7 +420,7 @@ export default function AliasesPage() {
             聚合各母号 Hide My Email 别名资产库，支持跨母号溯源、统一检索、批量维护与收件箱直达
           </p>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div className="page-actions">
           <button
             type="button"
             className="btn btn-secondary"
@@ -447,16 +433,6 @@ export default function AliasesPage() {
           </button>
           <button
             type="button"
-            className="btn btn-primary"
-            onClick={() => setBatchCreateOpen(true)}
-            disabled={accounts.length === 0}
-            title="批量生成别名 (1-5个)"
-          >
-            <IconPlus size={14} />
-            <span>批量生成</span>
-          </button>
-          <button
-            type="button"
             className="btn btn-secondary"
             onClick={handleRefreshPool}
             disabled={loading}
@@ -464,6 +440,16 @@ export default function AliasesPage() {
           >
             <IconRefresh size={14} />
             <span>{loading ? '刷新中…' : '刷新号池'}</span>
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={() => setBatchCreateOpen(true)}
+            disabled={accounts.length === 0}
+            title="批量生成别名 (1-5个)"
+          >
+            <IconPlus size={14} />
+            <span>批量生成</span>
           </button>
         </div>
       </div>
@@ -503,7 +489,7 @@ export default function AliasesPage() {
         {/* 工具筛选栏 */}
         <div className="filter-bar">
           <div className="filter-item">
-            <label htmlFor="alias-account" style={srOnly}>所属账号</label>
+            <label htmlFor="alias-account" className="sr-only">所属账号</label>
             <Select
               id="alias-account"
               aria-label="所属账号"
@@ -519,7 +505,7 @@ export default function AliasesPage() {
           </div>
 
           <div className="filter-item">
-            <label htmlFor="alias-filter" style={srOnly}>状态</label>
+            <label htmlFor="alias-filter" className="sr-only">状态</label>
             <Select
               id="alias-filter"
               aria-label="状态"
@@ -537,7 +523,7 @@ export default function AliasesPage() {
 
           <div className="filter-item filter-search">
             <IconSearch size={14} />
-            <label htmlFor="alias-search" style={srOnly}>搜索</label>
+            <label htmlFor="alias-search" className="sr-only">搜索</label>
             <input
               id="alias-search"
               aria-label="搜索"
@@ -551,7 +537,7 @@ export default function AliasesPage() {
 
         {/* 批量操作提示栏 */}
         {selectedIds.size > 0 && (
-          <div className="batch-action-bar" style={{ margin: '12px 20px 0' }}>
+          <div className="batch-action-bar">
             <div className="batch-action-left">
               <span className="batch-count-badge">{selectedIds.size}</span>
               <span className="batch-action-title">个别名已选中</span>
@@ -576,7 +562,7 @@ export default function AliasesPage() {
         )}
 
         {failedAccounts.length > 0 && (
-          <div className="alert-error" role="alert" style={{ margin: '12px 20px' }}>
+          <div className="alert-error card-inline-alert" role="alert">
             {failedAccounts.length} 个账号的别名未能读取，当前列表不完整：{failedAccounts.join('、')}
           </div>
         )}
@@ -630,7 +616,7 @@ export default function AliasesPage() {
                   return (
                     <tr
                       key={alias.anonymousId}
-                      style={selectedIds.has(alias.anonymousId) ? { background: 'var(--color-bg-subtle)' } : undefined}
+                      className={selectedIds.has(alias.anonymousId) ? 'is-selected' : undefined}
                     >
                       <td style={{ textAlign: 'center' }}>
                         <input
@@ -639,6 +625,7 @@ export default function AliasesPage() {
                           checked={selectedIds.has(alias.anonymousId)}
                           onChange={() => toggleSelect(alias.anonymousId)}
                           title="选择此别名"
+                          aria-label={`选择 ${alias.email}`}
                         />
                       </td>
                       <td>
@@ -662,7 +649,7 @@ export default function AliasesPage() {
                         </span>
                       </td>
                       <td>
-                        <div className="alias-cell" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                        <div className="alias-cell">
                           <span className="alias-label-text" title={alias.label || '无备注'}>{alias.label || '—'}</span>
                           <button
                             type="button"
@@ -683,12 +670,11 @@ export default function AliasesPage() {
                       </td>
                       <td className="text-xs text-secondary">{formatDate(alias.createdAt)}</td>
                       <td style={{ textAlign: 'right' }}>
-                        <div className="row-actions" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, justifyContent: 'flex-end', flexWrap: 'nowrap', whiteSpace: 'nowrap' }}>
+                        <div className="row-actions">
                           <Link
                             to={aliasAccId ? `/inbox?account_id=${encodeURIComponent(aliasAccId)}&alias=${encodeURIComponent(alias.email)}` : `/inbox?alias=${encodeURIComponent(alias.email)}`}
                             className="btn btn-xs btn-primary-soft"
                             title="查看此别名的收件箱"
-                            style={{ display: 'inline-flex', alignItems: 'center', gap: 3, textDecoration: 'none' }}
                           >
                             <IconInbox size={11} />
                             <span>收件箱</span>
@@ -698,9 +684,8 @@ export default function AliasesPage() {
                             className="btn btn-xs btn-ghost"
                             onClick={() => setDirectLinkEmail(alias.email)}
                             title="获取此别名的对外直出链接 (取码/查信/正文)"
-                            style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}
                           >
-                            <IconZap size={11} style={{ color: '#38bdf8' }} />
+                            <IconZap size={11} />
                             <span>直链</span>
                           </button>
                           {alias.active ? (
@@ -815,10 +800,10 @@ export default function AliasesPage() {
           accountId={editingAlias.account_id || editingAlias.accountId || (accountId !== 'all' ? accountId : accounts[0]?.id ?? '')}
           alias={editingAlias}
           onClose={() => setEditingAlias(null)}
-          onSaved={(newLabel) => {
+          onSaved={(newLabel, newNote) => {
             setAliases((prev) =>
               prev.map((a) =>
-                a.anonymousId === editingAlias.anonymousId ? { ...a, label: newLabel } : a,
+                a.anonymousId === editingAlias.anonymousId ? { ...a, label: newLabel, note: newNote } : a,
               ),
             )
             setEditingAlias(null)
@@ -834,10 +819,10 @@ export default function AliasesPage() {
           selectedIds={Array.from(selectedIds)}
           aliases={aliases}
           onClose={() => setBatchEditOpen(false)}
-          onSaved={(succeededIds, newLabel, warning) => {
+          onSaved={(succeededIds, newLabel, warning, newNote) => {
             const idSet = new Set(succeededIds)
             setAliases((prev) =>
-              prev.map((a) => (idSet.has(a.anonymousId) ? { ...a, label: newLabel } : a)),
+              prev.map((a) => (idSet.has(a.anonymousId) ? { ...a, label: newLabel, note: newNote } : a)),
             )
             setSelectedIds((prev) => new Set([...prev].filter((id) => !idSet.has(id))))
             setBatchEditOpen(false)
@@ -871,7 +856,7 @@ export default function AliasesPage() {
       )}
 
       {actionError && (
-        <div className="alert-error" role="alert" style={{ marginTop: 16 }}>
+        <div className="alert-error" role="alert">
           {actionError}
         </div>
       )}

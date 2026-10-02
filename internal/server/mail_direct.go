@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 gin, html/template, net/http, strings, time, encoding/json, fmt, strconv, icloud-hme/internal/auth, icloud-hme/internal/mail, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 findAccountForEmail, mailViewHandler, mailRawHandler
- * [POS]: internal/server 的对外直出链接管道，正文失败逐项显式交付，HTML 与文本独立展示，指定邮件预览使用隔离响应
+ * [POS]: internal/server 的对外直出链接管道，正文失败逐项显式交付，HTML 与文本独立展示，取码保留 MIME 字段边界，指定邮件预览使用隔离响应
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -185,7 +185,7 @@ var mailViewTemplate = template.Must(template.New("mailView").Parse(`<!DOCTYPE h
       </div>
       <div class="top-actions">
         <div class="refresh-pill" id="refreshPill" data-action="toggle-refresh" title="点击暂停/继续自动检测">
-          ⏱️ <span id="countdownSec">3s</span> 自动检测
+          <span id="countdownSec">3s</span> 后自动检测
         </div>
         <button class="btn btn-secondary" data-action="refresh" title="按 R 键立即刷新">
           <svg id="refreshSpin" viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
@@ -197,13 +197,13 @@ var mailViewTemplate = template.Must(template.New("mailView").Parse(`<!DOCTYPE h
     <!-- Alias Banner -->
     <div class="alias-banner">
       <div class="alias-info">
-        <span class="alias-label">目标别名:</span>
+        <span class="alias-label">别名</span>
         <span class="alias-chip" data-action="copy-email" data-email="{{.Email}}" title="点击复制邮箱">
           <span>{{.Email}}</span>
           <svg viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
         </span>
         {{if .AccountName}}
-        <span class="alias-meta">· 母号: {{.AccountName}}</span>
+        <span class="alias-meta">母号 · {{.AccountName}}</span>
         {{end}}
       </div>
       <div>
@@ -240,7 +240,7 @@ var mailViewTemplate = template.Must(template.New("mailView").Parse(`<!DOCTYPE h
 
       <!-- Historical OTPs Chips Row -->
       <div class="otp-history-section{{if le (len .AllOTPs) 1}} is-hidden{{end}}" id="otpHistorySection">
-        <span class="otp-history-label">全部验证信息 ({{len .AllOTPs}} 条):</span>
+        <span class="otp-history-label">全部验证信息 · {{len .AllOTPs}} 条</span>
         {{range .AllOTPs}}
         {{if .Code}}
         <button class="otp-chip-btn" data-action="copy-code" data-code="{{.Code}}" title="点击复制此验证码 (来自: {{.SenderName}} · {{.RelativeDate}})">
@@ -279,7 +279,7 @@ var mailViewTemplate = template.Must(template.New("mailView").Parse(`<!DOCTYPE h
             <div class="mail-item-bottom">
               {{if .Code}}
               <div class="item-otp-pill">
-                <span>⚡ {{.Code}}</span>
+                <span>{{.Code}}</span>
                 <span class="quick-copy" data-action="copy-code" data-code="{{.Code}}" title="复制验证码">复制</span>
               </div>
               {{else}}
@@ -313,7 +313,7 @@ var mailViewTemplate = template.Must(template.New("mailView").Parse(`<!DOCTYPE h
         <!-- Detail OTP Strip (Visible if current email has OTP) -->
         <div class="detail-otp-box{{if not .LatestItem.HasOTP}} is-hidden{{end}}" id="detailOtpBox">
           <div class="detail-otp-left{{if not .LatestItem.Code}} is-hidden{{end}}" id="detailOtpCodeBox">
-            <span class="detail-otp-label">本信验证码:</span>
+            <span class="detail-otp-label">本信验证码</span>
             <span class="detail-otp-code" id="detailOtpCode" data-action="copy-detail-otp">{{.LatestItem.Code}}</span>
           </div>
           <div class="detail-otp-actions">
@@ -330,9 +330,9 @@ var mailViewTemplate = template.Must(template.New("mailView").Parse(`<!DOCTYPE h
         <!-- Toolbar & Tabs -->
         <div class="mail-toolbar">
           <div class="tabs">
-            <button class="tab-btn active" id="tab-styled" data-action="switch-tab" data-view="styled">💬 优雅排版</button>
-            <button class="tab-btn" id="tab-html" data-action="switch-tab" data-view="html">🌐 网页视图</button>
-            <button class="tab-btn" id="tab-raw" data-action="switch-tab" data-view="raw">📄 原始文本</button>
+            <button class="tab-btn active" id="tab-styled" data-action="switch-tab" data-view="styled">排版文本</button>
+            <button class="tab-btn" id="tab-html" data-action="switch-tab" data-view="html">网页视图</button>
+            <button class="tab-btn" id="tab-raw" data-action="switch-tab" data-view="raw">原始文本</button>
           </div>
           <div>
             <button class="btn btn-secondary compact-btn" data-action="copy-full-body">
@@ -706,9 +706,11 @@ func (s *Server) fetchRecentMessagesForAlias(ctx context.Context, accountID, ema
 			BodyError:     bodyError,
 		}
 
-		otp := mail.ExtractOTP(subject, textBody)
-		if bodyError != "" {
-			otp = nil
+		var otp *mail.OTPResult
+		if fullMsg != nil && bodyError == "" {
+			otpMessage := *fullMsg
+			otpMessage.Subject = subject
+			otp = otpMessage.ExtractOTP()
 		}
 		if otp != nil && (otp.Code != "" || otp.MagicLink != "") {
 			item.HasOTP = true

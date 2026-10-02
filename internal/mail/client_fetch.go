@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 fmt, net/mail, sort, strings, time, github.com/emersion/go-imap
  * [OUTPUT]: 对外提供 (*Client).GetFull, (*Client).GetFullInFolder, (*Client).GetFullInFolderWithValidity, (*Client).GetFullBatchInFolder, (*Client).GetFullBatchInFolderWithValidity, (*Client).GetMailboxBoundary, (*Client).Delete, (*Client).DeleteInFolder
- * [POS]: internal/mail 的邮件正文提取与邮箱管理逻辑，原始 HTML 与清洗预览独立交付，严格校验 UIDVALIDITY，批量读取逐项返回正文错误
+ * [POS]: internal/mail 的邮件正文提取与邮箱管理逻辑，原始 HTML、清洗预览与独立 MIME 取码字段分别保留，严格校验 UIDVALIDITY，批量读取逐项返回正文错误
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -210,6 +210,7 @@ func decodeFullMessageBody(full *FullMessage, msg *imap.Message, section *imap.B
 		return fmt.Errorf("decode message body (uid=%d): %w", msg.Uid, err)
 	}
 	full.match = strings.Join(extractStructuralRecipients(full.To, em.Header), "\n")
+	full.otpBodies = []string{plain, html}
 	full.Preview = bodyPreview(plain, html)
 	full.Body = strings.TrimSpace(plain)
 	full.ContentType = "text/plain; charset=utf-8"

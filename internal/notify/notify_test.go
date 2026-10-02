@@ -74,6 +74,7 @@ func newTestSender(settings Settings) *Sender {
 
 // TestSenderEmitDispatchToChannels 校验 Emit 异步分发到全部已配置渠道。
 func TestSenderEmitDispatchToChannels(t *testing.T) {
+	t.Setenv("ICLOUD_HME_ALLOW_PRIVATE_WEBHOOK", "true") // Local test endpoints are explicit opt-in.
 	var feishuHits, barkHits atomic.Int32
 	feishu := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		feishuHits.Add(1)
@@ -182,6 +183,7 @@ func TestSenderEventSwitch(t *testing.T) {
 
 // TestSendTestResults 校验测试推送返回逐渠道结果(含失败渠道)。
 func TestSendTestResults(t *testing.T) {
+	t.Setenv("ICLOUD_HME_ALLOW_PRIVATE_WEBHOOK", "true")
 	feishu := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))

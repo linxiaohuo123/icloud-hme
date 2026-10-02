@@ -57,9 +57,9 @@ const accounts: AccountSummary[] = [
   },
 ]
 
-function renderPage() {
+function renderPage(initialEntry = '/accounts') {
   return render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={[initialEntry]}>
       <ToastProvider>
         <AccountsPage />
       </ToastProvider>
@@ -117,6 +117,14 @@ describe('AccountsPage', () => {
     await user.click(screen.getByRole('button', { name: /保存/ }))
     // 请求期间按钮禁用;成功后列表刷新
     await waitFor(() => expect(screen.getByText('新账号')).toBeInTheDocument())
+  })
+
+  it('侧边栏 ?add=true 深链直接打开添加账号弹窗', async () => {
+    server.use(
+      http.get('/api/accounts', () => HttpResponse.json({ success: true, data: accounts })),
+    )
+    renderPage('/accounts?add=true')
+    expect(await screen.findByRole('dialog', { name: '添加账号' })).toBeInTheDocument()
   })
 
   it('添加账号:host 只能选全球区或中国区', async () => {

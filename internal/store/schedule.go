@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 log, strings, time, icloud-hme/internal/store (Store)
- * [OUTPUT]: 对外提供 ScheduleConfig 与配置读取、保存、UpdateScheduleConfig 原子校验更新、配额仲裁和设置读写
+ * [OUTPUT]: 对外提供 ScheduleConfig 与配置原子更新、携带小时窗口的配额预留/释放和设置读写
  * [POS]: internal/store 的定时任务与配额持久化领域，配置更新不覆盖配额仲裁状态
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -164,16 +164,16 @@ func (s *Store) DeleteScheduleConfig(accountID string) error {
 }
 
 // TryReserveQuota 尝试原子预留指定数量的配额（单次/批量/调度统一入口）
-func (s *Store) TryReserveQuota(accountID string, count int) (allowed bool, remaining int, err error) {
+func (s *Store) TryReserveQuota(accountID string, count int) (allowed bool, remaining int, window int64, err error) {
 	if count <= 0 {
-		return true, 0, nil
+		return true, 0, 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	cfg, err := s.GetScheduleConfig(accountID)
 	if err != nil {
-		return false, 0, err
+		return false, 0, 0, err
 	}
 	currentHour := time.Now().Unix() / 3600
 	if cfg.LastHourWindow != currentHour {
@@ -186,7 +186,7 @@ func (s *Store) TryReserveQuota(accountID string, count int) (allowed bool, rema
 		if rem < 0 {
 			rem = 0
 		}
-		return false, rem, nil
+		return false, rem, currentHour, nil
 	}
 
 	cfg.CurrentHourCount += count
@@ -194,32 +194,22 @@ func (s *Store) TryReserveQuota(accountID string, count int) (allowed bool, rema
 	if err := s.saveScheduleConfigLocked(cfg, true); err != nil {
 		// 落库失败则回滚内存计数，拒绝本次预留，避免重启后配额归零超额出号
 		cfg.CurrentHourCount -= count
-		return false, cfg.HourlyQuota - cfg.CurrentHourCount, err
+		return false, cfg.HourlyQuota - cfg.CurrentHourCount, currentHour, err
 	}
-	return true, cfg.HourlyQuota - cfg.CurrentHourCount, nil
+	return true, cfg.HourlyQuota - cfg.CurrentHourCount, currentHour, nil
 }
 
-// ReleaseQuota 当别名创建失败时回滚配额
-func (s *Store) ReleaseQuota(accountID string, count int) error {
+// ReleaseQuota only releases reservations in their original hour, including partial batches.
+func (s *Store) ReleaseQuota(accountID string, count int, window int64) error {
 	if count <= 0 {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cfg, err := s.GetScheduleConfig(accountID)
-	if err != nil {
-		return err
-	}
-	currentHour := time.Now().Unix() / 3600
-	if cfg.LastHourWindow == currentHour {
-		cfg.CurrentHourCount -= count
-		if cfg.CurrentHourCount < 0 {
-			cfg.CurrentHourCount = 0
-		}
-		return s.saveScheduleConfigLocked(cfg, true)
-	}
-	return nil
+	_, err := s.db.Exec(`UPDATE schedules SET current_hour_count = MAX(0, current_hour_count - ?)
+		WHERE account_id = ? AND last_hour_window = ?`, count, accountID, window)
+	return err
 }
 
 // RemainingQuota 查询指定账号当前小时的剩余创建配额
@@ -243,7 +233,7 @@ func (s *Store) RemainingQuota(accountID string) (int, error) {
 }
 
 func (s *Store) IncrementHourlyQuota(accountID string) (allowed bool, current int, err error) {
-	ok, _, err := s.TryReserveQuota(accountID, 1)
+	ok, _, _, err := s.TryReserveQuota(accountID, 1)
 	if err != nil {
 		return false, 0, err
 	}

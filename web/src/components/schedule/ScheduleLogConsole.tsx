@@ -109,17 +109,17 @@ export const ScheduleLogConsole = memo(function ScheduleLogConsole({
   return (
     <div className="log-feed-card">
       <div className="log-feed-header">
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <IconTerminal size={16} style={{ color: 'var(--color-primary)' }} />
-          <span style={{ fontWeight: 600, fontSize: '14px', color: 'var(--color-text)' }}>
+        <div className="log-feed-heading">
+          <IconTerminal size={16} />
+          <span className="log-feed-title">
             实时调度日志
           </span>
-          <span className={`status-pill ${!loading && !error ? 'active' : ''}`} style={{ fontSize: '11px' }}>
+          <span className={`status-pill ${error ? 'error' : !loading ? 'active' : ''}`}>
             <span className="status-dot" />
             {error ? '读取中断' : loading ? '连接中…' : '自动监听中'}
           </span>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <div className="log-feed-tools">
           <div className="log-feed-filters">
             <button
               type="button"
@@ -151,6 +151,7 @@ export const ScheduleLogConsole = memo(function ScheduleLogConsole({
             className="btn-icon"
             onClick={onRefreshLogs}
             title="立即刷新日志"
+            aria-label="立即刷新日志"
           >
             <IconRefresh size={14} />
           </button>

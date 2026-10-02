@@ -968,8 +968,8 @@ export default function InboxTableView({
             </span>
 
             {isRevalidating && (
-              <span className="card-stat-pill" style={{ opacity: 0.85 }} title="正在后台获取最新邮件">
-                <span className="status-dot active" style={{ backgroundColor: 'var(--color-primary, #0071e3)' }} />
+              <span className="card-stat-pill is-loading" title="正在后台获取最新邮件">
+                <span className="status-dot" />
                 <span>更新中…</span>
               </span>
             )}
@@ -993,7 +993,7 @@ export default function InboxTableView({
             )}
 
             {isWebMailOnly && (
-              <span className="card-stat-pill" style={{ color: '#e6a23c', borderColor: 'rgba(230,162,60,0.3)' }} title="当前账号未配置 App 专用密码，运行于 WebMail 模式，仅支持默认收件箱拉取，文件夹与天数筛选已禁用">
+              <span className="card-stat-pill is-notice" title="当前账号未配置 App 专用密码，运行于 WebMail 模式，仅支持默认收件箱拉取，文件夹与天数筛选已禁用">
                 <span>WebMail 模式 (仅支持基础收件箱)</span>
               </span>
             )}

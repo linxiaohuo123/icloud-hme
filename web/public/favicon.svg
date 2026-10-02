@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <defs>
+    <linearGradient id="cloud-mail-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#2563eb" />
+    </linearGradient>
+  </defs>
+  <!-- Background Squircle (Generic UI shape) -->
+  <rect width="32" height="32" rx="7.5" fill="url(#cloud-mail-grad)" />
+  <rect x="0.5" y="0.5" width="31" height="31" rx="7" stroke="rgba(255,255,255,0.2)" fill="none" />
+  <!-- Open-source generic cloud (Non-infringing public domain curve) -->
+  <path d="M9 16a3.5 3.5 0 0 1 0-7 5 5 0 0 1 9.5-1.5A4 4 0 0 1 22 11.5a3.5 3.5 0 0 1-.8 6.5H9z" fill="rgba(255,255,255,0.4)" />
+  <!-- Generic mail envelope -->
+  <rect x="6.5" y="12" width="19" height="13" rx="2.5" fill="#FFFFFF" />
+  <path d="M7 13.5l8.2 5.8a1.4 1.4 0 0 0 1.6 0l8.2-5.8" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" fill="none" />
+  <path d="M7 23.5l5.2-4.2M25 23.5l-5.2-4.2" stroke="#cbd5e1" stroke-width="1.2" stroke-linecap="round" fill="none" />
+</svg>

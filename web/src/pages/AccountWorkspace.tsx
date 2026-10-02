@@ -1,7 +1,8 @@
 /**
  * [INPUT]: 依赖 api/client 的 request/ApiError, api/types 的各类实体, components 各通用 Dialog 与 ToastProvider, workspace 子组件组
- * [OUTPUT]: 对外提供 AccountWorkspace 单账号专属工作台总装容器，启停跨标签保持处理中状态并等待列表同步完成，复制反馈遵循实际结果
+ * [OUTPUT]: 对外提供 AccountWorkspace 单账号专属工作台总装容器，启停跨标签保持处理中状态并等待列表同步完成，删除同步在途锁与确认弹窗 busy，复制反馈遵循实际结果
  * [POS]: web/src/pages 的核心页面总装器，按账号隔离异步请求与局部状态，URL 作为收件箱筛选真相源
+ * 单条及批量元数据保存同步本地 label/note；创建弹窗自行使账号缓存失效。
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -56,6 +57,8 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
   const [mailboxOpen, setMailboxOpen] = useState(false)
   const [createAliasOpen, setCreateAliasOpen] = useState(false)
   const [confirmDeleteAlias, setConfirmDeleteAlias] = useState<Alias | null>(null)
+  const deleteInFlightRef = useRef(false)
+  const [deletingAlias, setDeletingAlias] = useState(false)
   const [editingAlias, setEditingAlias] = useState<Alias | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [batchEditOpen, setBatchEditOpen] = useState(false)
@@ -232,7 +235,9 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
   }
 
   async function handleDeleteAlias() {
-    if (!accountId || !confirmDeleteAlias) return
+    if (!accountId || !confirmDeleteAlias || deleteInFlightRef.current) return
+    deleteInFlightRef.current = true
+    setDeletingAlias(true)
     try {
       await request(
         `/api/aliases/${encodeURIComponent(confirmDeleteAlias.anonymousId)}`,
@@ -254,6 +259,9 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
       void loadAccountData()
     } catch (err) {
       show(err instanceof ApiError ? err.message : '删除别名失败')
+    } finally {
+      deleteInFlightRef.current = false
+      setDeletingAlias(false)
     }
   }
 
@@ -302,6 +310,7 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
           <button
             type="button"
             className={`segmented-tab ${activeTab === 'aliases' ? 'active' : ''}`}
+            aria-pressed={activeTab === 'aliases'}
             onClick={() => {
               searchParams.set('tab', 'aliases')
               setSearchParams(searchParams)
@@ -314,6 +323,7 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
           <button
             type="button"
             className={`segmented-tab ${activeTab === 'inbox' ? 'active' : ''}`}
+            aria-pressed={activeTab === 'inbox'}
             onClick={() => {
               searchParams.set('tab', 'inbox')
               setSearchParams(searchParams)
@@ -338,11 +348,12 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
           totalAliasCount={aliases.length || account?.alias_total || 0}
           activeAliasCount={activeAliasCount}
           togglingAliasId={togglingAliasId}
+          deletingAlias={deletingAlias}
           selectedIds={selectedIds}
           setSelectedIds={setSelectedIds}
           onEditAlias={(item) => setEditingAlias(item)}
           onToggleAlias={handleToggleAlias}
-          onDeleteAlias={(item) => setConfirmDeleteAlias(item)}
+          onDeleteAlias={(item) => { if (!deleteInFlightRef.current) setConfirmDeleteAlias(item) }}
           onReadMail={(email) => {
             searchParams.set('tab', 'inbox')
             searchParams.set('alias', email)
@@ -403,7 +414,6 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
             onClose={() => setCreateAliasOpen(false)}
             onCreated={(email, auditRecorded) => {
               setCreateAliasOpen(false)
-              invalidateAccounts(account.id)
               void loadAccountData()
               if (!auditRecorded) show(`别名 ${email} 已创建，但出号流水写入失败，请勿重复创建`)
             }}
@@ -412,6 +422,7 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
             <ConfirmDialog
               open={true}
               title="彻底删除别名"
+              busy={deletingAlias}
               message={`确定要删除别名 ${confirmDeleteAlias.email} 吗？此操作不可逆！`}
               onClose={() => setConfirmDeleteAlias(null)}
               onConfirm={() => void handleDeleteAlias()}
@@ -423,10 +434,10 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
               accountId={account.id}
               alias={editingAlias}
               onClose={() => setEditingAlias(null)}
-              onSaved={(newLabel) => {
+              onSaved={(newLabel, newNote) => {
                 setAliases((prev) =>
                   prev.map((a) =>
-                    a.anonymousId === editingAlias.anonymousId ? { ...a, label: newLabel } : a,
+                    a.anonymousId === editingAlias.anonymousId ? { ...a, label: newLabel, note: newNote } : a,
                   ),
                 )
                 setEditingAlias(null)
@@ -455,10 +466,10 @@ function AccountWorkspaceContent({ accountId }: { accountId: string | undefined 
               accountId={account.id}
               selectedIds={Array.from(selectedIds)}
               onClose={() => setBatchEditOpen(false)}
-              onSaved={(succeededIds, newLabel, warning) => {
+              onSaved={(succeededIds, newLabel, warning, newNote) => {
                 const idSet = new Set(succeededIds)
                 setAliases((prev) =>
-                  prev.map((a) => (idSet.has(a.anonymousId) ? { ...a, label: newLabel } : a)),
+                  prev.map((a) => (idSet.has(a.anonymousId) ? { ...a, label: newLabel, note: newNote } : a)),
                 )
                 setSelectedIds((prev) => new Set([...prev].filter((id) => !idSet.has(id))))
                 setBatchEditOpen(false)

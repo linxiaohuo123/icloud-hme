@@ -14,6 +14,11 @@ export default defineConfig({
         target: 'http://127.0.0.1:8081',
         changeOrigin: true,
       },
+      // 对外直出链接 (/mail/code、/mail/view、/mail/raw 及查信页静态资源) 由后端渲染，开发时同样转发
+      '^/mail/': {
+        target: 'http://127.0.0.1:8081',
+        changeOrigin: true,
+      },
     },
   },
   test: {

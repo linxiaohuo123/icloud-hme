@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 react, api/client 的 request/ApiError, api/types 的 NotifyChannelResult/NotifySettingsResponse/UpdateNotifySettingsRequest, components/ToastProvider, components/icons
- * [OUTPUT]: 对外提供 SettingsPage 系统设置组件 (通知渠道配置、读取失败重试与保存保护、事件开关、配额阈值与一键测试推送)
+ * [OUTPUT]: 对外提供 SettingsPage 系统设置组件 (通知渠道配置、读取失败重试与保存保护、事件开关、配额阈值与一键测试推送)；左说明右控件的设置行布局 + 底部常驻保存栏
  * [POS]: web/src/pages 的系统设置页面，通知配置脱敏显示、按需安全更新与 Fail-Closed 契约对齐
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -182,7 +182,7 @@ export default function SettingsPage() {
   }
 
   async function handleSave() {
-    if (saving || loading || loadError || !serverSettings) return
+    if (saving || testing || loading || loadError || !serverSettings) return
     setSaving(true)
     setError('')
     try {
@@ -241,7 +241,7 @@ export default function SettingsPage() {
   }
 
   async function handleTest() {
-    if (testing) return
+    if (testing || saving) return
     setTesting(true)
     setTestResults(null)
     try {
@@ -287,6 +287,39 @@ export default function SettingsPage() {
     )
   }
 
+  // 已配置渠道的状态行：脱敏值 + 清除/撤销，置于输入框下方
+  function renderChannelStatus(opts: {
+    configured: boolean | undefined
+    masked: string | undefined
+    cleared: boolean
+    clearLabel: string
+    onClear: () => void
+    onUndo: () => void
+  }) {
+    if (!opts.configured) return null
+    return (
+      <div className="settings-field-status">
+        {opts.cleared ? (
+          <>
+            <span className="badge badge-error">已标记清除</span>
+            <button type="button" className="btn btn-xs btn-secondary" disabled={saving} onClick={opts.onUndo}>
+              撤销清除
+            </button>
+          </>
+        ) : (
+          <>
+            <span className="badge badge-active" title={opts.masked}>
+              已配置: {opts.masked || '已设置'}
+            </span>
+            <button type="button" className="btn btn-xs btn-ghost-danger" disabled={saving} onClick={opts.onClear}>
+              {opts.clearLabel}
+            </button>
+          </>
+        )}
+      </div>
+    )
+  }
+
   return (
     <div className="page-container">
       <div className="settings-layout">
@@ -303,171 +336,101 @@ export default function SettingsPage() {
           </div>
         )}
 
-        {/* 卡片 1: 推送渠道配置 */}
-        <div className="card">
+        {/* 分组 1: 推送渠道 */}
+        <section className="card settings-section">
           <div className="card-header">
             <h2 className="card-title">
               <IconZap size={16} />
               推送渠道配置
             </h2>
-            <span className="card-badge">支持多渠道并行</span>
+            <span className="settings-section-note">支持多渠道并行</span>
           </div>
 
-          <div className="card-body">
-            {/* 飞书 */}
-            <div className="form-field">
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+          <div className="settings-rows">
+            <div className="settings-row">
+              <div className="settings-row-label">
                 <label htmlFor="feishu_webhook">飞书自定义机器人 Webhook</label>
-                {serverSettings?.feishu_configured && (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    {clearFeishu ? (
-                      <>
-                        <span className="badge badge-error">已标记清除</span>
-                        <button
-                          type="button"
-                          className="btn btn-xs btn-secondary"
-                          onClick={() => setClearFeishu(false)}
-                        >
-                          撤销清除
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <span className="badge badge-active" title={serverSettings.feishu_webhook_masked}>
-                          已配置: {serverSettings.feishu_webhook_masked || '已设置'}
-                        </span>
-                        <button
-                          type="button"
-                          className="btn btn-xs btn-ghost-danger"
-                          onClick={() => {
-                            setClearFeishu(true)
-                            setFeishuInput('')
-                          }}
-                        >
-                          清除配置
-                        </button>
-                      </>
-                    )}
-                  </div>
-                )}
+                <span className="hint">飞书群 → 设置 → 群机器人 → 添加自定义机器人，粘贴 Webhook 地址</span>
               </div>
-              <input
-                id="feishu_webhook"
-                className="input"
-                type="text"
-                placeholder={
-                  serverSettings?.feishu_configured && !clearFeishu
-                    ? '留空保持已配置 Webhook，或输入新地址覆盖'
-                    : 'https://open.feishu.cn/open-apis/bot/v2/hook/xxxx'
-                }
-                value={feishuInput}
-                onChange={(e) => {
-                  setFeishuInput(e.target.value)
-                  if (e.target.value.trim()) {
-                    setClearFeishu(false)
+              <div className="settings-row-control">
+                <input
+                  id="feishu_webhook"
+                  className="input"
+                  type="text"
+                  placeholder={
+                    serverSettings?.feishu_configured && !clearFeishu
+                      ? '留空保持已配置 Webhook，或输入新地址覆盖'
+                      : 'https://open.feishu.cn/open-apis/bot/v2/hook/xxxx'
                   }
-                }}
-                autoComplete="off"
-              />
-              <span className="hint">飞书群 → 设置 → 群机器人 → 添加自定义机器人，粘贴 Webhook 地址</span>
+                  value={feishuInput}
+                  onChange={(e) => {
+                    setFeishuInput(e.target.value)
+                    if (e.target.value.trim()) {
+                      setClearFeishu(false)
+                    }
+                  }}
+                  autoComplete="off"
+                  disabled={saving}
+                />
+                {renderChannelStatus({
+                  configured: serverSettings?.feishu_configured,
+                  masked: serverSettings?.feishu_webhook_masked,
+                  cleared: clearFeishu,
+                  clearLabel: '清除配置',
+                  onClear: () => {
+                    setClearFeishu(true)
+                    setFeishuInput('')
+                  },
+                  onUndo: () => setClearFeishu(false),
+                })}
+              </div>
             </div>
 
-            {/* Bark */}
-            <div className="form-field">
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+            <div className="settings-row">
+              <div className="settings-row-label">
                 <label htmlFor="bark_url">Bark 推送地址 (iOS)</label>
-                {serverSettings?.bark_configured && (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    {clearBark ? (
-                      <>
-                        <span className="badge badge-error">已标记清除</span>
-                        <button
-                          type="button"
-                          className="btn btn-xs btn-secondary"
-                          onClick={() => setClearBark(false)}
-                        >
-                          撤销清除
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <span className="badge badge-active" title={serverSettings.bark_url_masked}>
-                          已配置: {serverSettings.bark_url_masked || '已设置'}
-                        </span>
-                        <button
-                          type="button"
-                          className="btn btn-xs btn-ghost-danger"
-                          onClick={() => {
-                            setClearBark(true)
-                            setBarkInput('')
-                          }}
-                        >
-                          清除配置
-                        </button>
-                      </>
-                    )}
-                  </div>
-                )}
+                <span className="hint">App Store 安装 Bark 后复制推送 URL，保留到 DeviceKey 即可</span>
               </div>
-              <input
-                id="bark_url"
-                className="input"
-                type="text"
-                placeholder={
-                  serverSettings?.bark_configured && !clearBark
-                    ? '留空保持已配置地址，或输入新地址覆盖'
-                    : 'https://api.day.app/你的DeviceKey'
-                }
-                value={barkInput}
-                onChange={(e) => {
-                  setBarkInput(e.target.value)
-                  if (e.target.value.trim()) {
-                    setClearBark(false)
+              <div className="settings-row-control">
+                <input
+                  id="bark_url"
+                  className="input"
+                  type="text"
+                  placeholder={
+                    serverSettings?.bark_configured && !clearBark
+                      ? '留空保持已配置地址，或输入新地址覆盖'
+                      : 'https://api.day.app/你的DeviceKey'
                   }
-                }}
-                autoComplete="off"
-              />
-              <span className="hint">App Store 安装 Bark 后复制推送 URL，保留到 DeviceKey 即可</span>
+                  value={barkInput}
+                  onChange={(e) => {
+                    setBarkInput(e.target.value)
+                    if (e.target.value.trim()) {
+                      setClearBark(false)
+                    }
+                  }}
+                  autoComplete="off"
+                  disabled={saving}
+                />
+                {renderChannelStatus({
+                  configured: serverSettings?.bark_configured,
+                  masked: serverSettings?.bark_url_masked,
+                  cleared: clearBark,
+                  clearLabel: '清除配置',
+                  onClear: () => {
+                    setClearBark(true)
+                    setBarkInput('')
+                  },
+                  onUndo: () => setClearBark(false),
+                })}
+              </div>
             </div>
 
-            {/* Telegram */}
-            <div className="form-grid-2">
-              <div className="form-field">
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-                  <label htmlFor="telegram_token">Telegram Bot Token</label>
-                  {serverSettings?.telegram_configured && (
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      {clearTelegram ? (
-                        <>
-                          <span className="badge badge-error">已标记清除</span>
-                          <button
-                            type="button"
-                            className="btn btn-xs btn-secondary"
-                            onClick={() => setClearTelegram(false)}
-                          >
-                            撤销清除
-                          </button>
-                        </>
-                      ) : (
-                        <>
-                          <span className="badge badge-active" title={serverSettings.telegram_token_masked}>
-                            已配置: {serverSettings.telegram_token_masked || '已设置'}
-                          </span>
-                          <button
-                            type="button"
-                            className="btn btn-xs btn-ghost-danger"
-                            onClick={() => {
-                              setClearTelegram(true)
-                              setTelegramTokenInput('')
-                            }}
-                          >
-                            清除
-                          </button>
-                        </>
-                      )}
-                    </div>
-                  )}
-                </div>
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <label htmlFor="telegram_token">Telegram Bot Token</label>
+                <span className="hint">与 @BotFather 创建机器人获取；需能直连 api.telegram.org</span>
+              </div>
+              <div className="settings-row-control">
                 <input
                   id="telegram_token"
                   className="input"
@@ -485,12 +448,28 @@ export default function SettingsPage() {
                     }
                   }}
                   autoComplete="off"
+                  disabled={saving}
                 />
-                <span className="hint">与 @BotFather 创建机器人获取；需能直连 api.telegram.org</span>
+                {renderChannelStatus({
+                  configured: serverSettings?.telegram_configured,
+                  masked: serverSettings?.telegram_token_masked,
+                  cleared: clearTelegram,
+                  clearLabel: '清除',
+                  onClear: () => {
+                    setClearTelegram(true)
+                    setTelegramTokenInput('')
+                  },
+                  onUndo: () => setClearTelegram(false),
+                })}
               </div>
+            </div>
 
-              <div className="form-field">
+            <div className="settings-row">
+              <div className="settings-row-label">
                 <label htmlFor="telegram_chat">Telegram Chat ID</label>
+                <span className="hint">与 @userinfobot 对话可查询自己的 Chat ID</span>
+              </div>
+              <div className="settings-row-control">
                 <input
                   id="telegram_chat"
                   className="input"
@@ -499,16 +478,15 @@ export default function SettingsPage() {
                   value={telegramChatInput}
                   onChange={(e) => setTelegramChatInput(e.target.value)}
                   autoComplete="off"
-                  disabled={clearTelegram}
+                  disabled={clearTelegram || saving}
                 />
-                <span className="hint">与 @userinfobot 对话可查询自己的 Chat ID</span>
               </div>
             </div>
           </div>
-        </div>
+        </section>
 
-        {/* 卡片 2: 告警策略与触发事件 */}
-        <div className="card">
+        {/* 分组 2: 告警策略 */}
+        <section className="card settings-section">
           <div className="card-header">
             <h2 className="card-title">
               <IconSliders size={16} />
@@ -516,141 +494,131 @@ export default function SettingsPage() {
             </h2>
           </div>
 
-          <div className="card-body">
-            <div className="form-field">
-              <div className="form-field-label">通知触发事件</div>
-              <div className="notify-event-list">
-                {EVENT_ITEMS.map((item) => (
-                  <div key={item.key} className="notify-event-card">
-                    <div className="notify-event-info">
-                      <label htmlFor={`event_${item.key}`} className="notify-event-label">
-                        {item.label}
-                      </label>
-                      <span className="notify-event-desc">{item.desc}</span>
-                    </div>
-                    <label className="switch" htmlFor={`event_${item.key}`}>
-                      <input
-                        id={`event_${item.key}`}
-                        type="checkbox"
-                        checked={eventEnabled(item.key)}
-                        onChange={() => toggleEvent(item.key)}
-                      />
-                      <span className="slider" />
-                      <span className="sr-only">切换</span>
-                    </label>
-                  </div>
-                ))}
+          <div className="settings-rows">
+            {EVENT_ITEMS.map((item) => (
+              <div key={item.key} className="settings-row is-toggle">
+                <div className="settings-row-label">
+                  <label htmlFor={`event_${item.key}`} className="notify-event-label">
+                    {item.label}
+                  </label>
+                  <span className="hint">{item.desc}</span>
+                </div>
+                <div className="settings-row-control is-end">
+                  <label className="switch" htmlFor={`event_${item.key}`}>
+                    <input
+                      id={`event_${item.key}`}
+                      type="checkbox"
+                      disabled={saving}
+                      checked={eventEnabled(item.key)}
+                      onChange={() => toggleEvent(item.key)}
+                    />
+                    <span className="slider" />
+                    <span className="sr-only">切换</span>
+                  </label>
+                </div>
               </div>
-            </div>
+            ))}
 
-            <div className="form-field">
-              <label htmlFor="quota_threshold">配额水位阈值 (活跃别名数)</label>
-              <div className="input-with-suffix">
-                <input
-                  id="quota_threshold"
-                  className="input"
-                  type="number"
-                  min={0}
-                  max={2000}
-                  value={quotaThreshold}
-                  onChange={(e) => setQuotaThreshold(Number(e.target.value))}
-                />
-                <span className="input-suffix">个别名</span>
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <label htmlFor="quota_threshold">配额水位阈值 (活跃别名数)</label>
+                <span className="hint">设为 0 表示关闭。活跃别名数首次越过阈值时推送告警 (每个账号每天最多提醒一次)</span>
               </div>
-              <span className="hint">设为 0 表示关闭。活跃别名数首次越过阈值时推送告警 (每个账号每天最多提醒一次)</span>
+              <div className="settings-row-control">
+                <div className="input-with-suffix settings-number">
+                  <input
+                    id="quota_threshold"
+                    className="input"
+                    type="number"
+                    min={0}
+                    max={2000}
+                    disabled={saving}
+                    value={quotaThreshold}
+                    onChange={(e) => setQuotaThreshold(Number(e.target.value))}
+                  />
+                  <span className="input-suffix">个别名</span>
+                </div>
+              </div>
             </div>
           </div>
-        </div>
+        </section>
 
-        {/* 卡片 3: Camoufox 自动化上号代理 */}
-        <div className="card">
+        {/* 分组 3: Camoufox 自动化上号代理 */}
+        <section className="card settings-section">
           <div className="card-header">
             <h2 className="card-title">
               <IconShield size={16} />
               Camoufox 自动化上号代理
             </h2>
             {camoufoxInfo?.available ? (
-              <span className="badge badge-active">● 在线就绪 ({camoufoxInfo.latency_ms}ms)</span>
+              <span className="status-pill active">
+                <span className="status-dot" />
+                在线就绪 ({camoufoxInfo.latency_ms}ms)
+              </span>
             ) : (
-              <span className="badge badge-error">○ 离线 / 未连接</span>
+              <span className="status-pill error">
+                <span className="status-dot" />
+                离线 / 未连接
+              </span>
             )}
           </div>
-          <div className="card-body">
-            <div className="form-field">
-              <label htmlFor="camoufox-agent-url">代理服务地址</label>
-              <input
-                id="camoufox-agent-url"
-                className="input"
-                type="text"
-                readOnly
-                value={camoufoxInfo?.url || 'http://127.0.0.1:8089'}
-                style={{ backgroundColor: 'var(--color-bg-secondary, #f8fafc)', cursor: 'default' }}
-              />
-              <span className="hint">
-                说明：可通过环境变量 <code>ICLOUD_HME_CAMOUFOX_URL</code> 自定义服务地址；在账号管理中进行 Apple ID 授权登录时将自动由该环境驱动。
-              </span>
-            </div>
 
-            <div style={{ marginTop: 12 }}>
-              <button
-                type="button"
-                className="btn btn-secondary"
-                onClick={() => void handleTestCamoufox()}
-                disabled={camoufoxTesting}
-              >
-                <IconZap size={14} />
-                {camoufoxTesting ? '正在检测连通性…' : '测试代理连通性'}
-              </button>
-            </div>
-
-            {camoufoxTestResult && (
-              <div style={{ marginTop: 12 }} className={`notify-test-row ${camoufoxTestResult.success ? 'ok' : 'fail'}`}>
-                <span className="channel-badge">Camoufox Agent</span>
-                <span className="notify-test-status">
-                  {camoufoxTestResult.success ? (
-                    <>
-                      <IconCheck size={14} /> 连通成功 (延迟 {camoufoxTestResult.latency_ms}ms, 内核就绪: {camoufoxTestResult.camoufox_ready ? '是' : '否'})
-                    </>
-                  ) : (
-                    <>{camoufoxTestResult.message}</>
-                  )}
+          <div className="settings-rows">
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <label htmlFor="camoufox-agent-url">代理服务地址</label>
+                <span className="hint">
+                  可通过环境变量 <code>ICLOUD_HME_CAMOUFOX_URL</code> 自定义；在账号管理中进行 Apple ID 授权登录时自动使用。
                 </span>
               </div>
-            )}
+              <div className="settings-row-control">
+                <div className="input-row">
+                  <input
+                    id="camoufox-agent-url"
+                    className="input font-mono"
+                    type="text"
+                    readOnly
+                    value={camoufoxInfo?.url || 'http://127.0.0.1:8089'}
+                  />
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    onClick={() => void handleTestCamoufox()}
+                    disabled={camoufoxTesting}
+                  >
+                    <IconZap size={14} />
+                    {camoufoxTesting ? '正在检测连通性…' : '测试代理连通性'}
+                  </button>
+                </div>
 
-            {!camoufoxInfo?.available && !camoufoxTestResult?.success && (
-              <div className="alert-info" style={{ marginTop: 12, fontSize: 13 }}>
-                💡 <strong>提示</strong>：在项目根目录配置 <code>ICLOUD_HME_CAMOUFOX_TOKEN</code> 后运行 <code>docker compose up -d --build</code>；本地 Windows 可运行 <code>scripts\camoufox-agent\start_agent.bat</code>。
+                {camoufoxTestResult && (
+                  <div className={`notify-test-row ${camoufoxTestResult.success ? 'ok' : 'fail'}`}>
+                    <span className="channel-badge">Camoufox Agent</span>
+                    <span className="notify-test-status">
+                      {camoufoxTestResult.success ? (
+                        <>
+                          <IconCheck size={14} /> 连通成功 (延迟 {camoufoxTestResult.latency_ms}ms, 内核就绪: {camoufoxTestResult.camoufox_ready ? '是' : '否'})
+                        </>
+                      ) : (
+                        <>{camoufoxTestResult.message}</>
+                      )}
+                    </span>
+                  </div>
+                )}
+
+                {!camoufoxInfo?.available && !camoufoxTestResult?.success && (
+                  <div className="alert-info">
+                    <strong>提示</strong>：在项目根目录配置 <code>ICLOUD_HME_CAMOUFOX_TOKEN</code> 后运行 <code>docker compose up -d --build</code>；本地 Windows 可运行 <code>scripts\camoufox-agent\start_agent.bat</code>。
+                  </div>
+                )}
               </div>
-            )}
+            </div>
           </div>
-        </div>
-
-        {/* 操作区 */}
-        <div className="settings-actions">
-          <button
-            type="button"
-            className="btn btn-secondary"
-            onClick={() => void handleTest()}
-            disabled={testing}
-          >
-            <IconZap size={14} />
-            {testing ? '发送中…' : '发送测试通知'}
-          </button>
-          <button
-            type="button"
-            className="btn btn-primary"
-            onClick={() => void handleSave()}
-            disabled={saving || !serverSettings}
-          >
-            <IconCheck size={14} />
-            {saving ? '保存中…' : '保存配置'}
-          </button>
-        </div>
+        </section>
 
         {/* 测试结果 */}
         {testResults && testResults.length > 0 && (
-          <div className="card">
+          <section className="card settings-section">
             <div className="card-header">
               <h3 className="card-title">
                 <IconShield size={16} />
@@ -675,8 +643,33 @@ export default function SettingsPage() {
                 ))}
               </div>
             </div>
-          </div>
+          </section>
         )}
+
+        {/* 底部保存栏：滚动时始终可见 */}
+        <div className="settings-savebar">
+          <span className="settings-savebar-hint">修改通知渠道或告警策略后，保存即可立即生效</span>
+          <div className="settings-actions">
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => void handleTest()}
+              disabled={testing || saving}
+            >
+              <IconZap size={14} />
+              {testing ? '发送中…' : '发送测试通知'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => void handleSave()}
+              disabled={saving || testing || !serverSettings}
+            >
+              <IconCheck size={14} />
+              {saving ? '保存中…' : '保存配置'}
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   )

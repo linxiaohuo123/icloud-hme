@@ -403,10 +403,7 @@ export default function SchedulePage() {
       <div className="schedule-layout">
         {/* 账号调度策略配置大盘 */}
         <div className="card">
-          <div
-            className="card-header"
-            style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
-          >
+          <div className="card-header">
             <h2 className="card-title">各账号调度策略 ({accountsUnavailable ? '—' : accounts.length})</h2>
             <button
               type="button"
@@ -427,7 +424,7 @@ export default function SchedulePage() {
                   <th style={{ textAlign: 'center', width: 80 }}>配额/时</th>
                   <th>调度模式与时段</th>
                   <th>
-                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                    <div className="th-inline">
                       <span>别名备注模板</span>
                       <span
                         className="th-macro-tooltip-icon"
@@ -442,7 +439,7 @@ export default function SchedulePage() {
               <tbody>
                 {accounts.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="text-center text-muted" style={{ padding: '28px' }}>
+                    <td colSpan={5} className="empty-state">
                       {accountsLoading ? '账号加载中…' : accountsError ? '账号加载失败，请点击顶部重试' : '暂无账号，请先在「账号管理」页添加账号'}
                     </td>
                   </tr>

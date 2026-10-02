@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 React 基础能力、Dialog 基础容器及 API 客户端
- * [OUTPUT]: 对外提供 BatchEditAliasDialog 批量修改别名备注与说明对话框
+ * [OUTPUT]: 对外提供 BatchEditAliasDialog，分批修改备注与说明，回传成功 ID、label/note 和部分失败反馈
  * [POS]: web/src/components 的别名批量操作浮层，被 AccountWorkspace 和 AliasesPage 消费
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -15,7 +15,7 @@ interface BatchEditAliasDialogProps {
   aliases?: Array<{ anonymousId: string; accountId?: string; account_id?: string }>
   open: boolean
   onClose: () => void
-  onSaved: (succeededIds: string[], newLabel: string, warning?: string) => void
+  onSaved: (succeededIds: string[], newLabel: string, warning?: string, newNote?: string) => void
 }
 
 interface BatchUpdateResponse {
@@ -112,14 +112,14 @@ export default function BatchEditAliasDialog({
 
       const warning = warningText()
       if (allSucceeded.length > 0) {
-        onSaved(allSucceeded, trimmedLabel, warning || undefined)
+        onSaved(allSucceeded, trimmedLabel, warning || undefined, trimmedNote)
       } else {
         setError(warning || '批量修改未成功，请检查账号凭据有效性或网络连接')
       }
     } catch (err) {
       const message = err instanceof ApiError ? err.message : '批量更新别名失败'
       if (allSucceeded.length > 0) {
-        onSaved(allSucceeded, trimmedLabel, warningText(`后续批次未完成：${message}`))
+        onSaved(allSucceeded, trimmedLabel, warningText(`后续批次未完成：${message}`), trimmedNote)
       } else {
         setError(warningText(message))
       }
@@ -135,66 +135,48 @@ export default function BatchEditAliasDialog({
       title="批量修改别名备注"
     >
       <form onSubmit={handleSubmit}>
-        <div
-          style={{
-            background: 'var(--color-bg-subtle)',
-            padding: '10px 14px',
-            borderRadius: 'var(--radius)',
-            marginBottom: 16,
-            fontSize: 13,
-            color: 'var(--color-text-secondary)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-          }}
-        >
+        <div className="dialog-summary">
           <span>已选中待修改别名：</span>
-          <span
-            style={{
-              fontWeight: 700,
-              color: 'var(--color-primary)',
-              background: 'var(--color-primary-soft, rgba(0, 113, 227, 0.1))',
-              padding: '2px 8px',
-              borderRadius: 6,
-            }}
-          >
+          <span className="badge badge-info">
             {selectedIds.length} 个{selectedIds.length > 100 ? ` (自动分 ${Math.ceil(selectedIds.length / 100)} 批执行)` : ''}
           </span>
         </div>
 
         {error && (
-          <div className="alert-error" role="alert" style={{ marginBottom: 16 }}>
+          <div className="alert-error" role="alert">
             {error}
           </div>
         )}
 
-        <div className="form-field" style={{ marginBottom: 12 }}>
+        <div className="form-field">
           <label htmlFor="batch-alias-label-input">统一备注名称 (用途标签)</label>
           <input
             id="batch-alias-label-input"
             type="text"
             className="input"
             value={label}
+            disabled={submitting}
             onChange={(e) => setLabel(e.target.value)}
             placeholder="例如: Twitter注册批次, OpenAI主号, 游戏账号等"
             maxLength={200}
           />
         </div>
 
-        <div className="form-field" style={{ marginBottom: 16 }}>
+        <div className="form-field">
           <label htmlFor="batch-alias-note-input">统一补充说明 (可选)</label>
           <input
             id="batch-alias-note-input"
             type="text"
             className="input"
             value={note}
+            disabled={submitting}
             onChange={(e) => setNote(e.target.value)}
             placeholder="统一填写的备忘说明 (留空则不设置)"
             maxLength={500}
           />
         </div>
 
-        <div className="dialog-actions" style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+        <div className="dialog-actions">
           <button
             type="button"
             className="btn btn-secondary"

@@ -27,7 +27,7 @@ func TestTagDescriptionPatchPreservesOmittedAndClearsExplicitEmpty(t *testing.T)
 			}
 			defer st.Close()
 			original := store.BusinessTag{ID: "tag_probe", Tag: "test", Name: "test", Description: "old description", Status: "disabled", CreatedAt: "2026-01-01T00:00:00Z", LastAssignedAt: "2026-09-30T01:00:00Z"}
-			if err := st.SaveTag(original); err != nil {
+			if err := st.CreateTag(original); err != nil {
 				t.Fatal(err)
 			}
 			router := gin.New()
@@ -73,7 +73,7 @@ func TestScheduleValidationRejectsInvalidMergedConfigWithoutWriting(t *testing.T
 			if err := st.SaveScheduleConfig(store.ScheduleConfig{AccountID: "probe", Enabled: true, Mode: "always", HourlyQuota: 5, AliasLabel: "original"}); err != nil {
 				t.Fatal(err)
 			}
-			if _, _, err := st.TryReserveQuota("probe", 2); err != nil {
+			if _, _, _, err := st.TryReserveQuota("probe", 2); err != nil {
 				t.Fatal(err)
 			}
 			before, err := st.GetScheduleConfig("probe")

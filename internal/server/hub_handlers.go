@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 gin, icloud-hme/internal/store, icloud-hme/internal/scheduler
- * [OUTPUT]: 对外提供 Tags, Tokens, Leases, Schedules 的 HTTP Handler，令牌创建拒绝非法 JSON，支持描述清空与原子调度参数校验
+ * [OUTPUT]: 对外提供 Tags, Tokens, Leases, Schedules 的 HTTP Handler，令牌创建拒绝非法 JSON，支持原子标识创建/更新、母号引用保护、描述清空与调度参数校验
  * [POS]: internal/server 的中台功能路由处理器集合；scheduledTag 优先继承母号业务标签并回退 scheduled，切断与 AliasLabel 模板耦合
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -32,64 +32,34 @@ func (s *Server) listTagsHandler(c *gin.Context) {
 	ok(c, tags)
 }
 
-// tagExistsFor 检查业务标识名是否已被其他标签占用 (excludeID 为编辑时排除自身)
-func (s *Server) tagExistsFor(tag string, excludeID string) (bool, error) {
-	tags, err := s.store.ListTags()
-	if err != nil {
-		return false, err
-	}
-	for _, t := range tags {
-		if strings.EqualFold(t.Tag, tag) && t.ID != excludeID {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 func (s *Server) createTagHandler(c *gin.Context) {
-	var req store.BusinessTag
+	var req struct {
+		Name        string `json:"name"`
+		Tag         string `json:"tag"`
+		Description string `json:"description"`
+		Status      string `json:"status"`
+	}
 	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Tag) == "" {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "业务标识 (tag) 不能为空")
 		return
 	}
-	req.Tag = strings.TrimSpace(req.Tag)
-	req.Name = strings.TrimSpace(req.Name)
-	if req.Name == "" {
-		req.Name = req.Tag
+	tag := store.BusinessTag{ID: store.NewBusinessTagID(), Tag: strings.TrimSpace(req.Tag),
+		Name: strings.TrimSpace(req.Name), Description: req.Description, Status: req.Status,
+		CreatedAt: time.Now().Format(time.RFC3339)}
+	if tag.Name == "" {
+		tag.Name = tag.Tag
 	}
-	// 主键与时间戳必须在此处补全: Store.SaveTag 是值接收者，内部生成的字段不会回传给调用方
-	if req.ID == "" {
-		req.ID = store.NewBusinessTagID()
+	if tag.Status == "" {
+		tag.Status = "active"
 	}
-	if req.CreatedAt == "" {
-		req.CreatedAt = time.Now().Format(time.RFC3339)
-	}
-	if req.Status == "" {
-		req.Status = "active"
-	}
-	// tag 列有 UNIQUE 约束: 预检重名, 避免落库报"内部错误"
-	exists, err := s.tagExistsFor(req.Tag, "")
-	if err != nil {
-		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "读取业务标识失败")
+	if err := s.store.CreateTag(tag); err != nil {
+		tagMutationFail(c, err)
 		return
 	}
-	if exists {
-		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "业务标识已存在: "+req.Tag)
-		return
-	}
-	if err := s.store.SaveTag(req); err != nil {
-		if isUniqueViolation(err) {
-			failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "业务标识已存在: "+req.Tag)
-			return
-		}
-		backendFail(c, err)
-		return
-	}
-	ok(c, req)
+	ok(c, tag)
 }
 
 func (s *Server) updateTagHandler(c *gin.Context) {
-	id := c.Param("id")
 	var req struct {
 		Tag         string  `json:"tag"`
 		Name        string  `json:"name"`
@@ -100,57 +70,38 @@ func (s *Server) updateTagHandler(c *gin.Context) {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "无效参数")
 		return
 	}
-	// 真 PATCH 语义: 以库中现有记录为基线，只覆盖显式提交的字段，
-	// 避免"只改描述"把 tag/name/status 清空。
-	existing, found, err := s.findTagByID(id)
+	tag, err := s.store.UpdateTag(c.Param("id"), func(tag *store.BusinessTag) {
+		if req.Status != "" {
+			tag.Status = req.Status
+		}
+		if req.Description != nil {
+			tag.Description = *req.Description
+		}
+		if key := strings.TrimSpace(req.Tag); key != "" {
+			tag.Tag = key
+		}
+		if name := strings.TrimSpace(req.Name); name != "" {
+			tag.Name = name
+		}
+	})
 	if err != nil {
-		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "读取业务标识失败")
+		tagMutationFail(c, err)
 		return
 	}
-	if !found {
-		failCode(c, http.StatusNotFound, "NOT_FOUND", "业务标识不存在")
-		return
-	}
-	if req.Status != "" {
-		existing.Status = req.Status
-	}
-	if req.Description != nil {
-		existing.Description = *req.Description
-	}
-	if tag := strings.TrimSpace(req.Tag); tag != "" {
-		existing.Tag = tag
-	}
-	if name := strings.TrimSpace(req.Name); name != "" {
-		existing.Name = name
-	}
-	exists, err := s.tagExistsFor(existing.Tag, id)
-	if err != nil {
-		failCode(c, http.StatusInternalServerError, "PERSISTENCE_ERROR", "读取业务标识失败")
-		return
-	}
-	if exists {
-		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "业务标识已存在: "+existing.Tag)
-		return
-	}
-	if err := s.store.SaveTag(existing); err != nil {
-		backendFail(c, err)
-		return
-	}
-	ok(c, existing)
+	ok(c, tag)
 }
 
-// findTagByID 按主键定位业务标识。
-func (s *Server) findTagByID(id string) (store.BusinessTag, bool, error) {
-	tags, err := s.store.ListTags()
-	if err != nil {
-		return store.BusinessTag{}, false, err
+func tagMutationFail(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, store.ErrTagExists), isUniqueViolation(err):
+		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "业务标识已存在")
+	case errors.Is(err, store.ErrTagNotFound):
+		failCode(c, http.StatusNotFound, "NOT_FOUND", err.Error())
+	case errors.Is(err, store.ErrTagInUse):
+		failCode(c, http.StatusConflict, "TAG_IN_USE", err.Error())
+	default:
+		backendFail(c, err)
 	}
-	for _, t := range tags {
-		if t.ID == id {
-			return t, true, nil
-		}
-	}
-	return store.BusinessTag{}, false, nil
 }
 
 func (s *Server) deleteTagHandler(c *gin.Context) {
@@ -291,8 +242,18 @@ func normalizeScopes(raw string) (string, error) {
 
 func (s *Server) deleteTokenHandler(c *gin.Context) {
 	id := c.Param("id")
-	// 软注销 (Soft Revoke): 保持 token identity 与历史审计记录，同时立即使认证失效
-	affected, err := s.store.DeleteToken(id)
+	purge := c.Query("purge") == "true"
+	var (
+		affected bool
+		err      error
+	)
+	if purge {
+		// 物理清除 (Hard Delete): 从数据库中永久删除已作废历史令牌
+		affected, err = s.store.PurgeToken(id)
+	} else {
+		// 软注销 (Soft Revoke): 保持 token identity 与历史审计记录，同时立即使认证失效
+		affected, err = s.store.DeleteToken(id)
+	}
 	if err != nil {
 		backendFail(c, err)
 		return
@@ -301,7 +262,7 @@ func (s *Server) deleteTokenHandler(c *gin.Context) {
 		failCode(c, http.StatusNotFound, "NOT_FOUND", "令牌不存在")
 		return
 	}
-	ok(c, gin.H{"deleted": true})
+	ok(c, gin.H{"deleted": true, "purged": purge})
 }
 
 // --- 已用别名流水 Leases ---

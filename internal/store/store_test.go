@@ -246,11 +246,11 @@ func TestStoreConcurrentCreateNoOverwrite(t *testing.T) {
 			}); err != nil {
 				t.Errorf("SaveToken(%d) failed: %v", i, err)
 			}
-			if err := s.SaveTag(BusinessTag{
+			if err := s.CreateTag(BusinessTag{
 				Tag:  fmt.Sprintf("biz-%d", i),
 				Name: fmt.Sprintf("Biz%d", i),
 			}); err != nil {
-				t.Errorf("SaveTag(%d) failed: %v", i, err)
+				t.Errorf("CreateTag(%d) failed: %v", i, err)
 			}
 		}(i)
 	}
@@ -583,7 +583,7 @@ func TestSaveScheduleConfigPreservesReservedQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok, _, err := s.TryReserveQuota("acc_quota", 1); err != nil || !ok {
+	if ok, _, _, err := s.TryReserveQuota("acc_quota", 1); err != nil || !ok {
 		t.Fatalf("quota reservation failed: %v", err)
 	}
 	stale.Enabled = false
@@ -613,8 +613,8 @@ func TestStorePersistence(t *testing.T) {
 
 	// 1. Tags
 	tag := BusinessTag{Name: "GPT 注册", Tag: "gpt-register", Description: "用于注册"}
-	if err := s.SaveTag(tag); err != nil {
-		t.Fatalf("SaveTag failed: %v", err)
+	if err := s.CreateTag(tag); err != nil {
+		t.Fatalf("CreateTag failed: %v", err)
 	}
 	tags, err := s.ListTags()
 	if err != nil {

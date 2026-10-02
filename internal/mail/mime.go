@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 bytes, encoding/base64, fmt, io, mime, mime/multipart, mime/quotedprintable, net/mail, strings, time, github.com/emersion/go-imap, github.com/emersion/go-message/charset
  * [OUTPUT]: 对外提供 toMessage, toMessageWithBody, toMessageWithHeaderOnly, readBody, decodeHeader, decodeAppleRelay, folderRole, folderSortRank
- * [POS]: internal/mail 的 MIME 多级解析与字符集转码中心，保留解码后的正文与 HTML，预览独立清洗，读取与 multipart 解析失败显式返回
+ * [POS]: internal/mail 的 MIME 多级解析与字符集转码中心，保留解码后的正文与 HTML 取码边界，展示预览独立清洗，读取与 multipart 解析失败显式返回
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -92,11 +92,12 @@ func toMessageWithBody(msg *imap.Message, folder ...string) Message {
 		if err != nil {
 			continue
 		}
-		body, err := readBody(em)
+		plain, html, err := readBodyParts(em)
 		if err != nil {
 			continue
 		}
-		m.Preview = strings.TrimSpace(body)
+		m.Preview = bodyPreview(plain, html)
+		m.otpBodies = []string{plain, html}
 		recipients := extractStructuralRecipients(m.To, em.Header)
 		m.match = strings.Join(recipients, "\n")
 		break

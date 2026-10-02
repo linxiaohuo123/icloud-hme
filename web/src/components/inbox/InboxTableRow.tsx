@@ -113,16 +113,15 @@ function InboxTableRowBase({
       </td>
       <td>
         <div className="inbox-content-cell">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2, flexWrap: 'wrap' }}>
+          <div className="inbox-content-meta">
             {m.unread && (
-              <span className="badge badge-info" style={{ fontSize: 11, padding: '1px 6px', borderRadius: 4 }}>
+              <span className="badge badge-info">
                 未读
               </span>
             )}
             {m.folder && (
               <span
                 className={`badge ${m.folder.toLowerCase() === 'junk' ? 'badge-error' : 'badge-neutral'}`}
-                style={{ fontSize: 11, padding: '1px 6px', borderRadius: 4 }}
                 title={`存储文件夹: ${m.folder}`}
               >
                 {m.folder}
@@ -149,7 +148,7 @@ function InboxTableRowBase({
       </td>
       <td>
         <div className="sender-cell">
-          <div className="sender-avatar" style={{ background: sender.color }}>
+          <div className="sender-avatar" aria-hidden="true">
             {sender.initial}
           </div>
           <div className="sender-info">
@@ -205,7 +204,6 @@ function InboxTableRowBase({
             type="button"
             className="btn-row-action btn-row-action-danger"
             disabled
-            style={{ opacity: 0.4, cursor: 'not-allowed' }}
             title="物理删信功能因安全性考量暂不可用，已安全暂停"
             aria-label="删除邮件（已暂停）"
           >

@@ -5,7 +5,7 @@
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
-import type { SVGProps } from 'react'
+import { useId, type SVGProps } from 'react'
 
 export type IconProps = SVGProps<SVGSVGElement> & { size?: number }
 
@@ -409,6 +409,64 @@ export function IconDownload(props: IconProps) {
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
       <polyline points="7 10 12 15 17 10" />
       <line x1="12" y1="15" x2="12" y2="3" />
+    </svg>
+  )
+}
+
+
+export function IconMenu(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M4 6h16" />
+      <path d="M4 12h16" />
+      <path d="M4 18h16" />
+    </svg>
+  )
+}
+
+export function IconBrandLogo({ size = 24, className, ...props }: IconProps) {
+  const reactId = useId()
+  const gradId = `brand-grad-${reactId.replace(/:/g, '')}`
+
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 32 32"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      className={className}
+      aria-hidden="true"
+      {...props}
+    >
+      <defs>
+        <linearGradient id={gradId} x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stopColor="#38bdf8" />
+          <stop offset="100%" stopColor="#2563eb" />
+        </linearGradient>
+      </defs>
+      <rect width="32" height="32" rx="7.5" fill={`url(#${gradId})`} />
+      <rect x="0.5" y="0.5" width="31" height="31" rx="7" stroke="rgba(255,255,255,0.25)" fill="none" />
+      {/* 通用开源公共云朵轮廓 (非 Apple 专有双峰商标) */}
+      <path
+        d="M9 16a3.5 3.5 0 0 1 0-7 5 5 0 0 1 9.5-1.5A4 4 0 0 1 22 11.5a3.5 3.5 0 0 1-.8 6.5H9z"
+        fill="rgba(255,255,255,0.4)"
+      />
+      {/* 通用邮件信封 */}
+      <rect x="6.5" y="12" width="19" height="13" rx="2.5" fill="#FFFFFF" />
+      <path
+        d="M7 13.5l8.2 5.8a1.4 1.4 0 0 0 1.6 0l8.2-5.8"
+        stroke="#2563eb"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M7 23.5l5.2-4.2M25 23.5l-5.2-4.2"
+        stroke="#cbd5e1"
+        strokeWidth="1.2"
+        strokeLinecap="round"
+      />
     </svg>
   )
 }

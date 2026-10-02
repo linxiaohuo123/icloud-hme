@@ -37,16 +37,16 @@ export default class ErrorBoundary extends Component<Props, State> {
         return this.props.fallback
       }
       return (
-        <div className="page-container" style={{ padding: '40px 20px' }}>
-          <div className="card" style={{ borderColor: 'var(--color-danger)', maxWidth: '600px', margin: '0 auto', padding: '24px' }}>
-            <h2 style={{ color: 'var(--color-danger)', margin: '0 0 12px' }}>页面渲染异常</h2>
-            <p className="text-secondary" style={{ marginBottom: '16px' }}>
+        <div className="page-container">
+          <div className="card error-fallback" role="alert">
+            <h2>页面渲染异常</h2>
+            <p className="text-secondary">
               系统捕获到底层渲染错误，已防止整页白屏：
             </p>
-            <pre style={{ background: '#0f172a', color: '#f87171', padding: '12px', borderRadius: '6px', fontSize: '12px', overflowX: 'auto' }}>
+            <pre>
               {this.state.error?.message || '未知错误'}
             </pre>
-            <div style={{ marginTop: '16px', display: 'flex', gap: '10px' }}>
+            <div className="error-fallback-actions">
               <button
                 type="button"
                 className="btn btn-primary"

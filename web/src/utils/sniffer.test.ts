@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 utils/sniffer (extractVerifyCode, extractMagicLink, extractOTP, buildSniffContext, stripHtml, toHalfWidth, parseSenderInfo)
  * [OUTPUT]: 对外提供前端嗅探器单元测试套件
- * [POS]: web/src/utils 的嗅探逻辑与发件人解析回归防线；全面覆盖工业级盒式空格拆分、系词介词防穿透、Steam Guard 与链接嗅探
+ * [POS]: web/src/utils 的嗅探逻辑与发件人解析回归防线；覆盖盒式空格拆分、系词介词防穿透、Steam Guard，以及后端候选规则的歧义拒绝与 URL 隔离
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -17,12 +17,30 @@ import {
 } from './sniffer'
 
 describe('buildSniffContext & toHalfWidth', () => {
+  it.each([
+    ['Verification code', '482019', '<p>482019</p>'],
+    ['Verification code', '482019', '482019 is your verification code.'],
+    ['Login', 'Your code is 4820', 'Your code is 482019.'],
+    ['Login', 'Your code is 123456', 'Your code is 482019.'],
+  ])('完整正文优先，摘要不形成重复或冲突候选：%s / %s', (subject, preview, body) => {
+    expect(extractOTP(buildSniffContext(subject, preview, body))?.code).toBe('482019')
+  })
+
+  it('正文尚未加载或为空白时保留摘要取码', () => {
+    expect(extractOTP(buildSniffContext('Login', 'Your code is 482019', '  '))?.code).toBe('482019')
+  })
+  it('主题与正文边界独立于正文换行，无主题也能提取跨行数字', () => {
+    const body = 'Your code is 5\n7\n6\n9\n3\n2'
+    expect(extractOTP(buildSniffContext(undefined, '', body))?.code).toBe('576932')
+    expect(extractOTP(body)?.code).toBe('576932')
+    expect(extractOTP(buildSniffContext('Your code is 123456', '', '654321'))?.code).toBe('123456')
+  })
   it('正确联合标题与正文摘要，避免短路吞码', () => {
     expect(buildSniffContext('验证码是 123456', '尊敬的用户您好')).toBe(
-      '验证码是 123456\n尊敬的用户您好',
+      '验证码是 123456\u0000尊敬的用户您好',
     )
     expect(buildSniffContext('普通通知', undefined)).toBe('普通通知')
-    expect(buildSniffContext(undefined, '正文内容')).toBe('正文内容')
+    expect(buildSniffContext(undefined, '正文内容')).toBe('\u0000正文内容')
     expect(buildSniffContext('', '')).toBe('')
   })
 
@@ -174,6 +192,22 @@ describe('extractMagicLink & extractOTP', () => {
 })
 
 describe('stripHtml & parseSenderInfo', () => {
+  it.each(['head', 'title', 'style', 'script', 'noscript', 'template'])('不可见 %s 区块不参与候选', tag => {
+    const html = `<${tag}>Your code is 123456</${tag}><p>Your code is 482019.</p>`
+    expect(stripHtml(html)).toBe('Your code is 482019.')
+    expect(extractOTP(buildSniffContext('Login', 'Your code is 482019.', html))?.code).toBe('482019')
+  })
+
+  it('解码数字、十六进制和命名实体，且只解码一次', () => {
+    const html = '<p>Your code is &#52;&#x38;&#50;&#48;&#49;&#57;.</p>'
+    expect(stripHtml(html)).toBe('Your code is 482019.')
+    expect(extractOTP(buildSniffContext('Login', undefined, html))?.code).toBe('482019')
+    expect(stripHtml('<p>A &copy; B &amp;#52; &lt;script&gt;</p>')).toBe('A © B &#52; <script>')
+  })
+
+  it('HTML 注释不会泄漏隐藏验证码', () => {
+    expect(stripHtml('<!-- Your code is 123456 --><p>Your code is 482019.</p>')).toBe('Your code is 482019.')
+  })
   it('stripHtml 正确清洗 HTML 标签与样式并保留 a 标签链接', () => {
     const raw = '<style>body { color: red; }</style><p>Hello &nbsp; <b>World</b>! <a href="https://example.com/confirm?token=xyz123&amp;ref=1">激活账户</a></p>'
     expect(stripHtml(raw)).toBe('Hello World ! 激活账户 ( https://example.com/confirm?token=xyz123&ref=1 )')
@@ -191,5 +225,52 @@ describe('stripHtml & parseSenderInfo', () => {
     const info = parseSenderInfo('OpenAI <noreply_at_openai_com_123@icloud.com>')
     expect(info.name).toBe('OpenAI')
     expect(info.email).toBe('noreply_at_openai_com_123@icloud.com')
+  })
+})
+
+
+describe('backend candidate-policy parity', () => {
+  it.each([
+    ['bracketed order', 'Order [839201]', 'Your verification code is 492019.', '492019'],
+    ['repeated digits', 'Login', 'Your verification code is 111111.', '111111'],
+    ['explicit year', 'Login', 'Your code is 2026', '2026'],
+    ['year-shaped code', 'Login', 'Your code is 202619', '202619'],
+    ['zero code', 'Login', 'Your OTP is 000000', '000000'],
+    ['4+4 groups', 'Login', 'Your code is 1234-5678', '12345678'],
+    ['newline digits', 'Verification code', 'Your code is 5\n7\n6\n9\n3\n2', '576932'],
+    ['same code twice', 'Your code is 123456', 'Your code is 123456', '123456'],
+    ['weak candidate', 'Verification code', 'Please enter the number below.\n482019', '482019'],
+    ['strong wins', 'Verification code', 'Reference details 839201.\nYour code is 492019', '492019'],
+  ])('%s', (_name, subject, body, code) => {
+    expect(extractOTP(buildSniffContext(subject, '', body))?.code).toBe(code)
+  })
+
+  it.each([
+    ['Order [839201] shipped', 'Your parcel is on its way.'],
+    ['Verification code', 'Your code is 1234567890'],
+    ['Verification code', 'Your code is 1234-5678-9012'],
+    ['Verification code', 'Your code is 1 2 3 4 5 6 7 8 9'],
+    ['Login', 'Your code is 123456. Your code is 654321.'],
+    ['Your code is 123456', 'Your code is 654321'],
+    ['Verification code', '123456 or 654321'],
+    ['Security notice', 'Phone: 1234-5678'],
+    ['Verification code', 'User ID: ABC123456'],
+    ['Barcode', '654321'],
+    ['Verification code', 'Your code is 123456. Your code is 654321. https://example.com/confirm?token=a'],
+  ])('rejects ambiguous or invalid candidates: %s / %s', (subject, body) => {
+    expect(extractOTP(buildSniffContext(subject, '', body))).toBeNull()
+  })
+
+  it('isolates numeric URL tokens and strips trailing punctuation', () => {
+    expect(extractOTP(buildSniffContext('Verify your email', '', '<a href="https://example.com/verify?token=849201">Verify email</a>')))
+      .toEqual({ code: undefined, magicLink: 'https://example.com/verify?token=849201' })
+    expect(extractMagicLink('(https://example.com/Verify?token=abc).')).toBe('https://example.com/Verify?token=abc')
+  })
+  it.each([
+    'https://verify.example.com/news',
+    'https://example.com/confirm?token=a https://example.com/confirm?token=b',
+    'https://user:pass@example.com/verify',
+  ])('rejects unsafe or ambiguous links: %s', text => {
+    expect(extractMagicLink(text)).toBeNull()
   })
 })

@@ -1,14 +1,16 @@
 /**
- * [INPUT]: 依赖 api/client 的 request/ApiError，依赖 components/Dialog, components/Select
- * [OUTPUT]: 对外提供 AccountFormDialog 账号创建与编辑对话框组件
- * [POS]: web/src/components 的业务对话框，用于添加和修改账号基础信息
+ * [INPUT]: 依赖 api/client、Dialog/Select、useDialogSession 和 invalidateAccounts
+ * [OUTPUT]: 对外提供 AccountFormDialog，挂载时初始化草稿，提交锁与异步结果绑定会话
+ * [POS]: AccountsPage 按编辑目标 key 挂载，父页面刷新不重置输入或解除在途保存锁
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
-import { useCallback, useEffect, useState } from 'react'
+import { useState } from 'react'
 import Dialog from './Dialog'
 import Select from './Select'
 import { request, ApiError } from '../api/client'
+import { invalidateAccounts } from '../hooks/useAccounts'
+import { useDialogSession } from '../hooks/useDialogSession'
 
 interface AccountFormDialogProps {
   open: boolean
@@ -35,18 +37,7 @@ export default function AccountFormDialog({
   const [cookies, setCookies] = useState('')
   const [proxy, setProxy] = useState('')
   const [error, setError] = useState('')
-  const [submitting, setSubmitting] = useState(false)
-
-  useEffect(() => {
-    if (!open) return
-    setName(editing?.name ?? '')
-    setIcloudEmail(editing?.icloudEmail ?? '')
-    setHost(editing?.host ?? 'icloud.com')
-    setCookies('')
-    setProxy('')
-    setError('')
-    setSubmitting(false)
-  }, [open, editing])
+  const { busy: submitting, sessionRef, begin, finish } = useDialogSession(open, editing?.id ?? 'new')
 
   function reset() {
     setName('')
@@ -55,11 +46,10 @@ export default function AccountFormDialog({
     setCookies('')
     setProxy('')
     setError('')
-    setSubmitting(false)
   }
 
   async function handleSubmit() {
-    if (submitting) return
+    if (sessionRef.current?.pending) return
     if (!name.trim()) {
       setError('请输入账号名称')
       return
@@ -68,39 +58,34 @@ export default function AccountFormDialog({
       setError('请输入 iCloud 邮箱')
       return
     }
-    setSubmitting(true)
+    const session = begin()
+    if (!session) return
     setError('')
     try {
-      if (editing) {
-        await request(`/api/accounts/${editing.id}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ name: name.trim(), icloud_email: icloudEmail.trim(), host }),
-        })
-      } else {
-        await request('/api/accounts', {
-          method: 'POST',
-          body: JSON.stringify({
-            name: name.trim(),
-            icloud_email: icloudEmail.trim(),
-            host,
-            proxy: proxy.trim(),
-            cookies: cookies.trim(),
-          }),
-        })
-      }
+      const saved = await request<{ id: string }>(editing ? `/api/accounts/${editing.id}` : '/api/accounts', {
+        method: editing ? 'PATCH' : 'POST',
+        body: {
+          name: name.trim(), icloud_email: icloudEmail.trim(), host,
+          ...(!editing ? { proxy: proxy.trim(), cookies: cookies.trim() } : {}),
+        },
+      })
+      invalidateAccounts(saved.id)
+      if (!session.active) return
       reset()
       onSaved()
     } catch (err) {
+      if (!session.active) return
       setError(err instanceof ApiError ? err.message : '网络连接失败，请检查服务状态')
     } finally {
-      setSubmitting(false)
+      finish(session)
     }
   }
 
-  const handleClose = useCallback(() => {
+  function handleClose() {
+    if (sessionRef.current?.pending) return
     reset()
     onClose()
-  }, [onClose])
+  }
 
   return (
     <Dialog
@@ -118,6 +103,7 @@ export default function AccountFormDialog({
         <input
           id="acc-name"
           value={name}
+          disabled={submitting}
           onChange={(e) => setName(e.target.value)}
           maxLength={64}
         />
@@ -129,7 +115,7 @@ export default function AccountFormDialog({
           type="email"
           value={icloudEmail}
           onChange={(e) => setIcloudEmail(e.target.value)}
-          disabled={Boolean(editing)}
+          disabled={Boolean(editing) || submitting}
         />
       </div>
       <div className="form-field">
@@ -138,7 +124,7 @@ export default function AccountFormDialog({
           id="acc-host"
           value={host}
           onChange={setHost}
-          disabled={Boolean(editing)}
+          disabled={Boolean(editing) || submitting}
           options={[
             { value: 'icloud.com', label: '全球区 (icloud.com)' },
             { value: 'icloud.com.cn', label: '中国区 (icloud.com.cn)' },
@@ -152,6 +138,7 @@ export default function AccountFormDialog({
             <textarea
               id="acc-cookies"
               value={cookies}
+              disabled={submitting}
               onChange={(e) => setCookies(e.target.value)}
               spellCheck={false}
               placeholder="支持全格式智能识别：&#10;1. 键值对: key1=value1; key2=value2 (支持带 Cookie: 前缀)&#10;2. JSON 数组: [{'name':'...', 'value':'...'}] (Chrome 插件导出)&#10;3. JSON 对象: {'key': 'value'}&#10;4. Netscape 格式: 制表符分隔的 .txt 文件内容"
@@ -164,6 +151,7 @@ export default function AccountFormDialog({
               id="acc-proxy"
               type="text"
               value={proxy}
+              disabled={submitting}
               onChange={(e) => setProxy(e.target.value)}
               placeholder="http://user:pass@host:port"
             />
@@ -171,7 +159,7 @@ export default function AccountFormDialog({
         </>
       )}
       <div className="form-actions">
-        <button type="button" onClick={handleClose}>取消</button>
+        <button type="button" onClick={handleClose} disabled={submitting}>取消</button>
         <button type="button" className="primary" onClick={() => void handleSubmit()} disabled={submitting}>
           {submitting ? '保存中…' : '保存'}
         </button>

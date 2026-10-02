@@ -69,8 +69,9 @@ export default function MailDetailDialog({
       open={Boolean(detail || loading)}
       title={detail?.subject || (loading ? '读取邮件中…' : '邮件详情')}
       onClose={onClose}
+      size="lg"
     >
-      {loading && <p className="hint" style={{ padding: '24px 0', textAlign: 'center' }}>读取邮件正文中…</p>}
+      {loading && <p className="empty-state">读取邮件正文中…</p>}
 
       {detail && sender && (
         <div className="email-detail-box">
@@ -78,12 +79,7 @@ export default function MailDetailDialog({
             <div className="email-detail-sender-row">
               <div
                 className="sender-avatar"
-                style={{
-                  background: sender.color,
-                  width: 36,
-                  height: 36,
-                  fontSize: 14,
-                }}
+                aria-hidden="true"
               >
                 {sender.initial}
               </div>
@@ -98,7 +94,6 @@ export default function MailDetailDialog({
                   {detail.folder && (
                     <span
                       className={`badge ${detail.folder.toLowerCase() === 'junk' ? 'badge-error' : 'badge-neutral'}`}
-                      style={{ fontSize: 11, padding: '1px 6px' }}
                       title={`存储文件夹: ${detail.folder}`}
                     >
                       {detail.folder}
@@ -107,7 +102,6 @@ export default function MailDetailDialog({
                   {detail.body_complete === false && (
                     <span
                       className="badge badge-warning"
-                      style={{ fontSize: 11, padding: '1px 6px' }}
                       title="当前仅提供 WebMail 摘要预览，非完整邮件正文"
                     >
                       正文预览
@@ -146,8 +140,8 @@ export default function MailDetailDialog({
 
           {code && (
             <div className="email-code-banner">
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <IconKey size={18} style={{ color: 'var(--color-success)' }} />
+              <div className="email-code-banner-main">
+                <IconKey size={18} className="text-success" />
                 <span className="email-code-label">提取到验证码:</span>
                 <span className="email-code-value">{code}</span>
               </div>
@@ -163,9 +157,9 @@ export default function MailDetailDialog({
           )}
 
           {!code && magicLink && (
-            <div className="email-code-banner" style={{ background: 'color-mix(in srgb, var(--color-primary) 10%, transparent)', borderColor: 'color-mix(in srgb, var(--color-primary) 30%, transparent)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <IconExternalLink size={18} style={{ color: 'var(--color-primary)' }} />
+            <div className="email-code-banner is-link">
+              <div className="email-code-banner-main">
+                <IconExternalLink size={18} className="text-primary" />
                 <span className="email-code-label">检测到激活验证链接</span>
               </div>
               <a
@@ -173,7 +167,6 @@ export default function MailDetailDialog({
                 target="_blank"
                 rel="noopener noreferrer"
                 className="btn btn-sm btn-primary"
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
               >
                 <span>打开激活链接</span>
                 <IconExternalLink size={13} />
@@ -182,11 +175,10 @@ export default function MailDetailDialog({
           )}
 
           {isHtml && (
-            <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: -6 }}>
+            <div className="email-body-toolbar">
               <button
                 type="button"
                 className="btn btn-xs btn-ghost"
-                style={{ minHeight: 24, padding: '2px 8px', fontSize: 12 }}
                 onClick={() => setShowRawHtml((v) => !v)}
               >
                 {showRawHtml ? '显示清洗文本' : '显示原始源码'}
@@ -195,8 +187,8 @@ export default function MailDetailDialog({
           )}
 
           {detail.body_complete === false && (
-            <div className="hint" style={{ fontSize: 12, marginBottom: 8, color: 'var(--color-warning)' }}>
-              ⚠️ 当前邮件为 WebMail 摘要预览，未能获取完整正文。
+            <div className="email-body-note" role="note">
+              当前邮件为 WebMail 摘要预览，未能获取完整正文。
             </div>
           )}
 
@@ -207,7 +199,7 @@ export default function MailDetailDialog({
               : detail.body || '无正文内容'}
           </div>
 
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 8 }}>
+          <div className="dialog-actions">
             <button type="button" className="btn btn-secondary" onClick={onClose}>
               关闭
             </button>

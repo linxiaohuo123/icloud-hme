@@ -2,6 +2,7 @@
  * [INPUT]: 无外部依赖，作为整个前端的类型契约
  * [OUTPUT]: 导出 ApiResponse, AccountSummary, Alias, InboxMessage, BusinessTag, APIToken, LeaseRecord, ScheduleConfig, ScheduleLog, ScheduleStatus 等核心接口
  * [POS]: web/src/api 的类型定义中枢，与 internal/server 保持同构映射
+ * Alias 包含上游补充说明 note，用于编辑回显及名称修改时保持原说明。
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -47,6 +48,7 @@ export interface Alias {
   email: string
   anonymousId: string
   label: string
+  note?: string
   active: boolean
   createdAt?: string
   account_id?: string

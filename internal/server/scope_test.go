@@ -240,7 +240,7 @@ func TestScheduleConfigPatchSemantics(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("写入完整配置失败: %d %s", resp.StatusCode, body)
 	}
-	if ok, _, err := st.TryReserveQuota("acc_1", 3); err != nil || !ok {
+	if ok, _, _, err := st.TryReserveQuota("acc_1", 3); err != nil || !ok {
 		t.Fatal("预留 3 个配额应成功")
 	}
 	if got, err := st.RemainingQuota("acc_1"); err != nil || got != 7 {

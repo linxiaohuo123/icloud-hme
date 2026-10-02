@@ -126,7 +126,7 @@ func TestSelectAccountCandidatesQuotaPriority(t *testing.T) {
 
 	// acc_idle 水位低 (10) 但配额用完 (TryReserve 10)
 	// acc_busy 水位高 (120) 但有配额 (剩余 10)
-	allowed, _, err := st.TryReserveQuota("acc_tag_idle", 10)
+	allowed, _, _, err := st.TryReserveQuota("acc_tag_idle", 10)
 	if err != nil {
 		t.Fatal(err)
 	}

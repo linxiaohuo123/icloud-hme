@@ -250,7 +250,7 @@ export default function UsedAliasesPage() {
                 <strong>{tags.length}</strong> 个业务标识
               </span>
               {tagsError && (
-                <span className="card-stat-dim" style={{ color: 'var(--color-warning)' }}>
+                <span className="card-stat-dim text-warning">
                   (加载失败)
                 </span>
               )}
@@ -326,7 +326,7 @@ export default function UsedAliasesPage() {
                     <th style={{ width: '28%', minWidth: 220 }}>别名邮箱</th>
                     <th style={{ width: '16%', minWidth: 110 }}>所属账号</th>
                     <th style={{ width: '12%', minWidth: 90 }}>状态</th>
-                    <th style={{ width: 100, minWidth: 100, textAlign: 'right' }}>快捷操作</th>
+                    <th style={{ width: 160, minWidth: 160, textAlign: 'right' }}>快捷操作</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -363,7 +363,7 @@ export default function UsedAliasesPage() {
                           {r.account_email || r.account_name ? (
                             <>
                               <div className="font-mono">{r.account_email || r.account_name}</div>
-                              {r.account_email && r.account_name ? <div className="text-xs text-muted">{r.account_name}</div> : null}
+                              {r.account_email && r.account_name ? <div className="text-muted">{r.account_name}</div> : null}
                             </>
                           ) : (
                             <span className="font-mono">{r.account_id}</span>
@@ -380,22 +380,20 @@ export default function UsedAliasesPage() {
                           )}
                         </td>
                         <td style={{ textAlign: 'right' }}>
-                          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4, justifyContent: 'flex-end' }}>
+                          <div className="row-actions">
                             <button
                               type="button"
                               className="btn btn-xs btn-ghost"
                               onClick={() => setDirectLinkEmail(r.email)}
                               title="获取此别名的对外直出链接 (取码/查信/正文)"
-                              style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}
                             >
-                              <IconZap size={11} style={{ color: '#38bdf8' }} />
+                              <IconZap size={11} />
                               <span>直链</span>
                             </button>
                             <Link
                               to={`/workspace/${encodeURIComponent(r.account_id)}?tab=inbox&alias=${encodeURIComponent(r.email)}`}
                               className="btn btn-xs btn-primary-soft"
                               title="前往收件箱查看验证码"
-                              style={{ display: 'inline-flex', alignItems: 'center', gap: 4, textDecoration: 'none' }}
                             >
                               <IconInbox size={12} />
                               <span>收件箱</span>

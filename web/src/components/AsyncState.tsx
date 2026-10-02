@@ -19,6 +19,8 @@ interface AsyncStateProps {
   children: ReactNode
 }
 
+const SKELETON_WIDTHS = ['30%', '85%', '70%', '90%']
+
 /** 统一异步状态:骨架屏 loading / error+retry / empty / content */
 export default function AsyncState({
   loading,
@@ -33,18 +35,17 @@ export default function AsyncState({
     return (
       <div className="skeleton" role="status" aria-label="加载中" aria-busy="true">
         <span className="visually-hidden">加载中</span>
-        <div className="skeleton-line" style={{ width: '30%' }} />
-        <div className="skeleton-line" style={{ width: '85%' }} />
-        <div className="skeleton-line" style={{ width: '70%' }} />
-        <div className="skeleton-line" style={{ width: '90%' }} />
+        {SKELETON_WIDTHS.map((width) => (
+          <div key={width} className="skeleton-line" style={{ width }} />
+        ))}
       </div>
     )
   }
   if (error) {
     return (
       <div className="async-error" role="alert">
-        <div className="alert-error" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <IconAlert size={18} style={{ flexShrink: 0 }} />
+        <div className="alert-error">
+          <IconAlert size={16} />
           <span>{error}</span>
         </div>
         <button type="button" className="btn btn-sm btn-secondary" onClick={onRetry}>

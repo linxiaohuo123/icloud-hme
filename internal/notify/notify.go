@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 bytes, encoding/json, errors, fmt, io, net/http, sync, time
+ * [INPUT]: 依赖 bytes, encoding/json, errors, fmt, io, net/http, sync, time, internal/security 出站策略
  * [OUTPUT]: 对外提供 Sender, NewSender, Settings, Event, ChannelResult 与事件 Kind 常量
  * [POS]: internal/notify 的通知中枢，聚合飞书/Bark/Telegram 三渠道，提供事件开关、
  *        防重发节流与异步非阻塞投递，网络错误安全展示以避免推送凭据进入日志与响应
@@ -26,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"icloud-hme/internal/security"
 )
 
 // 事件 Kind 常量。
@@ -91,7 +93,7 @@ func NewSender() *Sender {
 		settings:     defaultSettings(),
 		lastSent:     make(map[string]time.Time),
 		queue:        make(chan Event, 32),
-		client:       &http.Client{Timeout: 10 * time.Second},
+		client:       security.NewOutboundHTTPClient(10 * time.Second),
 		telegramBase: "https://api.telegram.org",
 		stopCh:       make(chan struct{}),
 	}
@@ -366,6 +368,9 @@ type notificationRequestError struct {
 }
 
 func (e *notificationRequestError) Error() string {
+	if errors.Is(e.cause, security.ErrPrivateOutbound) {
+		return e.channel + " 目标地址被出站安全策略拒绝"
+	}
 	var timeout interface{ Timeout() bool }
 	if errors.As(e.cause, &timeout) && timeout.Timeout() {
 		return e.channel + " 请求超时"
@@ -378,7 +383,7 @@ func (e *notificationRequestError) Unwrap() error { return e.cause }
 // postJSON 发送 JSON POST 并校验 2xx 响应, 返回响应体。
 func postJSON(client *http.Client, url string, payload []byte, name string) ([]byte, error) {
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = security.NewOutboundHTTPClient(10 * time.Second)
 	}
 	resp, err := client.Post(url, "application/json", bytes.NewReader(payload))
 	if err != nil {

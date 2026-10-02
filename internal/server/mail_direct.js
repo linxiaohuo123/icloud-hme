@@ -1,4 +1,12 @@
 
+    // 与管理台的浅色/深色选择保持一致；未设置时跟随系统
+    try {
+      const savedTheme = localStorage.getItem('icloud_hme_theme');
+      if (savedTheme === 'light' || savedTheme === 'dark') document.documentElement.dataset.theme = savedTheme;
+    } catch (e) {
+      // 隐私模式下读取受限时跟随系统主题
+    }
+
     let emailList = [];
     try {
       const dataEl = document.getElementById('mailViewData');
@@ -26,26 +34,40 @@
       }, 2500);
     }
 
-    function copyText(str, msg) {
+    async function copyText(str, msg) {
       if (!str) return;
-      if (!navigator.clipboard) {
+      let copied = false;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        try {
+          await navigator.clipboard.writeText(str);
+          copied = true;
+        } catch (e) {
+          // Browser permissions may deny clipboard writes; try legacy copy.
+        }
+      }
+      if (!copied) {
+        const focused = document.activeElement;
         const ta = document.createElement('textarea');
         ta.value = str;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
         document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        showToast(msg || '已复制');
-        return;
+        try {
+          ta.select();
+          copied = document.execCommand('copy') === true;
+        } catch (e) {
+          copied = false;
+        } finally {
+          ta.remove();
+          if (focused && typeof focused.focus === 'function') focused.focus();
+        }
       }
-      navigator.clipboard.writeText(str).then(function() {
-        showToast(msg || '已复制');
-      });
+      showToast(copied ? (msg || '已复制') : '复制失败，请选择文本手动复制');
     }
 
     function copyCode(code) {
       if (!code) return;
-      copyText(code, '✨ 验证码 ' + code + ' 已复制到剪贴板');
+      copyText(code, '验证码 ' + code + ' 已复制');
     }
 
     function copyCurrentUrl() {
@@ -195,7 +217,7 @@
             link.target = '_blank';
             link.rel = 'noopener noreferrer';
             link.className = 'link-badge';
-            link.textContent = '🔗 ' + url.hostname.replace(/^www\./, '');
+            link.textContent = url.hostname.replace(/^www\./, '');
             node = link;
           } catch (e) {
             // Invalid URLs remain readable plain text.
@@ -275,7 +297,7 @@
         } else if (res.status === 401 || res.status === 403) {
           autoRefreshPaused = true;
           const pill = document.getElementById('refreshPill');
-          if (pill) pill.innerHTML = '⚠️ 权限已失效';
+          if (pill) pill.textContent = '权限已失效';
           showToast('身份验证失效，已暂停自动检测');
         } else if (isManual) {
           showToast('同步邮件失败，请稍后重试');
@@ -345,7 +367,7 @@
         if (historySec) {
           if (data.all_otps.length > 1) {
             historySec.classList.remove('is-hidden');
-            let chipsHTML = '<span class="otp-history-label">全部验证信息 (' + data.all_otps.length + ' 条):</span>';
+            let chipsHTML = '<span class="otp-history-label">全部验证信息 · ' + data.all_otps.length + ' 条</span>';
             data.all_otps.forEach(function(it) {
               if (!it.code) {
                 chipsHTML += '<a class="otp-chip-btn" href="' + escapeAttr(it.magic_link) + '" target="_blank" rel="noopener noreferrer">激活链接 · ' + escapeHtml(it.sender_name) + '</a>';
@@ -415,7 +437,7 @@
             const activeCls = (it.index === nextIndex) ? ' active' : '';
             let otpBadge = '<div class="item-preview">' + escapeHtml(it.subject) + '</div>';
             if (it.code) {
-              otpBadge = '<div class="item-otp-pill"><span>⚡ ' + escapeHtml(it.code) + '</span>' +
+              otpBadge = '<div class="item-otp-pill"><span>' + escapeHtml(it.code) + '</span>' +
                 '<span class="quick-copy" data-action="copy-code" data-code="' + escapeAttr(it.code) + '">复制</span></div>';
             }
             listHTML += '<div class="mail-item' + activeCls + '" id="mailItem-' + it.index + '" data-action="select-mail" data-index="' + it.index + '">' +
@@ -455,7 +477,7 @@
       autoRefreshPaused = !autoRefreshPaused;
       const pill = document.getElementById('refreshPill');
       if (pill) {
-        pill.innerHTML = autoRefreshPaused ? '⏸️ 自动检测已暂停' : '⏱️ <span id="countdownSec">' + Math.max(0, remaining) + 's</span> 自动检测';
+        pill.innerHTML = autoRefreshPaused ? '自动检测已暂停' : '<span id="countdownSec">' + Math.max(0, remaining) + 's</span> 后自动检测';
       }
       showToast(autoRefreshPaused ? '自动检测已暂停' : '自动检测已开启');
     }

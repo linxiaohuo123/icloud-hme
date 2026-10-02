@@ -118,3 +118,52 @@ describe('direct mail polling', () => {
     expect(document.getElementById('rawContentArea')).toHaveTextContent('New mail body')
   })
 })
+
+
+describe('direct mail clipboard feedback', () => {
+  it.each(['legacy false', 'legacy throw', 'clipboard denied'])('reports %s without claiming success', async mode => {
+    const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+    const execDescriptor = Object.getOwnPropertyDescriptor(document, 'execCommand')
+    const exec = mode === 'legacy throw' ? vi.fn(() => { throw new Error('denied') }) : vi.fn(() => false)
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: exec })
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: mode === 'clipboard denied' ? { writeText: vi.fn().mockRejectedValue(new Error('denied')) } : undefined })
+    try {
+      boot([])
+      document.body.insertAdjacentHTML('beforeend', '<div id="toast"></div><button id="copy" data-action="copy-email" data-email="fixture@example.com">Copy</button>')
+      document.getElementById('copy')!.focus()
+      document.getElementById('copy')!.click()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(exec).toHaveBeenCalledWith('copy')
+      expect(document.getElementById('toast')).toHaveTextContent('复制失败，请选择文本手动复制')
+      expect(document.querySelector('textarea')).toBeNull()
+      expect(document.activeElement).toBe(document.getElementById('copy'))
+    } finally {
+      if (clipboardDescriptor) Object.defineProperty(navigator, 'clipboard', clipboardDescriptor)
+      else Reflect.deleteProperty(navigator, 'clipboard')
+      if (execDescriptor) Object.defineProperty(document, 'execCommand', execDescriptor)
+      else Reflect.deleteProperty(document, 'execCommand')
+    }
+  })
+
+  it.each(['clipboard', 'legacy', 'denied then legacy'])('reports actual %s success', async mode => {
+    const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+    const execDescriptor = Object.getOwnPropertyDescriptor(document, 'execCommand')
+    const exec = vi.fn(() => true)
+    const writeText = mode === 'denied then legacy' ? vi.fn().mockRejectedValue(new Error('denied')) : vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: exec })
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: mode === 'legacy' ? undefined : { writeText } })
+    try {
+      boot([])
+      document.body.insertAdjacentHTML('beforeend', '<div id="toast"></div><button id="copy" data-action="copy-email" data-email="fixture@example.com">Copy</button>')
+      document.getElementById('copy')!.click()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(document.getElementById('toast')).toHaveTextContent('已复制')
+      expect(exec).toHaveBeenCalledTimes(mode === 'clipboard' ? 0 : 1)
+    } finally {
+      if (clipboardDescriptor) Object.defineProperty(navigator, 'clipboard', clipboardDescriptor)
+      else Reflect.deleteProperty(navigator, 'clipboard')
+      if (execDescriptor) Object.defineProperty(document, 'execCommand', execDescriptor)
+      else Reflect.deleteProperty(document, 'execCommand')
+    }
+  })
+})

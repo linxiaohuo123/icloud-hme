@@ -391,7 +391,7 @@ func TestSchedulerDoubleQuotaPrevention(t *testing.T) {
 	// 模拟 production server.go 中的 creator (它会调用 TryReserveQuota)
 	createdCount := 0
 	mockCreator := func(ctx context.Context, id, label string) (*hme.CreateResult, error) {
-		allowed, _, err := st.TryReserveQuota(id, 1)
+		allowed, _, _, err := st.TryReserveQuota(id, 1)
 		if err != nil {
 			return nil, err
 		}

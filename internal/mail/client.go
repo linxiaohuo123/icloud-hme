@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 context, github.com/emersion/go-imap, golang.org/x/net/proxy
- * [OUTPUT]: 对外提供 Client、NewClient、NewClientWithServer、Message、FullMessage
+ * [OUTPUT]: 对外提供 Client、NewClient、NewClientWithServer、Message、FullMessage（MIME 取码字段内部保留、不序列化）
  * [POS]: internal/mail 的 IMAP 客户端核心，支持可取消建连、库级命令期限与有限登出；内容拉取由 client_fetch.go 承载，增量扫描由 client_scan.go 承载，隧道拨号由 dial.go 承载
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -60,6 +60,7 @@ type Message struct {
 	UID         uint32 `json:"uid,omitempty"`          // IMAP UID
 	ThreadID    string `json:"thread_id,omitempty"`    // WebMail 线程 ID
 	match       string
+	otpBodies   []string // MIME alternatives remain independent OTP candidate fields; never serialized.
 }
 
 // Folder describes a selectable IMAP mailbox.

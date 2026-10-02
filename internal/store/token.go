@@ -363,6 +363,17 @@ func (s *Store) DeleteToken(id string) (bool, error) {
 	return n > 0, nil
 }
 
+// PurgeToken 物理清除 (Hard Delete) API 令牌记录。彻底从数据库中删除，返回 true 表示记录已删除。
+func (s *Store) PurgeToken(id string) (bool, error) {
+	id = strings.TrimSpace(id)
+	res, err := s.db.Exec(`DELETE FROM api_tokens WHERE id = ?`, id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // ValidateToken 检查令牌有效性
 func (s *Store) ValidateToken(tokenStr string) bool {
 	_, _, ok := s.ValidateTokenWithName(tokenStr)

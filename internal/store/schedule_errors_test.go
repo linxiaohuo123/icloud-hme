@@ -17,7 +17,7 @@ func TestStoreReadFailuresAreNotEmptyResults(t *testing.T) {
 		"schedule":        func() error { _, err := st.GetScheduleConfig("acc_1"); return err },
 		"schedules":       func() error { _, err := st.ListScheduleConfigs(); return err },
 		"remaining quota": func() error { _, err := st.RemainingQuota("acc_1"); return err },
-		"reserve quota":   func() error { _, _, err := st.TryReserveQuota("acc_1", 1); return err },
+		"reserve quota":   func() error { _, _, _, err := st.TryReserveQuota("acc_1", 1); return err },
 		"setting":         func() error { _, err := st.GetSetting("key"); return err },
 		"tags":            func() error { _, err := st.ListTags(); return err },
 		"tokens":          func() error { _, err := st.ListTokens(); return err },

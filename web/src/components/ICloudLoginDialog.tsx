@@ -108,7 +108,7 @@ export default function ICloudLoginDialog({
       onClose={() => void handleClose()}
     >
       {accountEmail && (
-        <div className="alert-info" style={{ marginBottom: 12 }}>
+        <div className="alert-info">
           正在为账号 <strong>{accountName ? `${accountName} (${accountEmail})` : accountEmail}</strong> 进行 Apple 官方认证
         </div>
       )}
@@ -132,7 +132,7 @@ export default function ICloudLoginDialog({
             onChange={(e) => setPassword(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') void handleSubmit() }}
           />
-          <span className="field-hint" style={{ fontSize: 12, color: 'var(--color-text-secondary, #64748b)', marginTop: 4, lineHeight: 1.5, display: 'block' }}>
+          <span className="field-hint">
             系统将向 Apple 申请登录凭据。如登录受阻，可通过【更新 Cookie】使用浏览器 Cookie 激活。
           </span>
         </div>
@@ -153,7 +153,7 @@ export default function ICloudLoginDialog({
         </div>
       )}
       {(submitting || cancelling) && (
-        <div className="alert-info" style={{ marginTop: 12 }}>
+        <div className="alert-info">
           {cancelling ? '正在取消登录…' : '正在完成 Apple 账号验证，请稍候…'}
         </div>
       )}

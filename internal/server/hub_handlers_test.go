@@ -100,6 +100,44 @@ func TestHubHandlers(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("POST /api/tokens failed: %d", w.Code)
 	}
+	var createdTok struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &createdTok); err != nil || createdTok.Data.ID == "" {
+		t.Fatalf("unmarshal created token failed: %v", err)
+	}
+
+	// 2.1 软注销 (Soft Revoke)
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("DELETE", "/api/tokens/"+createdTok.Data.ID, nil)
+	req.Header.Set("Cookie", cookie)
+	req.Header.Set("X-CSRF-Token", csrf)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("DELETE (soft revoke) /api/tokens failed: %d", w.Code)
+	}
+
+	// 2.2 物理清除 (Hard Purge)
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("DELETE", "/api/tokens/"+createdTok.Data.ID+"?purge=true", nil)
+	req.Header.Set("Cookie", cookie)
+	req.Header.Set("X-CSRF-Token", csrf)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("DELETE (purge) /api/tokens failed: %d", w.Code)
+	}
+
+	// 再次物理清除同一 ID 应返回 404 NOT_FOUND
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("DELETE", "/api/tokens/"+createdTok.Data.ID+"?purge=true", nil)
+	req.Header.Set("Cookie", cookie)
+	req.Header.Set("X-CSRF-Token", csrf)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("DELETE (purge non-existent) 期望 404, 实际得到: %d", w.Code)
+	}
 
 	// 3. Leases
 	w = httptest.NewRecorder()

@@ -1,5 +1,5 @@
 /**
- * [INPUT]: 依赖 react-router-dom 的 useNavigate, auth/AuthProvider 的 useAuth, api/client 的 ApiError, components/icons 的 IconLock/IconShield/IconEye/IconEyeOff
+ * [INPUT]: 依赖 react-router-dom 的 useNavigate, auth/AuthProvider 的 useAuth, api/client 的 ApiError, components/icons 的 IconLock/IconBrandLogo/IconEye/IconEyeOff
  * [OUTPUT]: 对外提供 LoginPage 管理员登录页面组件
  * [POS]: web/src/pages 的公开受限路由入口，负责单密码鉴权表单提交
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -9,7 +9,7 @@ import { useState, type FormEvent } from 'react'
 import { useNavigate, Navigate } from 'react-router-dom'
 import { useAuth } from '../auth/AuthProvider'
 import { ApiError } from '../api/client'
-import { IconEye, IconEyeOff, IconLock, IconShield } from '../components/icons'
+import { IconBrandLogo, IconEye, IconEyeOff, IconLock } from '../components/icons'
 
 export default function LoginPage() {
   const { login, status } = useAuth()
@@ -44,9 +44,9 @@ export default function LoginPage() {
     <div className="login-page">
       <div className="login-brand">
         <span className="logo" aria-hidden="true">
-          <IconShield size={30} />
+          <IconBrandLogo size={48} />
         </span>
-        <h1>iCloud HME 管理台</h1>
+        <h1>iCloud HME Plus</h1>
         <p>管理你的 iCloud 隐藏邮箱别名与邮件</p>
       </div>
       <form onSubmit={handleSubmit} className="card login-form">
@@ -57,7 +57,7 @@ export default function LoginPage() {
         )}
         <div className="form-field">
           <label htmlFor="admin-password">管理员密码</label>
-          <div style={{ position: 'relative', width: '100%' }}>
+          <div className="login-password-wrap">
             <input
               id="admin-password"
               type={showPassword ? 'text' : 'password'}
@@ -66,7 +66,6 @@ export default function LoginPage() {
               onChange={(e) => setPassword(e.target.value)}
               required
               placeholder="请输入管理员密码"
-              style={{ paddingRight: 40 }}
             />
             <button
               type="button"
@@ -89,6 +88,9 @@ export default function LoginPage() {
           <span>本地内存加密会话 · 杜绝泄露</span>
         </div>
       </form>
+      <div className="login-disclaimer">
+        iCloud 是 Apple Inc. 在美国及其他国家/地区的商标。本项目为独立第三方管理工具，与 Apple Inc. 无官方隶属或背书关系。
+      </div>
     </div>
   )
 }

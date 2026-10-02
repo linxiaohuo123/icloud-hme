@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 api/client (request, ApiError), api/types (AccountSummary, BatchCreateResult), components/Dialog, components/Select, utils/clipboard
- * [OUTPUT]: 对外提供 BatchCreateAliasDialog 批量生成别名弹窗组件，申请期间禁止关闭，账号列表刷新时保留表单与生成结果，复制失败显示明确错误
+ * [OUTPUT]: 对外提供 BatchCreateAliasDialog 批量生成别名弹窗组件，备注前缀最多 100 Unicode 字符，申请期间禁止关闭，账号列表刷新时保留表单与生成结果，复制失败显示明确错误
  * [POS]: web/src/components 的交互组件，为 AliasesPage 与 AccountWorkspace 提供 1-5 个别名的高并发原子生成
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -61,6 +61,10 @@ export default function BatchCreateAliasDialog({
       setError('请选择所属母账号')
       return
     }
+    if (Array.from(note.trim()).length > 100) {
+      setError('备注前缀不能超过 100 个字符')
+      return
+    }
     setLoading(true)
     setError('')
     try {
@@ -106,7 +110,7 @@ export default function BatchCreateAliasDialog({
       onClose={handleClose}
     >
       {error && (
-        <div className="alert-error" role="alert" style={{ marginBottom: 16 }}>
+        <div className="alert-error" role="alert">
           {error}
         </div>
       )}
@@ -131,14 +135,14 @@ export default function BatchCreateAliasDialog({
           </div>
 
           <div className="form-field">
-            <label htmlFor="batch-count">生成数量 (1 - 5)</label>
-            <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+            <div className="form-field-label" id="batch-count-label">生成数量 (1 - 5)</div>
+            <div className="count-picker" role="group" aria-labelledby="batch-count-label">
               {[1, 2, 3, 4, 5].map((num) => (
                 <button
                   key={num}
                   type="button"
-                  className={`btn btn-xs ${count === num ? 'btn-primary' : 'btn-secondary'}`}
-                  style={{ flex: 1, minHeight: 32, fontSize: 13 }}
+                  className={`btn btn-sm ${count === num ? 'btn-primary' : 'btn-secondary'}`}
+                  aria-pressed={count === num}
                   onClick={() => setCount(num)}
                   disabled={loading}
                 >
@@ -155,15 +159,14 @@ export default function BatchCreateAliasDialog({
               id="batch-note"
               type="text"
               value={note}
-              onChange={(e) => setNote(e.target.value.slice(0, 200))}
+              onChange={(e) => setNote(Array.from(e.target.value).slice(0, 100).join(''))}
               placeholder="例如：注册测试、社交订阅"
-              maxLength={200}
               disabled={loading}
             />
-            <p className="hint">若生成多个别名，将统一附加此前缀作为标签。</p>
+            <p className="hint">最多 100 个字符；生成多个别名时将统一附加此前缀作为标签。</p>
           </div>
 
-          <div className="form-actions" style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 20 }}>
+          <div className="form-actions">
             <button type="button" className="btn btn-secondary" onClick={handleClose} disabled={loading}>
               取消
             </button>
@@ -174,44 +177,32 @@ export default function BatchCreateAliasDialog({
         </form>
       ) : (
         <div>
-          <div className="alert-info" style={{ marginBottom: 16 }}>
+          <div className="alert-info">
             <span>
               成功申请 <b>{result.created_count}</b> / {result.requested} 个别名
             </span>
           </div>
 
           {result.created?.length > 0 && (
-            <div style={{ marginBottom: 16 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                <span style={{ fontSize: 13, fontWeight: 600 }}>生成的邮箱列表：</span>
+            <div className="form-field">
+              <div className="result-list-head">
+                <span>生成的邮箱列表：</span>
                 <button
                   type="button"
                   className="btn btn-xs btn-secondary"
                   onClick={() => void handleCopyAll()}
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
                 >
                   {copied ? <IconCheck size={12} /> : <IconCopy size={12} />}
                   <span>{copied ? '已复制' : '一键复制全部'}</span>
                 </button>
               </div>
-              <div style={{ background: 'var(--color-bg-subtle)', borderRadius: 6, padding: 8, maxHeight: 180, overflowY: 'auto' }}>
+              <div className="result-list">
                 {result.created.map((item, idx) => (
-                  <div
-                    key={idx}
-                    style={{
-                      display: 'flex',
-                      justifyContent: 'space-between',
-                      alignItems: 'center',
-                      padding: '4px 8px',
-                      fontFamily: 'monospace',
-                      fontSize: 13,
-                    }}
-                  >
+                  <div key={idx} className="result-list-row">
                     <span>{item.email}</span>
                     <button
                       type="button"
-                      className="link-button"
-                      style={{ fontSize: 12 }}
+                      className="link-button text-xs"
                       onClick={() => void copyText(item.email)}
                     >
                       复制
@@ -223,19 +214,19 @@ export default function BatchCreateAliasDialog({
           )}
 
           {result.last_error && (
-            <div className="alert-error" style={{ marginBottom: 16 }}>
-              <p style={{ fontWeight: 600, marginBottom: 4 }}>部分生成失败：</p>
-              <p style={{ margin: 0, fontSize: 12 }}>{result.last_error}</p>
+            <div className="alert-error">
+              <p className="font-semibold">部分生成失败：</p>
+              <p className="text-xs">{result.last_error}</p>
             </div>
           )}
 
           {result.audit_failed && result.audit_failed.length > 0 && (
-            <div className="alert-error" role="alert" style={{ marginBottom: 16 }}>
+            <div className="alert-error" role="alert">
               已生成但未写入出号记录：{result.audit_failed.join('、')}。请勿重复创建。
             </div>
           )}
 
-          <div className="form-actions" style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
+          <div className="form-actions">
             <button type="button" className="btn btn-primary" onClick={handleClose}>
               完成
             </button>

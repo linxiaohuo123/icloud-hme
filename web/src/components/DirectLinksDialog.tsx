@@ -50,35 +50,45 @@ export default function DirectLinksDialog({ open, onClose, email }: DirectLinksD
     }
   }
 
-  const inputStyle: React.CSSProperties = {
-    width: '100%',
-    minHeight: 34,
-    padding: '6px 10px',
-    fontSize: 12,
-    fontFamily: 'var(--font-mono)',
-    background: 'var(--color-bg)',
-    color: 'var(--color-text)',
-    border: '1px solid var(--color-border)',
-    borderRadius: 'var(--radius)',
-    cursor: 'pointer',
-  }
-
-  const cardStyle: React.CSSProperties = {
-    padding: 12,
-    background: 'var(--color-bg-subtle)',
-    border: '1px solid var(--color-border)',
-    borderRadius: 'var(--radius)',
-  }
+  const links = [
+    {
+      key: 'json',
+      icon: <IconTerminal size={14} />,
+      title: '1. 程序一行 GET 取验证码 (JSON)',
+      desc: '长轮询等待邮件到达并在 0.1 秒内出码，脚本无需携带复杂 Header 头；末尾追加 &raw=1 可直接输出 6 位纯数字文本。',
+      url: jsonUrl,
+      copyLabel: '取码直链',
+      openable: false,
+    },
+    {
+      key: 'view',
+      icon: <IconGlobe size={14} />,
+      title: '2. 网页可视化查信 (HTML)',
+      desc: '在浏览器中直接查看可视化邮件并醒目展示提取到的验证码，安全沙盒渲染。',
+      url: viewUrl,
+      copyLabel: '网页查信直链',
+      openable: true,
+    },
+    {
+      key: 'raw',
+      icon: <IconFileText size={14} />,
+      title: '3. 邮件纯正文 (Raw Text)',
+      desc: '直接输出未经 JSON 转义的邮件纯正文文本，方便爬虫使用正则提取长链接。',
+      url: rawUrl,
+      copyLabel: '正文纯文本直链',
+      openable: false,
+    },
+  ]
 
   return (
-    <Dialog open={open} onClose={onClose} title="对外直出链接 (开箱即用)">
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-        <div style={{ fontSize: 13, color: 'var(--color-text-secondary)', lineHeight: 1.6 }}>
-          针对邮箱 <strong style={{ color: 'var(--color-primary)' }}>{email}</strong> 生成可供外部自动化脚本调用的开箱即用直链。
-        </div>
+    <Dialog open={open} onClose={onClose} title="对外直出链接 (开箱即用)" size="lg">
+      <div className="dialog-stack">
+        <p className="dialog-lead">
+          针对邮箱 <strong>{email}</strong> 生成可供外部自动化脚本调用的开箱即用直链。
+        </p>
 
-        <div className="form-field" style={{ margin: 0 }}>
-          <label htmlFor="direct-links-token" style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+        <div className="form-field">
+          <label htmlFor="direct-links-token" className="inline-flex-center">
             <IconKey size={14} />
             <span>外部访问令牌 (Token)</span>
           </label>
@@ -88,115 +98,54 @@ export default function DirectLinksDialog({ open, onClose, email }: DirectLinksD
             value={token}
             onChange={(e) => setToken(e.target.value)}
             placeholder="填写在「业务标识」中生成的 Token (可选，会自动存入本机浏览器)"
-            style={{ width: '100%', fontSize: 13 }}
           />
-          <span style={{ fontSize: 12, color: 'var(--color-text-tertiary)', marginTop: 4 }}>
-            💡 当前浏览器已登录管理员会话时，网页查信直链无需 Token 也可直接点开；给外部脚本或客户使用时请填入 Token。
+          <span className="hint">
+            当前浏览器已登录管理员会话时，网页查信直链无需 Token 也可直接点开；给外部脚本或客户使用时请填入 Token。
           </span>
         </div>
 
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginTop: 4 }}>
-          {/* 1. 程序取码 (JSON) */}
-          <div className="card" style={cardStyle}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, fontSize: 13, color: 'var(--color-text)' }}>
-                <IconTerminal size={14} style={{ color: 'var(--color-primary)' }} />
-                <span>1. 程序一行 GET 取验证码 (JSON)</span>
+        {links.map((link) => (
+          <div key={link.key} className="direct-link-item">
+            <div className="direct-link-head">
+              <div className="direct-link-title">
+                {link.icon}
+                <span>{link.title}</span>
               </div>
-              <button
-                type="button"
-                className="btn btn-xs btn-primary"
-                onClick={() => void handleCopy(jsonUrl, '取码直链')}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
-              >
-                <IconCopy size={11} />
-                <span>复制链接</span>
-              </button>
-            </div>
-            <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 6 }}>
-              长轮询等待邮件到达并在 0.1 秒内出码，脚本无需携带复杂 Header 头；末尾追加 &raw=1 可直接输出 6 位纯数字文本。
-            </div>
-            <input
-              type="text"
-              readOnly
-              value={jsonUrl}
-              onClick={(e) => (e.target as HTMLInputElement).select()}
-              style={inputStyle}
-            />
-          </div>
-
-          {/* 2. 网页查信 (HTML) */}
-          <div className="card" style={cardStyle}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, fontSize: 13, color: 'var(--color-text)' }}>
-                <IconGlobe size={14} style={{ color: 'var(--color-success)' }} />
-                <span>2. 网页可视化查信 (HTML)</span>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <a
-                  href={viewUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="btn btn-xs btn-ghost"
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: 4, textDecoration: 'none' }}
-                >
-                  <IconExternalLink size={11} />
-                  <span>打开查信页</span>
-                </a>
+              <div className="direct-link-actions">
+                {link.openable && (
+                  <a
+                    href={link.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="btn btn-xs btn-ghost"
+                  >
+                    <IconExternalLink size={11} />
+                    <span>打开查信页</span>
+                  </a>
+                )}
                 <button
                   type="button"
-                  className="btn btn-xs btn-primary"
-                  onClick={() => void handleCopy(viewUrl, '网页查信直链')}
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                  className="btn btn-xs btn-secondary"
+                  onClick={() => void handleCopy(link.url, link.copyLabel)}
                 >
                   <IconCopy size={11} />
                   <span>复制链接</span>
                 </button>
               </div>
             </div>
-            <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 6 }}>
-              在浏览器中直接查看可视化邮件并醒目展示提取到的验证码，安全沙盒渲染。
-            </div>
+            <div className="direct-link-desc">{link.desc}</div>
             <input
               type="text"
               readOnly
-              value={viewUrl}
+              className="font-mono"
+              aria-label={link.copyLabel}
+              value={link.url}
               onClick={(e) => (e.target as HTMLInputElement).select()}
-              style={inputStyle}
             />
           </div>
+        ))}
 
-          {/* 3. 纯正文 (Raw) */}
-          <div className="card" style={cardStyle}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, fontSize: 13, color: 'var(--color-text)' }}>
-                <IconFileText size={14} style={{ color: 'var(--color-warning)' }} />
-                <span>3. 邮件纯正文 (Raw Text)</span>
-              </div>
-              <button
-                type="button"
-                className="btn btn-xs btn-primary"
-                onClick={() => void handleCopy(rawUrl, '正文纯文本直链')}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
-              >
-                <IconCopy size={11} />
-                <span>复制链接</span>
-              </button>
-            </div>
-            <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 6 }}>
-              直接输出未经 JSON 转义的邮件纯正文文本，方便爬虫使用正则提取长链接。
-            </div>
-            <input
-              type="text"
-              readOnly
-              value={rawUrl}
-              onClick={(e) => (e.target as HTMLInputElement).select()}
-              style={inputStyle}
-            />
-          </div>
-        </div>
-
-        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}>
+        <div className="dialog-actions">
           <button type="button" className="btn btn-secondary" onClick={onClose}>
             关闭
           </button>

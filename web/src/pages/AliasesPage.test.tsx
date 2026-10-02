@@ -462,3 +462,40 @@ describe('AliasesPage', () => {
     expect(screen.queryByText('a-refresh@icloud.com')).toBeNull()
   })
 })
+
+it('switching A to B to A must discard the old manual refresh', async () => {
+  const pending = createDeferred<void>()
+  let refreshStarted = false
+  let refreshResponded = false
+  let aReads = 0
+  server.use(
+    http.get('/api/accounts', () => HttpResponse.json({ success: true, data: [accounts[0], { ...accounts[0], id: 'audit_b', name: 'Audit B' }] })),
+    http.get('/api/aliases', async ({ request }) => {
+      const url = new URL(request.url)
+      const id = url.searchParams.get('account_id')
+      if (url.searchParams.get('refresh') === 'true') {
+        refreshStarted = true
+        await pending.promise
+        refreshResponded = true
+        return HttpResponse.json({ success: true, data: { aliases: [{ ...aliases[0], label: 'stale-refresh-label' }] } })
+      }
+      if (id === 'acc_1') aReads++
+      return HttpResponse.json({ success: true, data: { aliases: [{ ...aliases[0], label: id === 'audit_b' ? 'B-label' : aReads > 1 ? 'latest-A-label' : 'initial-label' }] } })
+    }),
+  )
+  renderPage( '/aliases?account_id=acc_1')
+  const user = userEvent.setup()
+  await screen.findByText('initial-label')
+  await user.click(screen.getByRole('button', { name: '刷新号池' }))
+  await waitFor(() => expect(refreshStarted).toBe(true))
+  await user.selectOptions(screen.getByLabelText('所属账号'), 'audit_b')
+  await screen.findByText('B-label')
+  await user.selectOptions(screen.getByLabelText('所属账号'), 'acc_1')
+  await screen.findByText('latest-A-label')
+  pending.resolve()
+  await waitFor(() => expect(refreshResponded).toBe(true))
+  expect(screen.getByRole('button', { name: '刷新号池' })).toBeEnabled()
+  expect(screen.queryByText('号池已与 Apple 同步最新数据')).not.toBeInTheDocument()
+  expect(screen.queryByText('stale-refresh-label')).not.toBeInTheDocument()
+  expect(screen.getByText('latest-A-label')).toBeInTheDocument()
+})

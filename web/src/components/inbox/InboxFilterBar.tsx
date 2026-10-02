@@ -65,6 +65,7 @@ export default function InboxFilterBar({
             账号
           </label>
           <Select
+          size="sm"
             id="inbox-account"
             aria-label="账号"
             value={accountId}
@@ -80,6 +81,7 @@ export default function InboxFilterBar({
           别名
         </label>
         <Select
+          size="sm"
           id="inbox-alias"
           aria-label="别名"
           value={alias}
@@ -103,16 +105,17 @@ export default function InboxFilterBar({
         onKeyDownCapture={onFolderInteract}
       >
         <label htmlFor="inbox-folder" className="inbox-filter-label">
-          文件夹 {isWebMailOnly && <span style={{ opacity: 0.6, fontSize: '0.85em' }}>(WebMail固定)</span>}
+          文件夹 {isWebMailOnly && <span className="inbox-filter-dim">(WebMail固定)</span>}
         </label>
         <Select
+          size="sm"
           id="inbox-folder"
           aria-label="文件夹"
           value={isWebMailOnly ? 'INBOX' : folder}
           onChange={onFolderChange}
           options={isWebMailOnly ? [{ value: 'INBOX', label: '收件箱 (WebMail模式)' }] : folderOptions}
           disabled={isWebMailOnly}
-          style={{ minWidth: 200, opacity: isWebMailOnly ? 0.6 : 1 }}
+          style={{ minWidth: 200 }}
         />
       </div>
 
@@ -121,6 +124,7 @@ export default function InboxFilterBar({
           每页
         </label>
         <Select
+          size="sm"
           id="inbox-limit"
           aria-label="每页"
           value={limit}
@@ -136,9 +140,10 @@ export default function InboxFilterBar({
 
       <div className="inbox-filter-item">
         <label htmlFor="inbox-days" className="inbox-filter-label">
-          时间范围 {isWebMailOnly && <span style={{ opacity: 0.6, fontSize: '0.85em' }}>(全量)</span>}
+          时间范围 {isWebMailOnly && <span className="inbox-filter-dim">(全量)</span>}
         </label>
         <Select
+          size="sm"
           id="inbox-days"
           aria-label="时间范围"
           value={days}
@@ -150,7 +155,7 @@ export default function InboxFilterBar({
             { value: 90, label: '90 天' },
           ]}
           disabled={isWebMailOnly}
-          style={{ minWidth: 90, opacity: isWebMailOnly ? 0.6 : 1 }}
+          style={{ minWidth: 90 }}
         />
       </div>
 
@@ -159,6 +164,7 @@ export default function InboxFilterBar({
           自动刷新
         </label>
         <Select
+          size="sm"
           id="inbox-autorefresh"
           aria-label="自动刷新"
           value={autoRefreshInterval}
