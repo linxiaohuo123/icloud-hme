@@ -103,6 +103,8 @@ type Server struct {
 	closeOnce       sync.Once          // 确保唯一后台清理协程只启动一次
 	closeDone       chan struct{}      // 真实清理完成通知信号
 	closeErr        error              // 最终持久化/底层连接池关闭错误
+	linkKeyMu       sync.Mutex         // 保护签名直链子密钥缓存与 epoch 递增
+	linkKey         []byte             // 当前 epoch 的签名直链子密钥缓存 (nil 表示待加载)
 }
 
 // New 创建 Server。mgr 为账号管理器,st 为持久化存储(可为 nil),cfg 为安全配置。
@@ -647,7 +649,7 @@ func (s *Server) register() {
 	s.r.GET("/mail/view-assets.js", serveMailDirectAsset("mail_direct.js", "application/javascript; charset=utf-8"))
 	mailGroup := s.r.Group("/mail")
 	mailGroup.Use(apiCacheControlMiddleware())
-	mailGroup.Use(requireSession(s.auth, s.cfg.APIKey, s.store, s.requestLimiter))
+	mailGroup.Use(requireSession(s.auth, s.cfg.APIKey, s.store, s.mailLinkPrincipal, s.requestLimiter))
 	mailGroup.Use(requireScope(store.ScopeVerify))
 	{
 		mailGroup.GET("/code", s.verifyCodeHandler)
@@ -667,7 +669,7 @@ func (s *Server) register() {
 
 		// ===== 受保护路由:统一 requireSession (支持 API Key 旁路) =====
 		authed := api.Group("")
-		authed.Use(requireSession(s.auth, s.cfg.APIKey, s.store, s.requestLimiter))
+		authed.Use(requireSession(s.auth, s.cfg.APIKey, s.store, nil, s.requestLimiter))
 		{
 			// ...
 			authed.POST("/auth/logout", csrfCheck(s.auth), s.handleLogout)
@@ -720,6 +722,10 @@ func (s *Server) register() {
 				adm.POST("/aliases/:id/reactivate", csrfCheck(s.auth), s.reactivateAliasHandler)
 				adm.DELETE("/aliases/:id", csrfCheck(s.auth), s.deleteAliasHandler)
 				adm.POST("/aliases/promote-to-pool", csrfCheck(s.auth), s.promoteAliasesToPoolHandler)
+
+				// 单别名只读签名直链 (对外分发，不暴露令牌)
+				adm.POST("/mail-links", csrfCheck(s.auth), s.createMailLinkHandler)
+				adm.POST("/mail-links/revoke", csrfCheck(s.auth), s.revokeMailLinksHandler)
 
 				// ===== 中台扩展: 业务标识 =====
 				adm.GET("/tags", s.listTagsHandler)

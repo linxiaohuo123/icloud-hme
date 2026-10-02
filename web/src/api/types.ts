@@ -261,3 +261,10 @@ export interface NotifyChannelResult {
   ok: boolean
   error?: string
 }
+
+/** POST /api/mail-links 单别名只读签名直链 */
+export interface MailLink {
+  email: string
+  expires_at: string
+  query: string
+}

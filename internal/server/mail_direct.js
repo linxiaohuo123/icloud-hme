@@ -165,7 +165,7 @@
           previewURL.searchParams.set('message_id', item.id);
           previewURL.searchParams.set('format', 'html');
           previewURL.searchParams.set('frame', '1');
-          ['token', 'api_key'].forEach(function(key) {
+          ['token', 'api_key', 'exp', 'sig'].forEach(function(key) {
             if (currentURL.searchParams.has(key)) previewURL.searchParams.set(key, currentURL.searchParams.get(key));
           });
           frame.removeAttribute('srcdoc');

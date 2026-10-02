@@ -29,6 +29,7 @@ HTTP JSON API，所有接口均采用标准 JSON 格式交互。
 | :--- | :--- | :--- |
 | `AUTH_REQUIRED` | 401 | 缺少身份凭证或会话已过期 |
 | `INVALID_CREDENTIALS` | 401 | 管理员登录密码错误 |
+| `INVALID_LINK` | 401 | 单别名签名直链无效、已过期或已被作废 |
 | `CSRF_INVALID` | 403 | 浏览器 Session 模式下缺少有效 `X-CSRF-Token` |
 | `ACCOUNT_NOT_FOUND` | 404 | 指定的 iCloud 账号不存在 |
 | `ACCOUNT_IDENTITY_MISMATCH` | 409 | 新 Cookie 或密码登录对应另一 Apple 账号，原账号和库存保持不变 |
@@ -664,6 +665,22 @@ GET /mail/raw?email=target@icloud.com&token=<TOKEN>
 ```
 
 也可使用请求头 `Authorization: Bearer <TOKEN>` 代替 `?token=`。
+
+**单别名签名直链（交给客户请用这个）**：`?token=` 会把整个令牌放进 URL，拿到链接的人能读该令牌名下全部别名并调用出号。对外分发请由管理员签发只读签名直链，链接只含 `email`、`exp`、`sig`，仅能读取这一个别名的 `/mail/code`、`/mail/view`、`/mail/raw`，不能改道到其他别名或账号，也无法触达任何 `/api` 接口：
+
+```http
+# 签发 (admin，days 1-3650)；返回 query，拼到三个直链路径之后即可
+POST /api/mail-links
+{"email": "target@icloud.com", "days": 30}
+→ {"email": "target@icloud.com", "expires_at": "2026-11-02T08:00:00Z", "query": "email=target%40icloud.com&exp=1793520000&sig=..."}
+
+GET /mail/code?email=target%40icloud.com&exp=1793520000&sig=...&timeout=30
+
+# 一键作废此前签发的全部直链 (admin)
+POST /api/mail-links/revoke
+```
+
+签名由 Master Key 派生的子密钥计算；过期、被作废或被篡改的链接返回 `401 INVALID_LINK`，长轮询交付前同样复查。轮换 Master Key 也会使全部直链失效。
 
 **路径形式**：别名也可放在路径中，如 `GET /mail/code/target@icloud.com`、`/mail/view/:email`、`/mail/raw/:email`。路径参数优先于查询参数。
 

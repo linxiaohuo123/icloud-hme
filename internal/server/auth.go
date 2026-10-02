@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 internal/auth, gin
- * [OUTPUT]: 对外提供 requireSession 中间件 (支持 API Key 旁路), handleLogin, handleSession, handleLogout
+ * [OUTPUT]: 对外提供 requireSession 中间件 (支持 API Key 旁路与直链签名主体), handleLogin, handleSession, handleLogout
  * [POS]: internal/server 的鉴权与会话管理层
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -164,8 +164,9 @@ func requireExternalV2Auth(apiKey string, st *store.Store, limiters ...*RequestL
 	}
 }
 
-// requireSession accepts an explicit API key or a valid administrator Cookie session.
-func requireSession(mgr *authManager, apiKey string, st *store.Store, limiters ...*RequestLimiter) gin.HandlerFunc {
+// requireSession accepts an explicit API key, a signed single-alias link (when link is
+// non-nil, direct-mail routes only) or a valid administrator Cookie session.
+func requireSession(mgr *authManager, apiKey string, st *store.Store, link func(*gin.Context) (auth.Principal, bool), limiters ...*RequestLimiter) gin.HandlerFunc {
 	var limiter *RequestLimiter
 	if len(limiters) > 0 {
 		limiter = limiters[0]
@@ -180,6 +181,20 @@ func requireSession(mgr *authManager, apiKey string, st *store.Store, limiters .
 			defer token.Release()
 			c.Set(InflightTokenContextKey, token)
 		}
+		// next 将已认证主体计入主体级在途配额后放行
+		next := func() {
+			if val, exists := c.Get(InflightTokenContextKey); exists {
+				if tok, ok := val.(*InflightToken); ok && tok != nil {
+					if p, pExists := getPrincipal(c); pExists && p.ID != "" {
+						if err := tok.BindPrincipalInflight(p); err != nil {
+							failCode(c, http.StatusTooManyRequests, "PRINCIPAL_BUSY", "主体并发在途请求已达上限，请稍后重试")
+							return
+						}
+					}
+				}
+			}
+			c.Next()
+		}
 
 		if reqKey := requestAPIKey(c); reqKey != "" {
 			authed, err := authenticateAPIKey(c, reqKey, apiKey, st)
@@ -191,19 +206,18 @@ func requireSession(mgr *authManager, apiKey string, st *store.Store, limiters .
 				failCode(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
 				return
 			}
-			if limiter != nil {
-				if val, exists := c.Get(InflightTokenContextKey); exists {
-					if tok, ok := val.(*InflightToken); ok && tok != nil {
-						if p, pExists := getPrincipal(c); pExists && p.ID != "" {
-							if err := tok.BindPrincipalInflight(p); err != nil {
-								failCode(c, http.StatusTooManyRequests, "PRINCIPAL_BUSY", "主体并发在途请求已达上限，请稍后重试")
-								return
-							}
-						}
-					}
-				}
+			next()
+			return
+		}
+		if link != nil && c.Query("sig") != "" {
+			p, ok := link(c)
+			if !ok {
+				failCode(c, http.StatusUnauthorized, "INVALID_LINK", "直链签名无效、已过期或已被作废")
+				return
 			}
-			c.Next()
+			c.Set("auth_scopes", store.ScopeVerify)
+			c.Set("principal", p)
+			next()
 			return
 		}
 		sessionID := sessionIDFromCookie(c)
@@ -225,19 +239,7 @@ func requireSession(mgr *authManager, apiKey string, st *store.Store, limiters .
 			Kind: auth.PrincipalAdmin, ID: "admin", TokenName: "admin_session",
 			Scopes: []string{store.ScopeAdmin},
 		})
-		if limiter != nil {
-			if val, exists := c.Get(InflightTokenContextKey); exists {
-				if tok, ok := val.(*InflightToken); ok && tok != nil {
-					if p, ok := getPrincipal(c); ok {
-						if err := tok.BindPrincipalInflight(p); err != nil {
-							failCode(c, http.StatusTooManyRequests, "PRINCIPAL_BUSY", "主体并发在途请求已达上限，请稍后重试")
-							return
-						}
-					}
-				}
-			}
-		}
-		c.Next()
+		next()
 	}
 }
 

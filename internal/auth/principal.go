@@ -21,6 +21,8 @@ const (
 	PrincipalToken PrincipalKind = "token"
 	// PrincipalSystem 本地系统任务主体
 	PrincipalSystem PrincipalKind = "system"
+	// PrincipalLink 单别名只读签名直链，ID 即别名邮箱
+	PrincipalLink PrincipalKind = "link"
 )
 
 // Principal 统一身份与授权主体

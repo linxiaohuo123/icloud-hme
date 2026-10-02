@@ -32,7 +32,7 @@ func TestRotatedTokenCannotReceivePendingCode(t *testing.T) {
 			bus := mail.NewEventBus(time.Minute)
 			srv := &Server{store: st, eventBus: bus}
 			router := gin.New()
-			router.GET("/mail/code", requireSession(nil, "", st), srv.verifyCodeHandler)
+			router.GET("/mail/code", requireSession(nil, "", st, nil), srv.verifyCodeHandler)
 			makeRequest := func(credential string) *http.Request {
 				url := "/mail/code?email=rotation@icloud.com"
 				if queryCredential {

@@ -61,6 +61,15 @@ func (s *Server) resolveMailAccountID(c *gin.Context, email string, p auth.Princ
 	if requested == "" {
 		requested = strings.TrimSpace(c.Query("account"))
 	}
+	if p.Kind == auth.PrincipalLink {
+		// 签名直链只绑定别名本身，账号一律服务端解析，不接受参数改道
+		accountID := s.findAccountForEmail(email)
+		if p.ID != email || accountID == "" || (requested != "" && requested != accountID) {
+			failCode(c, http.StatusNotFound, "RESOURCE_NOT_FOUND", "未找到该别名或无权访问")
+			return "", false
+		}
+		return accountID, true
+	}
 	if p.Kind == auth.PrincipalToken && !p.IsAdmin() {
 		if s.store == nil {
 			failCode(c, http.StatusNotFound, "RESOURCE_NOT_FOUND", "未找到该别名或无权访问")
@@ -402,13 +411,7 @@ var mailViewTemplate = template.Must(template.New("mailView").Parse(`<!DOCTYPE h
 //
 //	email / alias (必须): 别名邮箱
 func (s *Server) mailViewHandler(c *gin.Context) {
-	email := strings.ToLower(strings.TrimSpace(c.Param("email")))
-	if email == "" {
-		email = strings.ToLower(strings.TrimSpace(c.Query("email")))
-	}
-	if email == "" {
-		email = strings.ToLower(strings.TrimSpace(c.Query("alias")))
-	}
+	email := directMailEmail(c)
 	if email == "" {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "email 参数必填")
 		return
@@ -489,13 +492,7 @@ func (s *Server) mailViewHandler(c *gin.Context) {
 //	message_id (可选): 当前别名最近 20 封中的指定邮件；省略时返回最新邮件
 //	frame (可选): 1 表示 HTML 允许被同源查信页嵌入，仍禁止脚本与同源权限
 func (s *Server) mailRawHandler(c *gin.Context) {
-	email := strings.ToLower(strings.TrimSpace(c.Param("email")))
-	if email == "" {
-		email = strings.ToLower(strings.TrimSpace(c.Query("email")))
-	}
-	if email == "" {
-		email = strings.ToLower(strings.TrimSpace(c.Query("alias")))
-	}
+	email := directMailEmail(c)
 	if email == "" {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "email 参数必填")
 		return

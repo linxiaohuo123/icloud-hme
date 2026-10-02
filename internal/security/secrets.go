@@ -1,6 +1,6 @@
 /**
- * [INPUT]: 依赖 crypto/aes, crypto/cipher, crypto/rand, encoding/base64, errors, fmt, os, strings
- * [OUTPUT]: 对外提供 SecretCipher 结构、NewSecretCipher、LoadMasterKey、ParseMasterKey、AccountAAD、NotifySettingsAAD
+ * [INPUT]: 依赖 crypto/aes, crypto/cipher, crypto/hmac, crypto/rand, crypto/sha256, encoding/base64, errors, fmt, os, strings
+ * [OUTPUT]: 对外提供 SecretCipher 结构 (含 DeriveKey 用途派生)、NewSecretCipher、LoadMasterKey、ParseMasterKey、AccountAAD、NotifySettingsAAD
  * [POS]: internal/security 的核心加密机，为可恢复凭据 (Apple cookies/app_password/mailbox/proxy/notify_settings) 提供 AES-256-GCM 封装与 AAD 防篡改绑定
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -10,7 +10,9 @@ package security
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -165,6 +167,13 @@ func (c *SecretCipher) Decrypt(envelope string, aad []byte) ([]byte, error) {
 	}
 
 	return plaintext, nil
+}
+
+// DeriveKey 按用途标签从 Master Key 派生独立 HMAC 子密钥，主密钥本身不出包。
+func (c *SecretCipher) DeriveKey(label string) []byte {
+	mac := hmac.New(sha256.New, c.key)
+	mac.Write([]byte(label))
+	return mac.Sum(nil)
 }
 
 // AccountAAD 生成 accounts 表对应字段的 AAD: accounts:<account_id>:<field>

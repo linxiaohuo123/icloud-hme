@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 gin, time, strings, strconv, icloud-hme/internal/mail
+ * [INPUT]: 依赖 gin, time, strconv, icloud-hme/internal/auth, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 verifyCodeHandler
- * [POS]: server 的验证码提取管道，交付前复查原令牌凭据，Trigger 即时触发收信，精确消费来源事件，停机显式返回 503，安全拒绝 auto_delete 副作用
+ * [POS]: server 的验证码提取管道，交付前复查原令牌凭据或直链签名，Trigger 即时触发收信，精确消费来源事件，停机显式返回 503，安全拒绝 auto_delete 副作用
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -11,7 +11,6 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -26,13 +25,7 @@ import (
 //	timeout (可选): 最大等待秒数, 默认 30, 上限 120; 0 表示只查缓存立即返回
 //	auto_delete: 已废弃并明确拒绝 (传入返回 400 UNSUPPORTED_PARAMETER)
 func (s *Server) verifyCodeHandler(c *gin.Context) {
-	email := strings.ToLower(strings.TrimSpace(c.Param("email")))
-	if email == "" {
-		email = strings.ToLower(strings.TrimSpace(c.Query("email")))
-	}
-	if email == "" {
-		email = strings.ToLower(strings.TrimSpace(c.Query("alias")))
-	}
+	email := directMailEmail(c)
 	if email == "" {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "email 参数必填")
 		return
@@ -66,6 +59,10 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 			return
 		}
 	}
+	if p.Kind == auth.PrincipalLink && p.ID != email {
+		failCode(c, http.StatusNotFound, "RESOURCE_NOT_FOUND", "未找到该别名或无权访问")
+		return
+	}
 
 	fresh := c.Query("fresh") == "true" || c.Query("nocache") == "true"
 
@@ -86,6 +83,10 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 				failCode(c, http.StatusUnauthorized, "REVOKED_TOKEN", "令牌已失效或被轮换")
 				return
 			}
+		}
+		if p.Kind == auth.PrincipalLink && !s.validMailLink(email, c.Query("exp"), c.Query("sig")) {
+			failCode(c, http.StatusUnauthorized, "INVALID_LINK", "直链已过期或已被作废")
+			return
 		}
 		// 【C3】精准消费采用的事件 ID，绝不整桶清除更晚到达的其它新事件
 		if item != nil && item.EventID != "" {
