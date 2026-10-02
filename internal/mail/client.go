@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 context, github.com/emersion/go-imap, golang.org/x/net/proxy
- * [OUTPUT]: 对外提供 Client、NewClient、NewClientWithServer、Message、FullMessage（MIME 取码字段内部保留、不序列化）
+ * [OUTPUT]: 对外提供 Client、NewClient、NewClientWithServer、Message、FullMessage（MIME 取码字段内部保留、不序列化）；登录被拒返回可 errors.Is 识别的 ErrAuthFailed
  * [POS]: internal/mail 的 IMAP 客户端核心，支持可取消建连、库级命令期限与有限登出；内容拉取由 client_fetch.go 承载，增量扫描由 client_scan.go 承载，隧道拨号由 dial.go 承载
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -259,16 +259,16 @@ func (c *Client) ConnectContext(ctx context.Context) error {
 	if loginErr != nil {
 		if strings.Contains(loginErr.Error(), "Authentication Failed") || strings.Contains(loginErr.Error(), "AUTHENTICATIONFAILED") {
 			lowerServer := strings.ToLower(c.server)
-			if strings.Contains(lowerServer, "qq.com") || strings.Contains(lowerServer, "foxmail.com") {
-				return fmt.Errorf("QQ / Foxmail 邮箱 IMAP 认证失败 (Authentication Failed) — 请确认：1. 已在网页端【设置-账户】开启「POP3/IMAP服务」；2. 必须使用 16 位授权码，不可使用 QQ 登录密码；3. 授权码是否有效或被 QQ 安全中心异地拦截: %w", loginErr)
+			hint := "IMAP 登录失败 (Authentication Failed) — 请检查邮箱账号与授权码/应用专用密码是否正确"
+			switch {
+			case strings.Contains(lowerServer, "qq.com") || strings.Contains(lowerServer, "foxmail.com"):
+				hint = "QQ / Foxmail 邮箱 IMAP 认证失败 (Authentication Failed) — 请确认：1. 已在网页端【设置-账户】开启「POP3/IMAP服务」；2. 必须使用 16 位授权码，不可使用 QQ 登录密码；3. 授权码是否有效或被 QQ 安全中心异地拦截"
+			case strings.Contains(lowerServer, "163.com") || strings.Contains(lowerServer, "126.com") || strings.Contains(lowerServer, "yeah.net"):
+				hint = "网易邮箱 IMAP 认证失败 (Authentication Failed) — 请确认：1. 已在网页端【设置-POP3/SMTP/IMAP】开启「POP3/IMAP服务」；2. 必须使用网易专属授权密码，不可使用网易登录密码"
+			case strings.Contains(lowerServer, "mail.me.com") || strings.Contains(lowerServer, "icloud.com"):
+				hint = "IMAP 登录失败 (Authentication Failed) — 请检查账号与授权码；若密码无误，通常是该 Apple ID 尚未在苹果设备或网页端开通 iCloud 邮件（Mailbox does not exist）"
 			}
-			if strings.Contains(lowerServer, "163.com") || strings.Contains(lowerServer, "126.com") || strings.Contains(lowerServer, "yeah.net") {
-				return fmt.Errorf("网易邮箱 IMAP 认证失败 (Authentication Failed) — 请确认：1. 已在网页端【设置-POP3/SMTP/IMAP】开启「POP3/IMAP服务」；2. 必须使用网易专属授权密码，不可使用网易登录密码: %w", loginErr)
-			}
-			if strings.Contains(lowerServer, "mail.me.com") || strings.Contains(lowerServer, "icloud.com") {
-				return fmt.Errorf("IMAP 登录失败 (Authentication Failed) — 请检查账号与授权码；若密码无误，通常是该 Apple ID 尚未在苹果设备或网页端开通 iCloud 邮件（Mailbox does not exist）: %w", loginErr)
-			}
-			return fmt.Errorf("IMAP 登录失败 (Authentication Failed) — 请检查邮箱账号与授权码/应用专用密码是否正确: %w", loginErr)
+			return authError{fmt.Errorf("%s: %w", hint, loginErr)}
 		}
 		return fmt.Errorf("IMAP 登录失败 — 请检查邮箱账号、授权码和服务器地址: %w", loginErr)
 	}

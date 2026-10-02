@@ -35,6 +35,8 @@ const (
 	KindCookieExpired   = "cookie_expired"   // Cookie 失效(账号标记 error)
 	KindCookieRecovered = "cookie_recovered" // Cookie 恢复(error → active)
 	KindQuotaLow        = "quota_low"        // 别名配额水位告警
+	KindMailFailed      = "mail_failed"      // 收信邮箱连续认证失败(暂停出号)
+	KindMailRecovered   = "mail_recovered"   // 收信邮箱认证恢复
 	KindTest            = "test"             // 设置页测试推送
 )
 
@@ -44,6 +46,8 @@ func DefaultEventKinds() map[string]bool {
 		KindCookieExpired:   true,
 		KindCookieRecovered: true,
 		KindQuotaLow:        true,
+		KindMailFailed:      true,
+		KindMailRecovered:   true,
 	}
 }
 
@@ -168,10 +172,9 @@ func (s *Sender) eventEnabled(kind string) bool {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if len(s.settings.EventKinds) == 0 {
-		return true
-	}
-	return s.settings.EventKinds[kind]
+	// 旧配置里没有的新事件按默认开启，避免升级后新告警被静默关闭
+	on, ok := s.settings.EventKinds[kind]
+	return !ok || on
 }
 
 // throttleWindow 返回该事件的最小重发间隔(0 表示不节流)。
@@ -183,7 +186,7 @@ func (s *Sender) throttleWindow(kind string) time.Duration {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	switch kind {
-	case KindCookieExpired:
+	case KindCookieExpired, KindMailFailed:
 		if s.settings.ResendMinutes > 0 {
 			return time.Duration(s.settings.ResendMinutes) * time.Minute
 		}

@@ -120,14 +120,14 @@ func selectAccountCandidates(accounts []account.Summary, tag string, st *store.S
 	return res, nil
 }
 
-// selectPoolAccounts 筛选适合从别名池领号的母号 (对齐业务标签隔离；具备凭据；排除受保护账号；不受 500 上限限制因为已有别名无需新建)。
+// selectPoolAccounts 筛选适合从别名池领号的母号 (对齐业务标签隔离；具备凭据；排除受保护账号与收信认证故障账号；不受 500 上限限制因为已有别名无需新建)。
 func selectPoolAccounts(accounts []account.Summary, tag string) []string {
 	tag = strings.TrimSpace(strings.ToLower(tag))
 	matched := make([]string, 0)
 
 	if tag != "" && tag != "default" {
 		for _, acc := range accounts {
-			if acc.Status == "active" && (acc.HasCookies || acc.HasAppPassword) && !account.IsProtectedAccount(acc.Name, acc.Tags) {
+			if acc.Status == "active" && !acc.MailAuthFailed && (acc.HasCookies || acc.HasAppPassword) && !account.IsProtectedAccount(acc.Name, acc.Tags) {
 				for _, t := range acc.Tags {
 					if strings.EqualFold(t, tag) {
 						matched = append(matched, acc.ID)
@@ -142,7 +142,7 @@ func selectPoolAccounts(accounts []account.Summary, tag string) []string {
 
 	// tag == "" 或 tag == "default": 公共未打标账号或显式标为 default 的账号 (TAG-03，严格排除受保护账号)
 	for _, acc := range accounts {
-		if acc.Status == "active" && (acc.HasCookies || acc.HasAppPassword) && !account.IsProtectedAccount(acc.Name, acc.Tags) {
+		if acc.Status == "active" && !acc.MailAuthFailed && (acc.HasCookies || acc.HasAppPassword) && !account.IsProtectedAccount(acc.Name, acc.Tags) {
 			if len(acc.Tags) == 0 {
 				matched = append(matched, acc.ID)
 				continue

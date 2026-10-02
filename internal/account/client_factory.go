@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 internal/hme, internal/mail, time, strings, fmt
- * [OUTPUT]: 对外提供 HMEClient, HMEClientWithPassword, MailClient, WithMailClient, WebMailClient
+ * [OUTPUT]: 对外提供 HMEClient, HMEClientWithPassword, MailClient, WithMailClient (顺带记录收信认证健康度), WebMailClient
  * [POS]: internal/account 的外设客户端装配与连接池驱动工厂，IMAP 读取固定物理来源和账号配置快照，密码登录回写按凭据代际校验
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -252,13 +252,16 @@ func (m *Manager) WithMailClientContextAndKind(ctx context.Context, id string, i
 		if os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "true" || os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "1" {
 			proxyURL = ""
 		}
-		return m.getIMAPPool().DoContextWithServerAndKind(ctx, mailbox.Email, mailbox.Password, mailbox.IMAPHost, mailbox.IMAPPort, proxyURL, isBackground, fn)
+		err = m.getIMAPPool().DoContextWithServerAndKind(ctx, mailbox.Email, mailbox.Password, mailbox.IMAPHost, mailbox.IMAPPort, proxyURL, isBackground, fn)
+	} else {
+		imapEmail, appPassword, nativeProxy, credErr := nativeIMAPCreds(snap)
+		if credErr != nil {
+			return credErr
+		}
+		err = m.getIMAPPool().DoContextWithServerAndKind(ctx, imapEmail, appPassword, mail.IMAPServer, mail.IMAPPort, nativeProxy, isBackground, fn)
 	}
-	imapEmail, appPassword, proxyURL, err := nativeIMAPCreds(snap)
-	if err != nil {
-		return err
-	}
-	return m.getIMAPPool().DoContextWithServerAndKind(ctx, imapEmail, appPassword, mail.IMAPServer, mail.IMAPPort, proxyURL, isBackground, fn)
+	m.noteMailAuth(mailAuthKey(snap), err)
+	return err
 }
 
 type mailAccountSnapshotKey struct{}

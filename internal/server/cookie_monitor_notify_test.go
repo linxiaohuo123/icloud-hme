@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -111,4 +112,37 @@ func countKinds(events []notify.Event, kind string) int {
 		}
 	}
 	return n
+}
+
+// TestCookieMonitorMailAuthEdge 收信故障/恢复只在跳变沿各推一次，故障账号退出号池。
+func TestCookieMonitorMailAuthEdge(t *testing.T) {
+	sink := &recordingSink{}
+	fake := &fakeBackend{accounts: []account.Summary{{ID: "acc_1", Name: "一号", HasCookies: true, HasAppPassword: true, Status: "active"}}}
+	fake.validateFunc = func(string) error { return nil }
+	probes := 0
+	fake.onGetMailboxBoundaryContext = func(context.Context, string, string) (string, uint32, uint32, error) {
+		probes++
+		return "imap", 1, 1, nil
+	}
+	mon := NewCookieMonitor(fake, 30*time.Minute, sink)
+
+	fake.accounts[0].MailAuthFailed = true
+	mon.validateAccount("acc_1", "一号")
+	mon.validateAccount("acc_1", "一号")
+	if got := countKinds(sink.events, notify.KindMailFailed); got != 1 || probes != 2 {
+		t.Fatalf("故障应只推 1 次且每轮探测, 实际 events=%d probes=%d", got, probes)
+	}
+	if ids := selectPoolAccounts(fake.accounts, ""); len(ids) != 0 {
+		t.Fatalf("收信故障账号不应参与出号, 实际 %v", ids)
+	}
+
+	fake.accounts[0].MailAuthFailed = false
+	mon.validateAccount("acc_1", "一号")
+	mon.validateAccount("acc_1", "一号")
+	if got := countKinds(sink.events, notify.KindMailRecovered); got != 1 {
+		t.Fatalf("恢复应只推 1 次, 实际 %d", got)
+	}
+	if ids := selectPoolAccounts(fake.accounts, ""); len(ids) != 1 {
+		t.Fatalf("恢复后应重新参与出号, 实际 %v", ids)
+	}
 }

@@ -195,6 +195,7 @@ func (b *managerBackend) GetAccount(id string) (account.Summary, error) {
 		return account.Summary{}, &BackendError{Status: http.StatusNotFound, Code: "ACCOUNT_NOT_FOUND", Message: "账号不存在"}
 	}
 	sum := acc.Summary()
+	b.mgr.MarkMailAuth(&sum, acc)
 	b.aliasMu.RLock()
 	item, ok := b.aliasCache[id]
 	b.aliasMu.RUnlock()

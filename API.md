@@ -196,6 +196,8 @@ Authorization: Bearer <API_KEY>
 
 按 ID 查询单个账号使用 `GET /api/accounts/:id`，`data` 为与列表元素相同结构的单个对象；账号不存在返回 `404 ACCOUNT_NOT_FOUND`。
 
+`mail_auth_failed` 仅在为 `true` 时出现：该账号的收信邮箱 (App 专用密码或绑定的收件邮箱) 连续 3 次被服务端拒绝登录，账号暂停参与号池出号，`status_message` 同步给出原因。任意一次成功读信或更换授权码/收件邮箱后立即恢复；计数仅存内存，重启后由 Cookie 监控的下一轮探测重新判定。
+
 `schedule_protected` 是后端根据账号名称和保护标签计算的只读布尔值。为 `true` 时，账号不参与自动、普通手动或全员强制补货；前端据此标记保护状态并排除自动补货统计。修改账号名称或标签后的响应会重新计算该值。
 
 ### 5. 添加新账号
@@ -1091,7 +1093,9 @@ Content-Type: application/json
   "event_kinds": {
     "cookie_expired": true,
     "cookie_recovered": true,
-    "quota_low": true
+    "quota_low": true,
+    "mail_failed": true,
+    "mail_recovered": true
   },
   "quota_threshold": 450,
   "resend_minutes": 360
@@ -1099,6 +1103,7 @@ Content-Type: application/json
 ```
 - 支持飞书、Bark、Telegram 独立或并发推送。
 - `quota_threshold`：当账号活跃别名达到该水位时主动发送告警通知。
+- `mail_failed` / `mail_recovered`：收信邮箱连续认证失败而暂停出号、以及恢复时推送；Cookie 监控每轮顺带探测一次收信邮箱。旧配置中未出现的事件类型按开启处理。
 - 配置立即保存至 SQLite settings 表，全自动热加载生效。
 
 ### 36. 发送测试通知

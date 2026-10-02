@@ -83,6 +83,8 @@ type Manager struct {
 	store         *store.Store // SQLite 持久化后端
 	imapPool      *mail.Pool   // IMAP 长连接池
 	hmePool       *hmeClientPool
+	mailAuthMu    sync.Mutex
+	mailAuthFails map[string]int // 收信凭据指纹 → 连续认证失败次数 (仅内存)
 }
 
 // NewManager 创建管理器。st 为 SQLite 持久化后端，dataDir 用于存放 IMAP 等资源。
@@ -474,7 +476,9 @@ func (m *Manager) ListSummaries() []Summary {
 		if acc == nil {
 			continue
 		}
-		out = append(out, acc.Summary())
+		sum := acc.Summary()
+		m.MarkMailAuth(&sum, acc)
+		out = append(out, sum)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		ri, rj := statusRank(out[i].Status), statusRank(out[j].Status)

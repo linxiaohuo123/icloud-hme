@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 errors, fmt, log, sync, time, icloud-hme/internal/account, icloud-hme/internal/notify, icloud-hme/internal/scheduler
+ * [INPUT]: 依赖 errors, fmt, log, sync, time, icloud-hme/internal/account, icloud-hme/internal/mail, icloud-hme/internal/notify, icloud-hme/internal/scheduler
  * [OUTPUT]: 对外提供 CookieMonitor, NewCookieMonitor, EventSink
- * [POS]: server 的 Cookie 健康监控器，按校验开始时间节流、记录凭据状态跳变并支持平稳停机
+ * [POS]: server 的 Cookie 健康监控器，按校验开始时间节流、记录凭据状态跳变并支持平稳停机；顺带探测收信邮箱并在认证故障/恢复跳变沿通知
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"icloud-hme/internal/account"
+	"icloud-hme/internal/mail"
 	"icloud-hme/internal/notify"
 	"icloud-hme/internal/scheduler"
 )
@@ -53,6 +54,7 @@ type CookieMonitor struct {
 	mu         sync.Mutex
 	prevStatus map[string]string // accountID → 上次已知状态
 	prevQuota  map[string]int    // accountID → 上次已知 active 别名数
+	prevMail   map[string]bool   // accountID → 上次已知收信认证故障状态
 }
 
 // 账号间节流的自动摊平边界。
@@ -83,6 +85,7 @@ func NewCookieMonitor(be Backend, interval time.Duration, notifier EventSink) *C
 		cancel:     cancel,
 		prevStatus: make(map[string]string),
 		prevQuota:  make(map[string]int),
+		prevMail:   make(map[string]bool),
 	}
 }
 
@@ -249,6 +252,38 @@ func (m *CookieMonitor) validateAccount(id, name string) {
 		// 瞬时错误(网络/超时):不改状态，避免网络抖动引发大面积误判
 		m.logs.Add(fmt.Sprintf("账号=%s 校验暂时失败(网络原因)，保留原状态", name))
 		log.Printf("[CookieMonitor] 账号=%s(%s) 瞬时校验失败: %v", name, id, err)
+	}
+	m.checkMail(id, name)
+}
+
+// checkMail 读一次 INBOX 边界探测收信链路 (经共享 IMAP 入口刷新认证健康度)，在故障/恢复跳变沿推送通知。
+// ponytail: 无流量时每轮只探测一次，连续失败需累计到阈值才判定故障。
+func (m *CookieMonitor) checkMail(id, name string) {
+	sum, err := m.be.GetAccount(id)
+	if err != nil || (!sum.HasAppPassword && sum.Mailbox == nil) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(mail.WithBackgroundOp(m.ctx), 30*time.Second)
+	_, _, _, _ = m.be.GetMailboxBoundaryContext(ctx, id, "INBOX")
+	cancel()
+	if sum, err = m.be.GetAccount(id); err != nil {
+		return
+	}
+	m.mu.Lock()
+	prev := m.prevMail[id]
+	m.prevMail[id] = sum.MailAuthFailed
+	m.mu.Unlock()
+	switch {
+	case sum.MailAuthFailed && !prev:
+		m.logs.Add(fmt.Sprintf("账号=%s 收信邮箱认证连续失败，已暂停出号", name))
+		m.emit(notify.KindMailFailed, id, name,
+			"收信邮箱认证失败",
+			"账号的收信邮箱连续被拒绝登录 (授权码错误或已被撤销)，已暂停从该账号出号，请到管理台更新授权码。")
+	case !sum.MailAuthFailed && prev:
+		m.logs.Add(fmt.Sprintf("账号=%s 收信邮箱认证已恢复", name))
+		m.emit(notify.KindMailRecovered, id, name,
+			"收信邮箱已恢复",
+			"账号的收信邮箱已恢复登录，已重新参与出号。")
 	}
 }
 

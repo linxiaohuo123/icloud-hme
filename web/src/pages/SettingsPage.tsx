@@ -19,12 +19,16 @@ const DEFAULT_EVENT_KINDS: Record<string, boolean> = {
   cookie_expired: true,
   cookie_recovered: true,
   quota_low: true,
+  mail_failed: true,
+  mail_recovered: true,
 }
 
 const EVENT_ITEMS: Array<{ key: string; label: string; desc: string }> = [
   { key: 'cookie_expired', label: 'Cookie 失效', desc: '账号凭据失效被标记为 error 时推送' },
   { key: 'cookie_recovered', label: 'Cookie 恢复', desc: '失效账号校验恢复通过时推送' },
   { key: 'quota_low', label: '配额水位告警', desc: '活跃别名数首次越过阈值时推送' },
+  { key: 'mail_failed', label: '收信邮箱故障', desc: '收信邮箱连续认证失败、账号暂停出号时推送' },
+  { key: 'mail_recovered', label: '收信邮箱恢复', desc: '故障邮箱认证恢复、账号重新出号时推送' },
 ]
 
 const CHANNEL_LABELS: Record<string, string> = {

@@ -38,6 +38,7 @@ type Summary struct {
 	Tags              []string        `json:"tags,omitempty"`
 	ScheduleProtected bool            `json:"schedule_protected"`
 	Session           *SessionSummary `json:"session,omitempty"`
+	MailAuthFailed    bool            `json:"mail_auth_failed,omitempty"` // 收信邮箱连续被拒绝认证，已暂停出号
 }
 
 // SessionSummary contains only diagnostics, never cookies or authentication tokens.

@@ -186,7 +186,7 @@ func (s *Server) updateNotifySettingsHandler(c *gin.Context) {
 	if req.EventKinds != nil {
 		for kind := range req.EventKinds {
 			switch kind {
-			case notify.KindCookieExpired, notify.KindCookieRecovered, notify.KindQuotaLow:
+			case notify.KindCookieExpired, notify.KindCookieRecovered, notify.KindQuotaLow, notify.KindMailFailed, notify.KindMailRecovered:
 			default:
 				failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "未知的事件类型: "+kind)
 				return
