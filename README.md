@@ -189,7 +189,7 @@ go build -o icloud-hme .
 | `ICLOUD_HME_ALLOW_PRIVATE_WEBHOOK` | 允许通知 Webhook 指向内网地址 | `false`（默认拒绝内网，防盲 SSRF） |
 
 > **Breaking Change**：未设置 `ICLOUD_HME_ADMIN_PASSWORD` 或 `ICLOUD_HME_MASTER_KEY` 将拒绝启动；
-> 原有匿名 API 调用将收到 `401 AUTH_REQUIRED`。管理员会话只存内存，进程重启即失效。
+> 原有匿名 API 调用将收到 `401 AUTH_REQUIRED`。管理员会话为签名 Cookie，服务重启后仍有效；登出与撤销记录持久化，修改管理员密码会使全部旧会话失效。
 
 > **上线前四条硬性安全检查**
 >
@@ -199,6 +199,22 @@ go build -o icloud-hme .
 > 4. **必须由 TLS 反代暴露**。程序自身不提供 HTTPS；直接以 HTTP 暴露到公网时，管理员口令与会话 Cookie 均为明文传输。
 >    建议保持 `ICLOUD_HME_ADDR=127.0.0.1:8081` 并用 Nginx/Caddy 终止 TLS，同时设置 `ICLOUD_HME_SECURE_COOKIE=true`。
 >    程序会以 `0700` 创建目录、`0600` 收紧 SQLite 及其 WAL/SHM 文件；**Windows 部署需自行收紧目录 ACL**。
+
+#### 轮换 Master Key
+
+怀疑主密钥泄露或需要定期更换时，使用离线轮换命令把数据库中所有加密凭据从旧密钥重新加密为新密钥：
+
+```bash
+# 1. 停止服务 (轮换需要数据目录排他锁，服务运行中会直接拒绝)
+# 2. 生成新密钥并通过环境变量或文件提供；当前密钥仍按 ICLOUD_HME_MASTER_KEY / _FILE 读取
+export ICLOUD_HME_NEW_MASTER_KEY="$(openssl rand -base64 32)"   # 或 ICLOUD_HME_NEW_MASTER_KEY_FILE=/path/to/new.key
+./icloud-hme -data ./data -rotate-credentials
+# 3. 成功后把 ICLOUD_HME_MASTER_KEY (或密钥文件) 替换为新密钥，再启动服务
+```
+
+- 轮换前自动生成 `data/backups/pre-rotate-credentials-<时间>.db`，该快照仍由**旧密钥**加密，需要回退时必须同时保留旧密钥。
+- 全部记录在单个事务内解密、重新加密并逐条自检，任一失败整体回滚；清理阶段异常会自动从快照恢复，旧密钥保持有效。
+- 新旧密钥相同时拒绝执行。
 
 > **对外分发令牌请用作用域**：`GET /api/tokens` 仅回显掩码，`POST /api/tokens` 未指定 `scopes` 时默认只发放
 > `allocate,verify`（出号 + 取码），这类令牌**无法触达账号/令牌/设置等管理面**。详见 `API.md` 的「作用域模型」。

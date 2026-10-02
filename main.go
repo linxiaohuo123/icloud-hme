@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 context, flag, os, path/filepath, time, icloud-hme/internal/account, icloud-hme/internal/server, icloud-hme/internal/store
- * [OUTPUT]: icloud-hme 二进制可执行文件入口 (支持 -backup 与 -restore 一致性容灾 CLI)
+ * [OUTPUT]: icloud-hme 二进制可执行文件入口 (支持 -backup / -restore 一致性容灾与 -rotate-credentials 离线密钥轮换 CLI)
  * [POS]: 项目全局 CLI 引导与环境初始化层；生产停机资源由 Server.Run 按单一总体预算收尾，避免重复 defer 等待；监听或停机失败以非零码退出
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -20,7 +20,7 @@
 //	./icloud-hme -data ./data -backup ./backup.db   # 离线/在线一致性备份 (不启动服务)
 //	./icloud-hme -data ./data -restore ./backup.db  # 离线一致性恢复并校验 (不启动服务)
 //	./icloud-hme -debug             # 调试模式
-//	./icloud-hme -log-level debug   # 日志级别 (debug/info/warn/error)
+//	./icloud-hme -data ./data -rotate-credentials   # 离线 Master Key 轮换 (需 ICLOUD_HME_NEW_MASTER_KEY[_FILE]，不启动服务)
 //
 // 安全配置(必填):
 //
@@ -61,7 +61,6 @@ func main() {
 	debug := flag.Bool("debug", false, "调试模式 (启用 Gin 调试日志)")
 	passwordFlag := flag.String("password", "", "管理员密码 (至少 8 字符,也可通过 ICLOUD_HME_ADMIN_PASSWORD 设置)")
 	apiKeyFlag := flag.String("api-key", "", "自动化 API Key (也可通过 ICLOUD_HME_API_KEY 设置)")
-	apiTokenFlag := flag.String("api-token", "", "API Token 参数 (也可通过 ICLOUD_PRIME_API_TOKEN 设置)")
 	backupFlag := flag.String("backup", "", "一致性备份目标文件路径")
 	restoreFlag := flag.String("restore", "", "一致性恢复源备份文件路径")
 	rotateCredentialsFlag := flag.Bool("rotate-credentials", false, "执行 Master Key 离线凭据轮换 (不启动服务)")
@@ -229,13 +228,8 @@ func main() {
 	log.Printf("账号加载完成 count=%d data_dir=%s", count, abs)
 
 	apiKey := os.Getenv("ICLOUD_HME_API_KEY")
-	if apiKey == "" {
-		apiKey = os.Getenv("ICLOUD_PRIME_API_TOKEN")
-	}
 	if *apiKeyFlag != "" {
 		apiKey = *apiKeyFlag
-	} else if *apiTokenFlag != "" {
-		apiKey = *apiTokenFlag
 	}
 	if apiKey != "" {
 		log.Printf("自动化 API Key 鉴权已启用 (免 CSRF/Session)")

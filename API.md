@@ -58,7 +58,7 @@ HTTP JSON API，所有接口均采用标准 JSON 格式交互。
 ### 安全与鉴权约定
 
 1. **自动化无状态鉴权（推荐注册机与外部系统使用）**：
-   - 配置环境变量 `ICLOUD_HME_API_KEY`（或 `ICLOUD_PRIME_API_TOKEN`）。
+   - 配置环境变量 `ICLOUD_HME_API_KEY`（或启动参数 `-api-key`）。
    - 在请求头携带 `Authorization: Bearer <API_KEY>` 或 `X-API-Key: <API_KEY>`。
    - **完全无需登录 Cookie，免除一切 CSRF 校验**，专为高并发注册机、微服务无缝调用设计。
    - 该 Key 等同管理员权限，**请勿下发给第三方**；对外发放请改用第 2 条的作用域令牌。

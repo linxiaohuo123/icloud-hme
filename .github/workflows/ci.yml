@@ -47,6 +47,7 @@ jobs:
     name: Go (test + vet + build)
     runs-on: ubuntu-latest
     needs: web
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -65,7 +66,8 @@ jobs:
         env:
           ICLOUD_HME_MASTER_KEY: MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=
         run: |
-          go test -p 1 -v -timeout 8m ./... > test.log 2>&1 || {
+          # server 包含两个约 60 秒的 2000 任务压力测试，整包本地约 3 分钟，CI 机器更慢
+          go test -p 1 -v -timeout 20m ./... > test.log 2>&1 || {
             STATUS=$?
             echo "::error title=Go Test Failed::exit code $STATUS"
             echo "=== FAILED TESTS ==="
@@ -90,7 +92,8 @@ jobs:
         env:
           ICLOUD_HME_MASTER_KEY: MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=
         run: |
-          go test -p 1 -v -race -timeout 8m ./... > test_race.log 2>&1 || {
+          # -short 跳过压力测试 (上一步已完整执行)，避免 race 放大后超时
+          go test -p 1 -v -race -short -timeout 20m ./... > test_race.log 2>&1 || {
             STATUS=$?
             echo "::error title=Go Race Test Failed::exit code $STATUS"
             echo "=== FAILED RACE TESTS ==="
