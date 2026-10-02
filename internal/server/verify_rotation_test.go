@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -161,5 +162,38 @@ func TestV2RotationBetweenAuthenticationAndServiceIsRejected(t *testing.T) {
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("rotation after authentication bypassed recheck: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// /mail/code?timeout=0 只查缓存：命中立即交付，未命中立即 408，均不进入长轮询等待
+func TestMailCodeTimeoutZeroIsInstant(t *testing.T) {
+	s := newWithBackend(&fakeBackend{}, Config{AdminPassword: "admin-pass-2026-strong", APIKey: "instant-key"})
+	defer s.Close()
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	get := func(email string) (int, string, time.Duration) {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/mail/code?timeout=0&email="+email, nil)
+		req.Header.Set("X-API-Key", "instant-key")
+		start := time.Now()
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		buf := new(strings.Builder)
+		_, _ = io.Copy(buf, resp.Body)
+		return resp.StatusCode, buf.String(), time.Since(start)
+	}
+
+	status, body, took := get("missing@icloud.com")
+	if status != http.StatusRequestTimeout || !strings.Contains(body, "VERIFY_TIMEOUT") || took > 2*time.Second {
+		t.Fatalf("cache miss must return 408 immediately, got %d in %v: %s", status, took, body)
+	}
+
+	s.eventBus.Publish("instant@icloud.com", "acc_1", "Your code", "sender@example.com", "2026-10-02 12:00:00", &mail.OTPResult{Code: "246810"})
+	status, body, took = get("instant@icloud.com")
+	if status != http.StatusOK || !strings.Contains(body, "246810") || took > 2*time.Second {
+		t.Fatalf("cache hit must be delivered immediately, got %d in %v: %s", status, took, body)
 	}
 }

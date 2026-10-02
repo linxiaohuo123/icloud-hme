@@ -669,7 +669,7 @@ GET /mail/raw?email=target@icloud.com&token=<TOKEN>
 
 **参数说明**：
 - `email`（必填，亦兼容 `alias`）：待收件的别名地址。
-- `timeout`（可选）：最大挂起秒数，默认 30 秒，上限 120 秒。超时返回 `408 VERIFY_TIMEOUT`。
+- `timeout`（可选）：最大挂起秒数，默认 30 秒，上限 120 秒。超时返回 `408 VERIFY_TIMEOUT`。传 `0` 时只查已缓存的验证码并立即返回，未命中直接返回 `408`。
 - 长轮询在交付验证码前再次验证原请求的令牌凭据；令牌轮换、撤销或过期后，在途旧请求返回 `401 REVOKED_TOKEN`，不会消费该验证码事件。
 - `fresh` 或 `nocache`（可选）：布尔值，默认 `false`。传 `true` 时仅跳过本地近期内存缓存，**但不是严格的 IMAP 邮件基线保证**。需要严格基线保证时请使用 v2 端点。
 - `auto_delete`：**明确不支持并会被拒绝**。传入 `auto_delete=true` 或 `1` 会直接返回 `400 UNSUPPORTED_PARAMETER` 错误。依据 RFC 9110 规范，HTTP GET 必须具备安全/无副作用语义，严禁通过 GET 查询操作导致别名被隐式停用。

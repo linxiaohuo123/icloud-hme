@@ -245,7 +245,7 @@ func (s *Server) quickCreateHandler(c *gin.Context) {
 		}
 		if errors.Is(err, ErrPoolEmpty) {
 			c.Header("Retry-After", "60")
-			failCode(c, http.StatusServiceUnavailable, "POOL_EMPTY", "当前业务池无可用预存别名，请等待定时补货或使用 mode=pool")
+			failCode(c, http.StatusServiceUnavailable, "POOL_EMPTY", "当前业务池无可用预存别名，请等待定时补货或使用 mode=create 现场建号")
 			return
 		}
 		if errors.Is(err, store.ErrOperationPending) {

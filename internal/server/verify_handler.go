@@ -16,13 +16,14 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"icloud-hme/internal/auth"
+	"icloud-hme/internal/mail"
 )
 
 // verifyCodeHandler 处理浏览器直链取码 GET /mail/code 与 /mail/code/:email。
 // 参数:
 //
 //	email (必须): 待接收验证码的别名邮箱
-//	timeout (可选): 最大等待秒数, 默认 30, 上限 120
+//	timeout (可选): 最大等待秒数, 默认 30, 上限 120; 0 表示只查缓存立即返回
 //	auto_delete: 已废弃并明确拒绝 (传入返回 400 UNSUPPORTED_PARAMETER)
 func (s *Server) verifyCodeHandler(c *gin.Context) {
 	email := strings.ToLower(strings.TrimSpace(c.Param("email")))
@@ -39,7 +40,7 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 
 	timeoutSec := 30
 	if raw := c.Query("timeout"); raw != "" {
-		if t, err := strconv.Atoi(raw); err == nil && t > 0 {
+		if t, err := strconv.Atoi(raw); err == nil && t >= 0 {
 			if t > 120 {
 				t = 120
 			}
@@ -77,33 +78,8 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 		s.syncWorker.Trigger()
 	}
 
-	// 申请长轮询等待者名额，并释放短阶段在途名额 (PR-CONCURRENCY T1)
-	if timeoutSec > 0 && s.requestLimiter != nil {
-		relWaiter, err := s.requestLimiter.AcquireWaiter(p, email)
-		if err != nil {
-			var be *BackendError
-			if errors.As(err, &be) {
-				failCode(c, be.Status, be.Code, be.Message)
-				return
-			}
-			failCode(c, http.StatusTooManyRequests, "VERIFY_WAITER_LIMIT", err.Error())
-			return
-		}
-		defer relWaiter()
-	}
-	releaseInflight(c)
-
-	timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
-	defer timer.Stop()
-
-	var srvDone <-chan struct{}
-	if s != nil && s.ctx != nil {
-		srvDone = s.ctx.Done()
-	}
-
-	select {
-	case item := <-ch:
-		// 轮换保持主体 ID 不变，必须重新验证原请求凭据才能阻止旧长轮询继续取码。
+	// deliver 交付事件：轮换保持主体 ID 不变，必须重新验证原请求凭据才能阻止旧请求继续取码
+	deliver := func(item *mail.CachedOTP) {
 		if p.Kind == auth.PrincipalToken && s.store != nil {
 			id, _, _, valid := s.store.ValidateTokenPrincipal(requestAPIKey(c))
 			if !valid || id != p.ID {
@@ -128,6 +104,46 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 			"date":       item.Date,
 			"account_id": item.AccountID,
 		})
+	}
+
+	// timeout=0：只查已缓存的事件，不占等待者名额，立即返回
+	if timeoutSec == 0 {
+		select {
+		case item := <-ch:
+			deliver(item)
+		default:
+			failCode(c, http.StatusRequestTimeout, "VERIFY_TIMEOUT", "暂无可用验证码")
+		}
+		return
+	}
+
+	// 申请长轮询等待者名额，并释放短阶段在途名额 (PR-CONCURRENCY T1)
+	if s.requestLimiter != nil {
+		relWaiter, err := s.requestLimiter.AcquireWaiter(p, email)
+		if err != nil {
+			var be *BackendError
+			if errors.As(err, &be) {
+				failCode(c, be.Status, be.Code, be.Message)
+				return
+			}
+			failCode(c, http.StatusTooManyRequests, "VERIFY_WAITER_LIMIT", err.Error())
+			return
+		}
+		defer relWaiter()
+	}
+	releaseInflight(c)
+
+	timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
+	defer timer.Stop()
+
+	var srvDone <-chan struct{}
+	if s != nil && s.ctx != nil {
+		srvDone = s.ctx.Done()
+	}
+
+	select {
+	case item := <-ch:
+		deliver(item)
 	case <-timer.C:
 		failCode(c, http.StatusRequestTimeout, "VERIFY_TIMEOUT", "等待验证码超时")
 	case <-c.Request.Context().Done():
