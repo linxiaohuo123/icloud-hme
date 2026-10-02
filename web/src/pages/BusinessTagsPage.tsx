@@ -381,7 +381,7 @@ export default function BusinessTagsPage() {
             <span className="stat-badge stat-badge-green">● 就绪</span>
           </div>
           <div className="stat-value">已就绪</div>
-          <div className="stat-subtext">POST /api/quick-create · 点击直达接入示例 ↓</div>
+          <div className="stat-subtext">POST /api/external/v2/allocate · 点击直达接入示例 ↓</div>
         </div>
       </div>
 

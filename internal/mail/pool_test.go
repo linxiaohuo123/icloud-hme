@@ -429,3 +429,127 @@ func TestPoolDoContext_DeadConnectionDiscarded(t *testing.T) {
 		t.Fatalf("连接发生 dead connection 错误后应当从池中清掉，但依然存在: %v", cli)
 	}
 }
+
+func TestPoolActiveOpLimits_ForegroundVsBackground(t *testing.T) {
+	// 设置 maxActive=3, reservedForSync=1 => 前台上限为 2, 后台可达 3
+	p := NewPoolWithLimits(10, 3, 1)
+	defer p.Close()
+
+	// 模拟前台已占用 2 个槽位
+	rel1, err := p.acquireActiveOp(context.Background(), false)
+	if err != nil {
+		t.Fatalf("获取前台槽位 1 失败: %v", err)
+	}
+	defer rel1()
+
+	rel2, err := p.acquireActiveOp(context.Background(), false)
+	if err != nil {
+		t.Fatalf("获取前台槽位 2 失败: %v", err)
+	}
+	defer rel2()
+
+	// 前台第 3 个操作应当被拒绝 (不能挤占后台保留槽位)
+	_, err = p.acquireActiveOp(context.Background(), false)
+	if !errors.Is(err, ErrUpstreamBusy) {
+		t.Fatalf("期望前台第 3 个操作返回 ErrUpstreamBusy，实际为: %v", err)
+	}
+
+	// 但后台操作应当成功获取第 3 个槽位
+	relBg, err := p.acquireActiveOp(context.Background(), true)
+	if err != nil {
+		t.Fatalf("后台操作应当成功获取保留槽位，实际失败: %v", err)
+	}
+	defer relBg()
+
+	// 达到全局总上限 3 后，后台操作也应被拒绝
+	_, err = p.acquireActiveOp(context.Background(), true)
+	if !errors.Is(err, ErrUpstreamBusy) {
+		t.Fatalf("达到全局总上限后后台应当返回 ErrUpstreamBusy，实际为: %v", err)
+	}
+}
+
+func TestPoolPinAndCapacityLimit(t *testing.T) {
+	// 设置容量上限为 2 (无后台保留)
+	p := NewPoolWithLimits(2, 10, 0)
+	defer p.Close()
+
+	pc1, unpin1, err := p.getOrCreateWithServerAndPin("user1@icloud.com", IMAPServer, IMAPPort)
+	if err != nil {
+		t.Fatalf("获取 user1 失败: %v", err)
+	}
+	if pc1.pinCount != 1 {
+		t.Fatalf("期望 user1 pinCount=1, 实际: %d", pc1.pinCount)
+	}
+
+	pc2, unpin2, err := p.getOrCreateWithServerAndPin("user2@icloud.com", IMAPServer, IMAPPort)
+	if err != nil {
+		t.Fatalf("获取 user2 失败: %v", err)
+	}
+	if pc2.pinCount != 1 {
+		t.Fatalf("期望 user2 pinCount=1, 实际: %d", pc2.pinCount)
+	}
+
+	// 此时池内 2 个连接均被 Pin，尝试获取第 3 个连接应当被拒绝 ErrIMAPPoolBusy
+	_, _, err = p.getOrCreateWithServerAndPin("user3@icloud.com", IMAPServer, IMAPPort)
+	if !errors.Is(err, ErrIMAPPoolBusy) {
+		t.Fatalf("全量 Pin 时创建新连接应当返回 ErrIMAPPoolBusy，实际为: %v", err)
+	}
+
+	// unpin1 后，user1 变为可驱逐
+	unpin1()
+	if pc1.pinCount != 0 {
+		t.Fatalf("unpin 后 pinCount 应为 0, 实际: %d", pc1.pinCount)
+	}
+
+	// 再次获取 user3，应当成功驱逐 user1
+	pc3, unpin3, err := p.getOrCreateWithServerAndPin("user3@icloud.com", IMAPServer, IMAPPort)
+	if err != nil {
+		t.Fatalf("驱逐后获取 user3 应当成功: %v", err)
+	}
+	defer unpin3()
+	defer unpin2()
+
+	p.mu.Lock()
+	_, hasUser1 := p.items["user1@icloud.com"]
+	_, hasUser3 := p.items["user3@icloud.com"]
+	p.mu.Unlock()
+
+	if hasUser1 {
+		t.Fatalf("user1 应当已被淘汰")
+	}
+	if !hasUser3 || pc3 == nil {
+		t.Fatalf("user3 应当在池中")
+	}
+}
+
+func TestPoolConcurrentCloseNoDeadlock(t *testing.T) {
+	p := NewPoolWithLimits(10, 10, 2)
+	pc, unpin, err := p.getOrCreateWithServerAndPin("user@icloud.com", IMAPServer, IMAPPort)
+	if err != nil {
+		t.Fatalf("获取连接失败: %v", err)
+	}
+
+	// 模拟持有连接
+	pc.lock()
+
+	done := make(chan struct{})
+	go func() {
+		// 并发执行 Close
+		p.Close()
+		close(done)
+	}()
+
+	// 稍作等待，确保 Close() 进入
+	time.Sleep(20 * time.Millisecond)
+
+	// 释放连接锁与 Pin
+	pc.unlock()
+	unpin()
+
+	select {
+	case <-done:
+		// 正常完成，无死锁
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Close() 发生死锁")
+	}
+}

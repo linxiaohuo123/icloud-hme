@@ -8,11 +8,13 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	imapclient "github.com/emersion/go-imap/client"
 	"icloud-hme/internal/account"
 	"icloud-hme/internal/hme"
 	"icloud-hme/internal/mail"
@@ -79,9 +82,11 @@ type fakeBackend struct {
 	validateFunc             func(id string) error
 	onValidateAccountContext func(ctx context.Context, id string) error
 
-	onScanMailboxUIDPage        func(ctx context.Context, q ScanPageQuery) (ScanPageResult, error)
-	onGetMailboxBoundaryContext func(ctx context.Context, accountID, folder string) (string, uint32, uint32, error)
-	onGetMessagesContext        func(ctx context.Context, accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error)
+	onScanMailboxUIDPage            func(ctx context.Context, q ScanPageQuery) (ScanPageResult, error)
+	onGetMailboxBoundaryContext     func(ctx context.Context, accountID, folder string) (string, uint32, uint32, error)
+	onGetMailboxEndpointFingerprint func(accountID string) (string, bool)
+	onCaptureMailboxContext         func(context.Context, string) (context.Context, string, string, error)
+	onGetMessagesContext            func(ctx context.Context, accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error)
 
 	onSetAliasActive        func(accountID, anonymousID string, active bool) (bool, error)
 	onSetAliasActiveContext func(ctx context.Context, accountID, anonymousID string, active bool) (bool, error)
@@ -497,6 +502,21 @@ func (f *fakeBackend) GetMailboxBoundaryContext(ctx context.Context, accountID, 
 	return "imap", 1, 1000000, nil
 }
 
+func (f *fakeBackend) GetMailboxEndpointFingerprint(accountID string) (string, bool) {
+	if f.onGetMailboxEndpointFingerprint != nil {
+		return f.onGetMailboxEndpointFingerprint(accountID)
+	}
+	return accountID, true
+}
+
+func (f *fakeBackend) CaptureMailboxContext(ctx context.Context, accountID string) (context.Context, string, string, error) {
+	if f.onCaptureMailboxContext != nil {
+		return f.onCaptureMailboxContext(ctx, accountID)
+	}
+	fp, _ := f.GetMailboxEndpointFingerprint(accountID)
+	return ctx, "", fp, nil
+}
+
 func (f *fakeBackend) ScanMailboxUIDPage(ctx context.Context, q ScanPageQuery) (ScanPageResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ScanPageResult{}, err
@@ -651,55 +671,6 @@ func do(t *testing.T, req *http.Request) (int, string, []*http.Cookie) {
 	return resp.StatusCode, string(raw), resp.Cookies()
 }
 
-func TestGetMessagesBatchHandler(t *testing.T) {
-	fb := &fakeBackend{
-		accounts: []account.Summary{{ID: "acc_1", Name: "测试号"}},
-	}
-	_, ts := newTestServer(fb)
-	defer ts.Close()
-
-	cookie, csrf := login(t, ts, "admin-pass-2026-strong")
-
-	// 批量请求 2 封邮件
-	body := `{"account_id":"acc_1","messages":[{"folder":"INBOX","uid":"101"},{"folder":"INBOX","uid":"102"}]}`
-	req := authedReq(t, ts, "POST", "/api/messages", body)
-	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
-	req.Header.Set("X-CSRF-Token", csrf)
-
-	status, respBody, _ := do(t, req)
-	if status != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d: %s", status, respBody)
-	}
-
-	var res struct {
-		Success bool `json:"success"`
-		Data    struct {
-			AccountID string              `json:"account_id"`
-			Count     int                 `json:"count"`
-			Messages  []*mail.FullMessage `json:"messages"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(respBody), &res); err != nil {
-		t.Fatalf("unmarshal failed: %v", err)
-	}
-	if !res.Success || res.Data.Count != 2 {
-		t.Fatalf("expected count 2, got %d", res.Data.Count)
-	}
-
-	// id 作为 uid 别名（前端预取曾误发 id）
-	bodyID := `{"account_id":"acc_1","messages":[{"folder":"INBOX","id":"201"}]}`
-	reqID := authedReq(t, ts, "POST", "/api/messages", bodyID)
-	reqID.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
-	reqID.Header.Set("X-CSRF-Token", csrf)
-	statusID, respID, _ := do(t, reqID)
-	if statusID != http.StatusOK {
-		t.Fatalf("id alias expected 200, got %d: %s", statusID, respID)
-	}
-	if !strings.Contains(respID, `"count":1`) {
-		t.Fatalf("id alias expected count 1, got: %s", respID)
-	}
-}
-
 func TestCheckProxyHandler(t *testing.T) {
 	fb := &fakeBackend{}
 	_, ts := newTestServer(fb)
@@ -778,7 +749,7 @@ func TestExportAliasesHandler(t *testing.T) {
 	}
 }
 
-func TestGetMessagePrimeHandler(t *testing.T) {
+func TestGetMessageCompositeRefHandler(t *testing.T) {
 	fb := &fakeBackend{
 		accounts: []account.Summary{{ID: "acc_1", Name: "测试号"}},
 	}
@@ -787,7 +758,7 @@ func TestGetMessagePrimeHandler(t *testing.T) {
 
 	cookie, _ := login(t, ts, "admin-pass-2026-strong")
 
-	req := authedReq(t, ts, "GET", "/api/messages/INBOX:42?account_id=acc_1", "")
+	req := authedReq(t, ts, "GET", "/api/inbox/INBOX:42?account_id=acc_1", "")
 	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
 
 	status, respBody, _ := do(t, req)
@@ -1317,5 +1288,209 @@ func TestManagerBackendRemoveAccountInvalidatesCache(t *testing.T) {
 	// 验证缓存已被彻底驱逐
 	if _, ok := be.getCachedAliases(acc.ID); ok {
 		t.Fatalf("删除账号后别名缓存必须被立即销毁")
+	}
+}
+
+// TestBackend_ForegroundSaturationAndBackgroundReservation 验证方案 R06：
+// 前台满载时通过真实 Backend 链路拒绝并返回 503 与 Retry-After，而后台收信仍能取得保留配额持续工作。
+func TestBackend_ForegroundSaturationAndBackgroundReservation(t *testing.T) {
+	// 1. 启动本地 Mock IMAP TCP 服务端
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	holdForeground := make(chan struct{})
+	foregroundEntered := make(chan struct{})
+	var isForegroundFirst atomic.Bool
+	isForegroundFirst.Store(true)
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = c.Write([]byte("* OK [CAPABILITY IMAP4rev1] Mock IMAP Server Ready\r\n"))
+				reader := bufio.NewReader(c)
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						return
+					}
+					parts := strings.Fields(line)
+					if len(parts) == 0 {
+						continue
+					}
+					tag := parts[0]
+					cmd := ""
+					if len(parts) > 1 {
+						cmd = strings.ToUpper(parts[1])
+					}
+					switch cmd {
+					case "CAPABILITY":
+						_, _ = c.Write([]byte("* CAPABILITY IMAP4rev1\r\n" + tag + " OK CAPABILITY completed\r\n"))
+					case "LOGIN":
+						_, _ = c.Write([]byte(tag + " OK LOGIN completed\r\n"))
+					case "SELECT", "EXAMINE":
+						// 如果是首个前台连接触发的 SELECT，等待 holdForeground 信号后再响应
+						if isForegroundFirst.CompareAndSwap(true, false) {
+							close(foregroundEntered)
+							<-holdForeground
+						}
+						_, _ = c.Write([]byte("* 10 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] UIDs valid\r\n* OK [UIDNEXT 101] Predicted next UID\r\n" + tag + " OK [READ-ONLY] Select completed\r\n"))
+					case "SEARCH":
+						_, _ = c.Write([]byte("* SEARCH\r\n" + tag + " OK SEARCH completed\r\n"))
+					case "NOOP":
+						_, _ = c.Write([]byte(tag + " OK NOOP completed\r\n"))
+					case "LOGOUT":
+						_, _ = c.Write([]byte("* BYE IMAP4rev1 Server logging out\r\n" + tag + " OK LOGOUT completed\r\n"))
+						return
+					default:
+						_, _ = c.Write([]byte(tag + " OK " + cmd + " completed\r\n"))
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	tempDir := t.TempDir()
+	st, err := store.NewStore(tempDir)
+	if err != nil {
+		t.Fatalf("创建 store 失败: %v", err)
+	}
+	defer st.Close()
+
+	if err := st.SaveAccount(&store.AccountRecord{
+		ID:          "acc_fg1",
+		Name:        "acc_fg1",
+		ICloudEmail: "acc1@icloud.com",
+		AppPassword: "pass1",
+		Status:      "active",
+	}); err != nil {
+		t.Fatalf("保存账号 1 失败: %v", err)
+	}
+
+	if err := st.SaveAccount(&store.AccountRecord{
+		ID:          "acc_fg2",
+		Name:        "acc_fg2",
+		ICloudEmail: "acc2@icloud.com",
+		AppPassword: "pass2",
+		Status:      "active",
+	}); err != nil {
+		t.Fatalf("保存账号 2 失败: %v", err)
+	}
+
+	mgr, err := account.NewManager(tempDir, st)
+	if err != nil {
+		t.Fatalf("创建 manager 失败: %v", err)
+	}
+	defer mgr.Close()
+
+	// 配置限制：maxConns=10, maxActive=2, reservedForSync=1 => 前台配额限制为 2 - 1 = 1
+	pool := mail.NewPoolWithLimits(10, 2, 1)
+	defer pool.Close()
+	mgr.SetIMAPPoolForTest(pool)
+
+	// 预注入 mockClient 以绕过 TLS 握手，使 client 走本地 TCP 读写
+	dialConn1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial 1 失败: %v", err)
+	}
+	imapCli1, err := imapclient.New(dialConn1)
+	if err != nil {
+		t.Fatalf("imapClient 1 失败: %v", err)
+	}
+	if err := imapCli1.Login("acc1@icloud.com", "pass1"); err != nil {
+		t.Fatalf("imapCli1 login 失败: %v", err)
+	}
+	pool.SetClientForTesting("acc1@icloud.com", "pass1", mail.NewClientForTesting("acc1@icloud.com", "pass1", dialConn1, imapCli1))
+
+	dialConn2, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial 2 失败: %v", err)
+	}
+	imapCli2, err := imapclient.New(dialConn2)
+	if err != nil {
+		t.Fatalf("imapClient 2 失败: %v", err)
+	}
+	if err := imapCli2.Login("acc2@icloud.com", "pass2"); err != nil {
+		t.Fatalf("imapCli2 login 失败: %v", err)
+	}
+	pool.SetClientForTesting("acc2@icloud.com", "pass2", mail.NewClientForTesting("acc2@icloud.com", "pass2", dialConn2, imapCli2))
+
+	be := &managerBackend{mgr: mgr}
+
+	// 2. 发起第 1 个前台请求，占满唯一的前台配额 (fgLimit = 1)
+	fg1Done := make(chan error, 1)
+	go func() {
+		_, err := be.ListInboxContext(context.Background(), InboxQuery{AccountID: "acc_fg1", Folder: "INBOX"})
+		fg1Done <- err
+	}()
+
+	// 等待第 1 个前台请求进入 SELECT 并挂起
+	select {
+	case <-foregroundEntered:
+	case err := <-fg1Done:
+		t.Fatalf("前台请求 1 提前返回错误: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatalf("前台请求 1 未在预期时间内进入挂起")
+	}
+
+	// 此时前台槽位已饱和 (activeForegroundOps = 1 >= fgLimit = 1)
+	_, active, activeFg := pool.Stats()
+	if activeFg != 1 {
+		t.Fatalf("期望 activeForegroundOps 为 1, 实际为: %d (总 active: %d)", activeFg, active)
+	}
+
+	// 3. 发起第 2 个前台请求：应当被前台配额限制立即拒绝，返回 503 SERVER_BUSY 与 Retry-After: 2
+	_, errFg2 := be.ListInboxContext(context.Background(), InboxQuery{AccountID: "acc_fg2", Folder: "INBOX"})
+	if errFg2 == nil {
+		t.Fatalf("前台满载时第 2 个前台请求应当被拒绝")
+	}
+	var beErr *BackendError
+	if !errors.As(errFg2, &beErr) {
+		t.Fatalf("期望返回 BackendError，实际为: %T (%v)", errFg2, errFg2)
+	}
+	if beErr.Status != http.StatusServiceUnavailable {
+		t.Fatalf("期望状态码 503 Service Unavailable, 实际为: %d", beErr.Status)
+	}
+	if beErr.Code != "SERVER_BUSY" {
+		t.Fatalf("期望错误码 SERVER_BUSY, 实际为: %s", beErr.Code)
+	}
+	dataMap, ok := beErr.Data.(map[string]any)
+	if !ok || dataMap["retry_after"] != 2 {
+		t.Fatalf("期望携带 retry_after: 2, 实际 Data 为: %+v", beErr.Data)
+	}
+
+	// 4. 在前台满载期间，发起后台收信操作 (带 WithBackgroundOp)
+	// 后台操作应当成功取得保留配额 (reservedForSync=1, activeOps=1 < maxActive=2)，正常完成
+	bgCtx := mail.WithBackgroundOp(context.Background())
+	_, uidVal, uidNext, errBg := be.GetMailboxBoundaryContext(bgCtx, "acc_fg2", "INBOX")
+	if errBg != nil {
+		t.Fatalf("前台满载时后台收信应当被保留配额放行，实际报错: %v", errBg)
+	}
+	if uidVal != 1 || uidNext != 101 {
+		t.Fatalf("后台收信结果异常: uidVal=%d, uidNext=%d", uidVal, uidNext)
+	}
+
+	// 5. 释放第 1 个前台请求
+	close(holdForeground)
+	select {
+	case err := <-fg1Done:
+		if err != nil {
+			t.Fatalf("前台请求 1 最终执行失败: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("前台请求 1 未在超时内释放退出")
+	}
+
+	// 6. 前台配额恢复后，再次发起前台请求应当成功
+	_, errFg3 := be.ListInboxContext(context.Background(), InboxQuery{AccountID: "acc_fg2", Folder: "INBOX"})
+	if errFg3 != nil {
+		t.Fatalf("前台释放后重试应当成功，实际报错: %v", errFg3)
 	}
 }

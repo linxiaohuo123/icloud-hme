@@ -626,7 +626,7 @@ func TestVerificationCAS_CannotSucceedAfterExpiry(t *testing.T) {
 	}
 
 	// 尝试 Complete (由于当前尚未修复，expires_at 不在 WHERE 条件中，会导致 won=true 且变成 succeeded)
-	curReq, won, err := st.CompleteVerificationRequest(ctx, reqID, "123456", "ref_100")
+	curReq, won, err := st.CompleteVerificationRequestResult(ctx, reqID, VerificationCompletion{Code: "123456", MatchedEventRef: "ref_100"})
 	if err != nil {
 		t.Fatalf("CompleteVerificationRequest unexpected err: %v", err)
 	}
@@ -682,7 +682,7 @@ func TestVerificationCAS_ConcurrentExpiryVsSuccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			time.Sleep(1 * time.Millisecond)
-			_, _, _ = st.CompleteVerificationRequest(ctx, reqID, "666888", "ref_race")
+			_, _, _ = st.CompleteVerificationRequestResult(ctx, reqID, VerificationCompletion{Code: "666888", MatchedEventRef: "ref_race"})
 		}()
 
 		wg.Wait()
@@ -703,7 +703,7 @@ func TestVerificationCAS_ConcurrentExpiryVsSuccess(t *testing.T) {
 		}
 		// 若为 expired，则再次尝试 Complete 必须无法修改终态
 		if finalReq.Status == "expired" {
-			_, won, _ := st.CompleteVerificationRequest(ctx, reqID, "999999", "ref_late")
+			_, won, _ := st.CompleteVerificationRequestResult(ctx, reqID, VerificationCompletion{Code: "999999", MatchedEventRef: "ref_late"})
 			if won {
 				t.Fatalf("round %d: expired 终态绝不可被修改为 succeeded", round)
 			}

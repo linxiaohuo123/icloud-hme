@@ -8,6 +8,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -68,20 +69,26 @@ func (s *Store) UpsertAliasRoutes(accountID string, emails []string) error {
 	return tx.Commit()
 }
 
-// FindAliasRoute 按别名邮箱反查归属母号(主键点查)。
-func (s *Store) FindAliasRoute(email string) (string, bool) {
+// FindAliasRouteContext 按别名邮箱反查归属母号(主键点查)，支持 Context 传播与区分不存在与 DB 故障 (R07)。
+func (s *Store) FindAliasRouteContext(ctx context.Context, email string) (string, error) {
 	email = normalizeEmail(email)
 	if email == "" {
-		return "", false
+		return "", sql.ErrNoRows
 	}
 	var accountID string
-	if err := s.db.QueryRow(`SELECT account_id FROM alias_routes WHERE email = ?`, email).Scan(&accountID); err != nil {
-		return "", false
+	if err := s.db.QueryRowContext(ctx, `SELECT account_id FROM alias_routes WHERE email = ?`, email).Scan(&accountID); err != nil {
+		return "", err
 	}
 	if accountID == "" {
-		return "", false
+		return "", sql.ErrNoRows
 	}
-	return accountID, true
+	return accountID, nil
+}
+
+// FindAliasRoute 按别名邮箱反查归属母号(主键点查)。
+func (s *Store) FindAliasRoute(email string) (string, bool) {
+	accID, err := s.FindAliasRouteContext(context.Background(), email)
+	return accID, err == nil && accID != ""
 }
 
 // CountAliasRoutes 返回已登记的路由条数，供健康检查与日志观测。
@@ -134,21 +141,30 @@ func (s *Store) hasAnyAliasRoute() bool {
 	return s.db.QueryRow(`SELECT 1 FROM alias_routes LIMIT 1`).Scan(&one) == nil
 }
 
-// FindLeaseAccount 按别名邮箱反查最近一次出号归属的账号 ID。
-func (s *Store) FindLeaseAccount(email string) (string, bool) {
+// FindLeaseAccountContext 按别名邮箱反查最近一次出号归属的账号 ID (支持 Context 传播与区分不存在与 DB 故障)。
+func (s *Store) FindLeaseAccountContext(ctx context.Context, email string) (string, error) {
 	email = normalizeEmail(email)
 	if email == "" {
-		return "", false
+		return "", sql.ErrNoRows
 	}
 	var accountID string
-	err := s.db.QueryRow(
+	err := s.db.QueryRowContext(ctx,
 		`SELECT account_id FROM lease_records WHERE LOWER(email) = ? AND account_id != '' ORDER BY julianday(allocated_at) DESC, id DESC LIMIT 1`,
 		email,
 	).Scan(&accountID)
-	if err != nil || accountID == "" {
-		return "", false
+	if err != nil {
+		return "", err
 	}
-	return accountID, true
+	if accountID == "" {
+		return "", sql.ErrNoRows
+	}
+	return accountID, nil
+}
+
+// FindLeaseAccount 按别名邮箱反查最近一次出号归属的账号 ID。
+func (s *Store) FindLeaseAccount(email string) (string, bool) {
+	accID, err := s.FindLeaseAccountContext(context.Background(), email)
+	return accID, err == nil && accID != ""
 }
 
 // CountLeases 返回流水总条数。

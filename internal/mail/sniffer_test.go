@@ -279,4 +279,3 @@ func TestExtractOTPFalsePositiveImmunity(t *testing.T) {
 		t.Fatalf("提及 ChatGPT 的普通新闻不应误判验证码，实际得到: %q", res.Code)
 	}
 }
-

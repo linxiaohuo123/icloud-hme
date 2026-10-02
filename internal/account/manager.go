@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, os, filepath, sync, github.com/google/uuid, icloud-hme/internal/mail, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 Account, MailboxConfig, Manager, NewManager
- * [POS]: internal/account 的核心账号管理器与状态机，负责邮箱凭据限时预检、绑定与解绑、凭据代际及会话保存失败回滚；会话校验拆解至 manager_validate.go
+ * [POS]: internal/account 的核心账号管理器与状态机，负责邮箱凭据预检、绑定与解绑、凭据代际及保存失败回滚；测试替换池时回收旧池，会话校验拆解至 manager_validate.go
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -127,11 +127,29 @@ func (m *Manager) Store() *store.Store {
 	return m.store
 }
 
+// IMAPPoolStats 返回 IMAP 连接池状态快照。
+func (m *Manager) IMAPPoolStats() (conns, active, activeForeground int) {
+	if m.imapPool != nil {
+		return m.imapPool.Stats()
+	}
+	return 0, 0, 0
+}
+
+// SetIMAPPoolForTest 供单元测试注入受控的连接池实例。
+func (m *Manager) SetIMAPPoolForTest(p *mail.Pool) {
+	m.mu.Lock()
+	old := m.imapPool
+	m.imapPool = p
+	m.mu.Unlock()
+	if old != nil && old != p {
+		old.Close()
+	}
+}
+
 // Reload 重新加载账号数据，并平滑重置 IMAP 连接池。
 func (m *Manager) Reload() error {
 	// 先在锁内摘除旧池（持锁时间极短），再在锁外关闭。
-	// Pool.Close() 对每个连接执行阻塞 LOGOUT（单连接上限 IMAPCommandTimeout=90s，
-	// 最多 50 连接），若持 m.mu 关闭会把全站 API（几乎所有 handler 都走 RLock）冻结数分钟。
+	// Pool.Close() 会等待在途账号操作释放串行锁；持 m.mu 等待会冻结其他账号访问。
 	m.mu.Lock()
 	oldPool := m.imapPool
 	m.imapPool = nil

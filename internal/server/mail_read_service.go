@@ -38,11 +38,6 @@ type mailboxCacheEntry struct {
 	expiresAt time.Time
 }
 
-type listCacheEntry struct {
-	result    InboxResult
-	expiresAt time.Time
-}
-
 type inFlightListCall struct {
 	done     chan struct{}
 	res      InboxResult
@@ -51,7 +46,7 @@ type inFlightListCall struct {
 	cancel   context.CancelFunc
 }
 
-// batchMessageItemReq 前端或客户端批量请求单项
+// batchMessageItemReq 批量读取请求单项 (查信直链按别名批量取正文)
 type batchMessageItemReq struct {
 	MessageRef string `json:"message_ref"`
 	Folder     string `json:"folder,omitempty"`

@@ -128,7 +128,7 @@ func TestVerifyCodeHandler(t *testing.T) {
 	defer s.syncWorker.Stop()
 
 	// 发起验证码长轮询
-	req, _ := http.NewRequest("GET", ts.URL+"/api/verify-code?email=target@icloud.com&timeout=3", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/mail/code?email=target@icloud.com&timeout=3", nil)
 	req.Header.Set("X-API-Key", "test-key")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -194,10 +194,11 @@ func TestExternalAllocateAndVerifyRoutes(t *testing.T) {
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 
-	// 1. 测试 POST /api/allocate 携 Bearer Token 与 tag=chatgpt
-	req, _ := http.NewRequest("POST", ts.URL+"/api/allocate", strings.NewReader(`{"tag":"chatgpt","label":"chatgpt-reg"}`))
+	// 1. 测试 POST /api/external/v2/allocate 携 Bearer Token 与 tag=chatgpt
+	req, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"chatgpt","label":"chatgpt-reg"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer faka-token-secret-12345")
+	req.Header.Set("Idempotency-Key", "faka-alloc-1")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -206,7 +207,7 @@ func TestExternalAllocateAndVerifyRoutes(t *testing.T) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /api/allocate 期望 200, 实际得到: %d", resp.StatusCode)
+		t.Fatalf("POST /api/external/v2/allocate 期望 200, 实际得到: %d", resp.StatusCode)
 	}
 
 	var out struct {
@@ -237,21 +238,22 @@ func TestExternalAllocateAndVerifyRoutes(t *testing.T) {
 		t.Fatalf("期望 TokenName=faka_bot_01, 实际得到: %s", leases[0].TokenName)
 	}
 
-	// 3. 测试 POST /api/external/v1/allocate
-	req2, _ := http.NewRequest("POST", ts.URL+"/api/external/v1/allocate", strings.NewReader(`{"tag":"chatgpt","label":"bot2"}`))
+	// 3. 同一令牌换幂等键再次出号
+	req2, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"chatgpt","label":"bot2"}`))
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("Authorization", "Bearer faka-token-secret-12345")
+	req2.Header.Set("Idempotency-Key", "faka-alloc-2")
 	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("POST /api/external/v1/allocate 期望 200, 实际得到: %d", resp2.StatusCode)
+		t.Fatalf("第二次 POST /api/external/v2/allocate 期望 200, 实际得到: %d", resp2.StatusCode)
 	}
 
-	// 4. 测试 GET /api/external/v1/verify-code (使用 Token 查询自己租用的别名)
-	req3, _ := http.NewRequest("GET", ts.URL+"/api/external/v1/verify-code?email="+out.Data.Email+"&timeout=1", nil)
+	// 4. 测试 GET /mail/code (使用 Token 查询自己租用的别名)
+	req3, _ := http.NewRequest("GET", ts.URL+"/mail/code?email="+out.Data.Email+"&timeout=1", nil)
 	req3.Header.Set("Authorization", "Bearer faka-token-secret-12345")
 	resp3, err := http.DefaultClient.Do(req3)
 	if err != nil {
@@ -260,6 +262,6 @@ func TestExternalAllocateAndVerifyRoutes(t *testing.T) {
 	defer resp3.Body.Close()
 	// 超时期望 408，说明路由正确挂载且鉴权通过进入等待
 	if resp3.StatusCode != http.StatusRequestTimeout && resp3.StatusCode != http.StatusOK {
-		t.Fatalf("GET /api/external/v1/verify-code 期望 408 或 200, 实际得到: %d", resp3.StatusCode)
+		t.Fatalf("GET /mail/code 期望 408 或 200, 实际得到: %d", resp3.StatusCode)
 	}
 }

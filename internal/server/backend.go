@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/account.Manager, internal/hme.Client, internal/mail.Client/WebClient
  * [OUTPUT]: 对外提供 Backend 接口、managerBackend 生产适配器与 BackendError 错误结构
- * [POS]: internal/server 的高层业务门面，隔离协议实现并传递 Camoufox 登录请求取消与任务回收
+ * [POS]: internal/server 的高层业务门面，隔离协议实现并传递 Camoufox 取消与任务回收；认证错误优先使用哨兵与明确 HTTP 字段，避免 URL/UUID 数字误分类
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -93,6 +94,8 @@ type Backend interface {
 	GetMessagesContext(context.Context, string, []mail.MessageRef) ([]*mail.FullMessage, error)
 	GetMailboxBoundary(string, string) (string, uint32, uint32, error)
 	GetMailboxBoundaryContext(context.Context, string, string) (string, uint32, uint32, error)
+	GetMailboxEndpointFingerprint(string) (string, bool)
+	CaptureMailboxContext(context.Context, string) (context.Context, string, string, error)
 	ScanMailboxUIDPage(context.Context, ScanPageQuery) (ScanPageResult, error)
 	DeleteMessage(string, uint32) error
 	ValidateAccount(string) error
@@ -1025,6 +1028,9 @@ func (b *managerBackend) LoginAccountContext(ctx context.Context, id, password, 
 
 // classifyLoginErr 把 iCloud 登录错误映射为稳定错误。
 func classifyLoginErr(err error) *BackendError {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return classifyUpstreamErr("iCloud 登录失败", err)
+	}
 	if errors.Is(err, account.ErrAccountIdentityMismatch) {
 		return &BackendError{Status: http.StatusConflict, Code: "ACCOUNT_IDENTITY_MISMATCH", Message: err.Error()}
 	}
@@ -1051,7 +1057,7 @@ func classifyLoginErr(err error) *BackendError {
 		}
 		return &BackendError{Status: http.StatusUnauthorized, Code: "APPLE_AUTH_REJECTED", Message: cleanMsg}
 	}
-	if isSessionError(msg) || strings.Contains(msg, "auth complete") || strings.Contains(msg, "401") || strings.Contains(msg, "403") {
+	if isSessionError(err) {
 		return &BackendError{Status: http.StatusUnauthorized, Code: "APPLE_AUTH_BLOCKED", Message: "Apple 拒绝了模拟密码登录（触发了苹果安全风控），请点击【更新 Cookie】直接粘贴浏览器 Cookie 激活"}
 	}
 	return &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "iCloud 登录失败: " + msg}
@@ -1113,6 +1119,14 @@ func (b *managerBackend) ValidateAccountContext(ctx context.Context, id string) 
 
 // mapAccountErr 把账号管理器错误映射为稳定错误。
 func mapAccountErr(err error) *BackendError {
+	if errors.Is(err, account.ErrHMEOpBusy) || errors.Is(err, account.ErrHMEPoolBusy) {
+		return &BackendError{
+			Status:  http.StatusServiceUnavailable,
+			Code:    "SERVER_BUSY",
+			Message: "上游 HME 操作繁忙，已达并发上限，请稍后重试",
+			Data:    map[string]any{"retry_after": 2},
+		}
+	}
 	if errors.Is(err, hme.ErrRecoveryDeferred) {
 		return &BackendError{Status: http.StatusServiceUnavailable, Code: "SESSION_RECOVERY_DEFERRED", Message: "会话恢复暂缓，请稍后重试"}
 	}
@@ -1143,7 +1157,7 @@ func classifyUpstreamErr(fixedMsg string, err error) *BackendError {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, hme.ErrRecoveryDeferred) || errors.Is(err, hme.ErrOTPRequired) {
+	if errors.Is(err, account.ErrHMEOpBusy) || errors.Is(err, account.ErrHMEPoolBusy) || errors.Is(err, hme.ErrRecoveryDeferred) || errors.Is(err, hme.ErrOTPRequired) {
 		return mapAccountErr(err)
 	}
 	if errors.Is(err, hme.ErrAccessDenied) {
@@ -1164,19 +1178,32 @@ func classifyUpstreamErr(fixedMsg string, err error) *BackendError {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return &BackendError{Status: http.StatusGatewayTimeout, Code: "REQUEST_TIMEOUT", Message: "请求超时"}
 	}
-	if isSessionError(err.Error()) {
+	if isSessionError(err) {
 		return &BackendError{Status: http.StatusUnauthorized, Code: "UPSTREAM_UNAUTHORIZED", Message: "iCloud 会话失效,请更新 Cookie"}
 	}
 	return &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: fixedMsg}
 }
 
-// isSessionError 判断错误是否由会话失效引起。
-func isSessionError(msg string) bool {
-	m := strings.ToLower(msg)
-	return strings.Contains(m, "401") || strings.Contains(m, "403") || strings.Contains(m, "421") ||
-		strings.Contains(m, "session") || strings.Contains(m, "cookie") ||
-		strings.Contains(m, "unauthorized") || strings.Contains(m, "认证") ||
-		strings.Contains(m, "会话校验失败")
+var upstreamHTTPStatus = regexp.MustCompile(`(?i)\bHTTP(?:/\d(?:\.\d)?)?(?: status(?: code)?)?\s*[:=]?\s*([1-5][0-9]{2})\b`)
+
+// isSessionError 优先识别凭据哨兵；历史文本仅识别明确的 HTTP 状态字段。
+// 传输错误中的 URL、UUID、端口与请求 ID 不能充当认证状态。
+func isSessionError(err error) bool {
+	if errors.Is(err, hme.ErrAuthFailed) || errors.Is(err, account.ErrCookieExpired) {
+		return true
+	}
+	var transportErr *url.Error
+	var networkErr net.Error
+	if errors.As(err, &transportErr) || errors.As(err, &networkErr) {
+		return false
+	}
+	m := strings.ToLower(err.Error())
+	if status := upstreamHTTPStatus.FindStringSubmatch(m); status != nil {
+		return status[1] == "401" || status[1] == "403" || status[1] == "421"
+	}
+	return m == "unauthorized" || strings.Contains(m, "session expired") ||
+		strings.Contains(m, "invalid session") || strings.Contains(m, "cookie expired") ||
+		strings.Contains(m, "会话校验失败") || strings.Contains(m, "cookie 已失效")
 }
 
 // asBackendError 提取 BackendError,非 BackendError 统一为 INTERNAL_ERROR。
@@ -1256,4 +1283,18 @@ func (b *managerBackend) Close() {
 	if b.mgr != nil {
 		b.mgr.Close()
 	}
+}
+
+func (b *managerBackend) IMAPPoolStats() (conns, active, activeForeground int) {
+	if b.mgr != nil {
+		return b.mgr.IMAPPoolStats()
+	}
+	return 0, 0, 0
+}
+
+func (b *managerBackend) HMEPoolStats() (conns, active int) {
+	if b.mgr != nil {
+		return b.mgr.HMEPoolStats()
+	}
+	return 0, 0
 }

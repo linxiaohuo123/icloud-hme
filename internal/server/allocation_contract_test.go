@@ -651,4 +651,3 @@ func TestContract_EmptyStoredRequestHashMustNotWildcardMatch(t *testing.T) {
 		t.Fatalf("空 stored hash 被错误放行并生成了分配凭据: count=%d", count)
 	}
 }
-

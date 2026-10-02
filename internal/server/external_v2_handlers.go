@@ -1,17 +1,23 @@
 /**
  * [INPUT]: 依赖 gin, net/http, strings, fmt, errors, time, strconv, icloud-hme/internal/auth, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 externalV2AllocateHandler, externalV2CreateVerificationRequestHandler, externalV2GetVerificationRequestHandler, externalV2GetOperationHandler
- * [POS]: internal/server 的 v2 外部自动化 API 规范门面 (PR-04/PR-05-1)，强制令牌幂等键、规范请求哈希、真实持久化取码请求与严格主体资源隔离，取码传递原凭据供长轮询复查
+ * [POS]: internal/server 的 v2 自动化 API 门面，支持幂等任务与主体隔离；查询、创建及取码明确区分取消、超时和数据库故障，交付前复查原凭据
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 package server
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"icloud-hme/internal/store"
@@ -22,6 +28,28 @@ const (
 	maxGlobalActiveVerificationRequests   = 1000
 	maxPerTokenActiveVerificationRequests = 50
 )
+
+func getMaxGlobalActiveVerificationRequests() int {
+	for _, envKey := range []string{"MAX_GLOBAL_ACTIVE_VREQ", "ICLOUD_HME_MAX_GLOBAL_ACTIVE_VREQ"} {
+		if val := strings.TrimSpace(os.Getenv(envKey)); val != "" {
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	return maxGlobalActiveVerificationRequests
+}
+
+func getMaxPerTokenActiveVerificationRequests() int {
+	for _, envKey := range []string{"MAX_PER_TOKEN_ACTIVE_VREQ", "ICLOUD_HME_MAX_PER_TOKEN_ACTIVE_VREQ"} {
+		if val := strings.TrimSpace(os.Getenv(envKey)); val != "" {
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	return maxPerTokenActiveVerificationRequests
+}
 
 type externalV2AllocateReq struct {
 	Tag       string `json:"tag"`
@@ -160,6 +188,21 @@ func (s *Server) externalV2CreateVerificationRequestHandler(c *gin.Context) {
 		return
 	}
 
+	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	if idempotencyKey != "" {
+		if len(idempotencyKey) > 128 {
+			failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "Idempotency-Key 长度不能超过 128 字符")
+			return
+		}
+		for i := 0; i < len(idempotencyKey); i++ {
+			b := idempotencyKey[i]
+			if b < 0x21 || b > 0x7E {
+				failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "Idempotency-Key 必须全部为 ASCII 可打印字符")
+				return
+			}
+		}
+	}
+
 	var req v2VerificationReq
 	if err := c.ShouldBindJSON(&req); err != nil && err.Error() != "EOF" {
 		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "请求体格式错误: "+err.Error())
@@ -175,8 +218,24 @@ func (s *Server) externalV2CreateVerificationRequestHandler(c *gin.Context) {
 
 	if leaseID == "" {
 		if s.store != nil {
-			alloc, err := s.store.GetPrincipalAllocation(c.Request.Context(), email, string(p.Kind), p.ID)
-			if err == nil && alloc != nil {
+			lookupCtx, cancelLookup := withShortPhaseTimeout(c.Request.Context(), 5*time.Second)
+			alloc, err := s.store.GetPrincipalAllocation(lookupCtx, email, string(p.Kind), p.ID)
+			cancelLookup()
+			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					failBackendError(c, classifyUpstreamErr("查询别名租约失败", err))
+					return
+				}
+				if errors.Is(err, context.DeadlineExceeded) {
+					failCode(c, http.StatusGatewayTimeout, "DEADLINE_EXCEEDED", "查询别名租约超时: "+err.Error())
+					return
+				}
+				if !errors.Is(err, store.ErrAllocationNotFound) {
+					failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", "查询别名租约失败: "+err.Error())
+					return
+				}
+			}
+			if alloc != nil {
 				leaseID = alloc.AllocationID
 			} else if p.IsAdmin() {
 				leaseID = email
@@ -189,15 +248,36 @@ func (s *Server) externalV2CreateVerificationRequestHandler(c *gin.Context) {
 		}
 	}
 
-	vreq, err := s.verifyService.CreateVerificationRequest(c.Request.Context(), p, leaseID)
+	var idempotencyHash string
+	if idempotencyKey != "" {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("v1|lease:%s|mailbox:INBOX", leaseID)))
+		idempotencyHash = hex.EncodeToString(sum[:])
+	}
+
+	vreq, err := s.verifyService.CreateVerificationRequestWithIdempotency(c.Request.Context(), p, leaseID, idempotencyKey, idempotencyHash)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			failBackendError(c, classifyUpstreamErr("创建验证码任务失败", err))
+			return
+		}
+		if errors.Is(err, store.ErrIdempotencyConflict) || errors.Is(err, ErrIdempotencyConflict) {
+			failCode(c, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "相同 Idempotency-Key 使用不同请求参数产生冲突")
+			return
+		}
 		var be *BackendError
 		if errors.As(err, &be) {
-			failCode(c, be.Status, be.Code, be.Message)
+			failBackendError(c, be)
 			return
 		}
 		failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 		return
+	}
+
+	baselineReady := vreq.Status == "ready"
+	if baselineReady && vreq.ExpiresAt != "" {
+		if exp, perr := time.Parse(time.RFC3339, vreq.ExpiresAt); perr == nil && !time.Now().UTC().Before(exp) {
+			baselineReady = false
+		}
 	}
 
 	ok(c, gin.H{
@@ -205,7 +285,7 @@ func (s *Server) externalV2CreateVerificationRequestHandler(c *gin.Context) {
 		"lease_id":             vreq.LeaseID,
 		"alias_email":          vreq.AliasEmail,
 		"status":               vreq.Status,
-		"baseline_ready":       true,
+		"baseline_ready":       baselineReady,
 		"baseline_provider":    vreq.BaselineProvider,
 		"baseline_uidvalidity": vreq.BaselineUIDValidity,
 		"baseline_uid":         vreq.BaselineUID,
@@ -234,11 +314,19 @@ func (s *Server) externalV2GetVerificationRequestHandler(c *gin.Context) {
 		}
 	}
 
-	res, err := s.verifyService.GetVerificationResult(c.Request.Context(), p, requestID, timeoutSec, requestAPIKey(c))
+	onWaitStart := func() {
+		releaseInflight(c)
+	}
+
+	res, err := s.verifyService.GetVerificationResult(c.Request.Context(), p, requestID, timeoutSec, requestAPIKey(c), onWaitStart)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			failBackendError(c, classifyUpstreamErr("读取验证码任务失败", err))
+			return
+		}
 		var be *BackendError
 		if errors.As(err, &be) {
-			failCode(c, be.Status, be.Code, be.Message)
+			failBackendError(c, be)
 			return
 		}
 		failCode(c, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
@@ -246,6 +334,19 @@ func (s *Server) externalV2GetVerificationRequestHandler(c *gin.Context) {
 	}
 
 	ok(c, res)
+}
+
+func releaseInflight(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	rc := http.NewResponseController(c.Writer)
+	_ = rc.SetReadDeadline(time.Time{})
+	if val, exists := c.Get(InflightTokenContextKey); exists {
+		if tok, ok := val.(*InflightToken); ok && tok != nil {
+			tok.Release()
+		}
+	}
 }
 
 func (s *Server) externalV2GetOperationHandler(c *gin.Context) {

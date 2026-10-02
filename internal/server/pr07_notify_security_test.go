@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 encoding/json, net/http, net/http/httptest, strings, testing, icloud-hme/internal/store
- * [OUTPUT]: 对外提供 PR-07 通知安全测试套件：GET 脱敏掩码、PUT 脱敏值 Preserve 契约、PATCH 部分更新与显式置空
+ * [OUTPUT]: 对外提供 PR-07 通知安全测试套件：GET 脱敏掩码、PUT 脱敏值 Preserve 契约、PUT 部分更新与显式置空
  * [POS]: internal/server 的 PR-07 通知凭据加密与脱敏回归测试
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -154,7 +154,7 @@ func TestPR07_NotifySecretsPreserveContract(t *testing.T) {
 	}
 }
 
-// TestPR07_NotifySecretsPatchPreserveAndExplicitClear 验证 PATCH 部分更新与显式清空凭据。
+// TestPR07_NotifySecretsPatchPreserveAndExplicitClear 验证 PUT 部分更新与显式清空凭据。
 func TestPR07_NotifySecretsPatchPreserveAndExplicitClear(t *testing.T) {
 	ts, s, _ := newPR07NotifyServer(t)
 	sess, csrf := login(t, ts, "admin-pass-2026-strong")
@@ -170,13 +170,13 @@ func TestPR07_NotifySecretsPatchPreserveAndExplicitClear(t *testing.T) {
 	reqInit.Header.Set("X-CSRF-Token", csrf)
 	_, _, _ = do(t, reqInit)
 
-	// 2. PATCH 只更新 quota_threshold，省略凭据字段
-	reqPatch1 := authedReq(t, ts, "PATCH", "/api/settings/notify", `{"quota_threshold": 999}`)
+	// 2. PUT 部分更新只改 quota_threshold，省略凭据字段
+	reqPatch1 := authedReq(t, ts, "PUT", "/api/settings/notify", `{"quota_threshold": 999}`)
 	reqPatch1.AddCookie(&http.Cookie{Name: "hme_session", Value: sess})
 	reqPatch1.Header.Set("X-CSRF-Token", csrf)
 	statusP1, bodyP1, _ := do(t, reqPatch1)
 	if statusP1 != http.StatusOK {
-		t.Fatalf("PATCH 1 失败: %d %s", statusP1, bodyP1)
+		t.Fatalf("部分更新失败: %d %s", statusP1, bodyP1)
 	}
 
 	loaded1, err := s.loadNotifySettings()
@@ -184,22 +184,22 @@ func TestPR07_NotifySecretsPatchPreserveAndExplicitClear(t *testing.T) {
 		t.Fatalf("loadNotifySettings 1 failed: %v", err)
 	}
 	if loaded1.FeishuWebhook != "https://open.feishu.cn/open-apis/bot/v2/hook/feishu_keep_123" {
-		t.Fatalf("PATCH 省略凭据字段时不应清空飞书凭据: %s", loaded1.FeishuWebhook)
+		t.Fatalf("部分更新省略凭据字段时不应清空飞书凭据: %s", loaded1.FeishuWebhook)
 	}
 	if loaded1.BarkURL != "https://api.day.app/bark_keep_456/" {
-		t.Fatalf("PATCH 省略凭据字段时不应清空 Bark 凭据: %s", loaded1.BarkURL)
+		t.Fatalf("部分更新省略凭据字段时不应清空 Bark 凭据: %s", loaded1.BarkURL)
 	}
 	if loaded1.QuotaThreshold != 999 {
-		t.Fatalf("PATCH 更新 quota_threshold 失败: %d", loaded1.QuotaThreshold)
+		t.Fatalf("部分更新 quota_threshold 失败: %d", loaded1.QuotaThreshold)
 	}
 
 	// 3. 显式清空飞书 Webhook: 传空字符串
-	reqClear := authedReq(t, ts, "PATCH", "/api/settings/notify", `{"feishu_webhook": ""}`)
+	reqClear := authedReq(t, ts, "PUT", "/api/settings/notify", `{"feishu_webhook": ""}`)
 	reqClear.AddCookie(&http.Cookie{Name: "hme_session", Value: sess})
 	reqClear.Header.Set("X-CSRF-Token", csrf)
 	statusClr, bodyClr, _ := do(t, reqClear)
 	if statusClr != http.StatusOK {
-		t.Fatalf("PATCH clear 失败: %d %s", statusClr, bodyClr)
+		t.Fatalf("显式清空失败: %d %s", statusClr, bodyClr)
 	}
 
 	loaded2, err := s.loadNotifySettings()

@@ -8,6 +8,7 @@
 package server
 
 import (
+	"context"
 	"crypto/subtle"
 	"net/http"
 	"strconv"
@@ -61,15 +62,14 @@ func queryCredentialsAllowed(c *gin.Context) bool {
 		return false
 	}
 	switch c.FullPath() {
-	case "/mail/code", "/mail/code/:email", "/mail/view", "/mail/view/:email", "/mail/raw", "/mail/raw/:email",
-		"/api/verify-code", "/api/mail/code", "/api/mail/code/:email", "/api/mail/view", "/api/mail/view/:email", "/api/mail/raw", "/api/mail/raw/:email":
+	case "/mail/code", "/mail/code/:email", "/mail/view", "/mail/view/:email", "/mail/raw", "/mail/raw/:email":
 		return true
 	default:
 		return false
 	}
 }
 
-func authenticateAPIKey(c *gin.Context, reqKey, apiKey string, st *store.Store) bool {
+func authenticateAPIKey(c *gin.Context, reqKey, apiKey string, st *store.Store) (bool, error) {
 	if apiKey != "" && subtle.ConstantTimeCompare([]byte(reqKey), []byte(apiKey)) == 1 {
 		c.Set("is_api_key_auth", true)
 		c.Set("token_name", "global_api_key")
@@ -78,15 +78,23 @@ func authenticateAPIKey(c *gin.Context, reqKey, apiKey string, st *store.Store) 
 			Kind: auth.PrincipalAdmin, ID: "admin", TokenName: "global_api_key",
 			Scopes: []string{store.ScopeAdmin},
 		})
-		return true
+		return true, nil
 	}
 	if st == nil {
-		return false
+		return false, nil
 	}
-	id, tokenName, scopes, ok := st.ValidateTokenPrincipal(reqKey)
+
+	authCtx, authCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer authCancel()
+
+	id, tokenName, scopes, ok, err := st.ValidateTokenPrincipalContext(authCtx, reqKey)
+	if err != nil {
+		return false, err
+	}
 	if !ok {
-		return false
+		return false, nil
 	}
+
 	var scopeList []string
 	if strings.TrimSpace(scopes) == "" || strings.TrimSpace(scopes) == store.ScopeAdmin {
 		scopeList = []string{store.ScopeAdmin}
@@ -103,32 +111,97 @@ func authenticateAPIKey(c *gin.Context, reqKey, apiKey string, st *store.Store) 
 	c.Set("principal", auth.Principal{
 		Kind: auth.PrincipalToken, ID: id, TokenName: tokenName, Scopes: scopeList,
 	})
-	return true
+	return true, nil
 }
 
 // requireExternalV2Auth only accepts explicit credentials and rejects Cookie sessions.
-func requireExternalV2Auth(apiKey string, st *store.Store) gin.HandlerFunc {
+// 支持可选限流器 (PR-CONCURRENCY T1)
+func requireExternalV2Auth(apiKey string, st *store.Store, limiters ...*RequestLimiter) gin.HandlerFunc {
+	var limiter *RequestLimiter
+	if len(limiters) > 0 {
+		limiter = limiters[0]
+	}
 	return func(c *gin.Context) {
+		if limiter != nil {
+			token, err := limiter.AcquireGlobalInflight()
+			if err != nil {
+				failCode(c, http.StatusServiceUnavailable, "SERVER_BUSY", "系统并发在途请求已达上限，请稍后重试")
+				return
+			}
+			defer token.Release()
+			c.Set(InflightTokenContextKey, token)
+		}
+
 		reqKey := requestAPIKey(c)
 		if reqKey == "" {
 			failCode(c, http.StatusUnauthorized, "AUTH_REQUIRED", "外部 v2 接口仅支持 Bearer Token 认证，拒绝 Cookie 会话")
 			return
 		}
-		if !authenticateAPIKey(c, reqKey, apiKey, st) {
+		authed, err := authenticateAPIKey(c, reqKey, apiKey, st)
+		if err != nil {
+			failCode(c, http.StatusServiceUnavailable, "AUTH_BACKEND_UNAVAILABLE", "鉴权数据库暂不可用: "+err.Error())
+			return
+		}
+		if !authed {
 			failCode(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key / Bearer Token 无效")
 			return
 		}
+
+		if limiter != nil {
+			if val, exists := c.Get(InflightTokenContextKey); exists {
+				if tok, ok := val.(*InflightToken); ok && tok != nil {
+					if p, pExists := getPrincipal(c); pExists && p.ID != "" {
+						if err := tok.BindPrincipalInflight(p); err != nil {
+							failCode(c, http.StatusTooManyRequests, "PRINCIPAL_BUSY", "主体并发在途请求已达上限，请稍后重试")
+							return
+						}
+					}
+				}
+			}
+		}
+
 		c.Next()
 	}
 }
 
 // requireSession accepts an explicit API key or a valid administrator Cookie session.
-func requireSession(mgr *authManager, apiKey string, st *store.Store) gin.HandlerFunc {
+func requireSession(mgr *authManager, apiKey string, st *store.Store, limiters ...*RequestLimiter) gin.HandlerFunc {
+	var limiter *RequestLimiter
+	if len(limiters) > 0 {
+		limiter = limiters[0]
+	}
 	return func(c *gin.Context) {
+		if limiter != nil {
+			token, err := limiter.AcquireGlobalInflight()
+			if err != nil {
+				failCode(c, http.StatusServiceUnavailable, "SERVER_BUSY", "系统并发在途请求已达上限，请稍后重试")
+				return
+			}
+			defer token.Release()
+			c.Set(InflightTokenContextKey, token)
+		}
+
 		if reqKey := requestAPIKey(c); reqKey != "" {
-			if !authenticateAPIKey(c, reqKey, apiKey, st) {
+			authed, err := authenticateAPIKey(c, reqKey, apiKey, st)
+			if err != nil {
+				failCode(c, http.StatusServiceUnavailable, "AUTH_BACKEND_UNAVAILABLE", "鉴权数据库暂不可用: "+err.Error())
+				return
+			}
+			if !authed {
 				failCode(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
 				return
+			}
+			if limiter != nil {
+				if val, exists := c.Get(InflightTokenContextKey); exists {
+					if tok, ok := val.(*InflightToken); ok && tok != nil {
+						if p, pExists := getPrincipal(c); pExists && p.ID != "" {
+							if err := tok.BindPrincipalInflight(p); err != nil {
+								failCode(c, http.StatusTooManyRequests, "PRINCIPAL_BUSY", "主体并发在途请求已达上限，请稍后重试")
+								return
+							}
+						}
+					}
+				}
 			}
 			c.Next()
 			return
@@ -152,6 +225,18 @@ func requireSession(mgr *authManager, apiKey string, st *store.Store) gin.Handle
 			Kind: auth.PrincipalAdmin, ID: "admin", TokenName: "admin_session",
 			Scopes: []string{store.ScopeAdmin},
 		})
+		if limiter != nil {
+			if val, exists := c.Get(InflightTokenContextKey); exists {
+				if tok, ok := val.(*InflightToken); ok && tok != nil {
+					if p, ok := getPrincipal(c); ok {
+						if err := tok.BindPrincipalInflight(p); err != nil {
+							failCode(c, http.StatusTooManyRequests, "PRINCIPAL_BUSY", "主体并发在途请求已达上限，请稍后重试")
+							return
+						}
+					}
+				}
+			}
+		}
 		c.Next()
 	}
 }

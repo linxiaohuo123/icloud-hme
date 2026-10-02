@@ -61,13 +61,14 @@ func TestMIG_MID_01_PR04_To_PR08_VerificationRequestsSchemaEvolution(t *testing.
 	if req.BaselineMailbox != "INBOX" {
 		t.Fatalf("MIG-MID-01 失败: baseline_mailbox 默认值期望 'INBOX', 实际: %s", req.BaselineMailbox)
 	}
-	if req.Status != "pending" {
-		t.Fatalf("MIG-MID-01 失败: 既有状态被篡改: %s", req.Status)
+	// v12 explicitly invalidates unfinished historical tasks whose physical source is unknown.
+	if req.Status != "invalidated" || req.BaselineSource != "" || req.AliasEmail != "legacy@icloud.com" || req.LeaseID != "alloc_legacy" {
+		t.Fatalf("MIG-MID-01 失败: 未知来源旧任务未安全失效或业务字段损坏: %+v", req)
 	}
 
-	// 验证终态 CAS 对历史补列数据生效
-	_, ok, err := st.InvalidateVerificationRequest(ctx, "vreq_pr04_old")
-	if err != nil || !ok {
+	// 验证终态 CAS 不会重写已失效的历史记录
+	result, ok, err := st.InvalidateVerificationRequest(ctx, "vreq_pr04_old")
+	if err != nil || ok || result == nil || result.Status != "invalidated" {
 		t.Fatalf("MIG-MID-01 失败: 对补列历史记录执行 Invalidate 失败: ok=%v, err=%v", ok, err)
 	}
 }
@@ -260,13 +261,13 @@ func TestMIG_MID_04_PR07_PR08_VerificationAtomicCASAndBaselineMinUID(t *testing.
 	}
 
 	// 2. 原子完成 vreq_c1
-	_, ok, err := st.CompleteVerificationRequest(ctx, "vreq_c1", "654321", "ref_msg_1")
+	_, ok, err := st.CompleteVerificationRequestResult(ctx, "vreq_c1", VerificationCompletion{Code: "654321", MatchedEventRef: "ref_msg_1"})
 	if err != nil || !ok {
 		t.Fatalf("MIG-MID-04 失败: CompleteVerificationRequest 失败: ok=%v, err=%v", ok, err)
 	}
 
 	// 3. 重复完成或尝试改写终态必须被 CAS 阻断
-	_, okRepeat, err := st.CompleteVerificationRequest(ctx, "vreq_c1", "999999", "ref_msg_2")
+	_, okRepeat, err := st.CompleteVerificationRequestResult(ctx, "vreq_c1", VerificationCompletion{Code: "999999", MatchedEventRef: "ref_msg_2"})
 	if err != nil || okRepeat {
 		t.Fatalf("MIG-MID-04 失败: 已完成任务严禁被重复完成覆写: ok=%v", okRepeat)
 	}

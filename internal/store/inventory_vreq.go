@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, database/sql, errors, strings, time, icloud-hme/internal/store (Store, ErrVerificationRequestNotFound)
- * [OUTPUT]: 对外提供 VerificationRequest, VerificationCompletion, ActiveVerificationWatch, VerificationEventInput 类型, ErrConflictActiveRequest, ErrServerBusy, ErrTooManyRequests 错误及 CheckVerificationRequestAdmission, CreateVerificationRequestAtomic, CreateVerificationRequest, GetVerificationRequest, CompleteVerificationRequest, CompleteVerificationRequestResult, CompleteMatchingVerificationRequests, InvalidateVerificationRequestsForGenerationMismatch, ExpireVerificationRequest, InvalidateVerificationRequest, UpdateVerificationRequestResult, GetActiveVerificationRequestByLease, CountActiveVerificationRequests, CountActiveVerificationRequestsByPrincipal, GetMinBaselineUIDByEmail, ListActiveVerificationWatches, HasActiveVerificationRequests
- * [POS]: internal/store 的持久化取码请求与基线游标状态机领域 (PR-06/PR-08/PR-04B/PR-05)，提供终态原子 CAS 与容量仲裁、前置准入预检、权威持久化和持久化活跃观察查询
+ * [OUTPUT]: 对外提供 VerificationRequest, VerificationCompletion, ActiveVerificationWatch, VerificationEventInput 类型, ErrConflictActiveRequest, ErrServerBusy, ErrTooManyRequests 错误及 CheckVerificationRequestAdmission, CreateVerificationRequestAtomic, CreateVerificationRequest, GetVerificationRequest, CompleteVerificationRequestResult, CompleteMatchingVerificationRequests, InvalidateVerificationRequestsForGenerationMismatch, ExpireVerificationRequest, InvalidateVerificationRequest, GetActiveVerificationRequestByLease, CountActiveVerificationRequests, CountActiveVerificationRequestsByPrincipal, GetMinBaselineUIDByEmail, ListActiveVerificationWatches, HasActiveVerificationRequests
+ * [POS]: internal/store 的持久化取码状态机，提供终态 CAS、容量仲裁、准入预检和活跃观察查询；到期完成显式传播 CAS 错误，完成 CAS 必须显式携带物理来源 (已移除不带来源的旧完成接口)，扫描覆盖绑定当前任务集合，代际失效可限定为已观察任务 ID，批量完成采用先写 UPDATE RETURNING 避免 WAL 快照升级竞争
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -10,7 +10,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -35,13 +38,18 @@ type VerificationRequest struct {
 	BaselineMailbox     string `json:"baseline_mailbox,omitempty"`
 	BaselineUIDValidity uint32 `json:"baseline_uidvalidity,omitempty"`
 	BaselineUID         uint32 `json:"baseline_uid,omitempty"`
+	BaselineSource      string `json:"-"`
+	BaselineAccountID   string `json:"-"`
 	MatchedEventRef     string `json:"matched_event_ref,omitempty"`
 	Code                string `json:"code,omitempty"`
 	MagicLink           string `json:"magic_link,omitempty"`
+	IdempotencyKey      string `json:"idempotency_key,omitempty"`
+	IdempotencyHash     string `json:"idempotency_hash,omitempty"`
 }
 
 // VerificationCompletion 包含验证终态的权威结果字段 (PR-04B)
 type VerificationCompletion struct {
+	Source          string
 	Code            string
 	MagicLink       string
 	MatchedEventRef string
@@ -49,6 +57,8 @@ type VerificationCompletion struct {
 
 // ActiveVerificationWatch 记录当前活跃的验证观察目标 (PR-04B)
 type ActiveVerificationWatch struct {
+	BaselineSource      string `json:"-"`
+	BaselineAccountID   string `json:"-"`
 	RequestID           string `json:"request_id"`
 	PrincipalKind       string `json:"principal_kind"`
 	PrincipalID         string `json:"principal_id"`
@@ -63,6 +73,7 @@ type ActiveVerificationWatch struct {
 
 // VerificationEventInput 供原子完成匹配的事件入参 (PR-04B)
 type VerificationEventInput struct {
+	Source      string
 	AliasEmail  string
 	Provider    string
 	Mailbox     string
@@ -74,8 +85,9 @@ type VerificationEventInput struct {
 	Now         time.Time
 }
 
-// CheckVerificationRequestAdmission 在碰 IMAP 前做轻量 SQLite 准入预检 (PR-05 F09)
-// 只做只读与过期判定，快速拒绝明显超限请求，不得访问网络。最终原子性仍由 CreateVerificationRequestAtomic 权威保障。
+// CheckVerificationRequestAdmission 在碰 IMAP 前做轻量 SQLite 准入只读预检 (T4)。
+// 只做只读条件判定，不持有全局业务写锁，不执行写操作，快速建议性拒绝明显超限请求。
+// 最终原子性与权威仲裁由 CreateVerificationRequestAtomic 事务保障。
 func (s *Store) CheckVerificationRequestAdmission(
 	ctx context.Context,
 	principalKind string,
@@ -84,19 +96,9 @@ func (s *Store) CheckVerificationRequestAdmission(
 	maxGlobal int,
 	maxPerPrincipal int,
 ) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	nowStr := time.Now().UTC().Format(time.RFC3339)
 
-	// 1. 清理已过期的任务状态 (不再阻塞同 lease 的新任务，也不占活跃配额)
-	_, _ = s.db.ExecContext(ctx, `
-		UPDATE verification_requests
-		SET status = 'expired'
-		WHERE status IN ('pending', 'ready') AND expires_at < ?
-	`, nowStr)
-
-	// 2. 检查同 lease 是否存在活跃任务 (避免同 lease 重复打 IMAP)
+	// 1. 检查同 lease 是否存在活跃任务 (避免同 lease 重复打 IMAP)
 	var leaseActiveCount int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(1)
@@ -110,7 +112,7 @@ func (s *Store) CheckVerificationRequestAdmission(
 		return ErrConflictActiveRequest
 	}
 
-	// 3. 检查 principal 活跃任务上限 (不超过 maxPerPrincipal)
+	// 2. 检查 principal 活跃任务上限 (不超过 maxPerPrincipal)
 	if maxPerPrincipal > 0 {
 		var tokenActiveCount int
 		err := s.db.QueryRowContext(ctx, `
@@ -126,7 +128,7 @@ func (s *Store) CheckVerificationRequestAdmission(
 		}
 	}
 
-	// 4. 检查全局活跃任务上限 (不超过 maxGlobal)
+	// 3. 检查全局活跃任务上限 (不超过 maxGlobal)
 	if maxGlobal > 0 {
 		var globalActiveCount int
 		err := s.db.QueryRowContext(ctx, `
@@ -152,7 +154,9 @@ func (s *Store) CreateVerificationRequestAtomic(
 	maxGlobalActive int,
 	maxPerTokenActive int,
 ) error {
-	s.mu.Lock()
+	if err := s.mu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer s.mu.Unlock()
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -223,22 +227,41 @@ func (s *Store) CreateVerificationRequestAtomic(
 		req.BaselineMailbox = "INBOX"
 	}
 
-	// 5. 原子插入
+	// 5. 原子插入 (支持 T11 幂等键与指纹字段)
 	q := `
 	INSERT INTO verification_requests (
 		request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
-		baseline_provider, baseline_mailbox, baseline_uidvalidity, baseline_uid, matched_event_ref, code, magic_link
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		baseline_provider, baseline_mailbox, baseline_uidvalidity, baseline_uid, matched_event_ref, code, magic_link,
+		idempotency_key, idempotency_hash, baseline_source, baseline_account_id
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 	_, err = tx.ExecContext(ctx, q,
 		req.RequestID, req.PrincipalKind, req.PrincipalID, req.LeaseID, req.AliasEmail, req.Status, req.CreatedAt, req.ExpiresAt,
 		req.BaselineProvider, req.BaselineMailbox, req.BaselineUIDValidity, req.BaselineUID, req.MatchedEventRef, req.Code, req.MagicLink,
+		req.IdempotencyKey, req.IdempotencyHash, req.BaselineSource, req.BaselineAccountID,
 	)
 	if err != nil {
+		if isIdempotencyUniqueConflict(err) {
+			return ErrIdempotencyConflict
+		}
 		return err
 	}
 
 	return tx.Commit()
+}
+
+func isIdempotencyUniqueConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "uidx_vreq_idempotency") {
+		return true
+	}
+	if strings.Contains(s, "unique constraint failed") && strings.Contains(s, "idempotency_key") {
+		return true
+	}
+	return false
 }
 
 // CreateVerificationRequest 创建持久化取码请求 (Section VI)
@@ -249,12 +272,14 @@ func (s *Store) CreateVerificationRequest(ctx context.Context, req *Verification
 	q := `
 	INSERT INTO verification_requests (
 		request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
-		baseline_provider, baseline_mailbox, baseline_uidvalidity, baseline_uid, matched_event_ref, code, magic_link
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		baseline_provider, baseline_mailbox, baseline_uidvalidity, baseline_uid, matched_event_ref, code, magic_link,
+		idempotency_key, idempotency_hash, baseline_source, baseline_account_id
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 	_, err := s.db.ExecContext(ctx, q,
 		req.RequestID, req.PrincipalKind, req.PrincipalID, req.LeaseID, req.AliasEmail, req.Status, req.CreatedAt, req.ExpiresAt,
 		req.BaselineProvider, req.BaselineMailbox, req.BaselineUIDValidity, req.BaselineUID, req.MatchedEventRef, req.Code, req.MagicLink,
+		req.IdempotencyKey, req.IdempotencyHash, req.BaselineSource, req.BaselineAccountID,
 	)
 	return err
 }
@@ -266,13 +291,15 @@ func (s *Store) GetVerificationRequest(ctx context.Context, requestID, principal
 	q := `
 	SELECT request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
 	       baseline_provider, COALESCE(baseline_mailbox, 'INBOX'), baseline_uidvalidity, baseline_uid,
-	       matched_event_ref, code, COALESCE(magic_link, '')
+	       matched_event_ref, code, COALESCE(magic_link, ''),
+	       COALESCE(idempotency_key, ''), COALESCE(idempotency_hash, ''), COALESCE(baseline_source, ''), COALESCE(baseline_account_id, '')
 	FROM verification_requests
 	WHERE request_id = ? AND principal_kind = ? AND principal_id = ?
 	`
 	err := s.db.QueryRowContext(ctx, q, requestID, principalKind, principalID).Scan(
 		&req.RequestID, &req.PrincipalKind, &req.PrincipalID, &req.LeaseID, &req.AliasEmail, &req.Status, &req.CreatedAt, &req.ExpiresAt,
 		&req.BaselineProvider, &req.BaselineMailbox, &req.BaselineUIDValidity, &req.BaselineUID, &req.MatchedEventRef, &req.Code, &req.MagicLink,
+		&req.IdempotencyKey, &req.IdempotencyHash, &req.BaselineSource, &req.BaselineAccountID,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -290,13 +317,15 @@ func (s *Store) getVerificationRequestByID(ctx context.Context, requestID string
 	q := `
 	SELECT request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
 	       baseline_provider, COALESCE(baseline_mailbox, 'INBOX'), baseline_uidvalidity, baseline_uid,
-	       matched_event_ref, code, COALESCE(magic_link, '')
+	       matched_event_ref, code, COALESCE(magic_link, ''),
+	       COALESCE(idempotency_key, ''), COALESCE(idempotency_hash, ''), COALESCE(baseline_source, ''), COALESCE(baseline_account_id, '')
 	FROM verification_requests
 	WHERE request_id = ?
 	`
 	err := s.db.QueryRowContext(ctx, q, requestID).Scan(
 		&req.RequestID, &req.PrincipalKind, &req.PrincipalID, &req.LeaseID, &req.AliasEmail, &req.Status, &req.CreatedAt, &req.ExpiresAt,
 		&req.BaselineProvider, &req.BaselineMailbox, &req.BaselineUIDValidity, &req.BaselineUID, &req.MatchedEventRef, &req.Code, &req.MagicLink,
+		&req.IdempotencyKey, &req.IdempotencyHash, &req.BaselineSource, &req.BaselineAccountID,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -319,9 +348,9 @@ func (s *Store) CompleteVerificationRequestResult(ctx context.Context, requestID
 	q := `
 	UPDATE verification_requests
 	SET status = 'succeeded', code = ?, magic_link = ?, matched_event_ref = ?
-	WHERE request_id = ? AND status IN ('ready', 'pending') AND expires_at > ?
+	WHERE request_id = ? AND status IN ('ready', 'pending') AND expires_at > ? AND baseline_source = ?
 	`
-	res, err := s.db.ExecContext(ctx, q, comp.Code, comp.MagicLink, comp.MatchedEventRef, requestID, nowStr)
+	res, err := s.db.ExecContext(ctx, q, comp.Code, comp.MagicLink, comp.MatchedEventRef, requestID, nowStr, comp.Source)
 	if err != nil {
 		return nil, false, err
 	}
@@ -336,19 +365,11 @@ func (s *Store) CompleteVerificationRequestResult(ctx context.Context, requestID
 
 	// CAS 未中且数据库仍为非终态但已过 expires_at 时，原子级收敛为 expired
 	if rows == 0 && req != nil && (req.Status == "ready" || req.Status == "pending") && req.ExpiresAt <= nowStr {
-		_, _, _ = s.ExpireVerificationRequest(ctx, requestID)
-		req, _ = s.getVerificationRequestByID(ctx, requestID)
+		expired, _, err := s.ExpireVerificationRequest(ctx, requestID)
+		return expired, false, err
 	}
 
 	return req, rows > 0, nil
-}
-
-// CompleteVerificationRequest 原子 CAS 将取码任务标记为成功 (向下兼容旧签名)
-func (s *Store) CompleteVerificationRequest(ctx context.Context, requestID, code, matchedEventRef string, now ...time.Time) (*VerificationRequest, bool, error) {
-	return s.CompleteVerificationRequestResult(ctx, requestID, VerificationCompletion{
-		Code:            code,
-		MatchedEventRef: matchedEventRef,
-	}, now...)
 }
 
 // ExpireVerificationRequest 原子 CAS 将取码任务标记为超时过期 (Issue 6)
@@ -397,29 +418,6 @@ func (s *Store) InvalidateVerificationRequest(ctx context.Context, requestID str
 	return req, rows > 0, nil
 }
 
-// UpdateVerificationRequestResult 更新取码任务结果 (保证原子 CAS，拒绝终态覆盖)
-func (s *Store) UpdateVerificationRequestResult(ctx context.Context, requestID, status, code, matchedEventRef string) error {
-	switch status {
-	case "succeeded":
-		_, _, err := s.CompleteVerificationRequest(ctx, requestID, code, matchedEventRef)
-		return err
-	case "expired":
-		_, _, err := s.ExpireVerificationRequest(ctx, requestID)
-		return err
-	case "invalidated":
-		_, _, err := s.InvalidateVerificationRequest(ctx, requestID)
-		return err
-	default:
-		q := `
-		UPDATE verification_requests
-		SET status = ?, code = ?, matched_event_ref = ?
-		WHERE request_id = ? AND status IN ('ready', 'pending')
-		`
-		_, err := s.db.ExecContext(ctx, q, status, code, matchedEventRef, requestID)
-		return err
-	}
-}
-
 // GetActiveVerificationRequestByLease 查询指定 lease 是否已有进行中的取码任务 (status IN ('ready', 'pending') 且未过期) (PR-06 Section 9.2)
 func (s *Store) GetActiveVerificationRequestByLease(ctx context.Context, leaseID string) (*VerificationRequest, error) {
 	leaseID = strings.TrimSpace(leaseID)
@@ -428,7 +426,8 @@ func (s *Store) GetActiveVerificationRequestByLease(ctx context.Context, leaseID
 	q := `
 	SELECT request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
 	       baseline_provider, COALESCE(baseline_mailbox, 'INBOX'), baseline_uidvalidity, baseline_uid,
-	       matched_event_ref, code, COALESCE(magic_link, '')
+	       matched_event_ref, code, COALESCE(magic_link, ''),
+	       COALESCE(idempotency_key, ''), COALESCE(idempotency_hash, ''), COALESCE(baseline_source, ''), COALESCE(baseline_account_id, '')
 	FROM verification_requests
 	WHERE lease_id = ? AND status IN ('ready', 'pending') AND expires_at > ?
 	ORDER BY created_at DESC
@@ -437,6 +436,7 @@ func (s *Store) GetActiveVerificationRequestByLease(ctx context.Context, leaseID
 	err := s.db.QueryRowContext(ctx, q, leaseID, now).Scan(
 		&req.RequestID, &req.PrincipalKind, &req.PrincipalID, &req.LeaseID, &req.AliasEmail, &req.Status, &req.CreatedAt, &req.ExpiresAt,
 		&req.BaselineProvider, &req.BaselineMailbox, &req.BaselineUIDValidity, &req.BaselineUID, &req.MatchedEventRef, &req.Code, &req.MagicLink,
+		&req.IdempotencyKey, &req.IdempotencyHash, &req.BaselineSource, &req.BaselineAccountID,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -503,7 +503,7 @@ func (s *Store) ListActiveVerificationWatches(ctx context.Context) ([]ActiveVeri
 	q := `
 	SELECT request_id, principal_kind, principal_id, lease_id, alias_email,
 	       COALESCE(baseline_provider, ''), COALESCE(baseline_mailbox, 'INBOX'),
-	       COALESCE(baseline_uidvalidity, 0), COALESCE(baseline_uid, 0), expires_at
+	       COALESCE(baseline_uidvalidity, 0), COALESCE(baseline_uid, 0), expires_at, baseline_source, baseline_account_id
 	FROM verification_requests
 	WHERE status IN ('ready', 'pending') AND (expires_at IS NULL OR expires_at > ?)
 	ORDER BY created_at ASC
@@ -519,7 +519,7 @@ func (s *Store) ListActiveVerificationWatches(ctx context.Context) ([]ActiveVeri
 		var w ActiveVerificationWatch
 		if err := rows.Scan(
 			&w.RequestID, &w.PrincipalKind, &w.PrincipalID, &w.LeaseID, &w.AliasEmail,
-			&w.BaselineProvider, &w.BaselineMailbox, &w.BaselineUIDValidity, &w.BaselineUID, &w.ExpiresAt,
+			&w.BaselineProvider, &w.BaselineMailbox, &w.BaselineUIDValidity, &w.BaselineUID, &w.ExpiresAt, &w.BaselineSource, &w.BaselineAccountID,
 		); err != nil {
 			return nil, err
 		}
@@ -566,7 +566,9 @@ func (s *Store) CompleteMatchingVerificationRequests(ctx context.Context, ev Ver
 	}
 	nowStr := nowTime.Format(time.RFC3339)
 
-	s.mu.Lock()
+	if err := s.mu.LockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer s.mu.Unlock()
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -575,10 +577,11 @@ func (s *Store) CompleteMatchingVerificationRequests(ctx context.Context, ev Ver
 	}
 	defer tx.Rollback()
 
-	// 1. 查询所有符合 baseline 条件的活跃任务 ID
-	qSelect := `
-	SELECT request_id
-	FROM verification_requests
+	// 第一条语句直接取得写入权，避免 WAL 读取快照在并发写入后无法升级。
+	// 匹配与终态 CAS 在同一条语句中完成；仅在提交成功后返回可发布的结果。
+	qUpdate := `
+	UPDATE verification_requests
+	SET status = 'succeeded', code = ?, magic_link = ?, matched_event_ref = ?
 	WHERE status IN ('ready', 'pending')
 	  AND (expires_at IS NULL OR expires_at > ?)
 	  AND LOWER(TRIM(alias_email)) = ?
@@ -586,58 +589,37 @@ func (s *Store) CompleteMatchingVerificationRequests(ctx context.Context, ev Ver
 	  AND (baseline_mailbox = ? OR (baseline_mailbox = '' AND ? = 'INBOX'))
 	  AND baseline_uidvalidity = ?
 	  AND baseline_uid <= ?
+	  AND baseline_source = ?
+	RETURNING request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
+	          baseline_provider, COALESCE(baseline_mailbox, 'INBOX'), baseline_uidvalidity, baseline_uid,
+	          matched_event_ref, code, COALESCE(magic_link, ''),
+	          COALESCE(idempotency_key, ''), COALESCE(idempotency_hash, ''), COALESCE(baseline_source, ''), COALESCE(baseline_account_id, '')
 	`
-	rows, err := tx.QueryContext(ctx, qSelect,
-		nowStr, normAlias, ev.Provider, ev.Mailbox, ev.Mailbox, ev.UIDValidity, ev.UID,
+	rows, err := tx.QueryContext(ctx, qUpdate,
+		ev.Code, ev.MagicLink, ev.MessageRef, nowStr, normAlias, ev.Provider, ev.Mailbox, ev.Mailbox, ev.UIDValidity, ev.UID, ev.Source,
 	)
 	if err != nil {
 		return nil, err
 	}
-	var matchingIDs []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err == nil {
-			matchingIDs = append(matchingIDs, id)
-		}
-	}
-	rows.Close()
-
-	if len(matchingIDs) == 0 {
-		return nil, nil
-	}
-
-	// 2. 对每个匹配到的 request 进行原子 CAS 更新，拒绝覆盖终态
-	qUpdate := `
-	UPDATE verification_requests
-	SET status = 'succeeded', code = ?, magic_link = ?, matched_event_ref = ?
-	WHERE request_id = ? AND status IN ('ready', 'pending') AND (expires_at IS NULL OR expires_at > ?)
-	`
 	var completed []*VerificationRequest
-	for _, reqID := range matchingIDs {
-		res, err := tx.ExecContext(ctx, qUpdate, ev.Code, ev.MagicLink, ev.MessageRef, reqID, nowStr)
-		if err != nil {
-			return nil, err
+	for rows.Next() {
+		var req VerificationRequest
+		if err := rows.Scan(
+			&req.RequestID, &req.PrincipalKind, &req.PrincipalID, &req.LeaseID, &req.AliasEmail, &req.Status, &req.CreatedAt, &req.ExpiresAt,
+			&req.BaselineProvider, &req.BaselineMailbox, &req.BaselineUIDValidity, &req.BaselineUID, &req.MatchedEventRef, &req.Code, &req.MagicLink,
+			&req.IdempotencyKey, &req.IdempotencyHash, &req.BaselineSource, &req.BaselineAccountID,
+		); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan completed request failed: %w", err)
 		}
-		ra, err := res.RowsAffected()
-		if err != nil {
-			return nil, err
-		}
-		if ra > 0 {
-			var req VerificationRequest
-			qGet := `
-			SELECT request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
-			       baseline_provider, COALESCE(baseline_mailbox, 'INBOX'), baseline_uidvalidity, baseline_uid,
-			       matched_event_ref, code, COALESCE(magic_link, '')
-			FROM verification_requests
-			WHERE request_id = ?
-			`
-			if err := tx.QueryRowContext(ctx, qGet, reqID).Scan(
-				&req.RequestID, &req.PrincipalKind, &req.PrincipalID, &req.LeaseID, &req.AliasEmail, &req.Status, &req.CreatedAt, &req.ExpiresAt,
-				&req.BaselineProvider, &req.BaselineMailbox, &req.BaselineUIDValidity, &req.BaselineUID, &req.MatchedEventRef, &req.Code, &req.MagicLink,
-			); err == nil {
-				completed = append(completed, &req)
-			}
-		}
+		completed = append(completed, &req)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate matching requests failed: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close completed requests failed: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -646,8 +628,27 @@ func (s *Store) CompleteMatchingVerificationRequests(ctx context.Context, ev Ver
 	return completed, nil
 }
 
+// InvalidateVerificationRequestsForSourceMismatch 只更新配置快照之前已观察到的任务，避免旧扫描误伤后来创建的任务。
+func (s *Store) InvalidateVerificationRequestsForSourceMismatch(ctx context.Context, requestIDs []string, source string) error {
+	const batchSize = 500
+	for i := 0; i < len(requestIDs); i += batchSize {
+		chunk := requestIDs[i:min(i+batchSize, len(requestIDs))]
+		args := []any{source}
+		placeholders := make([]string, len(chunk))
+		for j, id := range chunk {
+			placeholders[j] = "?"
+			args = append(args, id)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE verification_requests SET status='invalidated'
+   WHERE status IN ('pending','ready') AND baseline_source != ?
+   AND request_id IN (`+strings.Join(placeholders, ",")+`)`, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // InvalidateVerificationRequestsForGenerationMismatch 原子 CAS 将因代际 (UIDVALIDITY) 突变导致失效的活跃取码任务标记为 invalidated (PR-04B)
-// 仅影响 status IN ('ready', 'pending') 的未终态任务，已经处于终态的绝不覆盖。
 func (s *Store) InvalidateVerificationRequestsForGenerationMismatch(
 	ctx context.Context,
 	alias string,
@@ -677,4 +678,265 @@ func (s *Store) InvalidateVerificationRequestsForGenerationMismatch(
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// InvalidateVerificationRequestsForGenerationMismatchByIDs 只失效读取邮箱边界之前已观察到的任务。
+// 边界读取与失效之间创建的新代际任务不在 requestIDs 中，旧边界不能误伤它们。
+func (s *Store) InvalidateVerificationRequestsForGenerationMismatchByIDs(ctx context.Context, requestIDs []string, mailbox string, uidValidity uint32, source string) (int64, error) {
+	if len(requestIDs) == 0 || uidValidity == 0 {
+		return 0, nil
+	}
+	if mailbox == "" {
+		mailbox = "INBOX"
+	}
+	if err := s.mu.LockContext(ctx); err != nil {
+		return 0, err
+	}
+	defer s.mu.Unlock()
+
+	const batchSize = 500
+	var totalAffected int64
+	for i := 0; i < len(requestIDs); i += batchSize {
+		chunk := requestIDs[i:min(i+batchSize, len(requestIDs))]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+4)
+		for j, id := range chunk {
+			placeholders[j] = "?"
+			args = append(args, id)
+		}
+		args = append(args, mailbox, mailbox, uidValidity, source)
+		res, err := s.db.ExecContext(ctx, `
+		UPDATE verification_requests
+		SET status = 'invalidated'
+		WHERE request_id IN (`+strings.Join(placeholders, ",")+`)
+		  AND status IN ('ready', 'pending')
+		  AND baseline_provider = 'imap'
+		  AND (baseline_mailbox = ? OR (baseline_mailbox = '' AND ? = 'INBOX'))
+		  AND baseline_uidvalidity > 0
+		  AND baseline_uidvalidity != ?
+		  AND baseline_source = ?
+		`, args...)
+		if err != nil {
+			return totalAffected, err
+		}
+		affected, _ := res.RowsAffected()
+		totalAffected += affected
+	}
+	return totalAffected, nil
+}
+
+// GetVerificationRequestByIdempotencyKey 根据主体身份和幂等键查询已有任务 (T11)
+func (s *Store) GetVerificationRequestByIdempotencyKey(ctx context.Context, principalKind, principalID, key string) (*VerificationRequest, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil, nil
+	}
+	var req VerificationRequest
+	q := `
+	SELECT request_id, principal_kind, principal_id, lease_id, alias_email, status, created_at, expires_at,
+	       baseline_provider, COALESCE(baseline_mailbox, 'INBOX'), baseline_uidvalidity, baseline_uid,
+	       matched_event_ref, code, COALESCE(magic_link, ''),
+	       COALESCE(idempotency_key, ''), COALESCE(idempotency_hash, ''), COALESCE(baseline_source, ''), COALESCE(baseline_account_id, '')
+	FROM verification_requests
+	WHERE principal_kind = ? AND principal_id = ? AND idempotency_key = ?
+	LIMIT 1
+	`
+	err := s.db.QueryRowContext(ctx, q, principalKind, principalID, key).Scan(
+		&req.RequestID, &req.PrincipalKind, &req.PrincipalID, &req.LeaseID, &req.AliasEmail, &req.Status, &req.CreatedAt, &req.ExpiresAt,
+		&req.BaselineProvider, &req.BaselineMailbox, &req.BaselineUIDValidity, &req.BaselineUID, &req.MatchedEventRef, &req.Code, &req.MagicLink,
+		&req.IdempotencyKey, &req.IdempotencyHash, &req.BaselineSource, &req.BaselineAccountID,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	// CAS 原子收敛已到期但未被收割的 ready/pending 任务
+	if (req.Status == "ready" || req.Status == "pending") && req.ExpiresAt != "" {
+		if exp, perr := time.Parse(time.RFC3339, req.ExpiresAt); perr == nil && !time.Now().UTC().Before(exp) {
+			updatedReq, _, err := s.ExpireVerificationRequest(ctx, req.RequestID)
+			if err != nil {
+				return nil, err
+			}
+			if updatedReq != nil {
+				return updatedReq, nil
+			}
+		}
+	}
+	return &req, nil
+}
+
+// GetMinBaselineUIDsByEmails 批量查询指定别名邮箱集合当前活跃取码任务的最小 baseline_uid (T5)。
+// 替换逐邮箱查询的 N+1 循环，分批执行 (每批最多 500 个)。
+func (s *Store) GetMinBaselineUIDsByEmails(ctx context.Context, emails []string) (map[string]uint32, error) {
+	baselines, _, err := s.GetVerificationScanBaselines(ctx, emails)
+	return baselines, err
+}
+
+// GetVerificationScanBaselines 将基线和当前任务集合在同一查询中固定；来源过滤隔离新旧邮箱。
+func (s *Store) GetVerificationScanBaselines(ctx context.Context, emails []string, source ...string) (map[string]uint32, map[string]string, error) {
+	coverage := make(map[string]string)
+	result := make(map[string]uint32)
+	if len(emails) == 0 {
+		return result, coverage, nil
+	}
+
+	normSet := make(map[string]struct{}, len(emails))
+	var uniqueNorms []string
+	for _, e := range emails {
+		norm := strings.ToLower(strings.TrimSpace(e))
+		if norm != "" {
+			if _, exists := normSet[norm]; !exists {
+				normSet[norm] = struct{}{}
+				uniqueNorms = append(uniqueNorms, norm)
+			}
+		}
+	}
+	if len(uniqueNorms) == 0 {
+		return result, coverage, nil
+	}
+
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+	const batchSize = 500
+
+	for i := 0; i < len(uniqueNorms); i += batchSize {
+		end := i + batchSize
+		if end > len(uniqueNorms) {
+			end = len(uniqueNorms)
+		}
+		chunk := uniqueNorms[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		for j, email := range chunk {
+			placeholders[j] = "?"
+			args = append(args, email)
+		}
+		args = append(args, nowStr)
+		sourceClause := ""
+		if len(source) > 0 {
+			sourceClause = " AND baseline_source = ?"
+			args = append(args, source[0])
+		}
+
+		q := `
+		SELECT
+			LOWER(TRIM(alias_email)) as norm_email,
+			count(*),
+			count(CASE WHEN baseline_uid > 0 AND baseline_provider = 'imap' THEN 1 END),
+			COALESCE(min(CASE WHEN baseline_uid > 0 AND baseline_provider = 'imap' THEN baseline_uid END), 0),
+			json_group_array(request_id)
+		FROM verification_requests
+		WHERE LOWER(TRIM(alias_email)) IN (` + strings.Join(placeholders, ",") + `)
+		  AND status IN ('ready', 'pending')
+		  AND (expires_at IS NULL OR expires_at > ?)
+		` + sourceClause + ` GROUP BY LOWER(TRIM(alias_email))
+		`
+
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, nil, err
+		}
+		for rows.Next() {
+			var normEmail string
+			var totalCount, validCount int
+			var minUID uint32
+			var idsJSON string
+			if err := rows.Scan(&normEmail, &totalCount, &validCount, &minUID, &idsJSON); err != nil {
+				rows.Close()
+				return nil, nil, err
+			}
+			if totalCount > 0 && totalCount == validCount && minUID > 0 {
+				result[normEmail] = minUID
+				var ids []string
+				if err := json.Unmarshal([]byte(idsJSON), &ids); err != nil {
+					rows.Close()
+					return nil, nil, err
+				}
+				sort.Strings(ids)
+				encoded, _ := json.Marshal(ids)
+				coverage[normEmail] = string(encoded)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return nil, nil, err
+		}
+		rows.Close()
+	}
+
+	return result, coverage, nil
+}
+
+// InvalidateVerificationRequestsForGenerationMismatchBatch 批量将因代际突变导致失效的任务标记为 invalidated (T5)
+func (s *Store) InvalidateVerificationRequestsForGenerationMismatchBatch(ctx context.Context, emails []string, mailbox string, uidValidity uint32, source ...string) (int64, error) {
+	if len(emails) == 0 {
+		return 0, nil
+	}
+	if mailbox == "" {
+		mailbox = "INBOX"
+	}
+
+	normSet := make(map[string]struct{}, len(emails))
+	var uniqueNorms []string
+	for _, e := range emails {
+		norm := strings.ToLower(strings.TrimSpace(e))
+		if norm != "" {
+			if _, exists := normSet[norm]; !exists {
+				normSet[norm] = struct{}{}
+				uniqueNorms = append(uniqueNorms, norm)
+			}
+		}
+	}
+	if len(uniqueNorms) == 0 {
+		return 0, nil
+	}
+
+	if err := s.mu.LockContext(ctx); err != nil {
+		return 0, err
+	}
+	defer s.mu.Unlock()
+
+	const batchSize = 500
+	var totalAffected int64
+
+	for i := 0; i < len(uniqueNorms); i += batchSize {
+		end := i + batchSize
+		if end > len(uniqueNorms) {
+			end = len(uniqueNorms)
+		}
+		chunk := uniqueNorms[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+3)
+		for j, email := range chunk {
+			placeholders[j] = "?"
+			args = append(args, email)
+		}
+		args = append(args, mailbox, mailbox, uidValidity)
+
+		q := `
+		UPDATE verification_requests
+		SET status = 'invalidated'
+		WHERE LOWER(TRIM(alias_email)) IN (` + strings.Join(placeholders, ",") + `)
+		  AND status IN ('ready', 'pending')
+		  AND baseline_provider = 'imap'
+		  AND (baseline_mailbox = ? OR (baseline_mailbox = '' AND ? = 'INBOX'))
+		  AND baseline_uidvalidity > 0
+		  AND baseline_uidvalidity != ?
+		`
+
+		if len(source) > 0 {
+			q += " AND baseline_source = ?"
+			args = append(args, source[0])
+		}
+		res, err := s.db.ExecContext(ctx, q, args...)
+		if err != nil {
+			return totalAffected, err
+		}
+		affected, _ := res.RowsAffected()
+		totalAffected += affected
+	}
+
+	return totalAffected, nil
 }

@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 os, path/filepath, encoding/json, bytes, time, strings, fmt
+ * [INPUT]: 依赖 os, path/filepath, encoding/json, bytes, time, strings, fmt, log
  * [OUTPUT]: 对外提供 ParseCookieInput, load, save, copyAccount, cloneCookies, importEditedExample, parseAccountsBytes
- * [POS]: internal/account 的原子持久化存储、Cookie 智能序列化与 accounts.example.json 范本自适应导入层
+ * [POS]: internal/account 的原子持久化存储、账号邮箱配置深拷贝、Cookie 智能序列化与 accounts.example.json 范本自适应导入层
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,6 +41,10 @@ func copyAccount(acc *Account) *Account {
 	cp := *acc
 	cp.Cookies = cloneCookies(acc.Cookies)
 	cp.Session = acc.Session.Clone()
+	if acc.Mailbox != nil {
+		mailbox := *acc.Mailbox
+		cp.Mailbox = &mailbox
+	}
 	return &cp
 }
 
@@ -116,7 +121,8 @@ func (m *Manager) migrateToSQLite() error {
 	// 归档 JSON 源文件
 	_ = os.Remove(m.dataFile + ".migrated")
 	if err := os.Rename(m.dataFile, m.dataFile+".migrated"); err != nil {
-		// 记录归档失败日志但 SQLite 已安全落库
+		// SQLite 已安全落库且之后只读 SQLite；但源文件含明文凭据，必须提示人工清理。
+		log.Printf("[Account] 归档旧账号文件失败，%s 仍以明文保留在磁盘，请手工删除: %v", m.dataFile, err)
 	}
 	_ = os.Remove(m.dataFile + ".bak")
 	_ = os.Remove(m.dataFile + ".tmp")

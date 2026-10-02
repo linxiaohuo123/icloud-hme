@@ -93,7 +93,7 @@ func TestMailDirectLinks(t *testing.T) {
 	}
 
 	// ==========================================
-	// 场景 1: /api/verify-code?email=...&token=...
+	// 场景 1: /mail/code?email=...&token=...
 	// ==========================================
 	t.Run("API VerifyCode Query Token", func(t *testing.T) {
 		srv.eventBus.PublishEvent(&mail.CachedOTP{
@@ -110,7 +110,7 @@ func TestMailDirectLinks(t *testing.T) {
 			ExpiresAt: time.Now().Add(time.Minute),
 		})
 
-		req := httptest.NewRequest("GET", "/api/verify-code?email="+testEmail+"&token="+secretToken, nil)
+		req := httptest.NewRequest("GET", "/mail/code?email="+testEmail+"&token="+secretToken, nil)
 		rec := httptest.NewRecorder()
 		srv.Handler().ServeHTTP(rec, req)
 
@@ -208,7 +208,7 @@ func TestMailDirectLinks(t *testing.T) {
 	})
 
 	t.Run("Mail View Cannot Override Token Account", func(t *testing.T) {
-		for _, path := range []string{"/mail/view", "/mail/raw", "/api/mail/view", "/api/mail/raw"} {
+		for _, path := range []string{"/mail/view", "/mail/raw", "/mail/view", "/mail/raw"} {
 			for _, parameter := range []string{"account_id", "account"} {
 				req := httptest.NewRequest("GET", path+"?email="+testEmail+"&"+parameter+"=acc_other_2&token="+secretToken, nil)
 				rec := httptest.NewRecorder()

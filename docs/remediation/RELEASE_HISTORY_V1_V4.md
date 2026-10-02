@@ -1,6 +1,6 @@
 # iCloud HME 发布与升级手册 (Release Runbook)
 
-> **文档范围说明**：本文是 V1–V4 历史迁移与回滚记录，不是当前版本的完整发布手册。当前数据库迁移、Schema 版本、Docker Compose 部署和就绪检查以 [docs/remediation/MIGRATION.md](docs/remediation/MIGRATION.md)、[docs/remediation/RELEASE.md](docs/remediation/RELEASE.md) 和 [README.md](README.md) 为准。不要把本文中的 `user_version = 2`、V2/V4 作为当前数据库版本判断。
+> **文档范围说明**：本文是 V1–V4 历史迁移与回滚记录，不是当前版本的完整发布手册。当前数据库迁移、Schema 版本、Docker Compose 部署和就绪检查以 [docs/remediation/MIGRATION.md](MIGRATION.md)、[docs/remediation/RELEASE.md](RELEASE.md) 和 [README.md](../../README.md) 为准。不要把本文中的 `user_version = 2`、V2/V4 作为当前数据库版本判断。
 
 ## V3 → V4 升级
 

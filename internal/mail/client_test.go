@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 testing, net, net/http, net/url, io, time, bufio, internal/mail
- * [OUTPUT]: 对外提供 TestDialHTTPConnectSuccess, TestDialHTTPConnectAuthFailure, TestResolveFoldersFallback
- * [POS]: internal/mail 的 HTTP CONNECT 代理隧道拨号、连通性与文件夹解析单元测试
+ * [OUTPUT]: 对外提供 HTTP CONNECT 连通性、鉴权、预读首包保留与文件夹解析测试
+ * [POS]: internal/mail 的 HTTP CONNECT 代理隧道回归，真实 TCP 验证合并响应首包完整与双向通信
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -9,6 +9,7 @@ package mail
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -75,11 +76,8 @@ func TestDialHTTPConnectSuccess(t *testing.T) {
 
 				_, _ = c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-				// 必须等两个方向都收尾再返回，否则 defer 强关会踩中经典 RST 竞态:
-				// 只等一个方向就返回时，另一个方向仍阻塞在读上，带未读数据关闭连接
-				// 会让内核发 RST，把已经转发给客户端的问候语一并丢掉，
-				// 表现为客户端 ReadString 拿到 EOF。真实代理会保持隧道，
-				// 所以这里也应当等到客户端主动断开。(-race 下调度变慢，该竞态几乎必现)
+				// Join both directions; propagate upstream EOF through a TCP half-close
+				// so buffered tunnel bytes arrive before the client sees EOF.
 				done := make(chan struct{}, 2)
 				go func() {
 					_, _ = io.Copy(targetConn, c)
@@ -87,6 +85,7 @@ func TestDialHTTPConnectSuccess(t *testing.T) {
 				}()
 				go func() {
 					_, _ = io.Copy(c, targetConn)
+					_ = c.(*net.TCPConn).CloseWrite()
 					done <- struct{}{}
 				}()
 				<-done
@@ -102,6 +101,9 @@ func TestDialHTTPConnectSuccess(t *testing.T) {
 		t.Fatalf("dialHTTPConnect 失败: %v", err)
 	}
 	defer tunnelConn.Close()
+	if err := tunnelConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 
 	reader := bufio.NewReader(tunnelConn)
 	line, err := reader.ReadString('\n')
@@ -142,6 +144,65 @@ func TestDialHTTPConnectAuthFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "407") {
 		t.Fatalf("期望错误信息包含 407, 实际得到: %v", err)
+	}
+}
+
+func TestDialHTTPConnectPreservesBufferedTunnelBytes(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-finished:
+		case <-time.After(4 * time.Second):
+			t.Error("CONNECT fixture did not stop")
+		}
+	})
+	go func() {
+		defer close(finished)
+		conn, err := ln.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := http.ReadRequest(bufio.NewReader(conn)); err != nil {
+			done <- err
+			return
+		}
+		// One write coalesces the HTTP header and the first IMAP tunnel bytes.
+		if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n* OK local IMAP ready\r\n"); err != nil {
+			done <- err
+			return
+		}
+		var ack [4]byte
+		_, err = io.ReadFull(conn, ack[:])
+		if err == nil && string(ack[:]) != "PING" {
+			err = fmt.Errorf("unexpected tunnel write %q", ack[:])
+		}
+		done <- err
+	}()
+	proxyURL, _ := url.Parse("http://" + ln.Addr().String())
+	conn, err := dialHTTPConnect(proxyURL, "imap.invalid.example:993", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(time.Second))
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil || line != "* OK local IMAP ready\r\n" {
+		t.Fatalf("first tunnel bytes were lost: line=%q err=%v", line, err)
+	}
+	if _, err := io.WriteString(conn, "PING"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -205,5 +266,3 @@ func TestQQMailboxFolderRole(t *testing.T) {
 		}
 	}
 }
-
-

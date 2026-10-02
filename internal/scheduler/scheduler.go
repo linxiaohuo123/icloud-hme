@@ -141,12 +141,6 @@ func (s *Scheduler) Status() Status {
 	return st
 }
 
-func (s *Scheduler) getStopCh() <-chan struct{} {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.stopCh
-}
-
 func (s *Scheduler) Start() {
 	s.mu.Lock()
 	if s.running {

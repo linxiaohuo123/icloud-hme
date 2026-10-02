@@ -81,7 +81,12 @@ func (m *Manager) updateCookies(id string, cookies map[string]string, saveInvali
 			return err
 		}
 	}
-	entry := m.hmePool.acquire(id)
+	entry, unpin, err := m.hmePool.acquire(id)
+	if err != nil {
+		return err
+	}
+	defer unpin()
+
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 	m.mu.RLock()

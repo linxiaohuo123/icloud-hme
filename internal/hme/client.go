@@ -244,11 +244,6 @@ func requestOrigin(rawURL string) string {
 	return "https://www.icloud.com"
 }
 
-// request 执行带重试的 HTTP 请求,返回响应体字符串。
-func (c *Client) request(method, rawURL string, body any, timeout time.Duration, maxAttempts int) (string, error) {
-	return c.RequestWithContext(context.Background(), method, rawURL, body, timeout, maxAttempts)
-}
-
 // RequestWithContext 执行带 context 贯穿与重试预算的 HTTP 请求 (PR-05)。
 func (c *Client) RequestWithContext(ctx context.Context, method, rawURL string, body any, timeout time.Duration, maxAttempts int) (string, error) {
 	if timeout == 0 {

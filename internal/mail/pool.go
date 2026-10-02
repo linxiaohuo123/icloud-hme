@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, sync, time, fmt, strings
  * [OUTPUT]: 对外提供 Pool, NewPool 等按账号复用的 IMAP 长连接池管理能力
- * [POS]: internal/mail 的连接复用与生命周期管控层，贯穿冷连接取消并接入 MailPerf 观测
+ * [POS]: internal/mail 的连接复用、前后台容量保留与生命周期管控层；排队不占网络名额，关闭时物理断开闲置连接并等待回收协程退出，接入 MailPerf 观测
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -11,14 +11,26 @@ package mail
 import (
 	"container/list"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 )
 
+var (
+	ErrUpstreamBusy = errors.New("上游 IMAP 操作繁忙，已达并发上限")
+	ErrIMAPPoolBusy = errors.New("IMAP 连接池已满且无可安全驱逐条目")
+)
+
 // DefaultMaxConns 默认最大同时持有的 IMAP 长连接数。
 const DefaultMaxConns = 50
+
+// DefaultIMAPMaxActive 默认全局最大活跃操作数
+const DefaultIMAPMaxActive = 32
+
+// DefaultSyncConcurrency 默认后台同步保留并发数
+const DefaultSyncConcurrency = 5
 
 // pooledConnHealthCheckInterval 最近活跃连接免 Ping 快速复用窗口 (PR-MAIL-05)。
 // 在此窗口期内最近使用过的长连接直接复用，消除多余的 NOOP 网络 RTT。
@@ -27,17 +39,26 @@ const pooledConnHealthCheckInterval = 30 * time.Second
 // Pool 管理按账号复用的 IMAP 长连接。同一账号串行使用(go-imap 非并发安全)。
 // 支持 LRU 驱逐与后台空闲连接主动回收，杜绝千号场景下的 socket 泄漏。
 type Pool struct {
-	mu        sync.Mutex
-	items     map[string]*list.Element
-	lruList   *list.List
-	maxConns  int
-	idleClose time.Duration
-	stopCh    chan struct{}
-	closed    bool
+	mu                  sync.Mutex
+	items               map[string]*list.Element
+	lruList             *list.List
+	maxConns            int
+	idleClose           time.Duration
+	stopCh              chan struct{}
+	reaperDone          chan struct{}
+	closed              bool
+	closeDone           chan struct{} // 支持重复/并发 Close 安全等待首次完成
+	maxActive           int           // 全局最大活跃操作
+	reservedForSync     int           // 为后台同步保留的活跃操作数与池条目容量
+	activeOps           int           // 当前正在进行网络 I/O 的总操作数
+	activeForegroundOps int           // 当前正在进行网络 I/O 的前台操作数
+	foregroundEntries   int           // 当前已被前台引用的不同条目数量 (T03)
 }
 
 type pooledConn struct {
 	sem         chan struct{} // 单账号并发信号量 (cap=1)，支持真正的无泄露 Context 超时
+	pinCount    int           // 引用计数，>0 时不可驱逐
+	fgPinCount  int           // 前台引用计数 (T03)
 	appleID     string
 	appPassword string
 	server      string
@@ -69,12 +90,29 @@ func (pc *pooledConn) tryLock() bool {
 
 // NewPool 创建连接池。
 func NewPool() *Pool {
+	return NewPoolWithLimits(DefaultMaxConns, DefaultIMAPMaxActive, DefaultSyncConcurrency)
+}
+
+// NewPoolWithLimits 创建指定容量与并发控制的连接池。
+func NewPoolWithLimits(maxConns, maxActive, reservedForSync int) *Pool {
+	if maxConns <= 0 {
+		maxConns = DefaultMaxConns
+	}
+	if maxActive <= 0 {
+		maxActive = DefaultIMAPMaxActive
+	}
+	if reservedForSync < 0 {
+		reservedForSync = DefaultSyncConcurrency
+	}
 	p := &Pool{
-		items:     make(map[string]*list.Element),
-		lruList:   list.New(),
-		maxConns:  DefaultMaxConns,
-		idleClose: 10 * time.Minute,
-		stopCh:    make(chan struct{}),
+		items:           make(map[string]*list.Element),
+		lruList:         list.New(),
+		maxConns:        maxConns,
+		maxActive:       maxActive,
+		reservedForSync: reservedForSync,
+		idleClose:       10 * time.Minute,
+		stopCh:          make(chan struct{}),
+		reaperDone:      make(chan struct{}),
 	}
 	go p.reaperLoop()
 	return p
@@ -91,13 +129,114 @@ func (p *Pool) SetMaxConns(max int) {
 	p.evictOldestLocked()
 }
 
-// DoContext 借出已连接的 Client 执行 fn，支持真实 Context 超时与取消 (Issue 13)。
-func (p *Pool) DoContext(ctx context.Context, appleID, appPassword, proxyURL string, fn func(*Client) error) error {
-	return p.DoContextWithServer(ctx, appleID, appPassword, IMAPServer, IMAPPort, proxyURL, fn)
+// SetLimits 动态更新连接池容量与并发限制。
+func (p *Pool) SetLimits(maxConns, maxActive, reservedForSync int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if maxConns > 0 {
+		p.maxConns = maxConns
+		p.evictOldestLocked()
+	}
+	if maxActive > 0 {
+		p.maxActive = maxActive
+	}
+	if reservedForSync > 0 {
+		p.reservedForSync = reservedForSync
+	}
 }
 
-// DoContextWithServer 借出指定服务器与端口的已连接 Client 执行 fn，支持真实 Context 超时与取消。
+// Stats 返回当前池连接数及总活跃/前台活跃操作数。
+func (p *Pool) Stats() (conns, active, activeForeground int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.items), p.activeOps, p.activeForegroundOps
+}
+
+// acquireActiveOp 申请全局活跃操作槽位，前台受保留配额约束，超限立即返回 ErrUpstreamBusy。
+func (p *Pool) acquireActiveOp(ctx context.Context, isBackground bool) (func(), error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed {
+		return nil, fmt.Errorf("连接池已关闭")
+	}
+
+	maxActive := p.maxActive
+	if maxActive <= 0 {
+		maxActive = DefaultIMAPMaxActive
+	}
+	reserved := p.reservedForSync
+	if reserved <= 0 {
+		reserved = DefaultSyncConcurrency
+	}
+
+	if !isBackground {
+		fgLimit := maxActive - reserved
+		if fgLimit < 1 {
+			fgLimit = 1
+		}
+		if p.activeForegroundOps >= fgLimit || p.activeOps >= maxActive {
+			return nil, ErrUpstreamBusy
+		}
+	} else {
+		if p.activeOps >= maxActive {
+			return nil, ErrUpstreamBusy
+		}
+	}
+
+	p.activeOps++
+	if !isBackground {
+		p.activeForegroundOps++
+	}
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			p.mu.Lock()
+			p.activeOps--
+			if !isBackground {
+				p.activeForegroundOps--
+			}
+			if p.activeOps < 0 {
+				p.activeOps = 0
+			}
+			if p.activeForegroundOps < 0 {
+				p.activeForegroundOps = 0
+			}
+			p.mu.Unlock()
+		})
+	}
+	return release, nil
+}
+
+type backgroundOpContextKey struct{}
+
+// WithBackgroundOp 标记 Context 发起的 IMAP 操作为后台类别（受保留配额保护）
+func WithBackgroundOp(ctx context.Context) context.Context {
+	return context.WithValue(ctx, backgroundOpContextKey{}, true)
+}
+
+// IsBackgroundOp 判断 Context 是否包含后台操作标记
+func IsBackgroundOp(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, ok := ctx.Value(backgroundOpContextKey{}).(bool)
+	return ok && v
+}
+
+// DoContext 借出已连接的 Client 执行 fn，支持真实 Context 超时与取消，并自动识别后台类别。
+func (p *Pool) DoContext(ctx context.Context, appleID, appPassword, proxyURL string, fn func(*Client) error) error {
+	return p.DoContextWithServerAndKind(ctx, appleID, appPassword, IMAPServer, IMAPPort, proxyURL, IsBackgroundOp(ctx), fn)
+}
+
+// DoContextWithServer 借出指定服务器与端口的已连接 Client 执行 fn，支持真实 Context 超时与取消，并自动识别后台类别。
 func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server string, port int, proxyURL string, fn func(*Client) error) error {
+	return p.DoContextWithServerAndKind(ctx, email, password, server, port, proxyURL, IsBackgroundOp(ctx), fn)
+}
+
+// DoContextWithServerAndKind 借出已连接 Client 执行 fn，区分前台请求与后台同步，并实行活跃操作上限控制与 Pin 防淘汰保护。
+func (p *Pool) DoContextWithServerAndKind(ctx context.Context, email, password, server string, port int, proxyURL string, isBackground bool, fn func(*Client) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -111,11 +250,15 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 	if port <= 0 {
 		port = IMAPPort
 	}
-	pc := p.getOrCreateWithServer(email, server, port)
-	if pc == nil {
-		return fmt.Errorf("连接池已关闭")
-	}
 
+	// 1. 从连接池获取/创建条目并 Pin（条目在借出期间 pinCount > 0，不可被 LRU 驱逐，前台受保留条目配额约束 T03）
+	pc, unpin, err := p.getOrCreateWithServerAndPinAndKind(email, server, port, isBackground)
+	if err != nil {
+		return err
+	}
+	defer unpin()
+
+	// 2. 单账号可取消串行锁等待（排队等待时不占用全局网络活跃操作配额，S02）
 	poolWaitStart := time.Now()
 	select {
 	case pc.sem <- struct{}{}:
@@ -124,10 +267,24 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 	}
 	poolWaitMS := time.Since(poolWaitStart).Milliseconds()
 
+	// 检查池是否已关闭，避免在 Close 后继续执行或重建客户端 (S03)
+	p.mu.Lock()
+	poolClosed := p.closed
+	p.mu.Unlock()
+	if poolClosed {
+		pc.unlock()
+		return fmt.Errorf("连接池已关闭")
+	}
+
+	// 3. 拿到单账号锁后，申请全局活跃操作名额（前台受保留配额保护）
+	releaseOp, err := p.acquireActiveOp(ctx, isBackground)
+	if err != nil {
+		pc.unlock()
+		return err
+	}
+	defer releaseOp()
+
 	// perfRecord 只收集纯数据；最终 defer 在释放 pc.sem 之后才输出日志 (FIX-1)。
-	// 标准库 log.Print 是同步输出，若在持有单账号 IMAP slot 期间执行会人为延长 slot 占用并污染 pool_wait_ms 观测。
-	// 本 defer 注册最早 → LIFO 最后执行，天然保证时序:
-	//   连接状态收尾 (函数体内) → deadline 清理 → stopWatch 关闭 → pc.unlock → LogMailPerf
 	var perf *poolPerfRecord
 	defer func() {
 		pc.unlock()
@@ -193,7 +350,7 @@ func (p *Pool) DoContextWithServer(ctx context.Context, email, password, server 
 	}
 
 	opStart := time.Now()
-	err := fn(cli)
+	err = fn(cli)
 	perf.opMS = time.Since(opStart).Milliseconds()
 	if stopCancel != nil {
 		stopCancel()
@@ -227,27 +384,42 @@ func (p *Pool) Do(appleID, appPassword, proxyURL string, fn func(*Client) error)
 }
 
 // Close 关闭池内全部连接并停止后台回收协程。
+// 必须在释放池锁 p.mu 之后再断开具体连接，严禁持全局 map 锁等待连接信号量或网络 I/O，杜绝 ABBA 死锁。
 func (p *Pool) Close() {
 	p.mu.Lock()
 	if p.closed {
+		done := p.closeDone
 		p.mu.Unlock()
+		if done != nil {
+			<-done
+		}
 		return
 	}
 	p.closed = true
+	p.closeDone = make(chan struct{})
 	close(p.stopCh)
 
-	for k, elem := range p.items {
-		pc := elem.Value.(*pooledConn)
+	toClose := make([]*pooledConn, 0, len(p.items))
+	for _, elem := range p.items {
+		toClose = append(toClose, elem.Value.(*pooledConn))
+	}
+	p.items = make(map[string]*list.Element)
+	p.lruList.Init()
+	p.foregroundEntries = 0
+	p.mu.Unlock()
+
+	for _, pc := range toClose {
 		pc.lock()
 		if pc.client != nil {
-			pc.client.Disconnect()
+			// 已停止准入且持有账号锁，直接关闭闲置连接，避免串行等待 LOGOUT。
+			pc.client.ForceClose()
 			pc.client = nil
 		}
 		pc.unlock()
-		delete(p.items, k)
 	}
-	p.lruList.Init()
-	p.mu.Unlock()
+
+	<-p.reaperDone
+	close(p.closeDone)
 }
 
 func poolKey(email, server string, port int) string {
@@ -263,10 +435,22 @@ func (p *Pool) getOrCreate(appleID string) *pooledConn {
 }
 
 func (p *Pool) getOrCreateWithServer(email, server string, port int) *pooledConn {
+	pc, unpin, _ := p.getOrCreateWithServerAndPin(email, server, port)
+	if unpin != nil {
+		unpin()
+	}
+	return pc
+}
+
+func (p *Pool) getOrCreateWithServerAndPin(email, server string, port int) (*pooledConn, func(), error) {
+	return p.getOrCreateWithServerAndPinAndKind(email, server, port, false)
+}
+
+func (p *Pool) getOrCreateWithServerAndPinAndKind(email, server string, port int, isBackground bool) (*pooledConn, func(), error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
-		return nil
+		return nil, nil, fmt.Errorf("连接池已关闭")
 	}
 	server = strings.TrimSpace(server)
 	if server == "" {
@@ -276,23 +460,86 @@ func (p *Pool) getOrCreateWithServer(email, server string, port int) *pooledConn
 		port = IMAPPort
 	}
 	key := poolKey(email, server, port)
-	if elem, ok := p.items[key]; ok {
-		p.lruList.MoveToFront(elem)
-		return elem.Value.(*pooledConn)
+
+	reserved := p.reservedForSync
+	if reserved >= p.maxConns {
+		reserved = p.maxConns - 1
+		if reserved < 0 {
+			reserved = 0
+		}
+	}
+	maxFgEntries := p.maxConns - reserved
+	if maxFgEntries <= 0 {
+		maxFgEntries = 1
 	}
 
-	// 超出容量上限时，驱逐最久未使用的空闲连接
+	if elem, ok := p.items[key]; ok {
+		pc := elem.Value.(*pooledConn)
+		if !isBackground {
+			if pc.fgPinCount == 0 && p.foregroundEntries >= maxFgEntries {
+				return nil, nil, ErrIMAPPoolBusy
+			}
+			pc.fgPinCount++
+			if pc.fgPinCount == 1 {
+				p.foregroundEntries++
+			}
+		}
+		pc.pinCount++
+		p.lruList.MoveToFront(elem)
+		return pc, p.makeUnpinLocked(pc, isBackground), nil
+	}
+
+	// 新条目借用：前台必须受限于最大前台条目配额 (T03)
+	if !isBackground && p.foregroundEntries >= maxFgEntries {
+		return nil, nil, ErrIMAPPoolBusy
+	}
+
+	// 超出容量上限时，驱逐最久未使用的非 Pin 空闲连接
 	p.evictOldestLocked()
 
+	// 若驱逐后仍达池容量上限，说明全量连接在用或被 Pin，严格拒绝无界扩容
+	if p.lruList.Len() >= p.maxConns {
+		return nil, nil, ErrIMAPPoolBusy
+	}
+
 	pc := &pooledConn{
-		appleID: email,
-		server:  server,
-		port:    port,
-		sem:     make(chan struct{}, 1),
+		appleID:  email,
+		server:   server,
+		port:     port,
+		sem:      make(chan struct{}, 1),
+		pinCount: 1,
+	}
+	if !isBackground {
+		pc.fgPinCount = 1
+		p.foregroundEntries++
 	}
 	elem := p.lruList.PushFront(pc)
 	p.items[key] = elem
-	return pc
+	return pc, p.makeUnpinLocked(pc, isBackground), nil
+}
+
+func (p *Pool) makeUnpinLocked(pc *pooledConn, isBackground bool) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.mu.Lock()
+			pc.pinCount--
+			if pc.pinCount < 0 {
+				pc.pinCount = 0
+			}
+			if !isBackground {
+				pc.fgPinCount--
+				if pc.fgPinCount <= 0 {
+					pc.fgPinCount = 0
+					p.foregroundEntries--
+					if p.foregroundEntries < 0 {
+						p.foregroundEntries = 0
+					}
+				}
+			}
+			p.mu.Unlock()
+		})
+	}
 }
 
 // evictOldestLocked 淘汰超出 maxConns 的旧连接。调用方必须持有 p.mu。
@@ -301,8 +548,8 @@ func (p *Pool) evictOldestLocked() {
 	for p.lruList.Len() >= p.maxConns && elem != nil {
 		prev := elem.Prev()
 		pc := elem.Value.(*pooledConn)
-		// 仅淘汰当前空闲且非使用中的连接，杜绝将正在并发执行操作的活跃连接析构或漏泄
-		if pc.tryLock() {
+		// 仅淘汰当前未被 Pin 且非使用中的空闲连接，杜绝将正在并发执行操作的活跃连接析构或漏泄
+		if pc.pinCount == 0 && pc.tryLock() {
 			if pc.client != nil {
 				pc.client.forceClose()
 				pc.client = nil
@@ -311,6 +558,12 @@ func (p *Pool) evictOldestLocked() {
 			p.lruList.Remove(elem)
 			key := poolKey(pc.appleID, pc.server, pc.port)
 			delete(p.items, key)
+			if pc.fgPinCount > 0 {
+				p.foregroundEntries--
+				if p.foregroundEntries < 0 {
+					p.foregroundEntries = 0
+				}
+			}
 		}
 		elem = prev
 	}
@@ -318,6 +571,7 @@ func (p *Pool) evictOldestLocked() {
 
 // reaperLoop 定时扫描空闲过久的连接并断开，防止无期限占用系统句柄。
 func (p *Pool) reaperLoop() {
+	defer close(p.reaperDone)
 	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
 
@@ -524,8 +778,13 @@ func isLikelyConnErr(err error) bool {
 
 // SetClientForTesting 供测试在无需真实 Apple IMAP 认证时注入已初始化的 Client 验证生产连接池生命周期
 func (p *Pool) SetClientForTesting(appleID, appPassword string, cli *Client) {
-	pc := p.getOrCreate(appleID)
-	pc.appPassword = appPassword
+	p.SetClientForTestingWithServer(appleID, appPassword, IMAPServer, IMAPPort, cli)
+}
+
+// SetClientForTestingWithServer 注入仅使用本地协议端点的连接，避免测试重连访问公网。
+func (p *Pool) SetClientForTestingWithServer(email, password, server string, port int, cli *Client) {
+	pc := p.getOrCreateWithServer(email, server, port)
+	pc.appPassword = password
 	pc.lastUsed = time.Now()
 	pc.client = cli
 }

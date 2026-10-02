@@ -82,6 +82,27 @@ func (s *Server) systemStatsHandler(c *gin.Context) {
 		stats["message_cache_entries"] = 0
 	}
 
+	// 准入与并发控制水位 (PR-CONCURRENCY T10)
+	if s.requestLimiter != nil {
+		stats["request_limits"] = s.requestLimiter.Stats()
+	}
+	if s.be != nil {
+		if imapStats, ok := s.be.(interface{ IMAPPoolStats() (int, int, int) }); ok {
+			conns, active, fg := imapStats.IMAPPoolStats()
+			stats["imap_pool"] = gin.H{
+				"connections":       conns,
+				"active_operations": active,
+				"active_foreground": fg,
+			}
+		}
+		if hmeStats, ok := s.be.(interface{ HMEPoolStats() (int, int) }); ok {
+			conns, active := hmeStats.HMEPoolStats()
+			stats["hme_pool"] = gin.H{
+				"cached_clients":    conns,
+				"active_operations": active,
+			}
+		}
+	}
 	// 后台引擎状态
 	stats["engines"] = gin.H{
 		"mail_subscribers":        s.eventBus.HasSubscribers(),

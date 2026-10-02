@@ -28,7 +28,9 @@ func (s *Store) ClaimInventoryAlias(
 	idempKey = strings.TrimSpace(idempKey)
 	now := time.Now().UTC().Format(time.RFC3339)
 
-	s.mu.Lock()
+	if err := s.mu.LockContext(ctx); err != nil {
+		return nil, nil, err
+	}
 	defer s.mu.Unlock()
 
 	currentHash := reqHash

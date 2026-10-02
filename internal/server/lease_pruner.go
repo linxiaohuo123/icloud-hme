@@ -19,11 +19,6 @@ import (
 const (
 	// leasePruneInterval 是清理任务的执行周期(每天一次)
 	leasePruneInterval = 24 * time.Hour
-	// leasePruneBatch 是单批删除条数
-	leasePruneBatch = 5000
-	// leasePruneMaxBatches 限制单次运行的最大批数，避免一次清理长时间占用写锁。
-	// 每批 5000 条 × 100 批 = 单次最多 50 万条，剩余留到下次运行继续。
-	leasePruneMaxBatches = 100
 	// leasePruneInitialDelay 首次执行前的等待，错开启动期
 	leasePruneInitialDelay = 5 * time.Minute
 )

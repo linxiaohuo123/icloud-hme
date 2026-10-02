@@ -53,7 +53,7 @@ func TestPR04_A01_CrossTokenVerificationIsolation(t *testing.T) {
 	defer ts.Close()
 
 	// 1. 冷缓存测试：Token A 试图直接查询属于 Token B 的邮箱验证码
-	reqCold := authedReq(t, ts, "GET", "/api/verify-code?email=victim@icloud.com&timeout=1", "")
+	reqCold := authedReq(t, ts, "GET", "/mail/code?email=victim@icloud.com&timeout=1", "")
 	reqCold.Header.Set("X-API-Key", tokA.Token)
 
 	statusCold, bodyCold, _ := do(t, reqCold)
@@ -65,7 +65,7 @@ func TestPR04_A01_CrossTokenVerificationIsolation(t *testing.T) {
 	s.eventBus.Publish("victim@icloud.com", "acc_1", "您的验证码是 889900", "sender@example.com", "2026-09-21 12:00:00", &mail.OTPResult{Code: "889900"})
 
 	// Token A 再次试图拉取热缓存中的验证码
-	reqHot := authedReq(t, ts, "GET", "/api/verify-code?email=victim@icloud.com&timeout=1", "")
+	reqHot := authedReq(t, ts, "GET", "/mail/code?email=victim@icloud.com&timeout=1", "")
 	reqHot.Header.Set("X-API-Key", tokA.Token)
 
 	statusHot, bodyHot, _ := do(t, reqHot)
@@ -74,7 +74,7 @@ func TestPR04_A01_CrossTokenVerificationIsolation(t *testing.T) {
 	}
 
 	// 3. 验证拥有者 Token B 可以正常读取
-	reqOwner := authedReq(t, ts, "GET", "/api/verify-code?email=victim@icloud.com&timeout=1", "")
+	reqOwner := authedReq(t, ts, "GET", "/mail/code?email=victim@icloud.com&timeout=1", "")
 	reqOwner.Header.Set("X-API-Key", tokB.Token)
 
 	statusOwner, bodyOwner, _ := do(t, reqOwner)
@@ -150,7 +150,7 @@ func TestPR04_A04_TokenRenameAndRecreateNoDataLeak(t *testing.T) {
 	defer ts.Close()
 
 	// 新令牌试图读取同名旧令牌的历史别名，必须返回 404，绝不越权继承！
-	req := authedReq(t, ts, "GET", "/api/verify-code?email=cs_mail@icloud.com&timeout=1", "")
+	req := authedReq(t, ts, "GET", "/mail/code?email=cs_mail@icloud.com&timeout=1", "")
 	req.Header.Set("X-API-Key", tokNew.Token)
 
 	status, body, _ := do(t, req)
@@ -185,7 +185,7 @@ func TestPR04_A05_TokenRevocationDuringLongPoll(t *testing.T) {
 	var body string
 
 	go func() {
-		req := authedReq(t, ts, "GET", "/api/verify-code?email=ephemeral@icloud.com&timeout=5", "")
+		req := authedReq(t, ts, "GET", "/mail/code?email=ephemeral@icloud.com&timeout=5", "")
 		req.Header.Set("X-API-Key", tok.Token)
 		status, body, _ = do(t, req)
 		close(doneCh)

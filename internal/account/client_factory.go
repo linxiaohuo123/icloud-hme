@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/hme, internal/mail, time, strings, fmt
  * [OUTPUT]: 对外提供 HMEClient, HMEClientWithPassword, MailClient, WithMailClient, WebMailClient
- * [POS]: internal/account 的外设客户端装配与连接池驱动工厂，密码登录回写按凭据代际校验
+ * [POS]: internal/account 的外设客户端装配与连接池驱动工厂，IMAP 读取固定物理来源和账号配置快照，密码登录回写按凭据代际校验
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -9,6 +9,8 @@ package account
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -48,7 +50,12 @@ func (m *Manager) HMEClient(id string, verbose bool) (*hme.Client, error) {
 // HMEClientWithPassword 为指定账号创建一个新的 HME 客户端,使用账号密码登录。
 // 支持两阶段 2FA 认证挂起与恢复；登录成功后会自动获取 Cookie 并保存到账号配置。
 func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTPProvider) (*hme.Client, error) {
-	entry := m.hmePool.acquire(id)
+	entry, unpin, err := m.hmePool.acquire(id)
+	if err != nil {
+		return nil, err
+	}
+	defer unpin()
+
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 	m.mu.RLock()
@@ -225,34 +232,77 @@ func (m *Manager) MailClient(id string) (*mail.Client, error) {
 	return mail.NewClientWithProxy(imapEmail, snap.AppPassword, proxy), nil
 }
 
-// WithMailClientContext 使用连接池中的长连接执行 fn，支持真实 Context 超时与取消 (Issue 13)。
+// WithMailClientContext 使用连接池中的长连接执行 fn，支持真实 Context 超时与取消 (Issue 13)，并自动识别后台类别。
 func (m *Manager) WithMailClientContext(ctx context.Context, id string, fn func(*mail.Client) error) error {
+	return m.WithMailClientContextAndKind(ctx, id, mail.IsBackgroundOp(ctx), fn)
+}
+
+// WithMailClientContextAndKind 使用连接池中的长连接执行 fn，显式指定前后台操作类别并受前后台配额控制。
+func (m *Manager) WithMailClientContextAndKind(ctx context.Context, id string, isBackground bool, fn func(*mail.Client) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	m.mu.RLock()
-	acc, ok := m.accounts[id]
-	var mailbox *MailboxConfig
-	var proxyURL string
-	if ok {
-		if acc.Mailbox != nil {
-			copy := *acc.Mailbox
-			mailbox = &copy
-		}
-		proxyURL = acc.Proxy
+	snap, err := m.mailAccountSnapshot(ctx, id)
+	if err != nil {
+		return err
 	}
-	m.mu.RUnlock()
+	mailbox := snap.Mailbox
+	proxyURL := snap.Proxy
 	if mailbox != nil && mailbox.Email != "" && mailbox.Password != "" {
 		if os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "true" || os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "1" {
 			proxyURL = ""
 		}
-		return m.getIMAPPool().DoContextWithServer(ctx, mailbox.Email, mailbox.Password, mailbox.IMAPHost, mailbox.IMAPPort, proxyURL, fn)
+		return m.getIMAPPool().DoContextWithServerAndKind(ctx, mailbox.Email, mailbox.Password, mailbox.IMAPHost, mailbox.IMAPPort, proxyURL, isBackground, fn)
 	}
-	imapEmail, appPassword, proxyURL, err := m.imapCreds(id)
+	imapEmail, appPassword, proxyURL, err := nativeIMAPCreds(snap)
 	if err != nil {
 		return err
 	}
-	return m.getIMAPPool().DoContext(ctx, imapEmail, appPassword, proxyURL, fn)
+	return m.getIMAPPool().DoContextWithServerAndKind(ctx, imapEmail, appPassword, mail.IMAPServer, mail.IMAPPort, proxyURL, isBackground, fn)
+}
+
+type mailAccountSnapshotKey struct{}
+
+// CaptureMailContext 固定整轮读取的账号配置。来源只包含物理邮箱身份，
+// 连接指纹还包含授权码和代理；普通凭据轮换不改变持久化任务的来源。
+func (m *Manager) CaptureMailContext(ctx context.Context, id string) (context.Context, string, string, error) {
+	snap, err := m.mailAccountSnapshot(ctx, id)
+	if err != nil {
+		return ctx, "", "", err
+	}
+	ctx = context.WithValue(ctx, mailAccountSnapshotKey{}, snap)
+	email, password, proxyURL, err := nativeIMAPCreds(snap)
+	host, port := mail.IMAPServer, mail.IMAPPort
+	if mb := snap.Mailbox; mb != nil && mb.Email != "" && mb.Password != "" {
+		email, password, proxyURL, err = mb.Email, mb.Password, snap.Proxy, nil
+		host, port = strings.TrimSpace(mb.IMAPHost), mb.IMAPPort
+		if host == "" {
+			host = mail.IMAPServer
+		}
+		if port <= 0 {
+			port = mail.IMAPPort
+		}
+	}
+	if err != nil {
+		// 无 IMAP 配置仍保留现有 WebMail 能力判断，由基线接口明确拒绝严格取码。
+		return ctx, "", "", nil
+	}
+	if os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "true" || os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "1" {
+		proxyURL = ""
+	}
+	identity, _ := json.Marshal([]any{strings.ToLower(strings.TrimSpace(email)), strings.ToLower(strings.TrimSpace(host)), port})
+	connection, _ := json.Marshal([]any{string(identity), password, proxyURL})
+	return ctx, fmt.Sprintf("imap:%x", sha256.Sum256(identity)), fmt.Sprintf("imap:%x", sha256.Sum256(connection)), nil
+}
+
+func (m *Manager) mailAccountSnapshot(ctx context.Context, id string) (*Account, error) {
+	if snap, ok := ctx.Value(mailAccountSnapshotKey{}).(*Account); ok && snap.ID == id {
+		return snap, nil
+	}
+	if snap, ok := m.GetAccount(id); ok {
+		return snap, nil
+	}
+	return nil, fmt.Errorf("账号不存在: %s", id)
 }
 
 // WithMailClient 使用连接池中的长连接执行 fn(串行/账号级)。
@@ -288,6 +338,10 @@ func (m *Manager) imapCreds(id string) (imapEmail, appPassword, proxyURL string,
 	if !ok {
 		return "", "", "", fmt.Errorf("账号不存在: %s", id)
 	}
+	return nativeIMAPCreds(snap)
+}
+
+func nativeIMAPCreds(snap *Account) (imapEmail, appPassword, proxyURL string, err error) {
 	imapEmail = snap.ICloudEmail
 	if imapEmail == "" {
 		imapEmail = snap.RealEmail

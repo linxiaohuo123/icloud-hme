@@ -197,7 +197,7 @@ func TestPR08_FinalHardening_TokenIdentityIsolation(t *testing.T) {
 	}
 
 	// 6. Token B 试图通过 v1 接口获取 Token A 别名的验证码 -> 必须返回 404
-	v1ReqB, _ := http.NewRequest("GET", ts.URL+"/api/external/v1/verify-code?email="+targetEmail+"&timeout=1", nil)
+	v1ReqB, _ := http.NewRequest("GET", ts.URL+"/mail/code?email="+targetEmail+"&timeout=1", nil)
 	v1ReqB.Header.Set("Authorization", "Bearer secret-token-bbb-222")
 
 	v1RespB, err := http.DefaultClient.Do(v1ReqB)
@@ -212,9 +212,9 @@ func TestPR08_FinalHardening_TokenIdentityIsolation(t *testing.T) {
 }
 
 // ============================================================================
-// PR-08 Final Hardening §2: external/v2/allocate 也统一进入 AliasAllocationService
+// PR-08 Final Hardening §2: 外部令牌唯一出号入口 external/v2/allocate 的权限护栏
 // ============================================================================
-func TestPR08_FinalHardening_AllFiveAllocateEndpointsUnified(t *testing.T) {
+func TestPR08_FinalHardening_ExternalAllocateGuards(t *testing.T) {
 	st, _, ts := setupAllocTestServer(t)
 	defer st.Close()
 	defer ts.Close()
@@ -234,14 +234,10 @@ func TestPR08_FinalHardening_AllFiveAllocateEndpointsUnified(t *testing.T) {
 		url               string
 		requireIdempotent bool
 	}{
-		{url: "/api/quick-create", requireIdempotent: false},
-		{url: "/api/alias/lease", requireIdempotent: false},
-		{url: "/api/allocate", requireIdempotent: false},
-		{url: "/api/external/v1/allocate", requireIdempotent: false},
 		{url: "/api/external/v2/allocate", requireIdempotent: true},
 	}
 
-	// 1. 外部令牌试图指定 account_id，所有 5 个端点统一返回 403 FORBIDDEN
+	// 1. 外部令牌试图指定 account_id，返回 403 FORBIDDEN
 	for _, ep := range endpoints {
 		t.Run("ForbidAccountID_"+ep.url, func(t *testing.T) {
 			body, _ := json.Marshal(map[string]interface{}{
@@ -265,7 +261,7 @@ func TestPR08_FinalHardening_AllFiveAllocateEndpointsUnified(t *testing.T) {
 		})
 	}
 
-	// 2. 外部令牌试图指定 mode=create，所有 5 个端点统一阻断并返回 503 (ALLOCATION_STATE_NOT_READY)
+	// 2. 外部令牌试图指定 mode=create，阻断并返回 503 (ALLOCATION_STATE_NOT_READY)
 	for _, ep := range endpoints {
 		t.Run("ForbidCreateMode_"+ep.url, func(t *testing.T) {
 			body, _ := json.Marshal(map[string]interface{}{

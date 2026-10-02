@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 database/sql, fmt, strings, time, sync
  * [OUTPUT]: 对外提供 CurrentSchemaVersion, schemaExecutor 接口, migrateV0ToV1, validateSchema, SetBeforeMigrationStepHookForTest
- * [POS]: internal/store 的版本化架构与终态校验，v9 要求 Reserve 意图用途字段，唯一性契约覆盖整张表
+ * [POS]: internal/store 的版本化架构与终态校验，v12 持久化取码物理邮箱来源并失效来源未知的旧活跃任务，保留完整唯一性契约
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -15,8 +15,8 @@ import (
 	"time"
 )
 
-// CurrentSchemaVersion 数据库正式版本基线
-const CurrentSchemaVersion = 9
+// CurrentSchemaVersion 数据库正式版本基线 (v12: 取码任务物理邮箱来源)
+const CurrentSchemaVersion = 12
 
 type schemaExecutor interface {
 	Exec(query string, args ...any) (sql.Result, error)
@@ -409,6 +409,8 @@ func migrateV0ToV1(tx *sql.Tx) error {
 		{"verification_requests", "matched_event_ref", "TEXT DEFAULT ''"},
 		{"verification_requests", "code", "TEXT DEFAULT ''"},
 		{"verification_requests", "magic_link", "TEXT DEFAULT ''"},
+		{"verification_requests", "idempotency_key", "TEXT DEFAULT ''"},
+		{"verification_requests", "idempotency_hash", "TEXT DEFAULT ''"},
 	}
 
 	for _, c := range colsToAdd {
@@ -494,6 +496,8 @@ func migrateV0ToV1(tx *sql.Tx) error {
 	CREATE INDEX IF NOT EXISTS idx_vreq_principal ON verification_requests (principal_kind, principal_id);
 	CREATE INDEX IF NOT EXISTS idx_vreq_lease ON verification_requests (lease_id);
 	CREATE INDEX IF NOT EXISTS idx_vreq_email ON verification_requests (alias_email);
+	CREATE INDEX IF NOT EXISTS idx_vreq_status_exp ON verification_requests (status, expires_at);
+	CREATE UNIQUE INDEX IF NOT EXISTS uidx_vreq_idempotency ON verification_requests (principal_kind, principal_id, idempotency_key) WHERE idempotency_key != '';
 	CREATE INDEX IF NOT EXISTS idx_hme_intents_unresolved ON hme_reserve_intents (account_id, state);
 	`
 	if _, err := tx.Exec(indexesDDL); err != nil {
@@ -641,6 +645,39 @@ func validateSchema(db *sql.DB) error {
 	return validateSchemaVersion(db, CurrentSchemaVersion)
 }
 
+func migrateV10ToV11(tx *sql.Tx) error {
+	if _, err := tx.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_vreq_email_normalized ON verification_requests(LOWER(TRIM(alias_email)), status, expires_at);
+		DROP INDEX IF EXISTS idx_vreq_principal;
+		CREATE INDEX idx_vreq_principal ON verification_requests(principal_kind, principal_id, status, expires_at);
+	`); err != nil {
+		return fmt.Errorf("create verification hot-path indexes: %w", err)
+	}
+	if err := callMigrationStepHook("v11_after_verification_indexes"); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`PRAGMA user_version=11;`)
+	return err
+}
+
+func migrateV11ToV12(tx *sql.Tx) error {
+	for _, col := range []string{"baseline_source", "baseline_account_id"} {
+		if err := ensureColumn(tx, "verification_requests", col, "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+	// 旧任务无法证明基线来自哪个物理邮箱，不用当前配置猜测历史来源。
+	if _, err := tx.Exec(`UPDATE verification_requests SET status='invalidated'
+		WHERE status IN ('pending','ready') AND COALESCE(baseline_source,'')=''`); err != nil {
+		return err
+	}
+	if err := callMigrationStepHook("v12_after_verification_sources"); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`PRAGMA user_version=12`)
+	return err
+}
+
 func validateSchemaVersion(db *sql.DB, expectedVersion int) error {
 	// 1. 检查 user_version
 	var v int
@@ -741,6 +778,17 @@ func validateSchemaVersion(db *sql.DB, expectedVersion int) error {
 	if expectedVersion >= 9 {
 		requiredCols = append(requiredCols, struct{ table, col string }{"hme_reserve_intents", "purpose"})
 	}
+	if expectedVersion >= 10 {
+		requiredCols = append(requiredCols,
+			struct{ table, col string }{"verification_requests", "idempotency_key"},
+			struct{ table, col string }{"verification_requests", "idempotency_hash"},
+		)
+	}
+	if expectedVersion >= 12 {
+		for _, col := range []string{"baseline_source", "baseline_account_id"} {
+			requiredCols = append(requiredCols, struct{ table, col string }{"verification_requests", col})
+		}
+	}
 	for _, rc := range requiredCols {
 		has, err := tableHasColumn(db, rc.table, rc.col)
 		if err != nil || !has {
@@ -783,6 +831,12 @@ func validateSchemaVersion(db *sql.DB, expectedVersion int) error {
 	}
 	if expectedVersion >= 7 {
 		requiredIndexes = append(requiredIndexes, "idx_camoufox_tasks_task")
+	}
+	if expectedVersion >= 10 {
+		requiredIndexes = append(requiredIndexes, "idx_vreq_status_exp", "uidx_vreq_idempotency")
+	}
+	if expectedVersion >= 11 {
+		requiredIndexes = append(requiredIndexes, "idx_vreq_email_normalized", "idx_vreq_principal")
 	}
 	for _, idx := range requiredIndexes {
 		var count int

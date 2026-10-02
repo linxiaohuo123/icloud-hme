@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/mail, internal/account
- * [OUTPUT]: 对外提供 managerBackend 的邮件收发与邮箱管理方法 (ListInbox, ListMailboxes, GetMessage, GetMessages, DeleteMessage, ScanMailboxUIDPage, GetMailboxBoundaryContext)、parseMessageID 与 InboxQuery, InboxResult, ScanPageQuery, ScanPageResult, MessageRef 类型
- * [POS]: internal/server 的邮件业务门面实现；IMAP 批量正文逐项隔离失败，基线保留真实 IMAP 故障，WebMail 详情标记为不完整预览，接入 MailPerf 观测
+ * [OUTPUT]: 对外提供 managerBackend 的邮件收发与邮箱管理方法 (ListInbox, ListMailboxes, GetMessage, GetMessages, DeleteMessage, ScanMailboxUIDPage, GetMailboxBoundaryContext)、mailBusyErr、parseMessageID 与 InboxQuery, InboxResult, ScanPageQuery, ScanPageResult, MessageRef 类型
+ * [POS]: internal/server 的邮件业务门面；IMAP 批量正文逐项隔离失败，保留基线故障，WebMail 使用明确认证分类并标记预览，物理邮箱指纹用于同源聚合，接入 MailPerf 观测
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -9,9 +9,12 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -68,6 +71,19 @@ type MessageRef = mail.MessageRef
 //
 // 仅当冒号后缀能解析为 uint32、且前缀非空时，才视为 IMAP 的 folder:uid；
 // 否则整串当作 WebMail ThreadID（允许含冒号），禁止把 "thread:abc" 误切成空 UID。
+// mailBusyErr 把 IMAP 连接池满载或活跃操作饱和映射为可重试的 SERVER_BUSY；其他错误返回 nil。
+func mailBusyErr(err error) *BackendError {
+	if !errors.Is(err, mail.ErrUpstreamBusy) && !errors.Is(err, mail.ErrIMAPPoolBusy) {
+		return nil
+	}
+	return &BackendError{
+		Status:  http.StatusServiceUnavailable,
+		Code:    "SERVER_BUSY",
+		Message: "上游邮件操作繁忙，已达并发上限，请稍后重试",
+		Data:    map[string]any{"retry_after": 2},
+	}
+}
+
 func parseMessageID(rawID string) (folder, idPart string, uid uint32, hasUID bool) {
 	rawID = strings.TrimSpace(rawID)
 	if rawID == "" {
@@ -83,17 +99,6 @@ func parseMessageID(rawID string) (folder, idPart string, uid uint32, hasUID boo
 		return "", rawID, uint32(u), true
 	}
 	return "", rawID, 0, false
-}
-
-// webMailIDMatch 只做精确相等，禁止 strings.Contains：空 idPart 或短数字会命中所有 ThreadID。
-func webMailIDMatch(messageID, rawID, idPart string) bool {
-	if messageID == "" {
-		return false
-	}
-	if messageID == rawID {
-		return true
-	}
-	return idPart != "" && idPart != rawID && messageID == idPart
 }
 
 // ListInboxContext 读取收件箱摘要 (支持 context 上下文超时与真实底层连接中断，支持 SinceUID 增量游标，Issue 13 & 14)。
@@ -185,6 +190,11 @@ func (b *managerBackend) ListInboxContext(ctx context.Context, q InboxQuery) (in
 
 	if ctx.Err() != nil {
 		return InboxResult{}, ctx.Err()
+	}
+
+	// 上游连接池满载或活跃操作饱和时，直接返回可识别的 SERVER_BUSY 与 Retry-After，绝不盲目触发 WebMail 回退 (S07)
+	if busy := mailBusyErr(poolErr); busy != nil {
+		return InboxResult{}, busy
 	}
 
 	// 检查当前账号配置的邮件凭据
@@ -375,6 +385,9 @@ func (b *managerBackend) GetMessageContext(ctx context.Context, accountID string
 		return nil, ctx.Err()
 	}
 
+	if busy := mailBusyErr(imapErr); busy != nil {
+		return nil, busy
+	}
 	if errors.Is(imapErr, mail.ErrUIDValidityMismatch) {
 		return nil, &BackendError{Status: http.StatusNotFound, Code: "UIDVALIDITY_MISMATCH", Message: "邮箱 UIDVALIDITY 已变更，原邮件引用失效"}
 	}
@@ -501,6 +514,9 @@ func (b *managerBackend) GetMessagesContext(ctx context.Context, accountID strin
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			if busy := mailBusyErr(err); busy != nil {
+				return nil, busy
+			}
 			if strings.Contains(err.Error(), "不存在") || strings.Contains(err.Error(), "未设置") {
 				return nil, mapAccountErr(err)
 			}
@@ -566,6 +582,9 @@ func (b *managerBackend) GetMailboxBoundaryContext(ctx context.Context, accountI
 	}
 	if ctx.Err() != nil {
 		return "", 0, 0, ctx.Err()
+	}
+	if busy := mailBusyErr(poolErr); busy != nil {
+		return "", 0, 0, busy
 	}
 
 	acc, ok := b.mgr.GetAccount(accountID)
@@ -650,6 +669,9 @@ func (b *managerBackend) ScanMailboxUIDPage(ctx context.Context, q ScanPageQuery
 	if ctx.Err() != nil {
 		return ScanPageResult{}, ctx.Err()
 	}
+	if busy := mailBusyErr(poolErr); busy != nil {
+		return ScanPageResult{}, busy
+	}
 	if errors.Is(poolErr, mail.ErrUIDValidityMismatch) {
 		return ScanPageResult{}, mail.ErrUIDValidityMismatch
 	}
@@ -673,8 +695,72 @@ func classifyInboxErr(err error) *BackendError {
 			Message: "该 Apple ID 未开通 @icloud.com 原生邮箱（或尚未初始化）。发往别名的邮件已被苹果转寄至您的注册邮箱，请在【账号管理】中配置收件邮箱（如 QQ/163 邮箱 IMAP 授权码），或在苹果设备上开启 iCloud 邮件。",
 		}
 	}
-	if isSessionError(msg) {
+	if isSessionError(err) {
 		return &BackendError{Status: http.StatusUnauthorized, Code: "UPSTREAM_UNAUTHORIZED", Message: "iCloud 会话失效，请更新 Cookie"}
 	}
 	return &BackendError{Status: http.StatusBadGateway, Code: "UPSTREAM_FAILURE", Message: "读取邮件失败: " + msg}
+}
+
+func canonicalProxyFingerprint(proxyStr string) string {
+	proxyStr = strings.TrimSpace(proxyStr)
+	if proxyStr == "" {
+		return "direct"
+	}
+	u, err := url.Parse(proxyStr)
+	if err != nil {
+		h := sha256.Sum256([]byte(proxyStr))
+		return fmt.Sprintf("invalid_%x", h[:8])
+	}
+	// 不可逆 hash 完整代理配置（含凭据，任何改动都会产生新 hash，触发重连与游标隔离）
+	h := sha256.Sum256([]byte(proxyStr))
+	// 仅保留 scheme 和 host，绝对不保留 Userinfo/明文凭据
+	return fmt.Sprintf("%s://%s#%x", strings.ToLower(u.Scheme), strings.ToLower(u.Host), h[:8])
+}
+
+// CaptureMailboxContext 将基线、分页和正文读取绑定到同一配置快照。
+func (b *managerBackend) CaptureMailboxContext(ctx context.Context, accountID string) (context.Context, string, string, error) {
+	return b.mgr.CaptureMailContext(ctx, accountID)
+}
+
+// GetMailboxEndpointFingerprint 返回账号底层 IMAP 收件箱的物理端点指纹。
+// 核对生效服务器、端口、凭据及代理策略，确保仅当完全同源时才聚合共享扫描 (PR-CONCURRENCY)。
+func (b *managerBackend) GetMailboxEndpointFingerprint(accountID string) (string, bool) {
+	acc, ok := b.mgr.GetAccount(accountID)
+	if !ok {
+		return "", false
+	}
+	// 1. 外部转发邮箱模式
+	if acc.Mailbox != nil && acc.Mailbox.Email != "" && acc.Mailbox.Password != "" {
+		host := acc.Mailbox.IMAPHost
+		if host == "" {
+			host = "imap.gmail.com"
+		}
+		port := acc.Mailbox.IMAPPort
+		if port <= 0 {
+			port = 993
+		}
+		email := strings.ToLower(strings.TrimSpace(acc.Mailbox.Email))
+		proxy := acc.Proxy
+		if os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "true" || os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "1" {
+			proxy = ""
+		}
+		proxyFingerprint := canonicalProxyFingerprint(proxy)
+		sum := sha256.Sum256([]byte(acc.Mailbox.Password))
+		return fmt.Sprintf("ext|%s|%s|%d|%s|%x", email, strings.ToLower(host), port, proxyFingerprint, sum[:8]), true
+	}
+	// 2. 原生 iCloud 邮箱模式
+	if acc.AppPassword != "" {
+		email := strings.ToLower(strings.TrimSpace(acc.ICloudEmail))
+		if email == "" {
+			email = strings.ToLower(strings.TrimSpace(acc.RealEmail))
+		}
+		proxy := acc.Proxy
+		if os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "true" || os.Getenv("ICLOUD_HME_IMAP_DIRECT") == "1" {
+			proxy = ""
+		}
+		proxyFingerprint := canonicalProxyFingerprint(proxy)
+		sum := sha256.Sum256([]byte(acc.AppPassword))
+		return fmt.Sprintf("icloud|%s|%s|%x", email, proxyFingerprint, sum[:8]), true
+	}
+	return "", false
 }

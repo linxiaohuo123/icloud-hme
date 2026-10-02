@@ -201,4 +201,3 @@ func metadataRecipientHeaderSection() *imap.BodySectionName {
 		Peek: true,
 	}
 }
-

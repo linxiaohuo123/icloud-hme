@@ -21,7 +21,7 @@
 /icloud-hme_darwin_arm64
 
 # Web frontend build output & deps
-/web/node_modules/
+node_modules/
 /internal/webui/dist/*
 !/internal/webui/dist/placeholder.txt
 
@@ -35,10 +35,13 @@ accounts.json.migrated
 
 # Agent / tooling
 CLAUDE.md
+skills-lock.json
 /.claude/
 .agents/
 /docs/*
 !/docs/remediation/
+# 审查过程的原始日志与探针副本仅本地保留，结论见 docs/remediation/*.md
+/docs/remediation/review_*/
 .ccg/
 .superpowers/
 /icloud-hme-gemini-execution-plan/

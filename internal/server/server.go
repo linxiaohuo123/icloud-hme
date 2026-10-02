@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 internal/account, internal/auth, internal/mail, internal/webui
  * [OUTPUT]: 对外提供 Server 结构体, New, Run, Handler
- * [POS]: internal/server 的主入口，统一 API 与 WebUI，事务化完成补货入库，停机等待超时后仍持续清理并支持再次等待
+ * [POS]: internal/server 的主入口，统一 API 与 WebUI 和补货入库；停机先取消业务，HTTP 与资源关闭共享总体预算，调用方等待超时后清理继续并支持再次等待；准入计数泄漏限时等待后不阻塞资源关闭
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -9,6 +9,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -61,6 +62,15 @@ type Config struct {
 	// 属于该列表时才采信 XFF，攻击者从外部直连时对端不是代理，XFF 会被忽略，
 	// 既能恢复「按真实客户端限流」，又不会被伪造头绕过。
 	TrustedProxies []string
+
+	// 并发与准入控制配置 (PR-CONCURRENCY T1/R10)
+	MaxInflightGlobal         int
+	MaxInflightPerPrincipal   int
+	MaxWaitersGlobal          int
+	MaxWaitersPerPrincipal    int
+	MaxWaitersPerKey          int
+	MaxGlobalActiveVReq       int
+	MaxPerPrincipalActiveVReq int
 }
 
 // Server 封装 Gin 引擎、账号后端与认证。
@@ -68,6 +78,7 @@ type Server struct {
 	be              Backend
 	auth            *auth.Manager
 	limiter         *auth.Limiter
+	requestLimiter  *RequestLimiter
 	cfg             Config
 	r               *gin.Engine
 	eventBus        *mail.EventBus
@@ -86,9 +97,12 @@ type Server struct {
 	autoSyncWg      sync.WaitGroup     // 跟踪启动预热任务收敛 (PR-05 F10)
 	ctx             context.Context    // 【BUG-11】停机信号,由 Close() 触发 cancel
 	cancel          context.CancelFunc // 【BUG-11】停机信号取消函数
-	closeOnce       sync.Once          // Start cleanup once; callers wait with independent budgets.
-	closeDone       chan struct{}
-	closeErr        error // Published by closing closeDone.
+	reqMu           sync.RWMutex       // 保护在途 HTTP 请求生命周期与优雅停机同步 (T01/T02)
+	reqWg           sync.WaitGroup     // 等待所有已接纳的 HTTP 请求 handler 彻底完成
+	stopping        bool               // 标记停止接纳新业务
+	closeOnce       sync.Once          // 确保唯一后台清理协程只启动一次
+	closeDone       chan struct{}      // 真实清理完成通知信号
+	closeErr        error              // 最终持久化/底层连接池关闭错误
 }
 
 // New 创建 Server。mgr 为账号管理器,st 为持久化存储(可为 nil),cfg 为安全配置。
@@ -179,7 +193,22 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 		startedAt:       time.Now(),
 		ctx:             ctx,
 		cancel:          cancel,
+		closeDone:       make(chan struct{}),
 	}
+	reqLimiterCfg := RequestLimiterConfig{
+		MaxWaitersGlobal:        cfg.MaxWaitersGlobal,
+		MaxWaitersPerPrincipal:  cfg.MaxWaitersPerPrincipal,
+		MaxWaitersPerKey:        cfg.MaxWaitersPerKey,
+		MaxInflightGlobal:       cfg.MaxInflightGlobal,
+		MaxInflightPerPrincipal: cfg.MaxInflightPerPrincipal,
+	}
+	s.requestLimiter = NewRequestLimiter(reqLimiterCfg)
+	s.verifyService.SetRequestLimiter(s.requestLimiter)
+	s.verifyService.SetServerContext(ctx)
+	if cfg.MaxGlobalActiveVReq > 0 || cfg.MaxPerPrincipalActiveVReq > 0 {
+		s.verifyService.SetMaxLimitsForTest(cfg.MaxGlobalActiveVReq, cfg.MaxPerPrincipalActiveVReq)
+	}
+
 	// 调度器在 Server 组装完成后注入，语义闭环为可用库存补货 (PR-06 §9.4, Issue 10, PR-05 F10)
 	s.scheduler = scheduler.NewScheduler(st, func(ctx context.Context, accountID, label string) (*hme.CreateResult, error) {
 		res, err := be.CreateAliasForReplenishmentContext(ctx, accountID, label)
@@ -251,6 +280,7 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 	s.auth = authManager
 	hasAuth := cfg.AdminPassword != "" || cfg.APIKey != ""
 	s.r = gin.New()
+	s.r.Use(s.requestTrackingMiddleware())
 	s.r.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipQueryString: true}), gin.Recovery(), securityHeadersMiddleware(), dnsRebindingMiddleware(hasAuth))
 	// 默认不信任任意代理头,登录限流使用真实连接 IP;
 	// 显式配置 TrustedProxies 时才采信来自这些地址的 X-Forwarded-For。
@@ -259,8 +289,43 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 	return s, nil
 }
 
+// requestTrackingMiddleware 统一跟踪所有已接纳的 HTTP 请求生命周期，使请求 context 与服务关停取消信号严格联动 (T01/T02)。
+func (s *Server) requestTrackingMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		s.reqMu.RLock()
+		stopping := s.stopping || (s.ctx != nil && s.ctx.Err() != nil)
+		if stopping {
+			s.reqMu.RUnlock()
+			failCode(c, http.StatusServiceUnavailable, "SERVER_BUSY", "服务正在停机收尾")
+			return
+		}
+		s.reqWg.Add(1)
+		s.reqMu.RUnlock()
+
+		defer s.reqWg.Done()
+
+		if s.ctx != nil {
+			reqCtx, reqCancel := context.WithCancel(c.Request.Context())
+			defer reqCancel()
+			go func() {
+				select {
+				case <-s.ctx.Done():
+					reqCancel()
+				case <-reqCtx.Done():
+				}
+			}()
+			c.Request = c.Request.WithContext(reqCtx)
+		}
+
+		c.Next()
+	}
+}
+
 // 优雅停机默认超时预算 (PR-05 F10)。统一约束 HTTP Shutdown 与后台各 Worker 收敛。
 const defaultShutdownTimeout = 10 * time.Second
+
+// limiterDrainTimeout 是 handler 全部返回后等待准入计数归零的上限；变量形式供测试缩短。
+var limiterDrainTimeout = 2 * time.Second
 
 // Run 启动 HTTP 服务并开启后台引擎，支持响应中断信号优雅停机。
 func (s *Server) Run(addr string) error {
@@ -295,23 +360,39 @@ func (s *Server) Run(addr string) error {
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(quit)
 
+	var serveErr error
 	select {
 	case err := <-errCh:
-		return err
+		serveErr = err
 	case sig := <-quit:
 		log.Printf("[Server] 捕获退出信号 (%s)，开始优雅停机...", sig)
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
-	defer cancel()
+	return errors.Join(serveErr, s.shutdownHTTP(httpServer))
+}
 
-	shutdownErr := httpServer.Shutdown(shutdownCtx)
-	closeErr := s.CloseContext(shutdownCtx)
-	if shutdownErr != nil {
-		return shutdownErr
+// shutdownHTTP 先停止准入和广播取消，HTTP drain 与资源清理共享一个总体预算。
+func (s *Server) shutdownHTTP(httpServer *http.Server) error {
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), defaultShutdownTimeout)
+	defer cancelShutdown()
+	s.startClose()
+	httpErr := httpServer.Shutdown(shutdownCtx)
+	if httpErr != nil && !errors.Is(httpErr, http.ErrServerClosed) {
+		log.Printf("[Server] HTTP 停机等待超时或异常，强制断开剩余连接: %v", httpErr)
+		_ = httpServer.Close()
 	}
-	return closeErr
+
+	if err := s.CloseContext(shutdownCtx); err != nil {
+		log.Printf("[Server] 后台引擎关闭异常: %v", err)
+		return errors.Join(httpErr, err)
+	}
+	if httpErr != nil {
+		return httpErr
+	}
+	log.Printf("[Server] 服务已优雅停机")
+	return nil
 }
 
 // 启动预热的分摊参数。
@@ -403,20 +484,26 @@ func (s *Server) autoSyncAccounts() {
 	log.Printf("[Server] 启动预热完成: %d 个账号", len(targets))
 }
 
-// CloseContext 停止后台工作引擎，严格遵守优雅停机生命周期顺序与单一预算约束 (PR-05 F10):
-//  1. 发送上下文取消信号 (停止接纳新工作与预热请求)
-//  2. 并发通知后台 worker 退出；ctx 只限制当前调用的等待预算，清理持续执行
-//  3. 只有在 worker 全部平稳收敛后，才依次关闭底层客户端连接池与持久化数据库 (Store)
-//     若超时未完成，严禁提前关闭 Store，避免在途 goroutine 访问已关闭 DB 造成 panic 或数据破坏。
-func (s *Server) CloseContext(ctx context.Context) error {
+// CloseContext 停止后台工作引擎，严格遵守优雅停机生命周期顺序与单一预算约束 (T01/T02):
+//  1. 发送上下文取消信号，停止接纳新请求，通知已接纳请求立即取消
+//  2. 启动唯一清理协程持续执行，不受单个调用方等待超时影响
+//  3. 等待所有后台 worker 收敛并等待所有在途 HTTP handler 彻底退出
+//  4. 只有在所有在途 HTTP handler 和后台任务归零后，才关闭底层连接池与 Store
+func (s *Server) startClose() {
 	s.closeOnce.Do(func() {
-		s.closeDone = make(chan struct{})
-		// 1. 停止接收新工作，通知所有引用 s.ctx 的后台 goroutine 立即取消
+		if s.closeDone == nil {
+			s.closeDone = make(chan struct{})
+		}
+		// 1. 停止接收新工作，通知所有引用 s.ctx 的后台 goroutine 与在途请求立即取消
+		s.reqMu.Lock()
+		s.stopping = true
+		s.reqMu.Unlock()
+
 		if s.cancel != nil {
 			s.cancel()
 		}
 
-		// 2. 并发停止各 worker 并等待它们退出
+		// 2. 启动唯一的后台清理协程持续执行，直到真实收尾 (T01/T02)
 		go func() {
 			defer close(s.closeDone)
 			var wg sync.WaitGroup
@@ -492,8 +579,27 @@ func (s *Server) CloseContext(ctx context.Context) error {
 			}()
 
 			wg.Wait()
-			// Cleanup continues after a caller's wait budget expires. Store stays
-			// open until every worker exits; later callers observe the same result.
+
+			// 严格等待所有已接纳的 HTTP handler 生命周期彻底完成 (T01)
+			s.reqWg.Wait()
+
+			// handler 全部返回后名额应已释放 (S04)；仍有残留说明计数泄漏，限时等待后记录并继续收尾，
+			// 不能让泄漏的计数永久阻止连接池与 Store 关闭。
+			if s.requestLimiter != nil {
+				deadline := time.Now().Add(limiterDrainTimeout)
+				for {
+					stats := s.requestLimiter.Stats()
+					if stats.ActiveWaiters == 0 && stats.ActiveInflight == 0 {
+						break
+					}
+					if time.Now().After(deadline) {
+						log.Printf("[Server] 停机时准入计数未归零 (waiters=%d inflight=%d)，继续关闭资源", stats.ActiveWaiters, stats.ActiveInflight)
+						break
+					}
+					time.Sleep(2 * time.Millisecond)
+				}
+			}
+
 			if closer, ok := s.be.(interface{ Close() }); ok {
 				closer.Close()
 			}
@@ -502,16 +608,20 @@ func (s *Server) CloseContext(ctx context.Context) error {
 			}
 		}()
 	})
-	select {
-	case <-s.closeDone:
-		return s.closeErr
-	default:
-	}
+}
+
+func (s *Server) CloseContext(ctx context.Context) error {
+	s.startClose()
 	select {
 	case <-s.closeDone:
 		return s.closeErr
 	case <-ctx.Done():
-		return ctx.Err()
+		select {
+		case <-s.closeDone:
+			return s.closeErr
+		default:
+			return ctx.Err()
+		}
 	}
 }
 
@@ -532,12 +642,12 @@ func (s *Server) register() {
 	// /readyz 就绪探针: 检查核心存储健康, 严格 2s 超时, 严禁触碰 Apple, 不含敏感信息
 	s.r.GET("/readyz", s.handleReadyz)
 
-	// ===== 对外查信与直出路由组 (同步支持 /mail 前缀) =====
+	// ===== 浏览器直链：取码 JSON、邮件预览与原文 (verify 作用域，允许 URL 携带令牌) =====
 	s.r.GET("/mail/view-assets.css", serveMailDirectAsset("mail_direct.css", "text/css; charset=utf-8"))
 	s.r.GET("/mail/view-assets.js", serveMailDirectAsset("mail_direct.js", "application/javascript; charset=utf-8"))
 	mailGroup := s.r.Group("/mail")
 	mailGroup.Use(apiCacheControlMiddleware())
-	mailGroup.Use(requireSession(s.auth, s.cfg.APIKey, s.store))
+	mailGroup.Use(requireSession(s.auth, s.cfg.APIKey, s.store, s.requestLimiter))
 	mailGroup.Use(requireScope(store.ScopeVerify))
 	{
 		mailGroup.GET("/code", s.verifyCodeHandler)
@@ -557,49 +667,25 @@ func (s *Server) register() {
 
 		// ===== 受保护路由:统一 requireSession (支持 API Key 旁路) =====
 		authed := api.Group("")
-		authed.Use(requireSession(s.auth, s.cfg.APIKey, s.store))
+		authed.Use(requireSession(s.auth, s.cfg.APIKey, s.store, s.requestLimiter))
 		{
 			// ...
 			authed.POST("/auth/logout", csrfCheck(s.auth), s.handleLogout)
 
-			// ===== 最小权限: 出号作用域 (对外发放令牌的默认能力) =====
-			alloc := authed.Group("")
-			alloc.Use(requireScope(store.ScopeAllocate))
-			{
-				alloc.POST("/quick-create", csrfCheck(s.auth), s.quickCreateHandler)
-				alloc.POST("/alias/lease", csrfCheck(s.auth), s.quickCreateHandler)
-				alloc.POST("/allocate", csrfCheck(s.auth), s.quickCreateHandler)
-				alloc.POST("/external/v1/allocate", csrfCheck(s.auth), s.quickCreateHandler)
-			}
-
-			// ===== 最小权限: 取码作用域 =====
-			verify := authed.Group("")
-			verify.Use(requireScope(store.ScopeVerify))
-			{
-				verify.GET("/verify-code", s.verifyCodeHandler)
-				verify.GET("/external/v1/verify-code", s.verifyCodeHandler)
-				verify.GET("/mail/code", s.verifyCodeHandler)
-				verify.GET("/mail/code/:email", s.verifyCodeHandler)
-				verify.GET("/mail/view", s.mailViewHandler)
-				verify.GET("/mail/view/:email", s.mailViewHandler)
-				verify.GET("/mail/raw", s.mailRawHandler)
-				verify.GET("/mail/raw/:email", s.mailRawHandler)
-			}
-
-			// ===== 管理面: 仅管理员会话 / admin 作用域令牌可达 =====
+			// ===== 管理面: 仅管理员会话 / admin 作用域令牌可达；外部令牌统一走 /api/external/v2 与 /mail 直链 =====
 			adm := authed.Group("")
 			adm.Use(requireScope(store.ScopeAdmin))
 			{
+				// 管理台出号：可指定母号与 mode=create
+				adm.POST("/quick-create", csrfCheck(s.auth), s.quickCreateHandler)
+
 				// 【PR-01 安全止损】直接建号与母号邮件读取仅对管理员开放，普通外部令牌不可跨权调用
 				adm.POST("/create", csrfCheck(s.auth), s.createAliasHandler)
 				adm.POST("/create/batch", csrfCheck(s.auth), s.createAliasBatchHandler)
 				adm.GET("/inbox", s.listInboxHandler)
 				adm.GET("/inbox/:message_id", s.getMessageHandler)
-				adm.GET("/messages/:id", s.getMessagePrimeHandler)
-				adm.POST("/messages", s.getMessagesHandler)
 				adm.GET("/mailboxes", s.listMailboxesHandler)
 				adm.DELETE("/inbox/:message_id", csrfCheck(s.auth), s.deleteMessageHandler)
-				adm.DELETE("/messages/:id", csrfCheck(s.auth), s.deleteMessageHandler)
 
 				// ===== 账号管理 =====
 				adm.GET("/accounts", s.listAccountsHandler)
@@ -661,7 +747,6 @@ func (s *Server) register() {
 				// ===== 系统设置: 通知 =====
 				adm.GET("/settings/notify", s.getNotifySettingsHandler)
 				adm.PUT("/settings/notify", csrfCheck(s.auth), s.updateNotifySettingsHandler)
-				adm.PATCH("/settings/notify", csrfCheck(s.auth), s.updateNotifySettingsHandler)
 				adm.POST("/settings/notify/test", csrfCheck(s.auth), s.testNotifyHandler)
 
 				// ===== 系统设置: Camoufox 代理 =====
@@ -676,7 +761,7 @@ func (s *Server) register() {
 
 		// ===== 外部 v2 独立路由组：仅允许 Bearer Token / API Key 认证，彻底拒绝 Cookie 会话，杜绝 CSRF (Issue 19 方案 A) =====
 		v2 := api.Group("/external/v2")
-		v2.Use(requireExternalV2Auth(s.cfg.APIKey, s.store))
+		v2.Use(requireExternalV2Auth(s.cfg.APIKey, s.store, s.requestLimiter))
 		{
 			v2Alloc := v2.Group("")
 			v2Alloc.Use(requireScope(store.ScopeAllocate))

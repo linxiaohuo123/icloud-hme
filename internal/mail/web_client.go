@@ -257,11 +257,6 @@ func (c *WebClient) resolveMccGatewayContext(ctx context.Context) error {
 	return nil
 }
 
-// resolveMccGateway 从 validate 响应中获取 mccgateway URL。
-func (c *WebClient) resolveMccGateway() error {
-	return c.resolveMccGatewayContext(context.Background())
-}
-
 // threadSearchResp 是 thread/search 接口的响应结构。
 type threadSearchResp struct {
 	Success          *bool  `json:"success"`
@@ -371,11 +366,6 @@ func (c *WebClient) searchContext(ctx context.Context, payload string) ([]Messag
 		messages = append(messages, message)
 	}
 	return messages, nil
-}
-
-// search 执行 thread/search 请求,返回解析后的邮件列表。
-func (c *WebClient) search(payload string) ([]Message, error) {
-	return c.searchContext(context.Background(), payload)
 }
 
 func parseWebRecipients(toRaw, toRecipientsRaw, recipientsRaw json.RawMessage) string {

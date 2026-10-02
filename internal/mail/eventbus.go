@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 sync, sync/atomic, time, mail.OTPResult
- * [OUTPUT]: 对外提供 EventBus, NewEventBus, CachedOTP, BaselineBoundary, BoundaryDecision, MatchBoundary
- * [POS]: internal/mail 的内存事件分发总线，解耦邮件接收与 HTTP 长轮询，提供基于 UID/UIDVALIDITY/MAILBOX 边界的严格过滤与多事件并发隔离
+ * [OUTPUT]: 对外提供 EventBus (含 CachedMatch), NewEventBus, CachedOTP, BaselineBoundary, BoundaryDecision, MatchBoundary
+ * [POS]: internal/mail 的内存事件分发总线，解耦邮件接收与 HTTP 长轮询，提供基于物理来源/UID/UIDVALIDITY/MAILBOX 边界的严格过滤与多事件并发隔离，订阅时缓存可用验证码优先于旧代际事件，CachedMatch 仅返回满足基线的缓存事件
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -16,6 +16,7 @@ import (
 
 // CachedOTP 包装带精确来源、UID 边界与过期时间的验证码事件。
 type CachedOTP struct {
+	Source      string     `json:"-"`
 	EventID     string     `json:"event_id,omitempty"`
 	AccountID   string     `json:"account_id,omitempty"`
 	Email       string     `json:"email,omitempty"`
@@ -41,6 +42,7 @@ const (
 
 // BaselineBoundary 定义用于验证码事件过滤的基线边界。
 type BaselineBoundary struct {
+	Source      string
 	Mailbox     string
 	UIDValidity uint32
 	UID         uint32
@@ -52,6 +54,9 @@ type BaselineBoundary struct {
 // BASELINE_INVALIDATED: 同 mailbox + UIDValidity != baselineUIDValidity (代际失效)
 func MatchBoundary(ev *CachedOTP, baseline BaselineBoundary) BoundaryDecision {
 	if ev == nil {
+		return BoundaryIgnore
+	}
+	if baseline.Source != "" && ev.Source != baseline.Source {
 		return BoundaryIgnore
 	}
 
@@ -168,7 +173,7 @@ func (b *EventBus) SubscribeWithFresh(email string, fresh bool) (uint64, chan *C
 
 // SubscribeWithBoundary 订阅满足 UIDVALIDITY 和 UIDNEXT 边界的验证码到达事件 (PR-06 Section 9.2, 9.5, Final Closure)。
 // 严格绑定 mailbox (缺省 INBOX)；未过期缓存完整保留，绝不因未命中或代际失效截断丢弃。
-func (b *EventBus) SubscribeWithBoundary(email, baselineMailbox string, baselineUIDValidity, baselineUID uint32) (uint64, chan *CachedOTP) {
+func (b *EventBus) SubscribeWithBoundary(email, baselineMailbox string, baselineUIDValidity, baselineUID uint32, source ...string) (uint64, chan *CachedOTP) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -181,22 +186,33 @@ func (b *EventBus) SubscribeWithBoundary(email, baselineMailbox string, baseline
 		UIDValidity: baselineUIDValidity,
 		UID:         baselineUID,
 	}
+	if len(source) > 0 {
+		baseline.Source = source[0]
+	}
 
 	now := time.Now()
+	// 缓存中的旧代际事件可能早于本次基线采集，优先投递可用验证码，避免其遮蔽同缓存内的有效事件。
 	var unexpired []*CachedOTP
-	var matched *CachedOTP
+	var matched, invalidated *CachedOTP
 	for _, ev := range b.cache[email] {
 		if now.Before(ev.ExpiresAt) {
 			unexpired = append(unexpired, ev)
-			if matched == nil {
-				decision := MatchBoundary(ev, baseline)
-				if decision == BoundaryMatch || decision == BoundaryInvalidated {
+			switch MatchBoundary(ev, baseline) {
+			case BoundaryMatch:
+				if matched == nil {
 					matched = ev
+				}
+			case BoundaryInvalidated:
+				if invalidated == nil {
+					invalidated = ev
 				}
 			}
 		}
 	}
 	b.cache[email] = unexpired
+	if matched == nil {
+		matched = invalidated
+	}
 
 	if matched != nil {
 		ch <- matched
@@ -213,6 +229,22 @@ func (b *EventBus) SubscribeWithBoundary(email, baselineMailbox string, baseline
 		hasBoundary: true,
 	}
 	return subID, ch
+}
+
+// CachedMatch 返回缓存中首个满足基线边界的未过期事件，不返回代际失效事件。
+// 订阅通道容量为 1，旧事件占用通道时后到的有效事件只会留在缓存，等待方忽略旧事件后据此回查。
+func (b *EventBus) CachedMatch(email, baselineMailbox string, baselineUIDValidity, baselineUID uint32, source string) *CachedOTP {
+	email = strings.ToLower(strings.TrimSpace(email))
+	baseline := BaselineBoundary{Source: source, Mailbox: baselineMailbox, UIDValidity: baselineUIDValidity, UID: baselineUID}
+	now := time.Now()
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, ev := range b.cache[email] {
+		if now.Before(ev.ExpiresAt) && MatchBoundary(ev, baseline) == BoundaryMatch {
+			return ev
+		}
+	}
+	return nil
 }
 
 // SubscriberCount 返回指定邮箱当前的活跃订阅者数量（用于确定性同步屏障，杜绝固定 Sleep 碰运气）。
@@ -280,8 +312,8 @@ func (b *EventBus) PublishEvent(ev *CachedOTP) {
 	}
 }
 
-// ConsumeEvent 消费特定事件，绝不清除更晚到达的其它新事件 (PR-06 V04)。
-func (b *EventBus) ConsumeEvent(email string, eventID string) {
+// ConsumeEvent 消费特定来源的事件，绝不清除不同来源或更晚到达的其它事件 (PR-06 V04)。
+func (b *EventBus) ConsumeEvent(email string, eventID string, source ...string) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	eventID = strings.TrimSpace(eventID)
 	if email == "" || eventID == "" {
@@ -292,7 +324,7 @@ func (b *EventBus) ConsumeEvent(email string, eventID string) {
 
 	var remaining []*CachedOTP
 	for _, ev := range b.cache[email] {
-		if ev.EventID != eventID {
+		if ev.EventID != eventID || (len(source) > 0 && ev.Source != source[0]) {
 			remaining = append(remaining, ev)
 		}
 	}

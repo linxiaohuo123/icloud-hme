@@ -1,13 +1,14 @@
 /**
  * [INPUT]: 依赖 gin, time, strings, strconv, icloud-hme/internal/mail
  * [OUTPUT]: 对外提供 verifyCodeHandler
- * [POS]: server 的验证码提取管道，交付前复查原令牌凭据，Trigger 即时触发收信，安全拒绝 auto_delete 副作用
+ * [POS]: server 的验证码提取管道，交付前复查原令牌凭据，Trigger 即时触发收信，精确消费来源事件，停机显式返回 503，安全拒绝 auto_delete 副作用
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
 package server
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,7 +18,7 @@ import (
 	"icloud-hme/internal/auth"
 )
 
-// verifyCodeHandler 处理 GET /api/verify-code。
+// verifyCodeHandler 处理浏览器直链取码 GET /mail/code 与 /mail/code/:email。
 // 参数:
 //
 //	email (必须): 待接收验证码的别名邮箱
@@ -76,8 +77,29 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 		s.syncWorker.Trigger()
 	}
 
+	// 申请长轮询等待者名额，并释放短阶段在途名额 (PR-CONCURRENCY T1)
+	if timeoutSec > 0 && s.requestLimiter != nil {
+		relWaiter, err := s.requestLimiter.AcquireWaiter(p, email)
+		if err != nil {
+			var be *BackendError
+			if errors.As(err, &be) {
+				failCode(c, be.Status, be.Code, be.Message)
+				return
+			}
+			failCode(c, http.StatusTooManyRequests, "VERIFY_WAITER_LIMIT", err.Error())
+			return
+		}
+		defer relWaiter()
+	}
+	releaseInflight(c)
+
 	timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
 	defer timer.Stop()
+
+	var srvDone <-chan struct{}
+	if s != nil && s.ctx != nil {
+		srvDone = s.ctx.Done()
+	}
 
 	select {
 	case item := <-ch:
@@ -91,7 +113,7 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 		}
 		// 【C3】精准消费采用的事件 ID，绝不整桶清除更晚到达的其它新事件
 		if item != nil && item.EventID != "" {
-			s.eventBus.ConsumeEvent(email, item.EventID)
+			s.eventBus.ConsumeEvent(email, item.EventID, item.Source)
 		}
 		if c.Query("raw") == "1" || c.Query("format") == "text" {
 			c.String(http.StatusOK, item.OTP.Code)
@@ -109,6 +131,12 @@ func (s *Server) verifyCodeHandler(c *gin.Context) {
 	case <-timer.C:
 		failCode(c, http.StatusRequestTimeout, "VERIFY_TIMEOUT", "等待验证码超时")
 	case <-c.Request.Context().Done():
+		if s.ctx != nil && s.ctx.Err() != nil {
+			backendFail(c, &BackendError{Status: http.StatusServiceUnavailable, Code: "SERVER_SHUTTING_DOWN", Message: "服务正在优雅停机"})
+		}
+		return
+	case <-srvDone:
+		backendFail(c, &BackendError{Status: http.StatusServiceUnavailable, Code: "SERVER_SHUTTING_DOWN", Message: "服务正在优雅停机"})
 		return
 	}
 }

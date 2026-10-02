@@ -158,4 +158,3 @@ func TestA04_SubsequentProtectionBlocksClaim(t *testing.T) {
 		t.Fatalf("A04 FAILED: dynamically protected account's inventory was claimed, err=%v", err)
 	}
 }
-

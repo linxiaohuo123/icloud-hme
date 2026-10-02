@@ -121,21 +121,14 @@ func TestBaseline_InboxStageTimings(t *testing.T) {
 				MessageRef: mail.MessageRef{Provider: "imap", AccountID: "acc_perf", Mailbox: "INBOX", UID: uint32(100 + i)}.Encode(),
 			}
 		}
-		reqBody, _ := json.Marshal(map[string]interface{}{
-			"account_id": "acc_perf",
-			"messages":   items,
-		})
-
 		start := time.Now()
-		req := authedReq(t, ts, "POST", "/api/messages", string(reqBody))
-		req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
-		status, respBody, _ := do(t, req)
+		_, results, err := srv.mailReadService.GetMessagesBatch(context.Background(), "acc_perf", items)
 		batchDuration := time.Since(start)
-
-		if status != http.StatusOK {
-			t.Fatalf("expected 200, got %d: %s", status, respBody)
+		if err != nil {
+			t.Fatalf("GetMessagesBatch error: %v", err)
 		}
 
+		respBody, _ := json.Marshal(results)
 		payloadBytes := len(respBody)
 		t.Logf("[BASELINE] GetMessages (20 items) Latency: %v, Response Size: %d bytes (%d KB)", batchDuration, payloadBytes, payloadBytes/1024)
 	})
@@ -388,42 +381,37 @@ func TestOptimized_MailboxCache_And_InFlightDedup(t *testing.T) {
 func TestOptimized_GetMessagesBatch_TrueCancellation(t *testing.T) {
 	fb := &fakeBackend{
 		accounts: []account.Summary{{ID: "acc_opt", Name: "Opt Account", HasAppPassword: true}},
-		getMessagesFunc: func(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error) {
-			// Simulate slow IMAP fetch taking 500ms
-			time.Sleep(500 * time.Millisecond)
-			return []*mail.FullMessage{}, nil
+		onGetMessagesContext: func(ctx context.Context, accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error) {
+			// 模拟 500ms 慢速 IMAP 拉取，生产后端经连接池响应 ctx 取消
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+				return []*mail.FullMessage{}, nil
+			}
 		},
 	}
 
 	srv := newWithBackend(fb, Config{Debug: false, AdminPassword: "admin-pass-2026-strong"})
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-
-	cookie, _ := login(t, ts, "admin-pass-2026-strong")
+	defer srv.Close()
 
 	reqItems := []batchMessageItemReq{
 		{MessageRef: mail.MessageRef{Provider: "imap", AccountID: "acc_opt", Mailbox: "INBOX", UID: 999}.Encode()},
 	}
-	reqData, _ := json.Marshal(map[string]interface{}{
-		"account_id": "acc_opt",
-		"messages":   reqItems,
-	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 
 	start := time.Now()
-	req := authedReq(t, ts, "POST", "/api/messages", string(reqData))
-	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
-	req = req.WithContext(ctx)
-
-	client := &http.Client{}
-	_, err := client.Do(req)
+	_, _, err := srv.mailReadService.GetMessagesBatch(ctx, "acc_opt", reqItems)
 	dur := time.Since(start)
 
-	t.Logf("[OPTIMIZED] Cancelled /api/messages Duration: %v, Err: %v", dur, err)
+	t.Logf("[OPTIMIZED] Cancelled GetMessagesBatch Duration: %v, Err: %v", dur, err)
 	if dur > 200*time.Millisecond {
-		t.Fatalf("Expected client context cancellation to abort in <200ms, took %v", dur)
+		t.Fatalf("Expected caller context cancellation to abort in <200ms, took %v", dur)
+	}
+	if err == nil {
+		t.Fatal("expected context error after caller cancellation")
 	}
 }
 
@@ -962,6 +950,3 @@ func TestMailReadService_ConcurrentCommitAndInvalidateRace(t *testing.T) {
 
 	wg.Wait()
 }
-
-
-

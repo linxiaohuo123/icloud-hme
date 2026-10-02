@@ -33,7 +33,6 @@ type AliasBuffer struct {
 	capacity       int
 	refillInterval time.Duration
 	stopCh         chan struct{}
-	once           sync.Once
 	stopOnce       sync.Once
 }
 
@@ -94,11 +93,6 @@ func (b *AliasBuffer) AcquireContext(ctx context.Context, label string) (*hme.Cr
 
 	// 2. 缓冲池为空，走同步现场创建
 	return b.syncCreateContext(ctx, label)
-}
-
-// syncCreate 现场同步创建降级逻辑 (兼容保留包装)。
-func (b *AliasBuffer) syncCreate(label string) (*hme.CreateResult, string, error) {
-	return b.syncCreateContext(context.Background(), label)
 }
 
 // syncCreateContext 现场同步创建降级逻辑 (PR-05 F10)。

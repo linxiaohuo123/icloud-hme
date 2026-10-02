@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, errors, fmt, strings, time, icloud-hme/internal/auth, icloud-hme/internal/hme, icloud-hme/internal/store
  * [OUTPUT]: 对外提供 AliasAllocationService, AllocationRequest, AllocationResult, ErrPoolEmpty, ErrAllocationNotReady, ErrForbiddenAccountID, ErrForbiddenRemoteCreation, ErrTagNotAllowed
- * [POS]: internal/server 的领域出号应用服务 (Section I & II)，统一所有出号入口（/quick-create, /alias/lease, /allocate, /external/v1/allocate, /external/v2/allocate）至单一库存真相源，并阻断外部令牌远程建号
+ * [POS]: internal/server 的领域出号应用服务 (Section I & II)，统一管理台 /api/quick-create 与外部 /api/external/v2/allocate 两个出号入口至单一库存真相源，并阻断外部令牌远程建号
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -190,7 +190,7 @@ func (s *AliasAllocationService) Allocate(ctx context.Context, p auth.Principal,
 		}
 	}
 
-	principalKind := string(p.Kind)
+	var principalKind string // 每个分支都会赋值
 	principalID := p.ID
 	tokenDisplayName := p.TokenName
 

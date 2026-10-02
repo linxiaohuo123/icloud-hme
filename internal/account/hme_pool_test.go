@@ -362,8 +362,12 @@ func TestHMEPoolEvictsBeyondCapacity(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		id := fmt.Sprintf("acc_%02d", i)
-		e := p.acquire(id)
+		e, unpin, err := p.acquire(id)
+		if err != nil {
+			t.Fatalf("acquire 失败: %v", err)
+		}
 		e.lastUsed.Store(int64(i + 1))
+		unpin() // 归还 Pin，使其变为可驱逐状态
 	}
 	if len(p.entries) > p.max {
 		t.Fatalf("池条目应被淘汰到上限 %d 以内, 实际 %d", p.max, len(p.entries))
@@ -374,10 +378,61 @@ func TestHMEPoolEvictsBeyondCapacity(t *testing.T) {
 	}
 }
 
+// 验证全量 Pin 保护时，达到上限拒绝无界扩容
+func TestHMEPoolPinProtectsAndBlocksUnboundedGrowth(t *testing.T) {
+	p := newHMEClientPoolWithLimits(2, 5)
+	defer p.Close()
+
+	_, unpin1, err := p.acquire("acc_1")
+	if err != nil {
+		t.Fatalf("借出 acc_1 失败: %v", err)
+	}
+	defer unpin1()
+
+	_, unpin2, err := p.acquire("acc_2")
+	if err != nil {
+		t.Fatalf("借出 acc_2 失败: %v", err)
+	}
+	defer unpin2()
+
+	// 此时两个条目均处于 Pin 状态，无法驱逐
+	_, _, err = p.acquire("acc_3")
+	if !errors.Is(err, ErrHMEPoolBusy) {
+		t.Fatalf("全量 Pin 状态下超出容量上限应返回 ErrHMEPoolBusy，实际为: %v", err)
+	}
+}
+
+// 验证全局活跃 HME 操作上限与拒绝
+func TestHMEPoolActiveOpLimit(t *testing.T) {
+	p := newHMEClientPoolWithLimits(10, 2)
+	defer p.Close()
+
+	rel1, err := p.acquireActiveOp(context.Background())
+	if err != nil {
+		t.Fatalf("申请槽位 1 失败: %v", err)
+	}
+	defer rel1()
+
+	rel2, err := p.acquireActiveOp(context.Background())
+	if err != nil {
+		t.Fatalf("申请槽位 2 失败: %v", err)
+	}
+	defer rel2()
+
+	// 达到 maxActive=2，第 3 个申请应当返回 ErrHMEOpBusy
+	_, err = p.acquireActiveOp(context.Background())
+	if !errors.Is(err, ErrHMEOpBusy) {
+		t.Fatalf("超限申请应返回 ErrHMEOpBusy，实际为: %v", err)
+	}
+}
+
 // Close 必须幂等且清空池。
 func TestHMEPoolCloseIsIdempotent(t *testing.T) {
 	p := newHMEClientPool()
-	_ = p.acquire("acc_1")
+	_, unpin, _ := p.acquire("acc_1")
+	if unpin != nil {
+		unpin()
+	}
 	p.Close()
 	p.Close()
 	if len(p.entries) != 0 {

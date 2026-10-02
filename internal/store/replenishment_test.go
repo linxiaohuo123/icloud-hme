@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -98,7 +99,7 @@ func TestMigrationV8ToV9PreservesUnknownIntentPurpose(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	backups, err := filepath.Glob(filepath.Join(dir, "backups", "pre-migrate-v8-to-v9-*.db"))
+	backups, err := filepath.Glob(filepath.Join(dir, "backups", fmt.Sprintf("pre-migrate-v8-to-v%d-*.db", CurrentSchemaVersion)))
 	if err != nil || len(backups) != 1 {
 		t.Fatalf("migration backup is missing or repeated: %v %v", backups, err)
 	}

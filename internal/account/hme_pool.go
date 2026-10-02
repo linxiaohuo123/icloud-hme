@@ -25,8 +25,12 @@ import (
 // ErrHMEClientUnavailable 表示未能借出 HME 客户端（账号不存在 / 未配置 Cookie / 客户端构造失败）。
 //
 // 调用方据此把错误映射为「账号类」错误，而不是上游故障，保持与改造前的错误语义一致。
-var ErrHMEClientUnavailable = errors.New("HME 客户端不可用")
-var ErrSessionChanged = errors.New("账号会话已更新，请重试操作")
+var (
+	ErrHMEClientUnavailable = errors.New("HME 客户端不可用")
+	ErrSessionChanged       = errors.New("账号会话已更新，请重试操作")
+	ErrHMEPoolBusy          = errors.New("HME 客户端池已满且无可安全驱逐条目")
+	ErrHMEOpBusy            = errors.New("上游 HME 操作繁忙，已达并发上限")
+)
 
 const (
 	// defaultHMEClientIdleTTL 是空闲客户端被回收前的保留时长。
@@ -35,8 +39,9 @@ const (
 	//
 	// 每个缓存的客户端自带一条到 Apple 的连接池，必须设上限，
 	// 否则几千账号会把空闲 socket 一直攥在手里。
-	defaultMaxHMEClients  = 200
-	hmeClientReapInterval = time.Minute
+	defaultMaxHMEClients   = 200
+	defaultMaxActiveHMEOps = 16
+	hmeClientReapInterval  = time.Minute
 )
 
 // hmeClientEntry 是单个账号的客户端缓存条目。
@@ -46,6 +51,9 @@ const (
 // 「置空端点 → 重新校验」自愈流程与其它并发操作交错时仍会读到空端点。
 type hmeClientEntry struct {
 	mu              sync.Mutex
+	pinCount        int // 引用计数，>0 时不可被 LRU 驱逐
+	closing         atomic.Bool
+	closedDone      chan struct{}
 	fingerprint     string
 	credentialEpoch uint64
 	client          *hme.Client
@@ -55,81 +63,233 @@ type hmeClientEntry struct {
 
 // hmeClientPool 按账号 ID 缓存并复用 HME 客户端。
 type hmeClientPool struct {
-	mu       sync.Mutex
-	entries  map[string]*hmeClientEntry
-	max      int
-	idleTTL  time.Duration
-	stopCh   chan struct{}
-	stopOnce sync.Once
+	mu             sync.Mutex
+	entries        map[string]*hmeClientEntry
+	closingEntries map[string]*hmeClientEntry
+	max            int
+	maxActive      int
+	activeOps      int
+	idleTTL        time.Duration
+	closed         bool
+	closeDone      chan struct{} // 支持并发重复 Close 安全等待首次完成
+	stopCh         chan struct{}
+	stopOnce       sync.Once
 }
 
 func newHMEClientPool() *hmeClientPool {
+	return newHMEClientPoolWithLimits(defaultMaxHMEClients, defaultMaxActiveHMEOps)
+}
+
+func newHMEClientPoolWithLimits(max, maxActive int) *hmeClientPool {
+	if max <= 0 {
+		max = defaultMaxHMEClients
+	}
+	if maxActive <= 0 {
+		maxActive = defaultMaxActiveHMEOps
+	}
 	p := &hmeClientPool{
-		entries: make(map[string]*hmeClientEntry),
-		max:     defaultMaxHMEClients,
-		idleTTL: defaultHMEClientIdleTTL,
-		stopCh:  make(chan struct{}),
+		entries:        make(map[string]*hmeClientEntry),
+		closingEntries: make(map[string]*hmeClientEntry),
+		max:            max,
+		maxActive:      maxActive,
+		idleTTL:        defaultHMEClientIdleTTL,
+		stopCh:         make(chan struct{}),
 	}
 	go p.reapLoop()
 	return p
 }
 
-// acquire 取得（必要时创建）某账号的条目。注意只取条目，不加条目锁。
-func (p *hmeClientPool) acquire(id string) *hmeClientEntry {
+func (p *hmeClientPool) isClosed() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.entries[id]; ok {
-		return e
+	return p.closed
+}
+
+// Stats 返回当前缓存条目数与活跃操作数。
+func (p *hmeClientPool) Stats() (conns, active int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.entries), p.activeOps
+}
+
+// acquireActiveOp 申请全局活跃 HME 操作槽位。
+func (p *hmeClientPool) acquireActiveOp(ctx context.Context) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	// 必须在插入之前腾出位置:否则新建条目的 lastUsed 还是零值，
-	// 会被紧跟其后的淘汰逻辑判定为"最久未用"而立刻踢掉，
-	// 结果是池永远长不大、而调用方还握着一个已脱离池的孤儿条目。
-	if len(p.entries) >= p.max {
-		p.evictLocked(id)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed {
+		return nil, errors.New("HME 客户端池已关闭")
 	}
-	e := &hmeClientEntry{}
-	e.lastUsed.Store(time.Now().UnixNano())
-	p.entries[id] = e
-	return e
+
+	maxActive := p.maxActive
+	if maxActive <= 0 {
+		maxActive = defaultMaxActiveHMEOps
+	}
+	if p.activeOps >= maxActive {
+		return nil, ErrHMEOpBusy
+	}
+	p.activeOps++
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			p.mu.Lock()
+			p.activeOps--
+			if p.activeOps < 0 {
+				p.activeOps = 0
+			}
+			p.mu.Unlock()
+		})
+	}
+	return release, nil
+}
+
+// acquire 取得（必要时创建）某账号的条目并增加 Pin 保护 (兼容无 Context 调用)。
+func (p *hmeClientPool) acquire(id string) (*hmeClientEntry, func(), error) {
+	return p.acquireContext(context.Background(), id)
+}
+
+// acquireContext 取得（必要时创建）某账号的条目并增加 Pin 保护，等待清理时支持 Context 取消。
+func (p *hmeClientPool) acquireContext(ctx context.Context, id string) (*hmeClientEntry, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, nil, errors.New("HME 客户端池已关闭")
+		}
+
+		// 若存在同账号旧条目正在退出，必须等待其彻底收尾退出，且等待支持 Context 取消 (S03)
+		if old, ok := p.closingEntries[id]; ok {
+			done := old.closedDone
+			p.mu.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+		}
+
+		if e, ok := p.entries[id]; ok {
+			e.pinCount++
+			p.mu.Unlock()
+			return e, p.makeUnpin(e), nil
+		}
+		// 必须在插入之前腾出位置:否则新建条目的 lastUsed 还是零值，
+		// 会被紧跟其后的淘汰逻辑判定为"最久未用"而立刻踢掉
+		if len(p.entries) >= p.max {
+			p.evictLocked(id)
+		}
+		// 若驱逐后仍达上限，说明全量在用，严格拒绝无界扩容
+		if len(p.entries) >= p.max {
+			p.mu.Unlock()
+			return nil, nil, ErrHMEPoolBusy
+		}
+		e := &hmeClientEntry{
+			pinCount:   1,
+			closedDone: make(chan struct{}),
+		}
+		e.lastUsed.Store(time.Now().UnixNano())
+		p.entries[id] = e
+		p.mu.Unlock()
+		return e, p.makeUnpin(e), nil
+	}
+}
+
+func (p *hmeClientPool) makeUnpin(e *hmeClientEntry) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.mu.Lock()
+			e.pinCount--
+			if e.pinCount < 0 {
+				e.pinCount = 0
+			}
+			p.mu.Unlock()
+		})
+	}
 }
 
 // drop 丢弃某账号的缓存（账号被删除或凭据整体失效时调用）。
 func (p *hmeClientPool) drop(id string) {
 	p.mu.Lock()
 	e, ok := p.entries[id]
-	if ok {
-		delete(p.entries, id)
-	}
-	p.mu.Unlock()
 	if !ok {
+		p.mu.Unlock()
 		return
 	}
+	e.closing.Store(true)
+	delete(p.entries, id)
+	p.closingEntries[id] = e
+	p.mu.Unlock()
+
 	e.mu.Lock()
 	if e.client != nil {
 		e.client.Close()
 		e.client = nil
 	}
+	select {
+	case <-e.closedDone:
+	default:
+		close(e.closedDone)
+	}
 	e.mu.Unlock()
+
+	p.mu.Lock()
+	delete(p.closingEntries, id)
+	p.mu.Unlock()
 }
 
-// Close 关闭全部缓存客户端并停止回收协程（幂等）。
+// Close 关闭全部缓存客户端并停止回收协程（幂等且并发安全等待首次完成）。
 func (p *hmeClientPool) Close() {
 	p.stopOnce.Do(func() { close(p.stopCh) })
 
 	p.mu.Lock()
-	entries := p.entries
+	if p.closed {
+		done := p.closeDone
+		p.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+		return
+	}
+	p.closed = true
+	p.closeDone = make(chan struct{})
+
+	allEntries := make([]*hmeClientEntry, 0, len(p.entries)+len(p.closingEntries))
+	for _, e := range p.entries {
+		e.closing.Store(true)
+		allEntries = append(allEntries, e)
+	}
+	for _, e := range p.closingEntries {
+		e.closing.Store(true)
+		allEntries = append(allEntries, e)
+	}
 	p.entries = make(map[string]*hmeClientEntry)
+	p.closingEntries = make(map[string]*hmeClientEntry)
 	p.mu.Unlock()
 
-	for _, e := range entries {
-		if e.mu.TryLock() {
-			if e.client != nil {
-				e.client.Close()
-				e.client = nil
-			}
-			e.mu.Unlock()
+	for _, e := range allEntries {
+		e.mu.Lock()
+		if e.client != nil {
+			e.client.Close()
+			e.client = nil
 		}
+		select {
+		case <-e.closedDone:
+		default:
+			close(e.closedDone)
+		}
+		e.mu.Unlock()
 	}
+
+	close(p.closeDone)
 }
 
 func (p *hmeClientPool) reapLoop() {
@@ -154,8 +314,8 @@ func (p *hmeClientPool) reapIdle() {
 		if e.lastUsed.Load() > cutoff {
 			continue
 		}
-		// 只回收当前空闲的条目，绝不动正在执行操作的连接
-		if e.mu.TryLock() {
+		// 只回收当前未被 Pin 且空闲的条目，绝不动正在执行操作的连接
+		if e.pinCount == 0 && e.mu.TryLock() {
 			if e.client != nil {
 				e.client.Close()
 				e.client = nil
@@ -170,9 +330,7 @@ func (p *hmeClientPool) reapIdle() {
 // evictLocked 按最久未用淘汰空闲条目，为即将插入的新条目腾出位置。调用方须持有 p.mu。
 //
 // 淘汰目标是让 len 严格小于 max（因为调用方随后还要插入一条），跳过 keepID，
-// 且只淘汰 tryLock 成功的空闲条目 —— 正在执行操作的客户端绝不能被回收。
-// 若所有条目都在使用中，池会临时超出上限，这是安全的降级
-// （宁可多占一点内存，也不能把在用客户端抽走）。
+// 且只淘汰 pinCount == 0 且 tryLock 成功的空闲条目 —— 正在执行操作的客户端绝不能被回收。
 func (p *hmeClientPool) evictLocked(keepID string) {
 	if len(p.entries) < p.max {
 		return
@@ -195,7 +353,7 @@ func (p *hmeClientPool) evictLocked(keepID string) {
 		if len(p.entries) < p.max {
 			return
 		}
-		if c.e.mu.TryLock() {
+		if c.e.pinCount == 0 && c.e.mu.TryLock() {
 			if c.e.client != nil {
 				c.e.client.Close()
 				c.e.client = nil
@@ -234,21 +392,10 @@ func hmeFingerprint(acc *Account) string {
 }
 
 // WithHMEClient 借出账号级 HME 客户端执行 fn，调用返回后客户端留在池中复用。
-//
-// 【为什么必须复用】hme.NewClient 内部会构造一个**独立的 http.Transport**。
-// 每次操作都新建客户端，就等于每次都从一个没有任何空闲连接的 transport 出发，
-// 于是**每一个 HME 请求都要走一遍完整 TLS 握手**。实测(本地 TLS 服务)：
-//
-//	每次新建客户端: 5 次请求 → 5 个 TCP 连接(5 次握手)
-//	复用同一客户端: 5 次请求 → 1 个 TCP 连接
-//
-// 注意别被构造开销误导 —— hme.NewClient 本身只要约 9.5µs，真正的代价是那次跨洋握手
-// (新建连接 = TCP 三次握手 + TLS 1.3 握手 ≈ 2 RTT，国内到 Apple 约 300–500ms)。
-// 因此这个池省下的是 RTT 量级，不是微秒量级。
-//
-// 另外，同一账号的调用在此串行执行：hme.Client 的 ListAliases 在失败时会
-// 「置空端点 → 重新校验」，若与并发操作交错，对方会读到空端点。
-//
+func (m *Manager) WithHMEClient(id string, fn func(*hme.Client) error) error {
+	return m.WithHMEClientContext(context.Background(), id, fn)
+}
+
 // WithHMEClientContext 借出账号级 HME 客户端执行 fn，借锁阶段响应 Context 取消 (PR-05 F10)。
 // 调用返回后客户端留在池中复用。
 func (m *Manager) WithHMEClientContext(ctx context.Context, id string, fn func(*hme.Client) error) error {
@@ -257,12 +404,30 @@ func (m *Manager) WithHMEClientContext(ctx context.Context, id string, fn func(*
 	})
 }
 
+// HMEPoolStats 返回当前 HME 客户端池的缓存条目数与活跃操作数。
+func (m *Manager) HMEPoolStats() (conns, active int) {
+	if m.hmePool == nil {
+		return 0, 0
+	}
+	return m.hmePool.Stats()
+}
+
 // WithHMEClientContextSession 将借出时的凭据代际交给需要提交本地状态的调用方。
 func (m *Manager) WithHMEClientContextSession(ctx context.Context, id string, fn func(*hme.Client, uint64) error) error {
-	entry := m.hmePool.acquire(id)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
+	// 1. 从池中借出条目并增加 Pin 保护（安全借用/Pin，排队等待时不占用全局网络操作配额，S02）
+	entry, unpin, err := m.hmePool.acquireContext(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unpin()
+
+	// 2. 单账号可取消串行锁等待
 	if !entry.mu.TryLock() {
-		ticker := time.NewTicker(10 * time.Millisecond)
+		ticker := time.NewTicker(5 * time.Millisecond)
 		defer ticker.Stop()
 		locked := false
 		for !locked {
@@ -277,6 +442,22 @@ func (m *Manager) WithHMEClientContextSession(ctx context.Context, id string, fn
 		}
 	}
 	defer entry.mu.Unlock()
+
+	// 3. 拿到单账号锁后，检查池状态和条目 closing 状态（S03: 严防 Close 后重建客户端，T07: 原子同步保护）
+	if m.hmePool.isClosed() || entry.closing.Load() {
+		return errors.New("HME 客户端池已关闭")
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// 4. 拿到单账号锁后，申请全局活跃操作槽位（网络操作准入，S02）
+	releaseOp, err := m.hmePool.acquireActiveOp(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseOp()
 
 	if err := ctx.Err(); err != nil {
 		return err
@@ -376,11 +557,6 @@ func (m *Manager) WithHMEClientContextSession(ctx context.Context, id string, fn
 	entry.fingerprint = hmeFingerprint(snap)
 
 	return nil
-}
-
-// WithHMEClient 借出账号级 HME 客户端执行 fn (兼容保留包装)。
-func (m *Manager) WithHMEClient(id string, fn func(*hme.Client) error) error {
-	return m.WithHMEClientContext(context.Background(), id, fn)
 }
 
 // accountSnapshot 返回账号的深拷贝（含 Cookies）。

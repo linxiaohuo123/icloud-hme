@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 gin, net/http, strings, strconv, errors, icloud-hme/internal/mail
- * [OUTPUT]: 对外提供 listInboxHandler, listMailboxesHandler, getMessageHandler, getMessagePrimeHandler, getMessagesHandler, deleteMessageHandler, checkProxyHandler 等 HTTP 端点
+ * [OUTPUT]: 对外提供 listInboxHandler, listMailboxesHandler, getMessageHandler, deleteMessageHandler, checkProxyHandler 等 HTTP 端点
  * [POS]: internal/server 的邮件收件箱与消息详情路由处理器，统一由 MailReadService 驱动并消除冗余私有缓存
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -120,54 +120,6 @@ func (s *Server) handleGetMessageDetail(c *gin.Context, rawID string) {
 
 func (s *Server) getMessageHandler(c *gin.Context) {
 	s.handleGetMessageDetail(c, c.Param("message_id"))
-}
-
-func (s *Server) getMessagePrimeHandler(c *gin.Context) {
-	s.handleGetMessageDetail(c, c.Param("id"))
-}
-
-type getMessagesReq struct {
-	AccountID string                `json:"account_id"`
-	Messages  []batchMessageItemReq `json:"messages"`
-}
-
-func (s *Server) getMessagesHandler(c *gin.Context) {
-	var req getMessagesReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "参数错误: account_id, messages 必填 — "+err.Error())
-		return
-	}
-	req.AccountID = strings.TrimSpace(req.AccountID)
-	if req.AccountID == "" {
-		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "account_id 必填")
-		return
-	}
-	if len(req.Messages) == 0 {
-		ok(c, gin.H{
-			"account_id": req.AccountID,
-			"messages":   []*mail.FullMessage{},
-			"items":      []BatchItemResult{},
-			"count":      0,
-		})
-		return
-	}
-	if len(req.Messages) > 50 {
-		failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "单次最多批量获取 50 封邮件")
-		return
-	}
-
-	out, items, err := s.mailReadService.GetMessagesBatch(c.Request.Context(), req.AccountID, req.Messages)
-	if err != nil {
-		backendFail(c, err)
-		return
-	}
-
-	ok(c, gin.H{
-		"account_id": req.AccountID,
-		"messages":   out,
-		"items":      items,
-		"count":      len(out),
-	})
 }
 
 func (s *Server) deleteMessageHandler(c *gin.Context) {

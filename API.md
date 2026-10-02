@@ -51,6 +51,9 @@ HTTP JSON API，所有接口均采用标准 JSON 格式交互。
 | `PROXY_CHECK_FAILED` | 502 | 代理服务器不可达、认证失败或无法建立外部隧道 |
 | `INTERNAL_ERROR` | 500 | 服务端底层存储或系统不可用 |
 | `INCOMPLETE_EXPORT` | 502 | 全量别名导出时至少一个账号读取失败，未生成导出文件 |
+| `IDEMPOTENCY_CONFLICT` | 409 | 相同 Idempotency-Key 重放但携带了不同请求参数或冲突的租约 |
+| `TOO_MANY_WAITERS_PER_KEY` | 429 | 单取码任务长轮询等待者连接数达到上限 (单任务限 8 个并发等待连接) |
+| `SERVER_BUSY` | 503 | 上游邮件连接池或操作槽位满载 (响应含 `Retry-After` 头，请稍后重试) |
 
 ### 安全与鉴权约定
 
@@ -63,15 +66,15 @@ HTTP JSON API，所有接口均采用标准 JSON 格式交互。
    - 通过中台 `/api/tokens` 签发的令牌（如 `am_xxxxxx`），直接在请求头携带 `Authorization: Bearer <TOKEN>`。
    - 系统会自动记录该 Token 分销的出号流水，用于计量审计。
    - **令牌按作用域授权（最小权限）**，详见下方「作用域模型」。
-   - URL 查询参数 `token` / `api_key` 仅在 `GET /mail/code*`、`/mail/view*`、`/mail/raw*`、`/api/mail/code*`、`/api/mail/view*`、`/api/mail/raw*` 和 `GET /api/verify-code` 的已注册路由有效。管理接口、写接口及所有外部 v2 接口必须使用请求头凭据。
+   - URL 查询参数 `token` / `api_key` 仅在浏览器直链 `GET /mail/code*`、`/mail/view*`、`/mail/raw*` 有效。管理接口、写接口及所有外部 v2 接口必须使用请求头凭据。
    - 主服务访问日志省略查询参数，避免记录直链凭据；反向代理访问日志需采用相同的隐藏策略。
 3. **作用域模型 (Scopes)**：
 
    | 作用域 | 授权范围 | 覆盖端点与限制 |
    | --- | --- | --- |
-   | `allocate` | 出号 (仅限库存池) | 外部 v2 接口 `POST /api/external/v2/allocate` 及兼容出号端点 `/api/allocate`、`/api/quick-create`、`/api/alias/lease`、`/api/external/v1/allocate`。<br>**外部令牌严禁指定母号 account_id，严禁现场远程建号 (mode=create)，仅限认领可用库存**。 |
-   | `verify` | 关联租约取码 | `POST /api/external/v2/verification-requests`、`GET /api/external/v2/verification-requests/:id`、`GET /api/verify-code`、`/api/external/v1/verify-code`。<br>**仅限提取归属于该令牌的别名验证码；严禁调用管理员 inbox/messages/mailboxes 接口翻看全局邮件**。 |
-   | `admin` | 全部管理面 | 现场远程建号 (`POST /api/create`、`/create/batch`)、账号维护、全局收件箱 (`/api/inbox*`、`/api/messages*`、`/api/mailboxes`)、业务标识、令牌管理、流水、调度、系统设置、代理检测、`POST /api/reload`。 |
+   | `allocate` | 出号 (仅限库存池) | `POST /api/external/v2/allocate`、`GET /api/external/v2/operations/:id`。<br>**外部令牌严禁指定母号 account_id，严禁现场远程建号 (mode=create)，仅限认领可用库存**。 |
+   | `verify` | 关联租约取码 | `POST /api/external/v2/verification-requests`、`GET /api/external/v2/verification-requests/:id`，以及浏览器直链 `GET /mail/code*`、`/mail/view*`、`/mail/raw*`。<br>**仅限提取归属于该令牌的别名验证码；严禁调用管理员 inbox/mailboxes 接口翻看全局邮件**。 |
+   | `admin` | 全部管理面 | 管理台出号 (`POST /api/quick-create`)、现场远程建号 (`POST /api/create`、`/create/batch`)、账号维护、全局收件箱 (`/api/inbox*`、`/api/mailboxes`)、业务标识、令牌管理、流水、调度、系统设置、代理检测、`POST /api/reload`。 |
 
    - `POST /api/tokens` 未显式传 `scopes` 时，**默认只发放 `allocate,verify`**，即对外令牌无法触达任何管理面接口，也无法读取或收割其它令牌。
    - 需要管理员级令牌时显式传 `"scopes": "admin"`。
@@ -189,6 +192,8 @@ Authorization: Bearer <API_KEY>
   ]
 }
 ```
+
+按 ID 查询单个账号使用 `GET /api/accounts/:id`，`data` 为与列表元素相同结构的单个对象；账号不存在返回 `404 ACCOUNT_NOT_FOUND`。
 
 `schedule_protected` 是后端根据账号名称和保护标签计算的只读布尔值。为 `true` 时，账号不参与自动、普通手动或全员强制补货；前端据此标记保护状态并排除自动补货统计。修改账号名称或标签后的响应会重新计算该值。
 
@@ -359,15 +364,13 @@ Content-Type: application/json
 ```
 `audit_recorded=false` 表示 Apple 已创建该别名，但本地出号流水写入失败；不要重复创建，应记录返回的邮箱并排查存储故障。
 
-### 14. 智能一键出号 / 分销分配 (号池优先 / 注册机首选推荐)
+### 14. 管理台一键出号 (号池优先，仅 admin)
+
+外部令牌一律使用 v2 出号 `POST /api/external/v2/allocate` (见 21.1 节)；本接口仅供管理员会话、`ICLOUD_HME_API_KEY` 与 admin 作用域令牌调用，其他令牌返回 `403 SCOPE_DENIED`。
 
 ```http
 POST /api/quick-create
-# 兼容别名路由：
-# POST /api/alias/lease
-# POST /api/allocate
-# POST /api/external/v1/allocate
-Authorization: Bearer <API_KEY> # 或 Bearer <EXTERNAL_TOKEN>
+Authorization: Bearer <API_KEY>
 Content-Type: application/json
 
 {
@@ -381,7 +384,7 @@ Content-Type: application/json
 - `tag` (可选，字符串)：指定业务标签。优先分配绑定该标签的母号资产；如未指定则匹配通用号池，杜绝跨业务串号。
 - `label` (可选，字符串)：别名备注标签。
 - `mode` (可选，字符串，默认 `"pool"`)：
-  - `"pool"`（默认）：号池优先。管理员请求在号池耗尽时尝试 Apple 实时建号；普通外部令牌仅能从号池认领，耗尽时返回 `503 POOL_EMPTY`。
+  - `"pool"`（默认）：号池优先，号池耗尽时尝试 Apple 实时建号。
   - `"pool_only"`：**严格仅用号池**。仅从预存就绪号池中认领，绝不实时调用 Apple 上游；若号池耗尽立即返回 `503 POOL_EMPTY`（附带 `Retry-After: 60`），保护注册机免受上游风控与阻塞。
   - `"create"`：管理员强制实时建号。绕过预存号池，直接调用 Apple 上游 API 创建全新别名（受账号小时配额限制）。
 
@@ -390,7 +393,7 @@ Content-Type: application/json
 - **无需指定 `account_id`**：底层调度引擎结合号池优先策略与 Round-Robin 算法自动轮询分配。
 - **业务标签亲和隔离 (`tag`)**：优先分配打上指定业务标签的专属母号；若无则自动匹配通用号池，严禁跨业务串号。
 - **并发原子防重**：底层 `ClaimInventoryAlias` 在 SQLite 事务中认领库存并写入分配与流水，阻止同一别名重复出号。
-- **自动审计与流水落库**：使用外部接入令牌发起调用时，自动记录该 Token、分配的别名、出号来源 (`pool`/`created`)、业务标签至数据库。
+- **自动审计与流水落库**：自动记录调用主体、分配的别名、出号来源 (`pool`/`created`)、业务标签至数据库。
 - **存量资产充分复用**：单号达到 750 上限后虽无法新建，但其存量预置别名仍可划入号池供外部业务认领。
 
 **响应：**
@@ -590,15 +593,13 @@ Authorization: Bearer <API_KEY>
 
 ### 18. 单封邮件详情读取
 
-提供两种等价且互补的路由格式，适应不同前端与自动化客户端：
-
 WebMail 只返回不完整的邮件预览 (`body_complete=false`)。列表命中的邮件详情会缓存 10 分钟；缓存过期后，超过最新 100 封的 WebMail 邮件可能无法再通过详情接口找到。IMAP 详情不受此限制。
 
 IMAP 完整详情的 `body` 保留解码后的正文；存在 HTML 正文时返回 HTML，`content_type` 标识实际返回的正文类型及 UTF-8 编码。`preview` 为独立的清洗文本，multipart 邮件中的纯文本与 HTML 验证信息均保留在预览中，附件不参与正文或取码。
 
-#### 方式 A：扁平风格
 ```http
 GET /api/inbox/1042?account_id=acc_1
+# 也支持复合格式与规范 message_ref：GET /api/inbox/INBOX:1042?account_id=acc_1
 Authorization: Bearer <API_KEY>
 ```
 **响应：**
@@ -621,53 +622,7 @@ Authorization: Bearer <API_KEY>
 }
 ```
 
-#### 方式 B：嵌套包裹风格
-```http
-GET /api/messages/1042?account_id=acc_1
-# 也支持复合格式：GET /api/messages/INBOX:1042?account_id=acc_1
-Authorization: Bearer <API_KEY>
-```
-**响应：**
-```json
-{
-  "success": true,
-  "data": {
-    "account_id": "acc_1",
-    "message": {
-      "id": "1042",
-      "folder": "INBOX",
-      "from": "service@verify.com",
-      "to": "target@icloud.com",
-      "subject": "您的注册验证码",
-      "date": "2026-09-20T14:35:10+08:00",
-      "body": "您的验证码是 958204",
-      "content_type": "text/plain"
-    },
-    "method": "imap",
-    "cached": false
-  }
-}
-```
-
-### 19. 批量拉取邮件正文 (带 10 分钟缓存)
-
-```http
-POST /api/messages
-Authorization: Bearer <API_KEY>
-Content-Type: application/json
-
-{
-  "account_id": "acc_1",
-  "messages": [
-    {"folder": "INBOX", "uid": "1042"},
-    {"folder": "INBOX", "uid": "1043"}
-  ]
-}
-```
-- 单次最多批量拉取 50 封邮件，支持单条 IMAP `UidFetch` 指令批量聚合，自动载入服务端 10 分钟只读内存缓存。
-- 单封邮件正文超限、损坏或缺失时，`data.items` 按原请求顺序保留对应的 `error`；成功读取的邮件仍出现在 `data.messages` 中，并且只有成功正文进入缓存。网络、取消等整批失败仍返回错误，不伪装为逐项成功。
-
-### 20. 删除邮件（当前不支持）
+### 19. 删除邮件（当前不支持）
 
 ```http
 DELETE /api/inbox/1042?account_id=acc_1&folder=INBOX
@@ -675,7 +630,7 @@ Authorization: Bearer <API_KEY>
 ```
 - 当前接口返回 `400 MAIL_DELETE_UNSUPPORTED`，不会删除邮件或清除缓存。
 
-### 21. 查询邮箱文件夹列表
+### 20. 查询邮箱文件夹列表
 
 ```http
 GET /api/mailboxes?account_id=acc_1
@@ -695,26 +650,28 @@ Authorization: Bearer <API_KEY>
 }
 ```
 
-### 22. 验证码提取与对外直出链接 (开箱即用)
+### 21. 浏览器直链：取码、查信与原文
+
+面向人工在浏览器中打开的直链，令牌可放在 `?token=` 中。程序化接入请使用 21.1 节的 v2 链路，它提供幂等出号与严格邮件基线。
 
 ```http
-# 方式 1: 程序一行 GET 取验证码 (支持通过 ?token= 传参，免请求头)
-GET /api/verify-code?email=target@icloud.com&token=<TOKEN>&timeout=30
-# 简写别名：GET /mail/code?email=target@icloud.com&token=<TOKEN>&timeout=30
-# 方式 2: 网页可视化查信直链 (浏览器点开即看，沙盒隔离渲染)
-# GET /mail/view?email=target@icloud.com&token=<TOKEN>
-# 方式 3: 邮件纯正文直链 (Raw 文本输出，支持 &format=html)
-# GET /mail/raw?email=target@icloud.com&token=<TOKEN>
-# 兼容外部分销路由：
-# GET /api/external/v1/verify-code?email=target@icloud.com&timeout=30
-Authorization: Bearer <API_KEY> # 或 Bearer <EXTERNAL_TOKEN>
+# 取码 JSON (长轮询等待新验证码)
+GET /mail/code?email=target@icloud.com&token=<TOKEN>&timeout=30
+# 网页可视化查信 (沙盒隔离渲染)
+GET /mail/view?email=target@icloud.com&token=<TOKEN>
+# 邮件纯正文 (Raw 文本输出，支持 &format=html)
+GET /mail/raw?email=target@icloud.com&token=<TOKEN>
 ```
+
+也可使用请求头 `Authorization: Bearer <TOKEN>` 代替 `?token=`。
+
+**路径形式**：别名也可放在路径中，如 `GET /mail/code/target@icloud.com`、`/mail/view/:email`、`/mail/raw/:email`。路径参数优先于查询参数。
 
 **参数说明**：
 - `email`（必填，亦兼容 `alias`）：待收件的别名地址。
 - `timeout`（可选）：最大挂起秒数，默认 30 秒，上限 120 秒。超时返回 `408 VERIFY_TIMEOUT`。
 - 长轮询在交付验证码前再次验证原请求的令牌凭据；令牌轮换、撤销或过期后，在途旧请求返回 `401 REVOKED_TOKEN`，不会消费该验证码事件。
-- `fresh` 或 `nocache`（可选）：布尔值，默认 `false`。传 `true` 时仅跳过本地近期内存缓存，**但不是严格的 IMAP 邮件基线保证**。需要严格基线保证的新客户端请使用 v2 端点。
+- `fresh` 或 `nocache`（可选）：布尔值，默认 `false`。传 `true` 时仅跳过本地近期内存缓存，**但不是严格的 IMAP 邮件基线保证**。需要严格基线保证时请使用 v2 端点。
 - `auto_delete`：**明确不支持并会被拒绝**。传入 `auto_delete=true` 或 `1` 会直接返回 `400 UNSUPPORTED_PARAMETER` 错误。依据 RFC 9110 规范，HTTP GET 必须具备安全/无副作用语义，严禁通过 GET 查询操作导致别名被隐式停用。
 - `/mail/view` 与 `/mail/raw` 支持 IMAP 正文和 WebMail 不完整预览。IMAP 默认查询 INBOX 最近 30 天；WebMail 不承诺按天数筛选，也不保证完整正文。
   - 普通外部令牌使用分配记录中的母号读取邮件；显式 `account_id` / `account` 与分配账号不一致时返回 `404 RESOURCE_NOT_FOUND`，无法通过此参数跨账号读取。
@@ -746,9 +703,11 @@ Authorization: Bearer <API_KEY> # 或 Bearer <EXTERNAL_TOKEN>
 }
 ```
 
-### 22.1 推荐方案：v2 规范化出号与权威取码链路 (新客户端首选)
+`/mail/code` 在已进入等待后遇到服务停机，返回 `503 SERVER_SHUTTING_DOWN`。客户端主动断连会取消等待并释放订阅。
 
-针对注册机、自动化客户端以及高可靠业务系统，推荐使用具备**显式幂等保障、主体资源隔离与严格 IMAP 邮件基线**的 v2 接口套件：
+### 21.1 外部接入：v2 出号与取码链路 (外部令牌唯一程序化入口)
+
+注册机、自动化客户端与业务系统统一使用具备**显式幂等保障、主体资源隔离与严格 IMAP 邮件基线**的 v2 接口套件：
 
 #### 步骤 1：规范化出号认领 (POST /api/external/v2/allocate)
 必须携带 `Idempotency-Key` 请求头（防止网络抖动导致的重复出号）：
@@ -782,19 +741,29 @@ Content-Type: application/json
 ```
 > **字段说明**：
 > - `lease_id` / `allocation_id`：租约唯一标识（两者值相同，指向同一数据库分配记录，用于后续取码绑定）。
-> - `allocated_at`：别名真实租约分配时间戳（RFC3339 UTC 格式）。注：历史 v1 的 `tag` 与 `created_at` 字段在 v2 契约中不再提供。
+> - `allocated_at`：别名真实租约分配时间戳（RFC3339 UTC 格式）。
 > - 若相同幂等键传参不一致返回 `409 IDEMPOTENCY_CONFLICT`；底层别名分配出现状态或唯一性冲突返回 `409 ALLOCATION_CONFLICT`。
 
 #### 步骤 2：创建取码意图并锁定邮件基线 (POST /api/external/v2/verification-requests)
+
+后台扫描或查询发现收件邮箱或 IMAP 服务器/端口变化时，原来源的未完成取码任务失效，GET 返回 `409 UIDVALIDITY_CHANGED`，需重新创建任务。仅轮换授权码或代理不改变来源。升级到数据库 v12 时，来源未知的历史未完成任务也会失效；已成功结果保留。
 
 配置了原生或外部 IMAP 时，基线读取失败返回 `502 UPSTREAM_FAILURE` 并保留实际 IMAP 故障；只有 Cookie/WebMail 可用的账号返回 `400 CAPABILITY_UNSUPPORTED`。
 
 严格取码同步中，完整邮件正文的超限、MIME 或编码损坏会按账号、文件夹、UIDVALIDITY 与 UID 记录逐项错误，并继续处理其他邮件；失败正文不会完成取码任务。缺失正文、网络错误或结果持久化失败仍保留当前页游标等待重试。
 
-使用出号时返回的 `allocation_id`（即 `lease_id`）建立取码任务。系统将自动原子采集目标母号 IMAP 的最新 `UIDVALIDITY` 与 `UIDNEXT` 基线：
+**幂等性支持 (Idempotency-Key)**：
+- 请求头可选携带 `Idempotency-Key`（最长 128 字符 ASCII，格式推荐 UUID 或客户端业务唯一标识）。
+- **同主体、同键、同有效参数**：原子恢复原任务（HTTP 200，原 `request_id`），不重复读取 IMAP 基线，不延长任务到期时间 `expires_at`。
+- **同主体、同键、不同参数（如不同 lease_id）**：返回 `409 IDEMPOTENCY_CONFLICT`，失败请求不重复读取基线。
+- **不同主体**：不同 API Token / 身份凭据的幂等键互相物理隔离，互不干扰。
+- **状态收敛**：若原任务已过期但仍为 `ready`，重放时服务端原子 CAS 收敛为 `expired` 终态。
+
+使用出号时返回的 `allocation_id`（即 `lease_id`）建立取码任务。系统将自动原子采集目标母号 IMAP 的最新 `UIDVALIDITY` 与 `UIDNEXT` 基线，并绑定物理收件箱来源（邮箱地址、服务器及端口）：
 ```http
 POST /api/external/v2/verification-requests
 Authorization: Bearer <TOKEN>
+Idempotency-Key: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d
 Content-Type: application/json
 
 {
@@ -810,10 +779,13 @@ Content-Type: application/json
     "lease_id": "alloc_6f8b2a1c...",
     "alias_email": "fresh_alias@icloud.com",
     "status": "ready",
+    "baseline_ready": true,
     "expires_at": "2026-09-23T10:10:00Z"
   }
 }
 ```
+> **字段说明**：
+> - `baseline_ready`：布尔值。**仅在任务处于有效（未过期）且状态为 `ready` 时为 `true`**。终态（`succeeded`、`expired`、`invalidated`）或任务虽为 `ready` 但已超时时恒为 `false`。外部客户端应在 `baseline_ready == true` 时才向目标网站触发发送验证码，避免旧码早于基线到达或向已死任务发信。
 
 #### 步骤 3：在外部目标网站触发发送验证码邮件
 调用第三方注册/登录接口向 `fresh_alias@icloud.com` 发送验证码。
@@ -821,6 +793,13 @@ Content-Type: application/json
 #### 步骤 4：长轮询获取验证码 (GET /api/external/v2/verification-requests/:id)
 
 事件消费前与结果交付前均重新验证原请求凭据；等待期间令牌轮换、撤销或过期后返回 `401 TOKEN_REVOKED`。轮换保留任务归属，新凭据可继续查询原任务；消费事件前发现凭据失效时，不会消费该事件。
+
+**连接保护与过载控制**：
+- **单任务等待者上限**：每个 `request_id` 最多允许 8 个并发长轮询等待连接（保护客户端防重复循环打满连接）。超出限制立即返回 `429 TOO_MANY_WAITERS_PER_KEY`（或 `VERIFY_WAITER_LIMIT`）。
+- **连接超时分离**：v2 GET 默认 `timeout=0`（即时查询），长轮询须显式设置，建议 30~60s，上限 120s。浏览器直链 `/mail/code` 默认 30s。等待不受短阶段的 5 秒鉴权/数据库时限误杀；进入等待时释放短阶段在途名额。
+- **系统上游繁忙**：底层 IMAP 连接池或活跃操作槽位满载时，返回 `503 SERVER_BUSY` 并携带响应体 `{"retry_after": 2}` 及响应头 `Retry-After: 2`，断绝无预算的 WebMail 盲目回退。
+- **主动取消释放**：客户端断开连接或超时退出时，服务端立即取消上下文并安全归还等待者名额与连接槽位。
+- **失败分类**：数据库查询/提交故障返回 `500 INTERNAL_ERROR`，请求取消返回 `499 REQUEST_CANCELED`。停机主动取消长轮询时可返回 `503 SERVER_SHUTTING_DOWN`，级联取消也可能返回 499；服务恢复后可用原 `request_id` 继续查询。
 
 ```http
 GET /api/external/v2/verification-requests/vreq_8a3d1e4f...?timeout=30
@@ -846,7 +825,7 @@ Authorization: Bearer <TOKEN>
 
 ## 别名维护与管理端点
 
-### 23. 获取账号下别名列表
+### 22. 获取账号下别名列表
 
 `account_id=all` 或留空时聚合全部账号。响应额外包含 `complete` 和 `failed_accounts`；`complete=false` 时 `count` 仅表示已成功读取的别名数，不能视为全量。
 
@@ -876,7 +855,7 @@ Authorization: Bearer <API_KEY>
 }
 ```
 
-### 24. 导出别名 (CSV / JSON)
+### 23. 导出别名 (CSV / JSON)
 
 ```http
 GET /api/aliases/export?account_id=all&format=csv
@@ -885,7 +864,7 @@ Authorization: Bearer <API_KEY>
 - `account_id`：母账号 ID，传入 `all` 或留空可合并导出系统中所有账号的别名；任何账号读取失败时返回 `502 INCOMPLETE_EXPORT`，不输出不完整文件。
 - `format`：`csv`（默认，带 UTF-8 BOM，Excel 直接双击不乱码）或 `json`。
 
-### 25. 编辑别名标签与备注
+### 24. 编辑别名标签与备注
 
 ```http
 PATCH /api/aliases/:id
@@ -900,7 +879,7 @@ Content-Type: application/json
 ```
 - `:id` 为别名的 `anonymousId`。
 
-### 26. 批量更新别名
+### 25. 批量更新别名
 
 ```http
 POST /api/aliases/batch-update
@@ -917,7 +896,7 @@ Content-Type: application/json
 - 单次最多批量修改 100 个别名。
 - 响应中的 `succeeded` 和 `failed` 分别列出成功与失败的别名 ID。若 Apple 已处理修改但本地账号会话未同步，响应还会包含 `last_error`；此时应刷新列表核对结果。
 
-### 27. 停用别名
+### 26. 停用别名
 
 停用、重新激活与删除接口均拒绝非法 JSON 或字段类型错误，返回 `400 VALIDATION_ERROR` 且不执行操作；空请求体仍可通过查询参数 `account_id` 指定账号。
 
@@ -931,7 +910,7 @@ Content-Type: application/json
 }
 ```
 
-### 28. 重新激活别名
+### 27. 重新激活别名
 
 ```http
 POST /api/aliases/:id/reactivate
@@ -943,7 +922,7 @@ Content-Type: application/json
 }
 ```
 
-### 29. 物理删除别名
+### 28. 物理删除别名
 
 ```http
 DELETE /api/aliases/:id
@@ -955,7 +934,7 @@ Content-Type: application/json
 }
 ```
 
-### 29.1 存量别名受控激活入池 (Promote to Pool)
+### 28.1 存量别名受控激活入池 (Promote to Pool)
 
 将未被消费过的存量别名（处于 unknown 沉睡状态）受控激活为可用号池库存（available）。严格排除私人大号与受保护账号。
 
@@ -986,7 +965,7 @@ Content-Type: application/json
 
 ## 网络诊断与代理端点
 
-### 30. 代理连通性测试
+### 29. 代理连通性测试
 
 ```http
 POST /api/proxy/check
@@ -1016,7 +995,7 @@ Content-Type: application/json
 
 ## 业务中台治理端点
 
-### 31. 业务标识 (Tags)
+### 30. 业务标识 (Tags)
 
 用于在母账号池中划分业务领域（如区分不同游戏、不同海外电商渠道）：
 
@@ -1025,7 +1004,7 @@ Content-Type: application/json
 - `PATCH /api/tags/:id`：部分更新业务标识名称、标签、状态和描述。未提交字段保持现值；`{"description":""}` 清空描述，省略或传 `null` 保持原描述。创建时间和最近活动时间由服务端保留。
 - `DELETE /api/tags/:id`：删除业务标识
 
-### 32. 外部接入令牌 (APITokens)
+### 31. 外部接入令牌 (APITokens)
 
 用于向外部下游系统提供免密分销出号接入（**仅 `admin` 作用域可访问**）：
 
@@ -1036,16 +1015,19 @@ Content-Type: application/json
   - `expires_in_days` 必须是 JSON 整数；也可使用 RFC3339 字符串 `expires_at` 指定过期时间。非法 JSON 或字段类型错误返回 `400 VALIDATION_ERROR`，不会创建令牌。空请求体保留默认创建行为；不指定过期时间时令牌无到期时间。
   - `scopes` 留空时默认为最小权限 `allocate,verify`；需要管理面能力时显式传 `admin`。
   - 响应 `data` 中一次性返回明文 `token`，之后无法再次读取。
+- `POST /api/tokens/:id/rotate`：轮换令牌密钥。令牌 ID、名称、作用域、过期时间与历史归属 (租约、取码任务) 保持不变；旧密钥立即失效，在途长轮询交付前复查凭据并返回 `401`。
+  - 响应结构与创建相同，`data.token` 一次性返回新明文密钥。
+  - 令牌不存在返回 `404 NOT_FOUND`；已吊销令牌返回 `400 TOKEN_REVOKED`。
 - `DELETE /api/tokens/:id`：销毁吊销该接入令牌
 
-### 33. 已用别名流水审计 (Leases)
+### 32. 已用别名流水审计 (Leases)
 
 记录全站每一个被分配出的别名流水与归属 Token（定时调度产出同样入账，`token_name` 为 `scheduler`）：
 
 - `GET /api/leases?alias=...&tag=...&status=...&limit=20&offset=0`：`alias` 同时搜索别名邮箱、账号 ID、母号名称和母号邮箱；返回记录包含 `account_name`、`account_email` 供界面直接展示，分页检索出号流水与交付状态（`limit` 上限 500；查询故障返回 500）
 - `PATCH /api/leases/:id/status`：更新流水状态 `{"status": "completed"}`（仅接受 `completed` / `leased` / `abandoned`）
 
-### 34. 定时调度配置与运行大盘 (Schedules)
+### 33. 定时调度配置与运行大盘 (Schedules)
 
 - `GET /api/schedule/configs`：列出所有账号的定时调度策略
 - 调度配置、业务标识和令牌列表查询遇到数据库错误时返回 `500 PERSISTENCE_ERROR`，不会把故障当作空列表或配额耗尽。
@@ -1068,14 +1050,14 @@ Content-Type: application/json
 
 ## 系统设置与通知端点
 
-### 35. 读取通知配置
+### 34. 读取通知配置
 
 ```http
 GET /api/settings/notify
 Authorization: Bearer <API_KEY>
 ```
 
-### 36. 保存通知配置
+### 35. 保存通知配置
 
 ```http
 PUT /api/settings/notify
@@ -1100,7 +1082,7 @@ Content-Type: application/json
 - `quota_threshold`：当账号活跃别名达到该水位时主动发送告警通知。
 - 配置立即保存至 SQLite settings 表，全自动热加载生效。
 
-### 37. 发送测试通知
+### 36. 发送测试通知
 
 ```http
 POST /api/settings/notify/test
@@ -1119,11 +1101,22 @@ Authorization: Bearer <API_KEY>
 }
 ```
 
+### 36.1 Camoufox 上号代理状态
+
+```http
+GET /api/settings/camoufox
+POST /api/settings/camoufox/test
+Authorization: Bearer <API_KEY>
+```
+- 两者都对 `ICLOUD_HME_CAMOUFOX_URL` (默认 `http://127.0.0.1:8089`) 指向的上号代理服务做一次 10 秒内的健康探测，探测失败也返回 HTTP 200，结果在 `data` 中表达。
+- `GET` 返回 `url`、`available`、`ready`、`latency_ms`、`status_text`；离线时附带 `error`。
+- `POST .../test` 返回 `success`、`url`、`latency_ms`、`message`，供控制台"测试连接"按钮使用。
+
 ---
 
 ## 系统运维端点
 
-### 38. 磁盘配置热重载
+### 37. 磁盘配置热重载
 ```http
 POST /api/reload
 Authorization: Bearer <API_KEY>
@@ -1131,7 +1124,7 @@ Authorization: Bearer <API_KEY>
 - 重新解析加载磁盘上的 `data/accounts.json`。
 - 自动重置 IMAP 连接池与别名内存缓存，支持外部脚本修改 JSON 文件后热重载生效。
 
-### 39. 运行时可观测性水位 (System Stats)
+### 38. 运行时可观测性水位 (System Stats)
 
 ```http
 GET /api/system/stats

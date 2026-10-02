@@ -287,7 +287,7 @@ func TestC03_InterleavingWinnerAuthoritative(t *testing.T) {
 		BaselineUID:         100,
 	}
 	_ = st.CreateVerificationRequestAtomic(ctx, vreqSucc, 100, 100)
-	_ = st.UpdateVerificationRequestResult(ctx, "vreq_succ", "succeeded", "987654", "ev_succ")
+	_, _, _ = st.CompleteVerificationRequestResult(ctx, "vreq_succ", store.VerificationCompletion{Code: "987654", MatchedEventRef: "ev_succ"})
 
 	// 读取取码结果：尽管过期时间已过，数据库 winner 为 succeeded，绝不能返回 expired！
 	res1, err := vService.GetVerificationResult(ctx, p, "vreq_succ", 0, "sec_c03")
@@ -443,7 +443,7 @@ func TestC03_ConcurrentInterleaving_ExpiredAndSucceededDuringWait(t *testing.T) 
 	}
 
 	// 另一执行者将 DB 中该记录标记为 succeeded
-	_, won, _ = st.CompleteVerificationRequest(ctx, "vreq_wait_succ", "123456", "ev_succ_interleave")
+	_, won, _ = st.CompleteVerificationRequestResult(ctx, "vreq_wait_succ", store.VerificationCompletion{Code: "123456", MatchedEventRef: "ev_succ_interleave"})
 	if !won {
 		t.Fatal("expected CompleteVerificationRequest to win CAS")
 	}
@@ -587,7 +587,7 @@ func TestC03_UIDValidityMutation_LosesToExpiredOrSucceeded(t *testing.T) {
 	}
 
 	// 另一执行者并发将 DB 状态置为 succeeded (CAS 胜出)
-	_, won, _ = st.CompleteVerificationRequest(ctx, "vreq_uid_succ", "777888", "ev_prior_succ")
+	_, won, _ = st.CompleteVerificationRequestResult(ctx, "vreq_uid_succ", store.VerificationCompletion{Code: "777888", MatchedEventRef: "ev_prior_succ"})
 	if !won {
 		t.Fatal("CompleteVerificationRequest failed")
 	}
@@ -663,8 +663,8 @@ func TestC04_SingleEventConsumptionPreservesConcurrentEvents(t *testing.T) {
 		Date:    time.Now().Format(time.RFC3339),
 	})
 
-	// 调用 GET /api/verify-code 取码
-	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"/api/verify-code?email=multi@example.com&timeout=1", nil)
+	// 调用 GET /mail/code 取码
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"/mail/code?email=multi@example.com&timeout=1", nil)
 	req.Header.Set("Authorization", "Bearer sec_c04")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -730,7 +730,7 @@ func TestC05_TokenIsolationAndRevocationDuringWait(t *testing.T) {
 	_, _ = st.RecordAllocation(allocA, "tok_a")
 
 	// 1. tok_b 试图读取 tok_a 的别名验证码 -> 404 RESOURCE_NOT_FOUND
-	reqB, _ := http.NewRequest("GET", ts.URL+"/api/verify-code?email=alias_a@example.com&timeout=1", nil)
+	reqB, _ := http.NewRequest("GET", ts.URL+"/mail/code?email=alias_a@example.com&timeout=1", nil)
 	reqB.Header.Set("Authorization", "Bearer sec_b")
 	respB, err := http.DefaultClient.Do(reqB)
 	if err != nil {
@@ -744,7 +744,7 @@ func TestC05_TokenIsolationAndRevocationDuringWait(t *testing.T) {
 	// 2. tok_a 长轮询等待验证码期间，token 被撤销
 	doneCh := make(chan int)
 	go func() {
-		reqA, _ := http.NewRequest("GET", ts.URL+"/api/verify-code?email=alias_a@example.com&timeout=3", nil)
+		reqA, _ := http.NewRequest("GET", ts.URL+"/mail/code?email=alias_a@example.com&timeout=3", nil)
 		reqA.Header.Set("Authorization", "Bearer sec_a")
 		respA, err := http.DefaultClient.Do(reqA)
 		if err != nil {

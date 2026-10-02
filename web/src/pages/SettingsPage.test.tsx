@@ -21,7 +21,21 @@ const storedResponse: NotifySettingsResponse = {
 }
 
 function mockGet(data: NotifySettingsResponse = storedResponse) {
-  server.use(http.get('/api/settings/notify', () => HttpResponse.json({ success: true, data })))
+  server.use(
+    http.get('/api/settings/notify', () => HttpResponse.json({ success: true, data })),
+    http.get('/api/settings/camoufox', () =>
+      HttpResponse.json({
+        success: true,
+        data: {
+          url: 'http://camoufox:8089',
+          available: true,
+          ready: true,
+          latency_ms: 10,
+          status_text: '运行中 (就绪)',
+        },
+      }),
+    ),
+  )
 }
 
 function renderPage() {

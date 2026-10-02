@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 database/sql, modernc.org/sqlite, os, path/filepath, sync, time, encoding/hex, crypto/rand
  * [OUTPUT]: 对外提供 Store 结构定义、NewStore、Close 引擎生命周期与 initSchema SQLite 数据库与 DDL 初始化
- * [POS]: internal/store 的核心引擎，维护 WAL 生命周期与事务化迁移，v7 持久化登录任务，v9 持久化补货用途
+ * [POS]: internal/store 的核心引擎，维护 WAL 与事务化迁移，v12 持久化取码物理来源，事务升级并保留迁移前快照
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -51,9 +51,51 @@ func newOpaqueID(prefix string) string {
 	return NewOpaqueID(prefix)
 }
 
+// contextMutex 提供兼具 LockContext(ctx) 与标准 Lock()/Unlock() 的单一真相源互斥锁 (T4)。
+// 支持在等待写锁期间响应 Context 取消退出，且零值与并发初始化绝对安全。
+type contextMutex struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+func (m *contextMutex) init() {
+	m.once.Do(func() {
+		m.ch = make(chan struct{}, 1)
+		m.ch <- struct{}{}
+	})
+}
+
+func (m *contextMutex) Lock() {
+	m.init()
+	<-m.ch
+}
+
+func (m *contextMutex) Unlock() {
+	m.init()
+	select {
+	case m.ch <- struct{}{}:
+	default:
+		panic("unlock of unlocked mutex")
+	}
+}
+
+func (m *contextMutex) LockContext(ctx context.Context) error {
+	m.init()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-m.ch:
+		if err := ctx.Err(); err != nil {
+			m.ch <- struct{}{}
+			return err
+		}
+		return nil
+	}
+}
+
 // Store 统管中台数据 (基于嵌入式 SQLite)
 type Store struct {
-	mu             sync.Mutex
+	mu             contextMutex
 	backupMu       sync.Mutex
 	instanceLock   dataDirLock
 	dataDir        string
@@ -444,9 +486,62 @@ func (s *Store) initSchema(dbExistedBefore bool) error {
 			if err := tx.Commit(); err != nil {
 				return fmt.Errorf("commit migration v8 to v9: %w", err)
 			}
+		case 9:
+			tx, err := s.db.Begin()
+			if err != nil {
+				return fmt.Errorf("begin migration v9 to v10: %w", err)
+			}
+			if err := ensureColumn(tx, "verification_requests", "idempotency_key", "TEXT DEFAULT ''"); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migrate v9 to v10 add idempotency_key: %w", err)
+			}
+			if err := ensureColumn(tx, "verification_requests", "idempotency_hash", "TEXT DEFAULT ''"); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migrate v9 to v10 add idempotency_hash: %w", err)
+			}
+			if _, err := tx.Exec(`
+				CREATE INDEX IF NOT EXISTS idx_vreq_status_exp ON verification_requests (status, expires_at);
+				CREATE UNIQUE INDEX IF NOT EXISTS uidx_vreq_idempotency ON verification_requests (principal_kind, principal_id, idempotency_key) WHERE idempotency_key != '';
+				PRAGMA user_version = 10;
+			`); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migrate v9 to v10 exec failed: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit migration v9 to v10 failed: %w", err)
+			}
+		case 10:
+			tx, err := s.db.Begin()
+			if err != nil {
+				return fmt.Errorf("begin migration v10 to v11: %w", err)
+			}
+			if err := migrateV10ToV11(tx); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migrate v10 to v11: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit migration v10 to v11: %w", err)
+			}
+		case 11:
+			tx, err := s.db.Begin()
+			if err != nil {
+				return fmt.Errorf("begin migration v11 to v12: %w", err)
+			}
+			if err := migrateV11ToV12(tx); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migrate v11 to v12: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit migration v11 to v12: %w", err)
+			}
 		default:
 			return fmt.Errorf("unsupported migration path from version %d", currentV)
 		}
+	}
+
+	// 5.1 启动期幂等补齐与自愈: 针对可能因历史版本已处于 10 但缺少 v10 索引的数据库自愈修复
+	if err := repairV10SchemaIfNeeded(s.db); err != nil {
+		return fmt.Errorf("repair v10 schema failed: %w", err)
 	}
 
 	// 6. Schema 完整性终态校验门禁
@@ -455,4 +550,30 @@ func (s *Store) initSchema(dbExistedBefore bool) error {
 	}
 
 	return nil
+}
+
+func repairV10SchemaIfNeeded(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='verification_requests'").Scan(&count); err != nil || count == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := ensureColumn(tx, "verification_requests", "idempotency_key", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(tx, "verification_requests", "idempotency_hash", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_vreq_status_exp ON verification_requests (status, expires_at);
+		CREATE UNIQUE INDEX IF NOT EXISTS uidx_vreq_idempotency ON verification_requests (principal_kind, principal_id, idempotency_key) WHERE idempotency_key != '';
+	`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

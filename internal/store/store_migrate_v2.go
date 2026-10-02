@@ -30,18 +30,20 @@ func SetBeforeV2PhysicalCleanupHookForTest(hook func() error) {
 // migrateV1ToV2 执行 Version 1 -> Version 2 的安全迁移:
 // 状态机严格划分为三个阶段：
 // Phase 1 (逻辑事务):
-//   1. 检查是否存在受保护凭据 (无论明文还是 enc:v1 均强制要求 Master Key);
-//   2. 重建 api_tokens 表 (SQLite table rebuild 剔除 token 明文列，已有 V2 结构则幂等跳过);
-//   3. 加密 accounts 凭据与 settings.notify_settings (已有 enc:v1 密文自检验算后保留);
-//   4. 提交事务 (此时数据库已处于逻辑 V2 数据，但 user_version 仍保持为 1)。
+//  1. 检查是否存在受保护凭据 (无论明文还是 enc:v1 均强制要求 Master Key);
+//  2. 重建 api_tokens 表 (SQLite table rebuild 剔除 token 明文列，已有 V2 结构则幂等跳过);
+//  3. 加密 accounts 凭据与 settings.notify_settings (已有 enc:v1 密文自检验算后保留);
+//  4. 提交事务 (此时数据库已处于逻辑 V2 数据，但 user_version 仍保持为 1)。
+//
 // Phase 2 (安全物理收敛):
-//   5. PRAGMA wal_checkpoint(TRUNCATE) 截断 WAL;
-//   6. VACUUM 磁盘页面重整，抹除所有明文物理碎片;
-//   7. PRAGMA wal_checkpoint(TRUNCATE) 截断 VACUUM 产生的 WAL;
-//   8. quick_check 验证物理完整性。
+//  5. PRAGMA wal_checkpoint(TRUNCATE) 截断 WAL;
+//  6. VACUUM 磁盘页面重整，抹除所有明文物理碎片;
+//  7. PRAGMA wal_checkpoint(TRUNCATE) 截断 VACUUM 产生的 WAL;
+//  8. quick_check 验证物理完整性。
+//
 // Phase 3 (终态声明):
-//   9. PRAGMA user_version = 2 写入版本号;
-//   10. validateSchema 校验完整性终态。
+//  9. PRAGMA user_version = 2 写入版本号;
+//  10. validateSchema 校验完整性终态。
 func (s *Store) migrateV1ToV2() error {
 	// 1. 检查是否存在受保护凭据 (无论明文还是 enc:v1)
 	hasProtected, err := s.hasProtectedCredentials()

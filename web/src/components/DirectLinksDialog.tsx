@@ -38,7 +38,7 @@ export default function DirectLinksDialog({ open, onClose, email }: DirectLinksD
   const origin = typeof window !== 'undefined' ? window.location.origin : ''
   const tokenParam = token.trim() ? `&token=${encodeURIComponent(token.trim())}` : ''
 
-  const jsonUrl = `${origin}/api/verify-code?email=${encodeURIComponent(email)}${tokenParam}`
+  const jsonUrl = `${origin}/mail/code?email=${encodeURIComponent(email)}${tokenParam}`
   const viewUrl = `${origin}/mail/view?email=${encodeURIComponent(email)}${tokenParam}`
   const rawUrl = `${origin}/mail/raw?email=${encodeURIComponent(email)}${tokenParam}`
 

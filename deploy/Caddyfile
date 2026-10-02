@@ -1,38 +1,39 @@
 # [INPUT]: 客户端 HTTPS 请求，由 Caddy 自动申请 TLS 证书并反代至 127.0.0.1:8081
-# [OUTPUT]: 极简开箱即用的现代化反向代理，内置 upstream read_timeout 130s 保护
+# [OUTPUT]: 自动 TLS 反向代理，验证码响应头与读取期限 150s，覆盖 120s 等待及结果交付
 # [POS]: deploy/ 的 Caddy 自动化反代配置范本
 # [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
 
 hme.your-domain.com {
-    encode gzip zstd
+	encode gzip zstd
 
-    # 安全响应头
-    header {
-        X-Frame-Options "SAMEORIGIN"
-        X-Content-Type-Options "nosniff"
-        X-XSS-Protection "1; mode=block"
-    }
+	# 安全响应头
+	header {
+		X-Frame-Options "SAMEORIGIN"
+		X-Content-Type-Options "nosniff"
+		X-XSS-Protection "1; mode=block"
+	}
 
-    # 验证码长轮询接口专属保护 (130s > 后端 120s 超时，flush_interval -1 实时直通)
-    @verify path /api/verify/code
-    handle @verify {
-        reverse_proxy 127.0.0.1:8081 {
-            transport http {
-                read_timeout 130s
-            }
-            flush_interval -1
-        }
-    }
+	# 120s 等待之外保留存储读取、凭据复查和响应传输余量。
+	@verify path /mail/code* /api/external/v2/verification-requests/*
+	handle @verify {
+		reverse_proxy 127.0.0.1:8081 {
+			transport http {
+				response_header_timeout 150s
+				read_timeout 150s
+			}
+			flush_interval -1
+		}
+	}
 
-    # 前端带 Hash 静态资源长期缓存
-    @assets path /assets/*
-    handle @assets {
-        header Cache-Control "public, max-age=31536000, immutable"
-        reverse_proxy 127.0.0.1:8081
-    }
+	# 前端带 Hash 静态资源长期缓存
+	@assets path /assets/*
+	handle @assets {
+		header Cache-Control "public, max-age=31536000, immutable"
+		reverse_proxy 127.0.0.1:8081
+	}
 
-    # 默认全量反代
-    handle {
-        reverse_proxy 127.0.0.1:8081
-    }
+	# 默认全量反代
+	handle {
+		reverse_proxy 127.0.0.1:8081
+	}
 }

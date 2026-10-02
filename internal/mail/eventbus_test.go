@@ -177,3 +177,37 @@ func TestBoundary_Matrix(t *testing.T) {
 	}
 }
 
+// 订阅时缓存中排在前面的旧代际事件不能遮蔽同缓存内的有效验证码。
+func TestSubscribeWithBoundaryPrefersMatchOverStaleGeneration(t *testing.T) {
+	bus := NewEventBus(time.Minute)
+	email := "target@icloud.com"
+	bus.PublishEvent(&CachedOTP{Source: "inbox", EventID: "old", Email: email, Folder: "INBOX", UIDValidity: 1, UID: 150, OTP: &OTPResult{Code: "111111"}})
+	bus.PublishEvent(&CachedOTP{Source: "inbox", EventID: "new", Email: email, Folder: "INBOX", UIDValidity: 2, UID: 101, OTP: &OTPResult{Code: "222222"}})
+	subID, ch := bus.SubscribeWithBoundary(email, "INBOX", 2, 100, "inbox")
+	defer bus.Unsubscribe(email, subID)
+	select {
+	case ev := <-ch:
+		if ev.EventID != "new" {
+			t.Fatalf("stale generation event shadowed valid code: got %s", ev.EventID)
+		}
+	default:
+		t.Fatal("valid cached code was not delivered")
+	}
+}
+
+// CachedMatch 只返回满足基线的事件，旧代际事件不得被当作可交付结果。
+func TestCachedMatchSkipsInvalidatedGeneration(t *testing.T) {
+	bus := NewEventBus(time.Minute)
+	email := "target@icloud.com"
+	bus.PublishEvent(&CachedOTP{Source: "inbox", EventID: "old", Email: email, Folder: "INBOX", UIDValidity: 1, UID: 150, OTP: &OTPResult{Code: "111111"}})
+	if ev := bus.CachedMatch(email, "INBOX", 2, 100, "inbox"); ev != nil {
+		t.Fatalf("invalidated generation returned as match: %s", ev.EventID)
+	}
+	bus.PublishEvent(&CachedOTP{Source: "inbox", EventID: "new", Email: email, Folder: "INBOX", UIDValidity: 2, UID: 101, OTP: &OTPResult{Code: "222222"}})
+	if ev := bus.CachedMatch(email, "INBOX", 2, 100, "inbox"); ev == nil || ev.EventID != "new" {
+		t.Fatalf("valid cached event not found: %+v", ev)
+	}
+	if ev := bus.CachedMatch(email, "INBOX", 2, 100, "other"); ev != nil {
+		t.Fatal("cross-source event returned as match")
+	}
+}

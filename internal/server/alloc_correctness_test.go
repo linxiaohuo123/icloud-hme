@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -51,57 +50,52 @@ func setupAllocTestServer(t *testing.T) (*store.Store, *fakeBackend, *httptest.S
 	return st, fb, ts
 }
 
-// LEGACY01: POST /api/quick-create, /api/alias/lease, /api/allocate, /api/external/v1/allocate 均调用同一出号服务
-func TestLEGACY01_AllLegacyEndpointsUnified(t *testing.T) {
+// LEGACY01: 旧出号别名路由已移除，管理台只保留 /api/quick-create，外部令牌只走 /api/external/v2/allocate
+func TestLEGACY01_LegacyAllocateRoutesRemoved(t *testing.T) {
 	st, _, ts := setupAllocTestServer(t)
 	defer st.Close()
 	defer ts.Close()
 
-	// 预置 4 个别名到库存
-	for i := 1; i <= 4; i++ {
-		email := fmt.Sprintf("unified_%d@icloud.com", i)
-		_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: email, Active: true}, "replenish", true)
-	}
+	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "unified_1@icloud.com", Active: true}, "replenish", true)
 
 	cookie, csrf := login(t, ts, "admin-pass-2026-strong")
-	endpoints := []string{
-		"/api/quick-create",
-		"/api/alias/lease",
-		"/api/allocate",
-		"/api/external/v1/allocate",
-	}
-
-	for i, ep := range endpoints {
+	for _, ep := range []string{"/api/alias/lease", "/api/allocate", "/api/external/v1/allocate"} {
 		req, _ := http.NewRequest("POST", ts.URL+ep, strings.NewReader(`{"tag":"default"}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
 		req.Header.Set("X-CSRF-Token", csrf)
-
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("LEGACY01 失败: 路径 %s 期望 200, 实际得到: %d", ep, resp.StatusCode)
-		}
-		var out struct {
-			Success bool `json:"success"`
-			Data    struct {
-				Email  string `json:"email"`
-				Source string `json:"source"`
-			} `json:"data"`
-		}
-		_ = json.NewDecoder(resp.Body).Decode(&out)
 		resp.Body.Close()
-
-		expectedEmail := fmt.Sprintf("unified_%d@icloud.com", i+1)
-		if out.Data.Email != expectedEmail || out.Data.Source != "pool" {
-			t.Fatalf("LEGACY01 失败: 路径 %s 期望分配 %s (source=pool), 实际得到: %s (source=%s)", ep, expectedEmail, out.Data.Email, out.Data.Source)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("LEGACY01 失败: 已移除路由 %s 期望 404, 实际: %d", ep, resp.StatusCode)
 		}
+	}
+
+	req, _ := http.NewRequest("POST", ts.URL+"/api/quick-create", strings.NewReader(`{"tag":"default"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
+	req.Header.Set("X-CSRF-Token", csrf)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Data struct {
+			Email  string `json:"email"`
+			Source string `json:"source"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || out.Data.Email != "unified_1@icloud.com" || out.Data.Source != "pool" {
+		t.Fatalf("LEGACY01 失败: /api/quick-create 期望从库存分配 unified_1, 实际: %d %s (source=%s)", resp.StatusCode, out.Data.Email, out.Data.Source)
 	}
 }
 
-// LEGACY02: 所有旧入口均操作 alias_inventory，不再写入旧独立状态
+// LEGACY02: 管理台出号操作 alias_inventory，不再写入旧独立状态
 func TestLEGACY02_OperatesOnAliasInventory(t *testing.T) {
 	st, _, ts := setupAllocTestServer(t)
 	defer st.Close()
@@ -132,7 +126,7 @@ func TestLEGACY02_OperatesOnAliasInventory(t *testing.T) {
 	}
 }
 
-// LEGACY03: 外部 token 在号池为空时访问旧入口均返回 503 POOL_EMPTY
+// LEGACY03: 外部 token 只能走 v2 出号；号池为空返回 503 POOL_EMPTY，调用管理台 /api/quick-create 返回 403
 func TestLEGACY03_ExternalTokenPoolEmpty503(t *testing.T) {
 	st, _, ts := setupAllocTestServer(t)
 	defer st.Close()
@@ -145,26 +139,29 @@ func TestLEGACY03_ExternalTokenPoolEmpty503(t *testing.T) {
 		Scopes: "allocate,verify",
 	})
 
-	endpoints := []string{
-		"/api/quick-create",
-		"/api/alias/lease",
-		"/api/allocate",
-		"/api/external/v1/allocate",
+	req, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"default"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sec_ext")
+	req.Header.Set("Idempotency-Key", "legacy03")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("LEGACY03 失败: 外部 token 号池空时访问 v2 出号期望 503, 实际: %d", resp.StatusCode)
 	}
 
-	for _, ep := range endpoints {
-		req, _ := http.NewRequest("POST", ts.URL+ep, strings.NewReader(`{"tag":"default"}`))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer sec_ext")
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusServiceUnavailable {
-			t.Fatalf("LEGACY03 失败: 外部 token 号池空时访问 %s 期望 503, 实际: %d", ep, resp.StatusCode)
-		}
+	req, _ = http.NewRequest("POST", ts.URL+"/api/quick-create", strings.NewReader(`{"tag":"default"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sec_ext")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("LEGACY03 失败: 外部 token 调用管理台 /api/quick-create 期望 403, 实际: %d", resp.StatusCode)
 	}
 }
 
@@ -182,9 +179,10 @@ func TestALLOC01_ExternalTokenSuccessClaim(t *testing.T) {
 	})
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "avail@icloud.com", Active: true}, "replenish", true)
 
-	req, _ := http.NewRequest("POST", ts.URL+"/api/allocate", strings.NewReader(`{"tag":"default"}`))
+	req, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"tag":"default"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer sec_c1")
+	req.Header.Set("Idempotency-Key", "alloc01")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -213,9 +211,10 @@ func TestALLOC02_ExternalTokenAccountIdForbidden(t *testing.T) {
 	})
 	_ = st.AddInventoryAlias("acc_1", hme.Alias{Email: "some@icloud.com", Active: true}, "replenish", true)
 
-	req, _ := http.NewRequest("POST", ts.URL+"/api/allocate", strings.NewReader(`{"account_id":"acc_1","tag":"default"}`))
+	req, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"account_id":"acc_1","tag":"default"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer sec_c2")
+	req.Header.Set("Idempotency-Key", "alloc02")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -240,9 +239,10 @@ func TestALLOC03_ExternalTokenEmptyPoolNoRemoteCreate(t *testing.T) {
 		Scopes: "allocate",
 	})
 
-	req, _ := http.NewRequest("POST", ts.URL+"/api/allocate", strings.NewReader(`{"mode":"create","tag":"default"}`))
+	req, _ := http.NewRequest("POST", ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"mode":"create","tag":"default"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer sec_c3")
+	req.Header.Set("Idempotency-Key", "alloc03")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -262,7 +262,7 @@ func TestALLOC04_AdminAllowRemoteCreateOnEmpty(t *testing.T) {
 	defer ts.Close()
 
 	cookie, csrf := login(t, ts, "admin-pass-2026-strong")
-	req, _ := http.NewRequest("POST", ts.URL+"/api/allocate", strings.NewReader(`{"mode":"create","tag":"default"}`))
+	req, _ := http.NewRequest("POST", ts.URL+"/api/quick-create", strings.NewReader(`{"mode":"create","tag":"default"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
 	req.Header.Set("X-CSRF-Token", csrf)
@@ -878,5 +878,3 @@ func TestAllocate_NewlyCreatedAliasNotPrematurelyExposedToPool(t *testing.T) {
 		t.Fatalf("expected ErrPoolEmpty for consumer B, got: %v", errB2)
 	}
 }
-
-

@@ -1,72 +1,88 @@
 /**
  * [INPUT]: 依赖基础字符串参数 origin, tag, token
  * [OUTPUT]: 对外提供 buildLeaseCommand, buildCurlSnippet, buildPythonSnippet
- * [POS]: web/src/utils 的自动化接入脚本与命令模板生成器，服务于 BusinessTagsPage
+ * [POS]: web/src/utils 的外部 v2 接入脚本与命令模板生成器，服务于 BusinessTagsPage
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
+/** 把任意字符串安全包进 shell 单引号 */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
 /** 组装外部注册机领号命令；token 传占位符即为示例文案 */
 export function buildLeaseCommand(origin: string, tag: string, token: string): string {
-  const safeTag = encodeURIComponent(tag)
-  return `curl -X POST "${origin}/api/quick-create?tag=${safeTag}" \\\n  -H "Authorization: Bearer ${token}"`
+  return `curl -X POST "${origin}/api/external/v2/allocate" \\
+  -H "Authorization: Bearer ${token}" \\
+  -H "Idempotency-Key: lease-$(date +%s)-$RANDOM" \\
+  -H "Content-Type: application/json" \\
+  -d ${shellQuote(JSON.stringify({ tag }))}`
 }
 
 /** 组装完整 cURL 接入示例流水线 */
 export function buildCurlSnippet(origin: string, tag: string, token: string): string {
-  const safeTag = encodeURIComponent(tag)
   return `# ==============================================================================
-# 步骤 1: 获取邮箱别名 (支持 URL Query 或 JSON Body，号池就绪时直接分配已缓冲别名)
-# 注意事项: 现场向 Apple 申请别名约需 1~2 秒，客户端请求超时务必设为 10 秒以上
-# 可选参数: tag (业务标识, 默认 default), label (别名备注), account_id (指定出号账号)
+# 步骤 1: 认领别名 (仅分配库存池中已就绪的别名，号池为空返回 503 POOL_EMPTY)
+# Idempotency-Key 必填：网络重试时复用同一个键，避免重复出号
+# 可选参数: tag (业务标识, 默认 default), label (别名备注)
 # ==============================================================================
-curl -X POST "${origin}/api/quick-create?tag=${safeTag}" \\
-  -H "Authorization: Bearer ${token}"
+${buildLeaseCommand(origin, tag, token)}
 
-# 步骤 1 响应示例:
+# 步骤 1 响应示例 (记下 allocation_id):
 # {
 #   "success": true,
 #   "data": {
+#     "allocation_id": "alloc_6f8b2a1c",
 #     "email": "mysterious.tiger_0x@icloud.com",
-#     "account_id": "acc_1bb36f84",
-#     "label": "scheduled",
-#     "tag": "${tag}",
-#     "created_at": "2026-09-20T10:00:00Z"
+#     "source": "pool",
+#     "status": "allocated",
+#     "allocated_at": "2026-09-20T10:00:00Z"
 #   }
 # }
 
 # ==============================================================================
-# 步骤 2: 提取验证码 (长轮询等待邮件到达并自动解析)
-# 参数说明:
-#   email (必填): 待接码别名邮箱
-#   timeout (可选): 最大等待秒数 (默认 30, 上限 120)
-#   auto_delete 已不支持；需要停用别名时由管理员单独操作
+# 步骤 2: 创建取码任务，锁定邮件基线 (之后到达的邮件才会被认作验证码)
 # ==============================================================================
-curl "${origin}/api/verify-code?email=mysterious.tiger_0x@icloud.com&timeout=60" \\
+curl -X POST "${origin}/api/external/v2/verification-requests" \\
+  -H "Authorization: Bearer ${token}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"lease_id":"alloc_6f8b2a1c"}'
+
+# 步骤 2 响应示例 (baseline_ready 为 true 后再去目标网站发送验证码):
+# {
+#   "success": true,
+#   "data": { "request_id": "vreq_8a3d1e4f", "status": "ready", "baseline_ready": true }
+# }
+
+# ==============================================================================
+# 步骤 3: 在目标网站触发发送验证码，然后长轮询取码
+# timeout 为最长等待秒数 (默认 0 即时查询，上限 120)
+# ==============================================================================
+curl "${origin}/api/external/v2/verification-requests/vreq_8a3d1e4f?timeout=60" \\
   -H "Authorization: Bearer ${token}"
 
-# 步骤 2 响应示例:
+# 步骤 3 响应示例:
 # {
 #   "success": true,
 #   "data": {
-#     "email": "mysterious.tiger_0x@icloud.com",
+#     "request_id": "vreq_8a3d1e4f",
+#     "alias_email": "mysterious.tiger_0x@icloud.com",
+#     "status": "succeeded",
 #     "code": "849201",
-#     "magic_link": "",
-#     "subject": "TikTok Verification Code: 849201",
-#     "from": "verify@account.tiktok.com",
-#     "date": "2026-09-20T10:01:00Z"
+#     "magic_link": ""
 #   }
 # }`
 }
 
 /** 组装完整 Python 接入示例流水线 */
 export function buildPythonSnippet(origin: string, tag: string, token: string): string {
-  return `import requests
-import time
+  return `import uuid
+import requests
 
-# iCloud HME 自动化注册机完整流水线示例
+# iCloud HME 外部 v2 接入完整流水线示例
 BASE_URL = "${origin}"
 API_TOKEN = "${token}"
-TAG = "${tag}"
+TAG = ${JSON.stringify(tag)}
 
 headers = {
     "Authorization": f"Bearer {API_TOKEN}",
@@ -74,45 +90,56 @@ headers = {
 }
 
 # ----------------------------------------------------------------------
-# 步骤 1: 获取邮箱别名 (现场向 Apple 申请约需 1~2 秒，timeout 建议设为 10 秒以上)
+# 步骤 1: 认领别名 (网络重试时复用同一个 Idempotency-Key，避免重复出号)
 # ----------------------------------------------------------------------
-lease_resp = requests.post(
-    f"{BASE_URL}/api/quick-create",
-    params={"tag": TAG},
-    headers=headers,
-    timeout=10
+alloc_resp = requests.post(
+    f"{BASE_URL}/api/external/v2/allocate",
+    json={"tag": TAG},
+    headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+    timeout=15
 ).json()
 
-if not lease_resp.get("success"):
-    raise RuntimeError(f"领号失败: {lease_resp.get('message')}")
+if not alloc_resp.get("success"):
+    raise RuntimeError(f"领号失败: {alloc_resp.get('code')} {alloc_resp.get('message')}")
 
-email = lease_resp["data"]["email"]
+email = alloc_resp["data"]["email"]
+allocation_id = alloc_resp["data"]["allocation_id"]
 print(f"[*] 成功获取别名邮箱: {email} (业务标识: {TAG})")
 
 # ----------------------------------------------------------------------
-# 步骤 2: 在目标平台填表注册，触发验证码邮件
-# (此处调用你的自动化注册逻辑，如 Selenium / Playwright / 协议提交)
+# 步骤 2: 创建取码任务，锁定邮件基线
 # ----------------------------------------------------------------------
-# time.sleep(3)
+vreq_resp = requests.post(
+    f"{BASE_URL}/api/external/v2/verification-requests",
+    json={"lease_id": allocation_id},
+    headers=headers,
+    timeout=15
+).json()
+
+if not vreq_resp.get("success") or not vreq_resp["data"].get("baseline_ready"):
+    raise RuntimeError(f"创建取码任务失败: {vreq_resp.get('code')} {vreq_resp.get('message')}")
+
+request_id = vreq_resp["data"]["request_id"]
 
 # ----------------------------------------------------------------------
-# 步骤 3: 提取验证码 (长轮询等待邮件)
+# 步骤 3: 在目标平台填表注册，触发验证码邮件
+# (此处调用你的自动化注册逻辑，如 Selenium / Playwright / 协议提交)
+# ----------------------------------------------------------------------
+
+# ----------------------------------------------------------------------
+# 步骤 4: 长轮询提取验证码
 # ----------------------------------------------------------------------
 verify_resp = requests.get(
-    f"{BASE_URL}/api/verify-code",
-    params={
-        "email": email,
-        "timeout": 60
-    },
+    f"{BASE_URL}/api/external/v2/verification-requests/{request_id}",
+    params={"timeout": 60},
     headers=headers,
     timeout=65
 ).json()
 
-if verify_resp.get("success"):
-    data = verify_resp["data"]
-    print(f"[+] 提取验证码成功: {data.get('code')}")
-    print(f"[+] 邮件主题: {data.get('subject')}")
+data = verify_resp.get("data") or {}
+if verify_resp.get("success") and data.get("status") == "succeeded":
+    print(f"[+] 提取验证码成功: {data.get('code') or data.get('magic_link')}")
 else:
-    print(f"[-] 等待验证码超时或失败: {verify_resp.get('message')}")
+    print(f"[-] 未取到验证码: {data.get('status') or verify_resp.get('code')} {verify_resp.get('message', '')}")
 `
 }

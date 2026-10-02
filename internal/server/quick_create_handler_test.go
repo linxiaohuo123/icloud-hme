@@ -257,7 +257,7 @@ func TestQuickCreatePoolFirstAndFallback(t *testing.T) {
 	client := ts.Client()
 
 	postAllocate := func(body string) (int, map[string]any) {
-		req, _ := http.NewRequest("POST", ts.URL+"/api/allocate", strings.NewReader(body))
+		req, _ := http.NewRequest("POST", ts.URL+"/api/quick-create", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-API-Key", "test-key")
 		resp, err := client.Do(req)
@@ -370,7 +370,7 @@ func TestQuickCreateRoundRobinInterleaving(t *testing.T) {
 
 	client := ts.Client()
 	postAllocate := func() (string, string) {
-		req, _ := http.NewRequest("POST", ts.URL+"/api/allocate", strings.NewReader(`{}`))
+		req, _ := http.NewRequest("POST", ts.URL+"/api/quick-create", strings.NewReader(`{}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-API-Key", "test-key")
 		resp, err := client.Do(req)

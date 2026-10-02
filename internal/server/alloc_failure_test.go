@@ -46,7 +46,7 @@ func TestB04_DatabaseErrorDoesNotTriggerCreateAlias(t *testing.T) {
 	}
 
 	cookie, csrf := login(t, ts, "admin-pass-2026-strong")
-	req, _ := http.NewRequest("POST", ts.URL+"/api/allocate", strings.NewReader(`{"mode":"pool","tag":"default","idempotency_key":"key_b04"}`))
+	req, _ := http.NewRequest("POST", ts.URL+"/api/quick-create", strings.NewReader(`{"mode":"pool","tag":"default","idempotency_key":"key_b04"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
 	req.Header.Set("X-CSRF-Token", csrf)

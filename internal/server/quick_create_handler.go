@@ -167,7 +167,7 @@ func selectAccountByTag(accounts []account.Summary, tag string) string {
 	return cands[0]
 }
 
-// quickCreateHandler 处理 POST /api/quick-create、/api/alias/lease、/api/allocate 与 /api/external/v1/allocate。
+// quickCreateHandler 处理管理台出号 POST /api/quick-create (admin 作用域)；外部令牌统一走 /api/external/v2/allocate。
 func (s *Server) quickCreateHandler(c *gin.Context) {
 	var req quickCreateReq
 	if err := c.ShouldBindJSON(&req); err != nil && err.Error() != "EOF" {

@@ -43,7 +43,4 @@ export const handlers = [
   http.get('/api/mailboxes', () =>
     HttpResponse.json({ success: true, data: { folders: [] } }),
   ),
-  http.post('/api/messages', () =>
-    HttpResponse.json({ success: true, data: { messages: [], count: 0 } }),
-  ),
 ]

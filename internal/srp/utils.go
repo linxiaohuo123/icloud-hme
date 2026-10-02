@@ -44,10 +44,6 @@ func intFromBytes(bytes []byte) *big.Int {
 	return i
 }
 
-func intToBytes(i *big.Int) []byte {
-	return i.Bytes()
-}
-
 func bytesFromHexString(s string) []byte {
 	re, _ := regexp.Compile("[^0-9a-fA-F]")
 	h := re.ReplaceAll([]byte(s), []byte(""))

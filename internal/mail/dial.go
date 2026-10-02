@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 bufio, context, crypto/tls, encoding/base64, fmt, net, net/http, net/url, strings, time
  * [OUTPUT]: 对外提供 dialHTTPConnect、dialHTTPConnectContext
- * [POS]: internal/mail 的 HTTP CONNECT 隧道拨号器，支持请求取消与正向代理连接远程 IMAP 端口
+ * [POS]: internal/mail 的 HTTP CONNECT 隧道拨号器，支持请求取消并保留握手预读的隧道首包，连接远程 IMAP 端口
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -19,6 +19,15 @@ import (
 	"strings"
 	"time"
 )
+
+// HTTP response parsing may already read the first tunnel bytes into its buffer.
+// Read through that same buffer after CONNECT; all other net.Conn operations remain direct.
+type connectTunnelConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *connectTunnelConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
 
 // dialHTTPConnect 通过 HTTP/HTTPS 代理发起 CONNECT 请求建立到达目标 targetAddr 的裸 TCP 隧道。
 func dialHTTPConnect(proxyURL *url.URL, targetAddr string, timeout time.Duration) (net.Conn, error) {
@@ -73,7 +82,8 @@ func dialHTTPConnectContext(ctx context.Context, proxyURL *url.URL, targetAddr s
 		return nil, err
 	}
 
-	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, req)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -95,5 +105,5 @@ func dialHTTPConnectContext(ctx context.Context, proxyURL *url.URL, targetAddr s
 	}
 	_ = conn.SetDeadline(time.Time{})
 
-	return conn, nil
+	return &connectTunnelConn{Conn: conn, reader: reader}, nil
 }

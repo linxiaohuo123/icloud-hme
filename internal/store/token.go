@@ -375,39 +375,41 @@ func (s *Store) ValidateTokenWithName(tokenStr string) (name string, scopes stri
 	return name, scopes, ok
 }
 
-// ValidateTokenPrincipal 校验令牌并返回不可变 ID、名称与作用域集合 (PR-04/PR-07)。
-// 校验规则：
-// 1. token_hash 匹配；
-// 2. revoked_at 必须为空；
-// 3. expires_at 为空或大于当前时间；
-// 只有在认证完全成功时，才允许将 ID 写入 activityCh 推进活跃时间。
-func (s *Store) ValidateTokenPrincipal(tokenStr string) (id, name, scopes string, ok bool) {
+// ValidateTokenPrincipalContext 校验令牌并返回不可变 ID、名称与作用域集合，支持 Context 与区分存储异常与无效凭据 (T2)。
+// 当 context 取消时返回 ctx.Err()；底层 DB 查询错误返回具体 err；若令牌不存在、被注销、已过期或格式错误，返回 ok=false, err=nil。
+func (s *Store) ValidateTokenPrincipalContext(ctx context.Context, tokenStr string) (id, name, scopes string, ok bool, err error) {
 	tokenStr = strings.TrimSpace(tokenStr)
 	if tokenStr == "" {
-		return "", "", "", false
+		return "", "", "", false, nil
 	}
 
 	tokenHash := HashToken(tokenStr)
 	var expiresAt, revokedAt string
 
-	err := s.db.QueryRow(`
+	queryErr := s.db.QueryRowContext(ctx, `
 		SELECT id, name, COALESCE(scopes, ''), COALESCE(expires_at, ''), COALESCE(revoked_at, '')
 		FROM api_tokens WHERE token_hash = ?
 	`, tokenHash).Scan(&id, &name, &scopes, &expiresAt, &revokedAt)
-	if err != nil {
-		return "", "", "", false
+	if queryErr != nil {
+		if errors.Is(queryErr, sql.ErrNoRows) {
+			return "", "", "", false, nil
+		}
+		if ctx.Err() != nil {
+			return "", "", "", false, ctx.Err()
+		}
+		return "", "", "", false, queryErr
 	}
 
 	// 1. 检查是否已被注销
 	if revokedAt != "" {
-		return "", "", "", false
+		return "", "", "", false, nil
 	}
 
 	// 2. 检查是否已过期 (malformed expires_at 必须 fail closed，绝不能把格式错误当作永不过期)
 	if expiresAt != "" {
 		expTime, parseErr := time.Parse(time.RFC3339, expiresAt)
 		if parseErr != nil || !time.Now().UTC().Before(expTime) {
-			return "", "", "", false
+			return "", "", "", false, nil
 		}
 	}
 
@@ -416,7 +418,13 @@ func (s *Store) ValidateTokenPrincipal(tokenStr string) (id, name, scopes string
 	case s.activityCh <- id:
 	default:
 	}
-	return id, name, scopes, true
+	return id, name, scopes, true, nil
+}
+
+// ValidateTokenPrincipal 校验令牌并返回不可变 ID、名称与作用域集合 (PR-04/PR-07)。
+func (s *Store) ValidateTokenPrincipal(tokenStr string) (id, name, scopes string, ok bool) {
+	id, name, scopes, ok, _ = s.ValidateTokenPrincipalContext(context.Background(), tokenStr)
+	return id, name, scopes, ok
 }
 
 // GetToken 按 ID 查询 API 令牌记录 (PR-06/PR-07)

@@ -83,7 +83,7 @@ func TestTokenScopesRestrictAdminSurface(t *testing.T) {
 		// 【PR-01 安全止损】受限外部令牌不得触达母号收件箱、目录或邮件详情
 		{"/api/inbox", "scoped-token-aaaa", http.StatusForbidden},
 		{"/api/inbox/thread_123", "scoped-token-aaaa", http.StatusForbidden},
-		{"/api/messages/123", "scoped-token-aaaa", http.StatusForbidden},
+		{"/api/inbox/123", "scoped-token-aaaa", http.StatusForbidden},
 		{"/api/mailboxes", "scoped-token-aaaa", http.StatusForbidden},
 		// 管理员作用域令牌: 放行
 		{"/api/tokens", "admin-token-bbbb", http.StatusOK},
@@ -339,8 +339,7 @@ func TestPR01SafetyMitigations(t *testing.T) {
 
 	// 1. GET verify-code 附带 auto_delete 参数必须明确拒绝 400 UNSUPPORTED_PARAMETER
 	for _, path := range []string{
-		"/api/verify-code?email=target@icloud.com&auto_delete=true",
-		"/api/external/v1/verify-code?email=target@icloud.com&auto_delete=true",
+		"/mail/code?email=target@icloud.com&auto_delete=true",
 	} {
 		req, _ := http.NewRequest(http.MethodGet, ts.URL+path, nil)
 		req.Header.Set("X-API-Key", "scoped-token-aaaa")
@@ -369,22 +368,10 @@ func TestPR01SafetyMitigations(t *testing.T) {
 		}
 	}
 
-	// 3. 受限令牌试图调用 POST /api/messages (批量获取邮件)，必须被拒 403
-	reqMsgs, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/messages", strings.NewReader(`{"account_id":"acc_1","ids":["100"]}`))
-	reqMsgs.Header.Set("X-API-Key", "scoped-token-aaaa")
-	reqMsgs.Header.Set("Content-Type", "application/json")
-	respMsgs, err := ts.Client().Do(reqMsgs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	respMsgs.Body.Close()
-	if respMsgs.StatusCode != http.StatusForbidden {
-		t.Fatalf("受限令牌直接调用 POST /api/messages 期望 403, 实际 %d", respMsgs.StatusCode)
-	}
-
-	// 4. 受限令牌试图在 /api/allocate 中指定 account_id，必须被拒 403
-	reqAlloc, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/allocate", strings.NewReader(`{"account_id":"acc_1"}`))
+	// 3. 受限令牌试图在 /api/external/v2/allocate 中指定 account_id，必须被拒 403
+	reqAlloc, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/external/v2/allocate", strings.NewReader(`{"account_id":"acc_1"}`))
 	reqAlloc.Header.Set("X-API-Key", "scoped-token-aaaa")
+	reqAlloc.Header.Set("Idempotency-Key", "pr01-account-id")
 	reqAlloc.Header.Set("Content-Type", "application/json")
 	respAlloc, err := ts.Client().Do(reqAlloc)
 	if err != nil {
@@ -395,10 +382,9 @@ func TestPR01SafetyMitigations(t *testing.T) {
 		t.Fatalf("受限令牌指定 account_id 出号期望 403, 实际 %d", respAlloc.StatusCode)
 	}
 
-	// 5. 无论何种身份，物理删信入口必须阻断 400 MAIL_DELETE_UNSUPPORTED
+	// 4. 无论何种身份，物理删信入口必须阻断 400 MAIL_DELETE_UNSUPPORTED
 	for _, delPath := range []string{
 		"/api/inbox/100?account_id=acc_1",
-		"/api/messages/100?account_id=acc_1",
 	} {
 		reqDel, _ := http.NewRequest(http.MethodDelete, ts.URL+delPath, nil)
 		reqDel.Header.Set("X-API-Key", "admin-token-bbbb")

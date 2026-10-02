@@ -423,7 +423,11 @@ func TestPR06_V09_RevocationExpiryAndUIDValidityChange(t *testing.T) {
 	res := parseData(t, resp)
 	vreqID := res["request_id"].(string)
 
-	// 注入 UIDVALIDITY 突变的事件 (例如重建了 mailbox，validity 变为 999)
+	// 注入 UIDVALIDITY 突变的事件 (例如重建了 mailbox，validity 变为 999)。
+	// 事件代际须由当前邮箱边界确认，旧代际缓存事件不能单独否定较新的基线。
+	fb.mailboxBoundaryFunc = func(accountID, folder string) (string, uint32, uint32, error) {
+		return "imap", 999, 1, nil
+	}
 	s.eventBus.PublishEvent(&mail.CachedOTP{
 		EventID:     "evt_invalidated",
 		Email:       "target_alias@icloud.com",

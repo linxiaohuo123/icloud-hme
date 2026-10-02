@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, flag, os, path/filepath, time, icloud-hme/internal/account, icloud-hme/internal/server, icloud-hme/internal/store
  * [OUTPUT]: icloud-hme 二进制可执行文件入口 (支持 -backup 与 -restore 一致性容灾 CLI)
- * [POS]: 项目全局 CLI 引导与环境初始化层
+ * [POS]: 项目全局 CLI 引导与环境初始化层；生产停机资源由 Server.Run 按单一总体预算收尾，避免重复 defer 等待；监听或停机失败以非零码退出
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -220,13 +220,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("初始化数据库存储失败: %v", err)
 	}
-	defer st.Close()
 
 	mgr, err := account.NewManager(abs, st)
 	if err != nil {
 		log.Fatalf("初始化账号管理器失败: %v", err)
 	}
-	defer mgr.Close()
 	count := len(mgr.ListAccounts())
 	log.Printf("账号加载完成 count=%d data_dir=%s", count, abs)
 
@@ -243,31 +241,67 @@ func main() {
 		log.Printf("自动化 API Key 鉴权已启用 (免 CSRF/Session)")
 	}
 
+	maxInflightGlobal, err := parseOptionalInt("ICLOUD_HME_MAX_INFLIGHT_GLOBAL", 128, 1, 10000)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	maxInflightPrincipal, err := parseOptionalInt("ICLOUD_HME_MAX_INFLIGHT_PRINCIPAL", 64, 1, 5000)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	maxWaitersGlobal, err := parseOptionalInt("ICLOUD_HME_MAX_WAITERS_GLOBAL", 4000, 1, 50000)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	maxWaitersPrincipal, err := parseOptionalInt("ICLOUD_HME_MAX_WAITERS_PRINCIPAL", 2000, 1, 20000)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	maxWaitersPerKey, err := parseOptionalInt("ICLOUD_HME_MAX_WAITERS_PER_KEY", 8, 1, 100)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	maxGlobalActiveVReq, err := parseOptionalInt("ICLOUD_HME_MAX_GLOBAL_ACTIVE_VREQ", 2000, 1, 50000)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	maxPerPrincipalActiveVReq, err := parseOptionalInt("ICLOUD_HME_MAX_PER_TOKEN_ACTIVE_VREQ", 500, 1, 20000)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+
 	srv, err := server.New(mgr, st, server.Config{
-		DataDir:               abs,
-		Debug:                 *debug,
-		AdminPassword:         adminPassword,
-		APIKey:                apiKey,
-		SessionTTL:            sessionTTL,
-		SecureCookie:          secureCookie,
-		CookieMonitorInterval: cookieMonitorInterval,
-		CookieMonitorThrottle: cookieThrottle,
-		StartupSyncInterval:   startupSyncInterval,
-		MailPollInterval:      mailPollInterval,
-		LeaseRetention:        leaseRetention,
-		TrustedProxies:        trustedProxies,
+		DataDir:                   abs,
+		Debug:                     *debug,
+		AdminPassword:             adminPassword,
+		APIKey:                    apiKey,
+		SessionTTL:                sessionTTL,
+		SecureCookie:              secureCookie,
+		CookieMonitorInterval:     cookieMonitorInterval,
+		CookieMonitorThrottle:     cookieThrottle,
+		StartupSyncInterval:       startupSyncInterval,
+		MailPollInterval:          mailPollInterval,
+		LeaseRetention:            leaseRetention,
+		TrustedProxies:            trustedProxies,
+		MaxInflightGlobal:         maxInflightGlobal,
+		MaxInflightPerPrincipal:   maxInflightPrincipal,
+		MaxWaitersGlobal:          maxWaitersGlobal,
+		MaxWaitersPerPrincipal:    maxWaitersPrincipal,
+		MaxWaitersPerKey:          maxWaitersPerKey,
+		MaxGlobalActiveVReq:       maxGlobalActiveVReq,
+		MaxPerPrincipalActiveVReq: maxPerPrincipalActiveVReq,
 	})
 	if err != nil {
 		log.Fatalf("初始化服务失败: %v", err)
 	}
-	defer srv.Close()
 
 	// 密码只用于初始化认证,随后立即从进程环境清除
 	_ = os.Unsetenv("ICLOUD_HME_ADMIN_PASSWORD")
 
 	log.Printf("HTTP 服务就绪 addr=%s", listenAddr)
+	// Run 已在返回前完成停机收尾；监听失败或停机异常必须以非零码退出，供进程管理器和脚本识别。
 	if err := srv.Run(listenAddr); err != nil {
-		log.Fatalf("服务启动失败: %v", err)
+		log.Fatalf("[Server] 异常退出: %v", err)
 	}
 }
 
@@ -440,4 +474,19 @@ func resolveListenAddr(cliAddr string, cliSet bool) string {
 		return strings.TrimSpace(cliAddr)
 	}
 	return "127.0.0.1:8081"
+}
+
+func parseOptionalInt(envKey string, defaultVal, minVal, maxVal int) (int, error) {
+	v := strings.TrimSpace(os.Getenv(envKey))
+	if v == "" {
+		return defaultVal, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s 必须是整数: %w", envKey, err)
+	}
+	if n < minVal || n > maxVal {
+		return 0, fmt.Errorf("%s 超出允许范围 [%d, %d]: %d", envKey, minVal, maxVal, n)
+	}
+	return n, nil
 }

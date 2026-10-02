@@ -129,12 +129,12 @@ func TestPR02_DetailRoutesConsistency(t *testing.T) {
 
 	cookie, _ := login(t, ts, "admin-pass-2026-strong")
 
-	// 验证 /api/inbox/:id 与 /api/messages/:id 两条路由行为和结构完全一致
+	// 验证 /api/inbox/:id 与 /api/inbox/:id 两条路由行为和结构完全一致
 	reqInbox := authedReq(t, ts, "GET", "/api/inbox/99?account_id=acc_1", "")
 	reqInbox.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
 	status1, body1, _ := do(t, reqInbox)
 
-	reqMessages := authedReq(t, ts, "GET", "/api/messages/99?account_id=acc_1", "")
+	reqMessages := authedReq(t, ts, "GET", "/api/inbox/99?account_id=acc_1", "")
 	reqMessages.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
 	status2, body2, _ := do(t, reqMessages)
 
@@ -282,20 +282,12 @@ func TestPR02_GetMessagesNoFakeSubstitution(t *testing.T) {
 			return nil, errors.New("upstream imap failed")
 		},
 	}
-	_, ts := newTestServer(fb)
+	s, ts := newTestServer(fb)
 	defer ts.Close()
 
-	cookie, csrf := login(t, ts, "admin-pass-2026-strong")
-
-	payload := `{"account_id":"acc_1","messages":[{"folder":"INBOX","uid":"1001"}]}`
-	req := authedReq(t, ts, "POST", "/api/messages", payload)
-	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
-	req.Header.Set("X-CSRF-Token", csrf)
-
-	status, body, _ := do(t, req)
-	// 当 IMAP 读取失败时，必须返回错误，严禁用无关邮件冒充成功返回 200
-	if status == http.StatusOK {
-		t.Fatalf("expected failure status on batch get error, got 200: %s", body)
+	// 当 IMAP 读取失败时，必须返回错误，严禁用无关邮件冒充成功结果
+	if _, _, err := s.mailReadService.GetMessagesBatch(context.Background(), "acc_1", []batchMessageItemReq{{Folder: "INBOX", UID: "1001"}}); err == nil {
+		t.Fatal("expected error on batch get failure, got nil")
 	}
 }
 
@@ -325,36 +317,20 @@ func TestPR02_MAIL_ID_01_PartialBatchNotFound(t *testing.T) {
 			}, nil
 		},
 	}
-	_, ts := newTestServer(fb)
+	s, ts := newTestServer(fb)
 	defer ts.Close()
 
-	cookie, csrf := login(t, ts, "admin-pass-2026-strong")
-
-	payload := `{"account_id":"acc_1","messages":[{"message_ref":"` + ref41.Encode() + `"},{"message_ref":"` + ref42.Encode() + `"}]}`
-	req := authedReq(t, ts, "POST", "/api/messages", payload)
-	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
-	req.Header.Set("X-CSRF-Token", csrf)
-
-	status, body, _ := do(t, req)
-	if status != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d: %s", status, body)
+	_, items, err := s.mailReadService.GetMessagesBatch(context.Background(), "acc_1", []batchMessageItemReq{{MessageRef: ref41.Encode()}, {MessageRef: ref42.Encode()}})
+	if err != nil {
+		t.Fatalf("GetMessagesBatch error: %v", err)
 	}
 
-	var res struct {
-		Data struct {
-			Items []BatchItemResult `json:"items"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(body), &res); err != nil {
-		t.Fatalf("unmarshal error: %v", err)
-	}
-
-	if len(res.Data.Items) != 2 {
-		t.Fatalf("expected 2 items, got %d", len(res.Data.Items))
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
 	}
 
 	// 第一项: UID41 -> 必须 not found
-	item1 := res.Data.Items[0]
+	item1 := items[0]
 	if item1.Message != nil {
 		t.Fatalf("UID41 item must NOT have message, but got UID=%d", item1.Message.UID)
 	}
@@ -363,7 +339,7 @@ func TestPR02_MAIL_ID_01_PartialBatchNotFound(t *testing.T) {
 	}
 
 	// 第二项: UID42 -> 必须正确匹配 UID42
-	item2 := res.Data.Items[1]
+	item2 := items[1]
 	if item2.Message == nil || item2.Message.UID != 42 {
 		t.Fatalf("expected UID42 message, got %+v", item2.Message)
 	}
@@ -406,38 +382,22 @@ func TestPR02_MAIL_ID_02_OutOfOrderBatch(t *testing.T) {
 			}, nil
 		},
 	}
-	_, ts := newTestServer(fb)
+	s, ts := newTestServer(fb)
 	defer ts.Close()
 
-	cookie, csrf := login(t, ts, "admin-pass-2026-strong")
-
-	payload := `{"account_id":"acc_1","messages":[{"message_ref":"` + ref41.Encode() + `"},{"message_ref":"` + ref42.Encode() + `"}]}`
-	req := authedReq(t, ts, "POST", "/api/messages", payload)
-	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
-	req.Header.Set("X-CSRF-Token", csrf)
-
-	status, body, _ := do(t, req)
-	if status != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d: %s", status, body)
+	_, items, err := s.mailReadService.GetMessagesBatch(context.Background(), "acc_1", []batchMessageItemReq{{MessageRef: ref41.Encode()}, {MessageRef: ref42.Encode()}})
+	if err != nil {
+		t.Fatalf("GetMessagesBatch error: %v", err)
 	}
 
-	var res struct {
-		Data struct {
-			Items []BatchItemResult `json:"items"`
-		} `json:"data"`
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
 	}
-	if err := json.Unmarshal([]byte(body), &res); err != nil {
-		t.Fatalf("unmarshal error: %v", err)
+	if items[0].Message == nil || items[0].Message.UID != 41 {
+		t.Fatalf("item 0 must be UID41, got %+v", items[0].Message)
 	}
-
-	if len(res.Data.Items) != 2 {
-		t.Fatalf("expected 2 items, got %d", len(res.Data.Items))
-	}
-	if res.Data.Items[0].Message == nil || res.Data.Items[0].Message.UID != 41 {
-		t.Fatalf("item 0 must be UID41, got %+v", res.Data.Items[0].Message)
-	}
-	if res.Data.Items[1].Message == nil || res.Data.Items[1].Message.UID != 42 {
-		t.Fatalf("item 1 must be UID42, got %+v", res.Data.Items[1].Message)
+	if items[1].Message == nil || items[1].Message.UID != 42 {
+		t.Fatalf("item 1 must be UID42, got %+v", items[1].Message)
 	}
 }
 
@@ -477,38 +437,22 @@ func TestPR02_MAIL_ID_03_FolderIsolation(t *testing.T) {
 			}, nil
 		},
 	}
-	_, ts := newTestServer(fb)
+	s, ts := newTestServer(fb)
 	defer ts.Close()
 
-	cookie, csrf := login(t, ts, "admin-pass-2026-strong")
-
-	payload := `{"account_id":"acc_1","messages":[{"message_ref":"` + refInbox.Encode() + `"},{"message_ref":"` + refJunk.Encode() + `"}]}`
-	req := authedReq(t, ts, "POST", "/api/messages", payload)
-	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
-	req.Header.Set("X-CSRF-Token", csrf)
-
-	status, body, _ := do(t, req)
-	if status != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d: %s", status, body)
+	_, items, err := s.mailReadService.GetMessagesBatch(context.Background(), "acc_1", []batchMessageItemReq{{MessageRef: refInbox.Encode()}, {MessageRef: refJunk.Encode()}})
+	if err != nil {
+		t.Fatalf("GetMessagesBatch error: %v", err)
 	}
 
-	var res struct {
-		Data struct {
-			Items []BatchItemResult `json:"items"`
-		} `json:"data"`
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
 	}
-	if err := json.Unmarshal([]byte(body), &res); err != nil {
-		t.Fatalf("unmarshal error: %v", err)
+	if items[0].Message.Folder != "INBOX" || items[0].Message.Subject != "Inbox 42" {
+		t.Fatalf("item 0 must be INBOX 42, got folder=%s subject=%s", items[0].Message.Folder, items[0].Message.Subject)
 	}
-
-	if len(res.Data.Items) != 2 {
-		t.Fatalf("expected 2 items, got %d", len(res.Data.Items))
-	}
-	if res.Data.Items[0].Message.Folder != "INBOX" || res.Data.Items[0].Message.Subject != "Inbox 42" {
-		t.Fatalf("item 0 must be INBOX 42, got folder=%s subject=%s", res.Data.Items[0].Message.Folder, res.Data.Items[0].Message.Subject)
-	}
-	if res.Data.Items[1].Message.Folder != "Junk" || res.Data.Items[1].Message.Subject != "Junk 42" {
-		t.Fatalf("item 1 must be Junk 42, got folder=%s subject=%s", res.Data.Items[1].Message.Folder, res.Data.Items[1].Message.Subject)
+	if items[1].Message.Folder != "Junk" || items[1].Message.Subject != "Junk 42" {
+		t.Fatalf("item 1 must be Junk 42, got folder=%s subject=%s", items[1].Message.Folder, items[1].Message.Subject)
 	}
 }
 
@@ -537,125 +481,27 @@ func TestPR02_MAIL_ID_04_UIDValidityOldNew(t *testing.T) {
 			}, nil
 		},
 	}
-	_, ts := newTestServer(fb)
+	s, ts := newTestServer(fb)
 	defer ts.Close()
 
-	cookie, csrf := login(t, ts, "admin-pass-2026-strong")
-
-	payload := `{"account_id":"acc_1","messages":[{"message_ref":"` + refOld.Encode() + `"},{"message_ref":"` + refNew.Encode() + `"}]}`
-	req := authedReq(t, ts, "POST", "/api/messages", payload)
-	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
-	req.Header.Set("X-CSRF-Token", csrf)
-
-	status, body, _ := do(t, req)
-	if status != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d: %s", status, body)
+	_, items, err := s.mailReadService.GetMessagesBatch(context.Background(), "acc_1", []batchMessageItemReq{{MessageRef: refOld.Encode()}, {MessageRef: refNew.Encode()}})
+	if err != nil {
+		t.Fatalf("GetMessagesBatch error: %v", err)
 	}
 
-	var res struct {
-		Data struct {
-			Items []BatchItemResult `json:"items"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(body), &res); err != nil {
-		t.Fatalf("unmarshal error: %v", err)
-	}
-
-	if len(res.Data.Items) != 2 {
-		t.Fatalf("expected 2 items, got %d", len(res.Data.Items))
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
 	}
 	// 老代际必须 not found，绝不能把新代际的 42 错配给老代际
-	if res.Data.Items[0].Message != nil {
+	if items[0].Message != nil {
 		t.Fatalf("item 0 (old validity) must be not found, but got message")
 	}
-	if res.Data.Items[0].Error != "message not found" {
-		t.Fatalf("expected 'message not found', got %s", res.Data.Items[0].Error)
+	if items[0].Error != "message not found" {
+		t.Fatalf("expected 'message not found', got %s", items[0].Error)
 	}
 	// 新代际正确返回
-	if res.Data.Items[1].Message == nil || res.Data.Items[1].Message.UIDValidity != 200 {
-		t.Fatalf("item 1 (new validity) must be matched, got %+v", res.Data.Items[1].Message)
-	}
-}
-
-// TestPR02_CrossLayerContract_ReactToBackendPayload: 真实 React request payload -> 真实 Go JSON bind -> MessageRef 保持完整
-func TestPR02_CrossLayerContract_ReactToBackendPayload(t *testing.T) {
-	origRef := mail.MessageRef{
-		Provider:    "imap",
-		AccountID:   "acc_react_1",
-		Mailbox:     "INBOX",
-		UIDValidity: 9876,
-		UID:         12345,
-	}
-	encodedRef := origRef.Encode()
-
-	var capturedRefs []mail.MessageRef
-	fb := &fakeBackend{
-		accounts: []account.Summary{{ID: "acc_react_1", Name: "React测试号"}},
-		getMessagesFunc: func(accountID string, refs []mail.MessageRef) ([]*mail.FullMessage, error) {
-			capturedRefs = refs
-			return []*mail.FullMessage{
-				{
-					Message: mail.Message{
-						ID:          "12345",
-						Folder:      "INBOX",
-						UIDValidity: 9876,
-						UID:         12345,
-						Provider:    "imap",
-						MessageRef:  encodedRef,
-						Subject:     "React Contract Subject",
-					},
-					Provider: "imap",
-					Method:   "imap",
-				},
-			}, nil
-		},
-	}
-	_, ts := newTestServer(fb)
-	defer ts.Close()
-
-	cookie, csrf := login(t, ts, "admin-pass-2026-strong")
-
-	// 模拟真实 React 请求体：主路径严格仅发送 message_ref，无旧字段
-	reactPayload := map[string]any{
-		"account_id": "acc_react_1",
-		"messages": []map[string]any{
-			{
-				"message_ref": encodedRef,
-			},
-		},
-	}
-	payloadBytes, _ := json.Marshal(reactPayload)
-
-	req := authedReq(t, ts, "POST", "/api/messages", string(payloadBytes))
-	req.AddCookie(&http.Cookie{Name: "hme_session", Value: cookie})
-	req.Header.Set("X-CSRF-Token", csrf)
-
-	status, body, _ := do(t, req)
-	if status != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d: %s", status, body)
-	}
-
-	if len(capturedRefs) != 1 {
-		t.Fatalf("expected 1 captured ref in backend, got %d", len(capturedRefs))
-	}
-	cRef := capturedRefs[0]
-	if cRef.Provider != "imap" || cRef.AccountID != "acc_react_1" || cRef.Mailbox != "INBOX" || cRef.UIDValidity != 9876 || cRef.UID != 12345 {
-		t.Fatalf("MessageRef degraded or mutated: %+v", cRef)
-	}
-
-	var resp struct {
-		Data struct {
-			Items []BatchItemResult `json:"items"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		t.Fatalf("unmarshal error: %v", err)
-	}
-	if len(resp.Data.Items) != 1 || resp.Data.Items[0].Message == nil {
-		t.Fatalf("invalid items returned: %+v", resp.Data.Items)
-	}
-	if resp.Data.Items[0].RequestedRef != encodedRef {
-		t.Fatalf("requested ref mismatch: got %s, want %s", resp.Data.Items[0].RequestedRef, encodedRef)
+	if items[1].Message == nil || items[1].Message.UIDValidity != 200 {
+		t.Fatalf("item 1 (new validity) must be matched, got %+v", items[1].Message)
 	}
 }
 
@@ -793,4 +639,3 @@ func TestBatchIdentityJoin_ShuffledAndMissing(t *testing.T) {
 		t.Fatalf("expected 2 successful messages, got %d", len(msgs))
 	}
 }
-

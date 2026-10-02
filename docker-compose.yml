@@ -37,8 +37,22 @@ services:
       # Camoufox 自动化上号代理服务通信地址
       - ICLOUD_HME_CAMOUFOX_URL=${ICLOUD_HME_CAMOUFOX_URL:-http://camoufox-agent:8089}
       - ICLOUD_HME_CAMOUFOX_TOKEN=${ICLOUD_HME_CAMOUFOX_TOKEN:?请在 .env 中设置 Camoufox 通信令牌}
+      # 并发与长轮询保护配置 (PR-CONCURRENCY T1/T10)
+      - ICLOUD_HME_MAX_INFLIGHT_GLOBAL=${ICLOUD_HME_MAX_INFLIGHT_GLOBAL:-128}
+      - ICLOUD_HME_MAX_INFLIGHT_PRINCIPAL=${ICLOUD_HME_MAX_INFLIGHT_PRINCIPAL:-64}
+      - ICLOUD_HME_MAX_WAITERS_GLOBAL=${ICLOUD_HME_MAX_WAITERS_GLOBAL:-4000}
+      - ICLOUD_HME_MAX_WAITERS_PRINCIPAL=${ICLOUD_HME_MAX_WAITERS_PRINCIPAL:-2000}
+      - ICLOUD_HME_MAX_WAITERS_PER_KEY=${ICLOUD_HME_MAX_WAITERS_PER_KEY:-8}
+      - ICLOUD_HME_MAX_GLOBAL_ACTIVE_VREQ=${ICLOUD_HME_MAX_GLOBAL_ACTIVE_VREQ:-2000}
+      - ICLOUD_HME_MAX_PER_TOKEN_ACTIVE_VREQ=${ICLOUD_HME_MAX_PER_TOKEN_ACTIVE_VREQ:-500}
       # 时区设置
       - TZ=${TZ:-Asia/Shanghai}
+    stop_grace_period: 30s
+    # 长轮询占用真实 socket；显式设置句柄预算，避免宿主默认 1024 导致连接失败。
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     volumes:
       # 持久化存储账号凭据与 SQLite 数据库 (icloud_hme.db)
       # 注意: SQLite WAL 依赖共享内存映射，请确保该路径落在本地块设备文件系统上，

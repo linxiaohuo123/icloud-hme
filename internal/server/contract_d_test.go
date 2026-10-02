@@ -169,8 +169,8 @@ func TestD02_AutoDeleteRejectedAndAdminDeactivationPermission(t *testing.T) {
 	tokSecret := "sec_token_d02"
 	_ = st.SaveToken(store.APIToken{ID: "tok_d02", Name: "client_d02", Token: tokSecret, Scopes: "allocate,verify"})
 
-	// 1. GET /api/verify-code 传 auto_delete=true 必须返回 400 UNSUPPORTED_PARAMETER
-	req1, _ := http.NewRequest("GET", ts.URL+"/api/verify-code?email=target@icloud.com&auto_delete=true", nil)
+	// 1. GET /mail/code 传 auto_delete=true 必须返回 400 UNSUPPORTED_PARAMETER
+	req1, _ := http.NewRequest("GET", ts.URL+"/mail/code?email=target@icloud.com&auto_delete=true", nil)
 	req1.Header.Set("Authorization", "Bearer "+tokSecret)
 	resp1, err := http.DefaultClient.Do(req1)
 	if err != nil {
@@ -181,8 +181,8 @@ func TestD02_AutoDeleteRejectedAndAdminDeactivationPermission(t *testing.T) {
 		t.Fatalf("D02 FAILED: verify-code auto_delete=true should return 400, got: %d", resp1.StatusCode)
 	}
 
-	// 2. GET /api/external/v1/verify-code 传 auto_delete=1 必须返回 400 UNSUPPORTED_PARAMETER
-	req2, _ := http.NewRequest("GET", ts.URL+"/api/external/v1/verify-code?email=target@icloud.com&auto_delete=1", nil)
+	// 2. GET /mail/code 传 auto_delete=1 必须返回 400 UNSUPPORTED_PARAMETER
+	req2, _ := http.NewRequest("GET", ts.URL+"/mail/code?email=target@icloud.com&auto_delete=1", nil)
 	req2.Header.Set("Authorization", "Bearer "+tokSecret)
 	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {

@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 context, github.com/emersion/go-imap, golang.org/x/net/proxy
  * [OUTPUT]: 对外提供 Client、NewClient、NewClientWithServer、Message、FullMessage
- * [POS]: internal/mail 的 IMAP 客户端核心，支持可取消建连及列表按需正文；内容拉取由 client_fetch.go 承载，增量扫描由 client_scan.go 承载，隧道拨号由 dial.go 承载
+ * [POS]: internal/mail 的 IMAP 客户端核心，支持可取消建连、库级命令期限与有限登出；内容拉取由 client_fetch.go 承载，增量扫描由 client_scan.go 承载，隧道拨号由 dial.go 承载
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -81,20 +81,28 @@ type FullMessage struct {
 
 // Client 是 iCloud 邮件 IMAP 客户端。
 type Client struct {
-	username       string
-	password       string
-	server         string
-	port           int
-	proxyURL       string
-	cli            *client.Client
-	conn           net.Conn // 底层连接, 用于设置读写截止时间
-	curMailbox     string
-	curUIDValidity uint32
+	username string
+	password string
+	server   string
+	port     int
+	proxyURL string
+	cli      *client.Client
+	conn     net.Conn // 底层连接, 用于设置读写截止时间
 }
 
-// SetDeadline 给底层连接设置绝对读写截止时间; 零值清除。
+// SetDeadline 设置当前连接及后续命令的有限预算；零值清除。
+// go-imap execute 会重设 socket deadline，必须同时配置库的命令 Timeout。
 // 到期触发 i/o timeout, 连接会被连接池判定为坏连接丢弃重建。
 func (c *Client) SetDeadline(t time.Time) {
+	if c.cli != nil {
+		c.cli.Timeout = 0
+		if !t.IsZero() {
+			c.cli.Timeout = time.Until(t)
+			if c.cli.Timeout <= 0 {
+				c.cli.Timeout = time.Nanosecond
+			}
+		}
+	}
 	if c.conn != nil {
 		_ = c.conn.SetDeadline(t)
 	}
@@ -228,6 +236,7 @@ func (c *Client) ConnectContext(ctx context.Context) error {
 		return fmt.Errorf("IMAP 初始化失败: %w", err)
 	}
 	_ = rawConn.SetDeadline(time.Now().Add(IMAPCommandTimeout))
+	cli.Timeout = IMAPCommandTimeout
 	loginErr := cli.Login(c.username, c.password)
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -307,10 +316,10 @@ func (c *Client) Ping() error {
 // 【资源红线】go-imap 的 Logout() 只发送 LOGOUT 命令，真正的 conn.Close() 发生在
 // 服务端回 BYE 的分支里。若服务器不回 BYE(假死/半开)，Logout 超时返回后 reader
 // 协程会永久阻塞在 ReadResp 上，且持有 conn 引用使 finalizer 无法回收。
-// 因此这里必须先保留 deadline(不清零)，并在 Logout 失败时强制 Terminate。
+// 因此登出使用短命令预算，并在失败时强制 Terminate。
 func (c *Client) Disconnect() {
 	if c.cli != nil {
-		c.SetDeadline(time.Now().Add(IMAPCommandTimeout))
+		c.SetDeadline(time.Now().Add(2 * time.Second))
 		if err := c.cli.Logout(); err != nil {
 			_ = c.cli.Terminate()
 		}
@@ -1156,30 +1165,4 @@ func (c *Client) fetchCandidatesBody(folder string, uidValidity uint32, uids []u
 		return nil, bodyReceived, err
 	}
 	return fetched, bodyReceived, nil
-}
-
-// fetchOneUID 拉取单封邮件(含 body preview), 使用 BODY.PEEK 不标已读。
-func (c *Client) fetchOneUID(folder string, uid uint32) (Message, error) {
-	seqset := new(imap.SeqSet)
-	seqset.AddNum(uid)
-	section := &imap.BodySectionName{Peek: true}
-	items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate, imap.FetchFlags, section.FetchItem()}
-	messages := make(chan *imap.Message, 1)
-	done := make(chan error, 1)
-	go func() {
-		done <- c.cli.UidFetch(seqset, items, messages)
-	}()
-	var msg *imap.Message
-	for m := range messages {
-		if msg == nil && m != nil {
-			msg = m
-		}
-	}
-	if err := <-done; err != nil {
-		return Message{}, err
-	}
-	if msg == nil {
-		return Message{}, fmt.Errorf("邮件不存在 (uid=%d)", uid)
-	}
-	return toMessageWithBody(msg, folder), nil
 }
