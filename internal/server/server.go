@@ -84,7 +84,6 @@ type Server struct {
 	eventBus        *mail.EventBus
 	aliasBuffer     *AliasBuffer
 	syncWorker      *MailSyncWorker
-	reaper          *AliasReaper
 	cookieMon       *CookieMonitor
 	leasePruner     *LeasePruner
 	notifier        *notify.Sender
@@ -171,7 +170,6 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 		mailPoll = 1 * time.Second
 	}
 	syncWorker := NewMailSyncWorker(be, st, eventBus, mailPoll)
-	reaper := NewAliasReaper(be, 1*time.Hour, 2*time.Hour)
 	notifier := notify.NewSender()
 	mon := NewCookieMonitor(be, cfg.CookieMonitorInterval, notifier)
 	if st != nil {
@@ -187,7 +185,6 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 		eventBus:        eventBus,
 		aliasBuffer:     aliasBuf,
 		syncWorker:      syncWorker,
-		reaper:          reaper,
 		cookieMon:       mon,
 		notifier:        notifier,
 		store:           st,
@@ -340,7 +337,6 @@ func (s *Server) Run(addr string) error {
 	}
 	s.aliasBuffer.Start()
 	s.syncWorker.Start()
-	s.reaper.Start()
 	s.cookieMon.Start()
 	s.leasePruner.Start()
 	s.scheduler.Start()
@@ -546,15 +542,6 @@ func (s *Server) startClose() {
 				go func() {
 					defer wg.Done()
 					s.aliasBuffer.Stop()
-				}()
-			}
-
-			// Reaper
-			if s.reaper != nil {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					s.reaper.Stop()
 				}()
 			}
 
