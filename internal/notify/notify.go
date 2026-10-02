@@ -37,6 +37,7 @@ const (
 	KindQuotaLow        = "quota_low"        // 别名配额水位告警
 	KindMailFailed      = "mail_failed"      // 收信邮箱连续认证失败(暂停出号)
 	KindMailRecovered   = "mail_recovered"   // 收信邮箱认证恢复
+	KindPoolLow         = "pool_low"         // 号源余量 (可用库存 + 可建别名) 低于阈值
 	KindTest            = "test"             // 设置页测试推送
 )
 
@@ -48,6 +49,7 @@ func DefaultEventKinds() map[string]bool {
 		KindQuotaLow:        true,
 		KindMailFailed:      true,
 		KindMailRecovered:   true,
+		KindPoolLow:         true,
 	}
 }
 
@@ -59,6 +61,7 @@ type Settings struct {
 	TelegramChat   string          `json:"telegram_chat"`            // Telegram Chat ID
 	EventKinds     map[string]bool `json:"event_kinds"`              // 事件开关
 	QuotaThreshold int             `json:"quota_threshold"`          // 别名配额水位阈值, 0=关闭
+	PoolThreshold  int             `json:"pool_threshold"`           // 号源余量阈值, 0=关闭
 	ResendMinutes  int             `json:"resend_minutes,omitempty"` // 失效事件重提醒间隔(分钟), 0=6h
 }
 
@@ -138,6 +141,13 @@ func (s *Sender) QuotaThreshold() int {
 	return s.settings.QuotaThreshold
 }
 
+// PoolThreshold 返回号源余量阈值(0=关闭)。
+func (s *Sender) PoolThreshold() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.settings.PoolThreshold
+}
+
 // Stop 停止后台投递协程(线程安全且幂等)。
 func (s *Sender) Stop() {
 	s.stopOnce.Do(func() {
@@ -191,7 +201,7 @@ func (s *Sender) throttleWindow(kind string) time.Duration {
 			return time.Duration(s.settings.ResendMinutes) * time.Minute
 		}
 		return 6 * time.Hour
-	case KindQuotaLow:
+	case KindQuotaLow, KindPoolLow:
 		return 24 * time.Hour
 	}
 	return 0

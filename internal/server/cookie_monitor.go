@@ -36,6 +36,7 @@ import (
 type EventSink interface {
 	Emit(event notify.Event)
 	QuotaThreshold() int
+	PoolThreshold() int
 }
 
 // CookieMonitor 定时校验账号 Cookie 健康度的后台引擎。
@@ -55,6 +56,9 @@ type CookieMonitor struct {
 	prevStatus map[string]string // accountID → 上次已知状态
 	prevQuota  map[string]int    // accountID → 上次已知 active 别名数
 	prevMail   map[string]bool   // accountID → 上次已知收信认证故障状态
+	// poolAvailable 返回号池可用库存数 (生产注入 store 计数，nil 表示不检查号源余量)
+	poolAvailable func() int
+	poolLow       bool // 上次检查时号源余量是否低于阈值
 }
 
 // 账号间节流的自动摊平边界。
@@ -211,6 +215,41 @@ func (m *CookieMonitor) validateOnce() {
 	if checked > 0 {
 		m.logs.Add(fmt.Sprintf("本轮 Cookie 校验完成 accounts=%d 间隔=%v", checked, gap))
 	}
+	m.checkPool()
+}
+
+// checkPool 号源余量 (可用库存 + 可出号账号还能新建的别名) 首次低于阈值时告警，回升后复位。
+func (m *CookieMonitor) checkPool() {
+	if m.notifier == nil || m.poolAvailable == nil {
+		return
+	}
+	threshold := m.notifier.PoolThreshold()
+	if threshold <= 0 {
+		return
+	}
+	available := m.poolAvailable()
+	creatable := 0
+	for _, acc := range m.be.ListAccounts() {
+		if acc.Status == "active" && !acc.MailAuthFailed && !account.IsProtectedAccount(acc.Name, acc.Tags) {
+			creatable += creatableAliases(acc)
+		}
+	}
+	low := available+creatable < threshold
+	m.mu.Lock()
+	prev := m.poolLow
+	m.poolLow = low
+	m.mu.Unlock()
+	if low && !prev {
+		m.logs.Add(fmt.Sprintf("号源余量 %d 低于阈值 %d", available+creatable, threshold))
+		m.emit(notify.KindPoolLow, "", "号池",
+			"号源即将用完",
+			fmt.Sprintf("可用库存 %d 个 + 账号剩余可建 %d 个，合计 %d 个，已低于阈值 %d。请补充 Apple 账号。", available, creatable, available+creatable, threshold))
+	}
+}
+
+// creatableAliases 返回账号在 750 双维熔断前还能新建的别名数 (停用别名同样占用总数)。
+func creatableAliases(acc account.Summary) int {
+	return max(account.MaxAliasesPerAccount-max(acc.AliasTotal, acc.AliasActive), 0)
 }
 
 // validateAccount 校验单个账号：记录日志、在状态跳变沿推送通知、成功后检查配额水位。

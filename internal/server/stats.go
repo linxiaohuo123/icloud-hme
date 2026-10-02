@@ -55,10 +55,7 @@ func (s *Server) systemStatsHandler(c *gin.Context) {
 				if acc.Status == "active" {
 					totalActiveAliases += acc.AliasActive
 					if !account.IsProtectedAccount(acc.Name, acc.Tags) {
-						rem := account.MaxAliasesPerAccount - acc.AliasActive
-						if rem > 0 {
-							appleQuotaRemaining += rem
-						}
+						appleQuotaRemaining += creatableAliases(acc)
 					}
 				}
 			}

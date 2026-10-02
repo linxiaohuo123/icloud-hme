@@ -61,6 +61,7 @@ type NotifySettingsResponse struct {
 	TelegramChat        string          `json:"telegram_chat"`
 	EventKinds          map[string]bool `json:"event_kinds"`
 	QuotaThreshold      int             `json:"quota_threshold"`
+	PoolThreshold       int             `json:"pool_threshold"`
 	ResendMinutes       int             `json:"resend_minutes,omitempty"`
 }
 
@@ -84,6 +85,7 @@ func (s *Server) getNotifySettingsHandler(c *gin.Context) {
 		TelegramChat:        st.TelegramChat,
 		EventKinds:          st.EventKinds,
 		QuotaThreshold:      st.QuotaThreshold,
+		PoolThreshold:       st.PoolThreshold,
 		ResendMinutes:       st.ResendMinutes,
 	}
 	ok(c, resp)
@@ -97,6 +99,7 @@ type UpdateNotifySettingsRequest struct {
 	TelegramChat   *string         `json:"telegram_chat"`
 	EventKinds     map[string]bool `json:"event_kinds"`
 	QuotaThreshold *int            `json:"quota_threshold"`
+	PoolThreshold  *int            `json:"pool_threshold"`
 	ResendMinutes  *int            `json:"resend_minutes"`
 
 	ClearFeishu   bool `json:"clear_feishu"`
@@ -174,6 +177,13 @@ func (s *Server) updateNotifySettingsHandler(c *gin.Context) {
 		}
 		current.QuotaThreshold = *req.QuotaThreshold
 	}
+	if req.PoolThreshold != nil {
+		if *req.PoolThreshold < 0 || *req.PoolThreshold > 1000000 {
+			failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "号源余量阈值需在 0-1000000 之间 (0 表示关闭)")
+			return
+		}
+		current.PoolThreshold = *req.PoolThreshold
+	}
 
 	if req.ResendMinutes != nil {
 		if *req.ResendMinutes < 0 || *req.ResendMinutes > 7*24*60 {
@@ -186,7 +196,7 @@ func (s *Server) updateNotifySettingsHandler(c *gin.Context) {
 	if req.EventKinds != nil {
 		for kind := range req.EventKinds {
 			switch kind {
-			case notify.KindCookieExpired, notify.KindCookieRecovered, notify.KindQuotaLow, notify.KindMailFailed, notify.KindMailRecovered:
+			case notify.KindCookieExpired, notify.KindCookieRecovered, notify.KindQuotaLow, notify.KindMailFailed, notify.KindMailRecovered, notify.KindPoolLow:
 			default:
 				failCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "未知的事件类型: "+kind)
 				return
@@ -228,6 +238,7 @@ func (s *Server) updateNotifySettingsHandler(c *gin.Context) {
 		TelegramChat:        current.TelegramChat,
 		EventKinds:          current.EventKinds,
 		QuotaThreshold:      current.QuotaThreshold,
+		PoolThreshold:       current.PoolThreshold,
 		ResendMinutes:       current.ResendMinutes,
 	})
 }

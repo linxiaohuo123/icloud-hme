@@ -235,6 +235,7 @@ export interface NotifySettingsResponse {
   telegram_chat: string
   event_kinds: Record<string, boolean> | null
   quota_threshold: number
+  pool_threshold?: number
   resend_minutes?: number
 }
 
@@ -249,6 +250,7 @@ export interface UpdateNotifySettingsRequest {
   clear_telegram?: boolean
   event_kinds?: Record<string, boolean> | null
   quota_threshold?: number
+  pool_threshold?: number
   resend_minutes?: number
 }
 

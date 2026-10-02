@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,10 +15,12 @@ import (
 type recordingSink struct {
 	events    []notify.Event
 	threshold int
+	pool      int
 }
 
 func (r *recordingSink) Emit(ev notify.Event) { r.events = append(r.events, ev) }
 func (r *recordingSink) QuotaThreshold() int  { return r.threshold }
+func (r *recordingSink) PoolThreshold() int   { return r.pool }
 
 // TestCookieMonitorEmitsExpiredAndRecovered 校验失效与恢复仅在跳变沿各推送一次。
 func TestCookieMonitorEmitsExpiredAndRecovered(t *testing.T) {
@@ -144,5 +147,34 @@ func TestCookieMonitorMailAuthEdge(t *testing.T) {
 	}
 	if ids := selectPoolAccounts(fake.accounts, ""); len(ids) != 1 {
 		t.Fatalf("恢复后应重新参与出号, 实际 %v", ids)
+	}
+}
+
+// TestCookieMonitorPoolLowEdge 号源余量跌破阈值只推一次、回升后复位；停用别名同样占用 750 名额，故障/保护账号不计入。
+func TestCookieMonitorPoolLowEdge(t *testing.T) {
+	sink := &recordingSink{pool: 100}
+	fake := &fakeBackend{accounts: []account.Summary{
+		{ID: "acc_1", Name: "一号", Status: "active", AliasTotal: 740, AliasActive: 100}, // 可建 10
+		{ID: "acc_bad", Name: "坏邮箱", Status: "active", MailAuthFailed: true},           // 不计入
+		{ID: "acc_err", Name: "失效", Status: "error"},                                   // 不计入
+	}}
+	available := 50
+	mon := NewCookieMonitor(fake, 30*time.Minute, sink)
+	mon.poolAvailable = func() int { return available }
+
+	mon.checkPool() // 50 + 10 = 60 < 100
+	mon.checkPool()
+	if got := countKinds(sink.events, notify.KindPoolLow); got != 1 {
+		t.Fatalf("跌破阈值应只推 1 次, 实际 %d", got)
+	}
+	available = 200 // 回升复位
+	mon.checkPool()
+	available = 50 // 再次跌破
+	mon.checkPool()
+	if got := countKinds(sink.events, notify.KindPoolLow); got != 2 {
+		t.Fatalf("回升后再次跌破应重新告警, 实际 %d", got)
+	}
+	if !strings.Contains(sink.events[len(sink.events)-1].Message, "合计 60") {
+		t.Fatalf("余量应为 50 库存 + 10 可建: %s", sink.events[len(sink.events)-1].Message)
 	}
 }

@@ -21,6 +21,7 @@ const DEFAULT_EVENT_KINDS: Record<string, boolean> = {
   quota_low: true,
   mail_failed: true,
   mail_recovered: true,
+  pool_low: true,
 }
 
 const EVENT_ITEMS: Array<{ key: string; label: string; desc: string }> = [
@@ -29,6 +30,7 @@ const EVENT_ITEMS: Array<{ key: string; label: string; desc: string }> = [
   { key: 'quota_low', label: '配额水位告警', desc: '活跃别名数首次越过阈值时推送' },
   { key: 'mail_failed', label: '收信邮箱故障', desc: '收信邮箱连续认证失败、账号暂停出号时推送' },
   { key: 'mail_recovered', label: '收信邮箱恢复', desc: '故障邮箱认证恢复、账号重新出号时推送' },
+  { key: 'pool_low', label: '号源即将用完', desc: '可用库存加账号剩余可建别名低于阈值时推送' },
 ]
 
 const CHANNEL_LABELS: Record<string, string> = {
@@ -79,6 +81,7 @@ export default function SettingsPage() {
   // 策略与开关状态
   const [eventKinds, setEventKinds] = useState<Record<string, boolean>>(DEFAULT_EVENT_KINDS)
   const [quotaThreshold, setQuotaThreshold] = useState<number>(0)
+  const [poolThreshold, setPoolThreshold] = useState<number>(0)
 
   const { show } = useToast()
 
@@ -92,6 +95,7 @@ export default function SettingsPage() {
         setServerSettings(data)
         setEventKinds(data.event_kinds || DEFAULT_EVENT_KINDS)
         setQuotaThreshold(data.quota_threshold ?? 0)
+        setPoolThreshold(data.pool_threshold ?? 0)
         setTelegramChatInput(data.telegram_chat || '')
       })
       .catch((err: unknown) => {
@@ -193,6 +197,7 @@ export default function SettingsPage() {
       const payload: UpdateNotifySettingsRequest = {
         event_kinds: eventKinds,
         quota_threshold: quotaThreshold,
+        pool_threshold: poolThreshold,
       }
 
       if (clearFeishu) {
@@ -233,6 +238,7 @@ export default function SettingsPage() {
       setTelegramChatInput(saved.telegram_chat || '')
       setEventKinds(saved.event_kinds || DEFAULT_EVENT_KINDS)
       setQuotaThreshold(saved.quota_threshold ?? 0)
+      setPoolThreshold(saved.pool_threshold ?? 0)
 
       show('通知配置已保存')
     } catch (err) {
@@ -539,6 +545,28 @@ export default function SettingsPage() {
                     disabled={saving}
                     value={quotaThreshold}
                     onChange={(e) => setQuotaThreshold(Number(e.target.value))}
+                  />
+                  <span className="input-suffix">个别名</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="settings-row">
+              <div className="settings-row-label">
+                <label htmlFor="pool_threshold">号源余量阈值 (可用库存 + 可建别名)</label>
+                <span className="hint">设为 0 表示关闭。全部可出号账号的可用库存加剩余可建别名低于阈值时推送，提醒补充 Apple 账号</span>
+              </div>
+              <div className="settings-row-control">
+                <div className="input-with-suffix settings-number">
+                  <input
+                    id="pool_threshold"
+                    className="input"
+                    type="number"
+                    min={0}
+                    max={1000000}
+                    disabled={saving}
+                    value={poolThreshold}
+                    onChange={(e) => setPoolThreshold(Number(e.target.value))}
                   />
                   <span className="input-suffix">个别名</span>
                 </div>

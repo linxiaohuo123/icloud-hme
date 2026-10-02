@@ -174,6 +174,9 @@ func newWithBackendAndStoreWithError(be Backend, cfg Config, st *store.Store) (*
 	reaper := NewAliasReaper(be, 1*time.Hour, 2*time.Hour)
 	notifier := notify.NewSender()
 	mon := NewCookieMonitor(be, cfg.CookieMonitorInterval, notifier)
+	if st != nil {
+		mon.poolAvailable = st.CountAuthoritativeAvailableAliases
+	}
 	mon.SetThrottle(cfg.CookieMonitorThrottle)
 
 	ctx, cancel := context.WithCancel(context.Background())

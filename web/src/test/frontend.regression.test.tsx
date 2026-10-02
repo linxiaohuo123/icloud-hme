@@ -131,7 +131,7 @@ it('工作台别名筛选同步 URL，切换标签后保持当前筛选', async 
 it('通知配置读取失败时不可保存，重试后按已读取策略保存', async () => {
   let reads = 0
   const submitted: UpdateNotifySettingsRequest[] = []
-  const settings = { event_kinds: { cookie_expired: true, cookie_recovered: false, quota_low: true }, quota_threshold: 700 }
+  const settings = { event_kinds: { cookie_expired: true, cookie_recovered: false, quota_low: true }, quota_threshold: 700, pool_threshold: 300 }
   server.use(
     http.get('/api/settings/notify', () => ++reads === 1
       ? HttpResponse.json({ success: false, code: 'INTERNAL_ERROR', message: '配置读取失败' }, { status: 500 })

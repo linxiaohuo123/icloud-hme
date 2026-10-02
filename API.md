@@ -1095,15 +1095,18 @@ Content-Type: application/json
     "cookie_recovered": true,
     "quota_low": true,
     "mail_failed": true,
-    "mail_recovered": true
+    "mail_recovered": true,
+    "pool_low": true
   },
   "quota_threshold": 450,
+  "pool_threshold": 300,
   "resend_minutes": 360
 }
 ```
 - 支持飞书、Bark、Telegram 独立或并发推送。
 - `quota_threshold`：当账号活跃别名达到该水位时主动发送告警通知。
 - `mail_failed` / `mail_recovered`：收信邮箱连续认证失败而暂停出号、以及恢复时推送；Cookie 监控每轮顺带探测一次收信邮箱。旧配置中未出现的事件类型按开启处理。
+- `pool_threshold`：号源余量阈值，0 表示关闭。余量 = 号池可用库存 + 可出号账号 (active、非保护、收信正常) 在 750 上限前还能新建的别名数；每轮 Cookie 监控检查一次，首次低于阈值推送 `pool_low`，回升到阈值以上后复位。
 - 配置立即保存至 SQLite settings 表，全自动热加载生效。
 
 ### 36. 发送测试通知
@@ -1201,7 +1204,7 @@ Authorization: Bearer <API_KEY>
 | `alias_pool.dormant_aliases` | **沉睡资产数**：处于 unknown 且干净未消费的别名数，可随时调 `promote-to-pool` 激活入池 |
 | `alias_pool.total_active_aliases` | 所有活跃账号在 Apple 远端处于激活状态的别名总数 |
 | `alias_pool.consumed_aliases` | 历史已被外部注册机或业务领用消费的别名总数 |
-| `alias_pool.apple_quota_remaining` | 距离 Apple 单母号 750 物理上限剩余可现场新建额度（已自动排除私人大号） |
+| `alias_pool.apple_quota_remaining` | 距离 Apple 单母号 750 物理上限剩余可现场新建额度（已自动排除私人大号）；按总数与活跃数中较大者计算，已停用别名同样占用额度 |
 | `goroutines` | 数千为正常；持续数万说明有泄漏（派生 goroutine 未退出） |
 | `heap_alloc_bytes` | 主要来自别名缓存（账号数 × 别名数）。2000×200 约 150–200 MB |
 | `store.leases` | 未配置 `ICLOUD_HME_LEASE_RETENTION` 时会持续累积增长 |
