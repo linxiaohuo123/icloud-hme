@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"icloud-hme/internal/account"
@@ -135,6 +136,13 @@ func TestHealthCheck_SPAHTMLFallbackCannotPassAsHealthy(t *testing.T) {
 	s := newWithBackendAndStore(f, Config{AdminPassword: "admin-pass-2026-strong"}, st)
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
+
+	// 内存前端资源，避免依赖 npm run build 产物
+	origWebUI := webuiFS
+	webuiFS = fstest.MapFS{
+		"index.html": {Data: []byte("<!DOCTYPE html><html><body>管理界面</body></html>")},
+	}
+	defer func() { webuiFS = origWebUI }()
 
 	// 请求未注册的路径，触发旧版 SPA fallback 行为
 	resp, err := ts.Client().Get(ts.URL + "/unregistered_legacy_probe")

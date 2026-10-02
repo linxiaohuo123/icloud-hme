@@ -38,10 +38,11 @@ func TestSPAAPI404JSON(t *testing.T) {
 		AdminPassword: "admin-pass-2026-strong",
 	})
 	// 替换 webui 为内存 FS,避免依赖构建产物
+	origWebUI := webuiFS
 	webuiFS = fstest.MapFS{
 		"index.html": {Data: []byte("<html>管理界面</html>")},
 	}
-	defer func() { webuiFS = nil }()
+	defer func() { webuiFS = origWebUI }()
 
 	req := httptest.NewRequest("GET", "/api/not-found", nil)
 	rec := httptest.NewRecorder()
@@ -67,10 +68,11 @@ func TestSPAIndexServed(t *testing.T) {
 		Debug:         false,
 		AdminPassword: "admin-pass-2026-strong",
 	})
+	origWebUI := webuiFS
 	webuiFS = fstest.MapFS{
 		"index.html": {Data: []byte("<html>管理界面</html>")},
 	}
-	defer func() { webuiFS = nil }()
+	defer func() { webuiFS = origWebUI }()
 
 	req := httptest.NewRequest("GET", "/accounts?account_id=acc_test", nil)
 	rec := httptest.NewRecorder()

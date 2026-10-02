@@ -1,0 +1,6 @@
+# 文本文件统一 LF：覆盖 Windows core.autocrlf，避免 Linux 包内 install.sh / systemd 单元带 CR 而失效
+* text=auto eol=lf
+
+# Windows 批处理需要 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
